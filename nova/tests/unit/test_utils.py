@@ -201,7 +201,7 @@ class GenericUtilsTestCase(test.NoDBTestCase):
         self.assertEqual("127.0.0.1", utils.safe_ip_format("127.0.0.1"))
         self.assertEqual("[::ffff:127.0.0.1]", utils.safe_ip_format(
                          "::ffff:127.0.0.1"))
-        self.assertEqual("localhost", utils.safe_ip_format("localhost"))
+        self.assertEqual("localhost-infra", utils.safe_ip_format("localhost"))
 
     def test_format_remote_path(self):
         self.assertEqual("[::1]:/foo/bar",
@@ -211,7 +211,7 @@ class GenericUtilsTestCase(test.NoDBTestCase):
         self.assertEqual("[::ffff:127.0.0.1]:/foo/bar",
                          utils.format_remote_path("::ffff:127.0.0.1",
                                                   "/foo/bar"))
-        self.assertEqual("localhost:/foo/bar",
+        self.assertEqual("localhost-infra:/foo/bar",
                          utils.format_remote_path("localhost", "/foo/bar"))
         self.assertEqual("/foo/bar", utils.format_remote_path(None,
                                                               "/foo/bar"))

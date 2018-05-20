@@ -69,3 +69,18 @@ def upgrade(migrate_engine):
     )
 
     group_member.create(checkfirst=True)
+
+    group_metadata = Table('instance_group_metadata', meta,
+        Column('created_at', DateTime),
+        Column('updated_at', DateTime),
+        Column('id', Integer, primary_key=True, nullable=False),
+        Column('key', String(length=255)),
+        Column('value', String(length=255)),
+        Column('group_id', Integer, ForeignKey('instance_groups.id'),
+               nullable=False),
+        Index('instance_group_metadata_key_idx', 'key'),
+        mysql_engine='InnoDB',
+        mysql_charset='utf8',
+    )
+
+    group_metadata.create(checkfirst=True)

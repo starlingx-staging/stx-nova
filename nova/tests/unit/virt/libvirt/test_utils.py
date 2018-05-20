@@ -12,6 +12,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2016-2017 Wind River Systems, Inc.
+#
 
 import functools
 import os
@@ -24,6 +27,7 @@ from oslo_config import cfg
 from oslo_utils import fileutils
 import six
 
+from nova.compute import utils as compute_utils
 from nova import context
 from nova import exception
 from nova import objects
@@ -54,14 +58,14 @@ class LibvirtUtilsTestCase(test.NoDBTestCase):
     def test_copy_image_remote_ssh(self, mock_rem_fs_remove):
         self.flags(remote_filesystem_transport='ssh', group='libvirt')
         libvirt_utils.copy_image('src', 'dest', host='host')
-        mock_rem_fs_remove.assert_called_once_with('src', 'host:dest',
+        mock_rem_fs_remove.assert_called_once_with('src', 'host-infra:dest',
             on_completion=None, on_execute=None, compression=True)
 
     @mock.patch('nova.virt.libvirt.volume.remotefs.RsyncDriver.copy_file')
     def test_copy_image_remote_rsync(self, mock_rem_fs_remove):
         self.flags(remote_filesystem_transport='rsync', group='libvirt')
         libvirt_utils.copy_image('src', 'dest', host='host')
-        mock_rem_fs_remove.assert_called_once_with('src', 'host:dest',
+        mock_rem_fs_remove.assert_called_once_with('src', 'host-infra:dest',
             on_completion=None, on_execute=None, compression=True)
 
     @mock.patch('os.path.exists', return_value=True)
@@ -545,12 +549,17 @@ disk size: 4.4M
                         '/some/path')
         mock_execute.assert_called_once_with(*execute_args, run_as_root=True)
 
-    def _do_test_extract_snapshot(self, mock_execute, src_format='qcow2',
+    @mock.patch.object(utils, 'disk_op_sema')
+    def _do_test_extract_snapshot(self, mock_execute, mock_disk_op_sema,
+                                  src_format='qcow2',
                                   dest_format='raw', out_format='raw'):
         libvirt_utils.extract_snapshot('/path/to/disk/image', src_format,
                                        '/extracted/snap', dest_format)
-        qemu_img_cmd = ('qemu-img', 'convert', '-f',
-                        src_format, '-O', out_format)
+        # WRS: mock out disk concurrency sema and add ionice & no caching
+        # options to qemu-img
+        qemu_img_cmd = ('ionice', '-c2', '-n4', 'qemu-img', 'convert',
+                        '-t', 'none',
+                        '-f', src_format, '-O', out_format)
         if CONF.libvirt.snapshot_compression and dest_format == "qcow2":
             qemu_img_cmd += ('-c',)
         qemu_img_cmd += ('/path/to/disk/image', '/extracted/snap')
@@ -712,12 +721,17 @@ disk size: 4.4M
 
         target = 't.qcow2'
         self.executes = []
-        expected_commands = [('qemu-img', 'convert', '-t', 'none',
+        # WRS: add ionice option to qemu-img and mock out disk
+        # concurrency sema
+        expected_commands = [('ionice', '-c2', '-n4',
+                              'qemu-img', 'convert', '-t', 'none',
                               '-O', 'raw', '-f', 'qcow2',
                               't.qcow2.part', 't.qcow2.converted'),
                              ('rm', 't.qcow2.part'),
                              ('mv', 't.qcow2.converted', 't.qcow2')]
-        images.fetch_to_raw(context, image_id, target)
+        with mock.patch.object(utils, 'disk_op_sema',
+                               new_callable=compute_utils.UnlimitedSemaphore):
+            images.fetch_to_raw(context, image_id, target)
         self.assertEqual(self.executes, expected_commands)
 
         target = 't.raw'

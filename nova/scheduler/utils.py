@@ -11,10 +11,14 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2013-2017 Wind River Systems, Inc.
+#
 
 """Utility methods for scheduling."""
 
 import collections
+import copy
 import functools
 import sys
 
@@ -33,14 +37,56 @@ from nova.objects import fields
 from nova.objects import instance as obj_instance
 from nova.objects.resource_provider import ResourceClass
 from nova import rpc
+from nova import utils
+from nova.virt import hardware
 
 
 LOG = logging.getLogger(__name__)
 
 CONF = nova.conf.CONF
 
+# WRS:extension - new options: metadetails
 GroupDetails = collections.namedtuple('GroupDetails', ['hosts', 'policies',
-                                                       'members'])
+                                                       'members',
+                                                       'metadetails', 'name'])
+
+
+# WRS:extension - extended rejection error with reasons
+def NoValidHost_extend(filter_properties, reason=None):
+    reject_map = filter_properties.get('reject_map', None)
+
+    if reject_map is None:
+        reject_str = 'No filter information'
+    else:
+        msgs = []
+        for k, v in sorted(reject_map.items()):
+            if isinstance(v, str) or isinstance(v, unicode):
+                msg = ' {}: {}'.format(str(k), str(v))
+                msgs.append(msg)
+            elif isinstance(v, list):
+                msg = ' {}: {}'.format(str(k), ', '.join(str(j) for j in v))
+                msgs.append(msg)
+        reject_str = ', '.join(msgs)
+
+    compute_map = filter_properties.get('compute_failures', None)
+    if compute_map is None:
+        compute_str = ''
+    else:
+        msgs = []
+        for k, v in sorted(compute_map.items()):
+            if isinstance(v, str) or isinstance(v, unicode):
+                msg = ' {}: {}'.format(str(k), str(v))
+                msgs.append(msg)
+            elif isinstance(v, list):
+                msg = ' {}: {}'.format(str(k), ', '.join(str(j) for j in v))
+                msgs.append(msg)
+        compute_str = ', '.join(msgs)
+
+    details = compute_str + reject_str
+    # add the details into reason so that the nested exception's info
+    # is passed back to the user
+    reason = ("" if reason is None else reason) + details
+    raise exception.NoValidHost(reason=reason, code=501, details=details)
 
 
 def build_request_spec(ctxt, image, instances, instance_type=None):
@@ -56,11 +102,31 @@ def build_request_spec(ctxt, image, instances, instance_type=None):
         else:
             instance_type = flavors.extract_flavor(instance)
 
+    # WRS: The request_spec requires an updated requested numa_topology,
+    # otherwise we use numa_topology from when instance was first created.
+    # The required numa topology changes when we do resize.
+    requested_topology = None
     if isinstance(instance, obj_instance.Instance):
         instance = obj_base.obj_to_primitive(instance)
         # obj_to_primitive doesn't copy this enough, so be sure
         # to detach our metadata blob because we modify it below.
         instance['system_metadata'] = dict(instance.get('system_metadata', {}))
+
+        if isinstance(instance_type, objects.Flavor):
+            if isinstance(image, dict) and 'properties' in image:
+                image_meta = objects.ImageMeta.from_dict(image)
+            else:
+                image_meta = objects.ImageMeta.from_dict(
+                    utils.get_image_from_system_metadata(
+                        instance['system_metadata']))
+            try:
+                requested_topology = hardware.numa_get_constraints(
+                    instance_type, image_meta)
+                instance['numa_topology'] = requested_topology
+            except Exception as ex:
+                LOG.error(
+                    "Cannot get numa constraints, error=%(err)r",
+                    {'err': ex})
 
     if isinstance(instance_type, objects.Flavor):
         instance_type = obj_base.obj_to_primitive(instance_type)
@@ -81,6 +147,11 @@ def build_request_spec(ctxt, image, instances, instance_type=None):
             'instance_properties': instance,
             'instance_type': instance_type,
             'num_instances': len(instances)}
+
+    # WRS: Update requested numa topology, needed for resize.
+    if requested_topology is not None:
+        request_spec.update({'numa_topology': requested_topology})
+
     return jsonutils.to_primitive(request_spec)
 
 
@@ -165,6 +236,45 @@ def resources_from_flavor(instance, flavor):
     if "extra_specs" in flavor:
         _process_extra_specs(flavor.extra_specs, resources)
     return resources
+
+
+# WRS: adjust vcpu resource claim for WRS features: dedicated/shared cpu
+# accounting, shared vcpu and isolate cpu_thread_policy reserved cpus
+def normalized_resources_for_placement_claim(resources, compute_node, vcpus,
+                          extra_specs, image_props, instance_numa_topology):
+    normalized_resources = copy.deepcopy(resources)
+    # Get host numa topology
+    host_numa_topology, _fmt = hardware.host_topology_and_format_from_host(
+                                                compute_node)
+    # Get set of reserved thread sibling pcpus that cannot be allocated
+    # when using 'isolate' cpu_thread_policy.
+    reserved = hardware.get_reserved_thread_sibling_pcpus(
+                                  instance_numa_topology, host_numa_topology)
+    threads_per_core = hardware._get_threads_per_core(host_numa_topology)
+    # As placement service only supports integer allocation, multiply floating
+    # vcpus from normalized_vcpus by cpu_allocation_ratio.  This means one
+    # dedicated vcpu will be allocated 16 while 1 floating cpu would be
+    # allocated 1.
+    normalized_resources[fields.ResourceClass.VCPU] = \
+        int(CONF.cpu_allocation_ratio * hardware.normalized_vcpus(vcpus=vcpus,
+                                            reserved=reserved,
+                                            extra_specs=extra_specs,
+                                            image_props=image_props,
+                                            ratio=CONF.cpu_allocation_ratio,
+                                            threads_per_core=threads_per_core))
+    return normalized_resources
+
+
+# WRS: For downscaled instance determine offline_cpus that are in range of the
+# new flavor.
+def determine_offline_cpus(flavor, numa_topology):
+    if numa_topology is not None:
+        offline_cpus = [i for i in numa_topology.offline_cpus
+                        if i < flavor.vcpus]
+        num_offline_cpus = len(offline_cpus)
+    else:
+        num_offline_cpus = 0
+    return num_offline_cpus
 
 
 def merge_resources(original_resources, new_resources, sign=1):
@@ -486,7 +596,9 @@ _SUPPORTS_SOFT_AFFINITY = None
 _SUPPORTS_SOFT_ANTI_AFFINITY = None
 
 
-def _get_group_details(context, instance_uuid, user_group_hosts=None):
+# WRS:extension - pass through request_spec
+def _get_group_details(context, instance_uuid, request_spec,
+                       user_group_hosts=None):
     """Provide group_hosts and group_policies sets related to instances if
     those instances are belonging to a group and if corresponding filters are
     enabled.
@@ -525,29 +637,70 @@ def _get_group_details(context, instance_uuid, user_group_hosts=None):
 
     policies = set(('anti-affinity', 'affinity', 'soft-affinity',
                     'soft-anti-affinity'))
+
+    filter_properties = request_spec.to_legacy_filter_properties_dict()
     if any((policy in policies) for policy in group.policies):
         if not _SUPPORTS_AFFINITY and 'affinity' in group.policies:
             msg = _("ServerGroupAffinityFilter not configured")
             LOG.error(msg)
-            raise exception.UnsupportedPolicyException(reason=msg)
+            # WRS:extension - extend failure message
+            NoValidHost_extend(filter_properties, reason=msg)
         if not _SUPPORTS_ANTI_AFFINITY and 'anti-affinity' in group.policies:
             msg = _("ServerGroupAntiAffinityFilter not configured")
             LOG.error(msg)
-            raise exception.UnsupportedPolicyException(reason=msg)
+            # WRS:extension - extend failure message
+            NoValidHost_extend(filter_properties, reason=msg)
         if (not _SUPPORTS_SOFT_AFFINITY
                 and 'soft-affinity' in group.policies):
             msg = _("ServerGroupSoftAffinityWeigher not configured")
             LOG.error(msg)
-            raise exception.UnsupportedPolicyException(reason=msg)
+            # WRS:extension - extend failure message
+            NoValidHost_extend(filter_properties, reason=msg)
         if (not _SUPPORTS_SOFT_ANTI_AFFINITY
                 and 'soft-anti-affinity' in group.policies):
             msg = _("ServerGroupSoftAntiAffinityWeigher not configured")
             LOG.error(msg)
-            raise exception.UnsupportedPolicyException(reason=msg)
+            # WRS:extension - extend failure message
+            NoValidHost_extend(filter_properties, reason=msg)
         group_hosts = set(group.get_hosts())
         user_hosts = set(user_group_hosts) if user_group_hosts else set()
+
+        # Count number of members that are not deleted, but only
+        # the instances that are launched_at or building.
+        group_member_uuids = group.get_members_launched(context)
+        members_launched = len(group_member_uuids)
+
+        # WRS: substract 1 if this is a re-schedule
+        if instance_uuid in group_member_uuids:
+            members_launched -= 1
+
+        # total members if launch minimal num of requested instances
+        total_members_min = members_launched + request_spec.min_num_instances
+        # total members if launch all requested instances
+        total_members = members_launched + request_spec.num_instances
+
+        # WRS: check group_size limit.
+        md = group.get('metadetails', {})
+        group_size = md.get('wrs-sg:group_size')
+        t_state = None
+        if request_spec.obj_attr_is_set('scheduler_hints') and \
+                            request_spec.scheduler_hints:
+            t_state = request_spec.scheduler_hints.get('task_state', None)
+        # if task_state is missing or None, this is a new VM being launched
+        # and so we need to check the group size limit
+        if group_size and t_state is None:
+            group_size = int(group_size)
+            if total_members_min > group_size:
+                raise exception.InstanceGroupSizeLimit(group_uuid=group.uuid,
+                                                       group_size=group_size)
+            group_exceed = max(total_members - group_size, 0)
+        else:
+            group_exceed = 0
+        md['wrs-sg:group_exceed'] = group_exceed
+
         return GroupDetails(hosts=user_hosts | group_hosts,
-                            policies=group.policies, members=group.members)
+                            policies=group.policies, members=group.members,
+                            metadetails=md, name=group.name)
 
 
 def setup_instance_group(context, request_spec):
@@ -562,11 +715,26 @@ def setup_instance_group(context, request_spec):
     else:
         group_hosts = None
     instance_uuid = request_spec.instance_uuid
-    group_info = _get_group_details(context, instance_uuid, group_hosts)
+
+    group_info = _get_group_details(context, instance_uuid, request_spec,
+                                    user_group_hosts=group_hosts)
     if group_info is not None:
-        request_spec.instance_group.hosts = list(group_info.hosts)
-        request_spec.instance_group.policies = group_info.policies
-        request_spec.instance_group.members = group_info.members
+        if request_spec.instance_group is None:
+            # WRS: create instance_group if it doesn't exist
+            request_spec.instance_group = objects.InstanceGroup(
+                         policies=group_info.policies,
+                         hosts=list(group_info.hosts),
+                         members=group_info.members,
+                         name=group_info.name,
+                         metadetails=group_info.metadetails)
+        else:
+            request_spec.instance_group.hosts = list(group_info.hosts)
+            request_spec.instance_group.policies = group_info.policies
+            request_spec.instance_group.members = group_info.members
+
+            # WRS:extension -- metadetails, name
+            request_spec.instance_group.metadetails = group_info.metadetails
+            request_spec.instance_group.name = group_info.name
 
 
 def retry_on_timeout(retries=1):

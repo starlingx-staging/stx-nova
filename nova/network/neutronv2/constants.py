@@ -12,6 +12,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2015-2017 Wind River Systems, Inc.
+#
 
 QOS_QUEUE = 'QoS Queue'
 NET_EXTERNAL = 'router:external'
@@ -20,3 +23,6 @@ VNIC_INDEX_EXT = 'VNIC Index'
 DNS_INTEGRATION = 'DNS Integration'
 AUTO_ALLOCATE_TOPO_EXT = 'Auto Allocated Topology Services'
 MULTI_NET_EXT = 'Multi Provider Network'
+WRS_PORTBINDING_EXT = "wrs-port-binding"
+PORT_VIF_MODEL = 'wrs-binding:vif_model'
+PORT_MAC_FILTERING = 'wrs-binding:mac_filtering'

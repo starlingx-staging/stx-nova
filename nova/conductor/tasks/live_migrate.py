@@ -9,12 +9,18 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2016-2017 Wind River Systems, Inc.
+#
 
+from oslo_concurrency import lockutils
 from oslo_log import log as logging
 import oslo_messaging as messaging
+from oslo_utils import strutils
 import six
 
 from nova.compute import power_state
+from nova.compute import utils as compute_utils
 from nova.conductor.tasks import base
 import nova.conf
 from nova import exception
@@ -33,6 +39,7 @@ class LiveMigrationTask(base.TaskBase):
                  servicegroup_api, scheduler_client, request_spec=None):
         super(LiveMigrationTask, self).__init__(context, instance)
         self.destination = destination
+        self.sched_limits = None
         self.block_migration = block_migration
         self.disk_over_commit = disk_over_commit
         self.migration = migration
@@ -48,34 +55,56 @@ class LiveMigrationTask(base.TaskBase):
         self._check_instance_is_active()
         self._check_host_is_up(self.source)
 
-        if not self.destination:
-            # Either no host was specified in the API request and the user
-            # wants the scheduler to pick a destination host, or a host was
-            # specified but is not forcing it, so they want the scheduler
-            # filters to run on the specified host, like a scheduler hint.
-            self.destination = self._find_destination()
-            self.migration.dest_compute = self.destination
-            self.migration.save()
+        def _select_destination():
+            if not self.destination:
+                # Either no host was specified in the API request and the user
+                # wants the scheduler to pick a destination host, or a host was
+                # specified but is not forcing it, so they want the scheduler
+                # filters to run on the specified host, like a scheduler hint.
+                self.destination, self.sched_limits = self._find_destination()
+            else:
+                # This is the case that the user specified the 'force' flag
+                # when live migrating with a specific destination host so the
+                # scheduler is bypassed. There are still some minimal checks
+                # performed here though.
+                source_node, dest_node = self._check_requested_destination()
+                # Now that we're semi-confident in the force specified host, we
+                # need to copy the source compute node allocations in Placement
+                # to the destination compute node.
+                # Normally select_destinations()
+                # in the scheduler would do this for us, but when forcing the
+                # target host we don't call the scheduler.
+                # TODO(mriedem): In Queens, call select_destinations() with a
+                # skip_filters=True flag so the scheduler does the work of
+                # claiming resources on the destination in Placement but still
+                # bypass the scheduler filters, which honors the 'force' flag
+                # in the API.
+                # This raises NoValidHost which will be handled in
+                # ComputeTaskManager.
+                scheduler_utils.claim_resources_on_destination(
+                    self.scheduler_client.reportclient, self.instance,
+                    source_node, dest_node)
+
+        if self._is_ordered_scheduling_needed():
+            # WRS: ensure scheduling of one live-migration at a time for
+            # instances in a given anti-affinity server group.
+            # This closes a race condition.
+            instance_group_name = self.request_spec.instance_group['name']
+
+            sema = lockutils.lock('instance-group-%s' % instance_group_name,
+                         external=True, fair=True)
         else:
-            # This is the case that the user specified the 'force' flag when
-            # live migrating with a specific destination host so the scheduler
-            # is bypassed. There are still some minimal checks performed here
-            # though.
-            source_node, dest_node = self._check_requested_destination()
-            # Now that we're semi-confident in the force specified host, we
-            # need to copy the source compute node allocations in Placement
-            # to the destination compute node. Normally select_destinations()
-            # in the scheduler would do this for us, but when forcing the
-            # target host we don't call the scheduler.
-            # TODO(mriedem): In Queens, call select_destinations() with a
-            # skip_filters=True flag so the scheduler does the work of claiming
-            # resources on the destination in Placement but still bypass the
-            # scheduler filters, which honors the 'force' flag in the API.
-            # This raises NoValidHost which will be handled in
-            # ComputeTaskManager.
-            scheduler_utils.claim_resources_on_destination(
-                self.scheduler_client.reportclient, self.instance,
-                source_node, dest_node)
+            sema = compute_utils.UnlimitedSemaphore()
+
+        with sema:
+            _select_destination()
+
+        # WRS: Log live migration
+        LOG.info("Live migrating instance %(inst_uuid)s: "
+                 "source:%(source)s dest:%(dest)s",
+                 {'inst_uuid': self.instance['uuid'],
+                  'source': self.source,
+                  'dest': self.destination})
 
         # TODO(johngarbutt) need to move complexity out of compute manager
         # TODO(johngarbutt) disk_over_commit?
@@ -94,6 +123,18 @@ class LiveMigrationTask(base.TaskBase):
         # except to call the compute method, that has no matching
         # rollback call right now.
         pass
+
+    def _is_ordered_scheduling_needed(self):
+        if hasattr(self.request_spec, 'instance_group') and \
+                   self.request_spec.instance_group:
+            metadetails = self.request_spec.instance_group['metadetails']
+            is_best_effort = strutils.bool_from_string(
+                                metadetails.get('wrs-sg:best_effort', 'False'))
+
+            if ('anti-affinity' in
+                    self.request_spec.instance_group['policies'] and
+                    not is_best_effort):
+                return True
 
     def _check_instance_is_active(self):
         if self.instance.power_state not in (power_state.RUNNING,
@@ -120,7 +161,8 @@ class LiveMigrationTask(base.TaskBase):
         self._check_destination_has_enough_memory()
         source_node, dest_node = self._check_compatible_with_source_hypervisor(
             self.destination)
-        self._call_livem_checks_on_host(self.destination)
+        self._call_livem_checks_on_host(self.destination,
+                                        limits=self.sched_limits)
         # Make sure the forced destination host is in the same cell that the
         # instance currently lives in.
         # NOTE(mriedem): This can go away if/when the forced destination host
@@ -184,11 +226,12 @@ class LiveMigrationTask(base.TaskBase):
             raise exception.DestinationHypervisorTooOld()
         return source_info, destination_info
 
-    def _call_livem_checks_on_host(self, destination):
+    def _call_livem_checks_on_host(self, destination, limits=None):
         try:
             self.migrate_data = self.compute_rpcapi.\
                 check_can_live_migrate_destination(self.context, self.instance,
-                    destination, self.block_migration, self.disk_over_commit)
+                    destination, self.block_migration, self.disk_over_commit,
+                    migration=self.migration, limits=limits)
         except messaging.MessagingTimeout:
             msg = _("Timeout while checking if we can live migrate to host: "
                     "%s") % destination
@@ -234,6 +277,14 @@ class LiveMigrationTask(base.TaskBase):
             # NOTE(sbauza): We were unable to find an original RequestSpec
             # object - probably because the instance is old.
             # We need to mock that the old way
+
+            # WRS: these hints are needed by the vcpu filter
+            hints = filter_properties.get('scheduler_hints', {})
+            hints['task_state'] = self.instance.task_state or ""
+            hints['host'] = self.instance.host or ""
+            hints['node'] = self.instance.node or ""
+            filter_properties['scheduler_hints'] = hints
+
             request_spec = objects.RequestSpec.from_components(
                 self.context, self.instance.uuid, image,
                 self.instance.flavor, self.instance.numa_topology,
@@ -242,10 +293,67 @@ class LiveMigrationTask(base.TaskBase):
             )
         else:
             request_spec = self.request_spec
+            # WRS: these hints are needed by the vcpu filter
+            hints = dict()
+            hints['task_state'] = [self.instance.task_state or ""]
+            hints['host'] = [self.instance.host or ""]
+            hints['node'] = [self.instance.node or ""]
+            if request_spec.obj_attr_is_set('scheduler_hints') and \
+                request_spec.scheduler_hints:
+                request_spec.scheduler_hints.update(hints)
+            else:
+                request_spec.scheduler_hints = hints
+
             # NOTE(sbauza): Force_hosts/nodes needs to be reset
             # if we want to make sure that the next destination
             # is not forced to be the original host
             request_spec.reset_forced_destinations()
+
+            # WRS: The request_spec has stale flavor, so this field must be
+            # updated. This occurs when we do a live-migration after a resize.
+            request_spec.flavor = self.instance.flavor
+
+            # WRS: The request_spec has stale instance_group information.
+            # Update from db to get latest members and metadetails.
+            if hasattr(request_spec, 'instance_group') and \
+                       request_spec.instance_group:
+                request_spec.instance_group = \
+                    objects.InstanceGroup.get_by_instance_uuid(
+                           self.context, self.instance.uuid)
+
+                # WRS: add hosts to Server group host list for group members
+                # that are migrating in progress
+                metadetails = request_spec.instance_group['metadetails']
+                is_best_effort = strutils.bool_from_string(
+                    metadetails.get('wrs-sg:best_effort', 'False'))
+
+                if ('anti-affinity' in request_spec.instance_group['policies']
+                    and not is_best_effort):
+                    group_members = request_spec.instance_group['members']
+
+                    for member_uuid in group_members:
+                        if member_uuid == self.instance.uuid:
+                            continue
+                        filters = {
+                            'migration_type': 'live-migration',
+                            'instance_uuid': member_uuid,
+                            'status': ['queued', 'accepted', 'pre-migrating',
+                                       'preparing', 'running']
+                        }
+                        migrations = objects.MigrationList. \
+                            get_by_filters(self.context, filters)
+
+                        for migration in migrations:
+                            if migration['source_compute'] not in \
+                                    request_spec.instance_group['hosts']:
+                                request_spec.instance_group['hosts'].\
+                                    append(migration['source_compute'])
+                            if (migration['dest_compute'] and (
+                                migration['dest_compute'] not in
+                                        request_spec.instance_group['hosts'])):
+                                request_spec.instance_group['hosts'].\
+                                    append(migration['dest_compute'])
+
         scheduler_utils.setup_instance_group(self.context, request_spec)
 
         # We currently only support live migrating to hosts in the same
@@ -263,14 +371,31 @@ class LiveMigrationTask(base.TaskBase):
                 cell=cell_mapping)
 
         request_spec.ensure_project_id(self.instance)
-        host = None
+
+        # WRS: determine offline cpus due to scaling to be used to calculate
+        # placement service resource claim in scheduler
+        request_spec.offline_cpus = scheduler_utils.determine_offline_cpus(
+                         self.instance.flavor, self.instance.numa_topology)
+        host = limits = None
+        migration_error = {}
         while host is None:
             self._check_not_over_max_retries(attempted_hosts)
             request_spec.ignore_hosts = attempted_hosts
             try:
+                # WRS: determine if instance is volume backed and update
+                # request spec to avoid allocating local disk resources.
+                request_spec_copy = request_spec
+                if self.instance.is_volume_backed():
+                    LOG.debug('Requesting zero root disk for '
+                              'boot-from-volume instance')
+                    # Clone this so we don't mutate the RequestSpec that was
+                    # passed in
+                    request_spec_copy = request_spec.obj_clone()
+                    request_spec_copy.flavor.root_gb = 0
                 hoststate = self.scheduler_client.select_destinations(
-                    self.context, request_spec, [self.instance.uuid])[0]
+                    self.context, request_spec_copy, [self.instance.uuid])[0]
                 host = hoststate['host']
+                limits = hoststate['limits']
             except messaging.RemoteError as ex:
                 # TODO(ShaoHe Feng) There maybe multi-scheduler, and the
                 # scheduling algorithm is R-R, we can let other scheduler try.
@@ -279,21 +404,37 @@ class LiveMigrationTask(base.TaskBase):
                 # ex.exc_type.
                 raise exception.MigrationSchedulerRPCError(
                     reason=six.text_type(ex))
+            except exception.NoValidHost as ex:
+                if (migration_error):
+                    # remove duplicated and superfluous info from exception
+                    msg = "%s" % ex.message
+                    msg = msg.replace("No valid host was found.", "")
+                    msg = msg.replace("No filter information", "")
+                    fp = {'reject_map': migration_error}
+                    scheduler_utils.NoValidHost_extend(fp, reason=msg)
+                else:
+                    raise
             try:
                 self._check_compatible_with_source_hypervisor(host)
-                self._call_livem_checks_on_host(host)
-            except (exception.Invalid, exception.MigrationPreCheckError) as e:
-                LOG.debug("Skipping host: %(host)s because: %(e)s",
-                    {"host": host, "e": e})
+                # NOTE(ndipanov): We don't need to pass the node as it's not
+                # relevant for drivers that support live migration
+                self._call_livem_checks_on_host(host, limits=limits)
+            except (exception.Invalid,
+                    exception.MigrationPreCheckError) as e:
+                # WRS: Change this from 'debug' log to 'info', we need this.
+                LOG.info("Skipping host: %(host)s because: %(e)s",
+                         {"host": host, "e": e})
+                migration_error[host] = "%s" % e.message
                 attempted_hosts.append(host)
                 # The scheduler would have created allocations against the
                 # selected destination host in Placement, so we need to remove
                 # those before moving on.
-                self._remove_host_allocations(host, hoststate['nodename'])
-                host = None
-        return host
+                self._remove_host_allocations(host, hoststate['nodename'],
+                                              request_spec)
+                host = limits = None
+        return host, limits
 
-    def _remove_host_allocations(self, host, node):
+    def _remove_host_allocations(self, host, node, request_spec):
         """Removes instance allocations against the given host from Placement
 
         :param host: The name of the host.
@@ -318,6 +459,16 @@ class LiveMigrationTask(base.TaskBase):
         resources = scheduler_utils.resources_from_flavor(
             self.instance, self.instance.flavor)
 
+        # WRS: adjust resource allocations based on request_spec
+        vcpus = request_spec.flavor.vcpus - request_spec.offline_cpus
+        extra_specs = request_spec.flavor.extra_specs
+        image_props = request_spec.image.properties
+        instance_numa_topology = request_spec.numa_topology
+        normalized_resources = \
+                  scheduler_utils.normalized_resources_for_placement_claim(
+                             resources, compute_node, vcpus, extra_specs,
+                             image_props, instance_numa_topology)
+
         # Now remove the allocations for our instance against that node.
         # Note that this does not remove allocations against any other node
         # or shared resource provider, it's just undoing what the scheduler
@@ -325,7 +476,7 @@ class LiveMigrationTask(base.TaskBase):
         self.scheduler_client.reportclient.\
             remove_provider_from_instance_allocation(
                 self.instance.uuid, compute_node.uuid, self.instance.user_id,
-                self.instance.project_id, resources)
+                self.instance.project_id, normalized_resources)
 
     def _check_not_over_max_retries(self, attempted_hosts):
         if CONF.migrate_max_retries == -1:

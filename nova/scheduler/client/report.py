@@ -30,6 +30,7 @@ from nova.i18n import _LE, _LI, _LW
 from nova import objects
 from nova.objects import fields
 from nova.scheduler import utils as scheduler_utils
+from nova import utils
 
 CONF = nova.conf.CONF
 LOG = logging.getLogger(__name__)
@@ -97,14 +98,20 @@ def _compute_node_to_inventory_dict(compute_node):
 
     # NOTE(jaypipes): Ironic virt driver will return 0 values for vcpus,
     # memory_mb and disk_gb if the Ironic node is not available/operable
+    # WRS: allow max_unit to be number of vcpus * allocation ratio to allow
+    # for instances with dedicated cpu_policy to allocate correctly.  Given
+    # change to max unit have to set allocation ratio in resource inventory
+    # to 1 so capacity check is correct.
     if compute_node.vcpus > 0:
         result[VCPU] = {
-            'total': compute_node.vcpus,
+            'total': int(compute_node.vcpus *
+                                    compute_node.cpu_allocation_ratio),
             'reserved': CONF.reserved_host_cpus,
             'min_unit': 1,
-            'max_unit': compute_node.vcpus,
+            'max_unit': int(compute_node.vcpus *
+                                    compute_node.cpu_allocation_ratio),
             'step_size': 1,
-            'allocation_ratio': compute_node.cpu_allocation_ratio,
+            'allocation_ratio': 1,
         }
     if compute_node.memory_mb > 0:
         result[MEMORY_MB] = {
@@ -131,7 +138,7 @@ def _compute_node_to_inventory_dict(compute_node):
     return result
 
 
-def _instance_to_allocations_dict(instance):
+def _instance_to_allocations_dict(instance, rp):
     """Given an `objects.Instance` object, return a dict, keyed by resource
     class of the amount used by the instance.
 
@@ -140,8 +147,17 @@ def _instance_to_allocations_dict(instance):
     alloc_dict = scheduler_utils.resources_from_flavor(instance,
         instance.flavor)
 
+    # WRS: adjust resource allocations for WRS features
+    system_metadata = instance.system_metadata
+    image_meta = utils.get_image_from_system_metadata(system_metadata)
+    image_props = image_meta.get('properties', {})
+    normalized_alloc_dict = \
+          scheduler_utils.normalized_resources_for_placement_claim(
+              alloc_dict, rp, instance.vcpus, instance.flavor.extra_specs,
+              image_props, instance.numa_topology)
+
     # Remove any zero allocations.
-    return {key: val for key, val in alloc_dict.items() if val}
+    return {key: val for key, val in normalized_alloc_dict.items() if val}
 
 
 def _move_operation_alloc_request(source_allocs, dest_alloc_req):
@@ -234,6 +250,10 @@ class SchedulerReportClient(object):
         # A dict, keyed by resource provider UUID, of sets of aggregate UUIDs
         # the provider is associated with
         self._provider_aggregate_map = {}
+        self._provider_age = {}
+        self._inventory = {}
+        self._usage = {}
+
         auth_plugin = keystone.load_auth_from_conf_options(
             CONF, 'placement')
         self._client = keystone.load_session_from_conf_options(
@@ -305,6 +325,150 @@ class SchedulerReportClient(object):
         return self._client.delete(
             url,
             endpoint_filter=self.ks_filter, raise_exc=False, **kwargs)
+
+    @safe_connect
+    def get_rejection_reasons(self, requested=None):
+        """Returns dictionary of placement rejection reasons.
+
+        This evaluates whether the requested allocation exceeds capacity or
+        size constraints for VCPU, MEMORY, and DISK, against all hosts.
+
+        This mimics the evaluation of objects/resource_provider.py routine:
+        _check_capacity_exceeded(). There are related SQL query functions with
+        the same constraints implemented, eg, _get_all_by_filters_from_db(),
+        _get_providers_with_shared_capacity(), _get_all_with_shared().
+
+        Rejection reasons are scaled units, eg, divide by scaling ratio
+        because that is more intuitive and more consistent with WRS normalized
+        resources.
+
+        :returns: A dictionary with a list of rejection strings per host,
+                  where the request would have failed.
+
+        :param requested: A dict, keyed by resource class name, of requested
+                          amounts of those resources.
+        """
+        reasons = {}
+
+        # Evaluate capacity and constraints with subset of resources
+        VCPU = fields.ResourceClass.VCPU
+        MEMORY_MB = fields.ResourceClass.MEMORY_MB
+        DISK_GB = fields.ResourceClass.DISK_GB
+        resources = [VCPU, MEMORY_MB, DISK_GB]
+
+        # Evaluate short variable name titles, without units
+        titles = {}
+        for rc in resources:
+            titles[rc] = rc.split('_')[0].lower()
+        scale = {VCPU: CONF.cpu_allocation_ratio,
+                 MEMORY_MB: CONF.ram_allocation_ratio,
+                 DISK_GB: CONF.disk_allocation_ratio}
+        # Decimals of precision to print scaled units
+        precision = {}
+        for k, v in scale.items():
+            if v > 1:
+                precision.update({k: 3})
+            else:
+                precision.update({k: 0})
+
+        # Ensure that empty request is zero
+        if requested is None:
+            requested = {}
+            for res in resources:
+                requested[res] = 0
+
+        rp_version = '1.10'
+        rp_url = '/resource_providers'
+
+        r = self.get(rp_url, version=rp_version)
+        if r.status_code == 200:
+            prov = r.json()
+            for rp in prov['resource_providers']:
+                uuid = rp['uuid']
+                gen = self._provider_age.get(uuid, None)
+                self._provider_age[uuid] = rp['generation']
+                if gen == self._provider_age[uuid]:
+                    continue
+                self._inventory[uuid] = \
+                    self._get_inventory(uuid)['inventories']
+                self._usage[uuid] = self._get_usage(uuid)['usages']
+
+        else:
+            LOG.error(
+                _LE("Failed to get placement resource providers. "
+                    "Got %(status_code)d: %(err_text)s."),
+                {'status_code': r.status_code, 'err_text': r.text})
+            return reasons
+
+        # Evaluate capacity constraints per host, per resource.
+        # Populate reasons dictionary of with the result.
+        for uuid in self._provider_age.keys():
+            reasons[uuid] = []
+            for rc in resources:
+                if rc not in requested:
+                    continue
+                title = titles[rc]
+                ratio = self._inventory[uuid][rc]['allocation_ratio']
+                max_unit = self._inventory[uuid][rc]['max_unit']
+                min_unit = self._inventory[uuid][rc]['min_unit']
+                reserved = self._inventory[uuid][rc]['reserved']
+                step_size = self._inventory[uuid][rc]['step_size']
+                total = self._inventory[uuid][rc]['total']
+                used = self._usage[uuid][rc] or 0
+                capacity = (total - reserved) * ratio
+                avail = capacity - used
+                amount_needed = requested[rc]
+
+                # Format scaled values for display purposes
+                requested_sc = "{value:.{precision}f}".\
+                    format(value=float(amount_needed / scale[rc]),
+                           precision=precision[rc])
+                avail_sc = "{value:.{precision}f}".\
+                    format(value=float(avail / scale[rc]),
+                           precision=precision[rc])
+                max_unit_sc = "{value:.{precision}f}".\
+                    format(value=float(max_unit / scale[rc]),
+                           precision=precision[rc])
+                min_unit_sc = "{value:.{precision}f}".\
+                    format(value=float(min_unit / scale[rc]),
+                           precision=precision[rc])
+                step_size_sc = "{value:.{precision}f}".\
+                    format(value=float(step_size / scale[rc]),
+                           precision=precision[rc])
+
+                # check allocation exceeds capacity
+                if capacity < (used + amount_needed):
+                    msg = ("%(req)s %(title)s requested > %(avail)s avail" %
+                           {'title': title,
+                            'req': requested_sc,
+                            'avail': avail_sc})
+                    reasons[uuid].append(msg)
+
+                # check allocation constraints
+                if amount_needed < min_unit:
+                    msg = ("%(req)s %(title)s requested < "
+                           "%(min_unit)s min_unit" %
+                           {'title': title,
+                            'req': requested_sc,
+                            'min_unit': min_unit_sc})
+                    reasons[uuid].append(msg)
+
+                if amount_needed > max_unit:
+                    msg = ("%(req)s %(title)s requested > "
+                           "%(max_unit)s max_unit" %
+                           {'title': title,
+                            'req': requested_sc,
+                            'max_unit': max_unit_sc})
+                    reasons[uuid].append(msg)
+
+                if amount_needed % step_size != 0:
+                    msg = ("%(req)s %(title)s requested not divisible by "
+                           "%(step_size)s step_size" %
+                           {'title': title,
+                            'req': requested_sc,
+                            'step_size': step_size_sc})
+                    reasons[uuid].append(msg)
+        return reasons
 
     @safe_connect
     def get_allocation_candidates(self, resources):
@@ -518,6 +682,13 @@ class SchedulerReportClient(object):
         result = self.get(url)
         if not result:
             return {'inventories': {}}
+        return result.json()
+
+    def _get_usage(self, rp_uuid):
+        url = '/resource_providers/%s/usages' % rp_uuid
+        result = self.get(url)
+        if not result:
+            return {'usages': {}}
         return result.json()
 
     def _get_inventory_and_update_provider_generation(self, rp_uuid):
@@ -908,9 +1079,9 @@ class SchedulerReportClient(object):
             return resp.json()['allocations'].get(
                 rp_uuid, {}).get('resources', {})
 
-    def _allocate_for_instance(self, rp_uuid, instance):
-        my_allocations = _instance_to_allocations_dict(instance)
-        current_allocations = self.get_allocations_for_instance(rp_uuid,
+    def _allocate_for_instance(self, rp, instance):
+        my_allocations = _instance_to_allocations_dict(instance, rp)
+        current_allocations = self.get_allocations_for_instance(rp.uuid,
                                                                 instance)
         if current_allocations == my_allocations:
             allocstr = ','.join(['%s=%s' % (k, v)
@@ -922,7 +1093,7 @@ class SchedulerReportClient(object):
         LOG.debug('Sending allocation for instance %s',
                   my_allocations,
                   instance=instance)
-        res = self.put_allocations(rp_uuid, instance.uuid, my_allocations,
+        res = self.put_allocations(rp.uuid, instance.uuid, my_allocations,
                                    instance.project_id, instance.user_id)
         if res:
             LOG.info(_LI('Submitted allocation for instance'),
@@ -1091,6 +1262,11 @@ class SchedulerReportClient(object):
                       'allocation: %s', peer_alloc['resources'])
             new_allocs.append(peer_alloc)
 
+        # Remove any zero allocations.
+        for alloc in new_allocs:
+            alloc['resources'] = {key: val for key, val
+                                  in alloc['resources'].items() if val}
+
         payload = {'allocations': new_allocs}
         payload['project_id'] = project_id
         payload['user_id'] = user_id
@@ -1171,7 +1347,7 @@ class SchedulerReportClient(object):
 
     def update_instance_allocation(self, compute_node, instance, sign):
         if sign > 0:
-            self._allocate_for_instance(compute_node.uuid, instance)
+            self._allocate_for_instance(compute_node, instance)
         else:
             self.delete_allocation_for_instance(instance.uuid)
 

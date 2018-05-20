@@ -74,6 +74,7 @@ class ServiceFixture(fixtures.Fixture):
 
     def setUp(self):
         super(ServiceFixture, self).setUp()
+        CONF.set_override('service_enabled_flag', False)
         self.service = service.Service.create(**self.kwargs)
         self.service.start()
         self.addCleanup(self.service.kill)

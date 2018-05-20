@@ -25,6 +25,7 @@ class LockServerController(wsgi.Controller):
         super(LockServerController, self).__init__(*args, **kwargs)
         self.compute_api = compute.API()
 
+    @extensions.block_during_upgrade()
     @wsgi.response(202)
     @extensions.expected_errors(404)
     @wsgi.action('lock')

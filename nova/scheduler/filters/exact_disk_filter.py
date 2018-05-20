@@ -12,6 +12,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2013-2017 Wind River Systems, Inc.
+#
 
 from oslo_log import log as logging
 
@@ -43,6 +46,9 @@ class ExactDiskFilter(filters.BaseHostFilter):
                       {'host_state': host_state,
                        'requested_disk': requested_disk,
                        'usable_disk_mb': host_state.free_disk_mb})
+            msg = ('disk mismatch: req:%(req)s != usable:%(avail)s' %
+                   {'req': requested_disk, 'avail': host_state.free_disk_mb})
+            self.filter_reject(host_state, spec_obj, msg)
             return False
 
         # NOTE(mgoddard): Setting the limit ensures that it is enforced in

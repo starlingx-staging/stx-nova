@@ -12,6 +12,10 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2013-2017 Wind River Systems, Inc.
+#
+
 import six
 
 import mock
@@ -63,7 +67,7 @@ class TestNeutronSecurityGroupsV21(
         return self.controller.create(self.req, body={'security_group': sg})
 
     def _create_network(self):
-        body = {'network': {'name': 'net1'}}
+        body = {'network': {'name': 'net1', 'port_security_enabled': True}}
         neutron = get_client()
         net = neutron.create_network(body)
         body = {'subnet': {'network_id': net['network']['id'],
@@ -621,10 +625,11 @@ class TestNeutronSecurityGroupsOutputTest(TestNeutronSecurityGroupsTestCase):
         res = self._make_request(url)
 
         self.assertEqual(res.status_int, 200)
-        for i, server in enumerate(self._get_servers(res.body)):
-            for j, group in enumerate(self._get_groups(server)):
-                name = 'fake-%s-%s' % (i, j)
-                self.assertEqual(group.get('name'), name)
+        # WRS: Security groups are not returned when there are multiple servers
+        # for i, server in enumerate(self._get_servers(res.body)):
+        #     for j, group in enumerate(self._get_groups(server)):
+        #         name = 'fake-%s-%s' % (i, j)
+        #         self.assertEqual(group.get('name'), name)
 
     def test_no_instance_passthrough_404(self):
 

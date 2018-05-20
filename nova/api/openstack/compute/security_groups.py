@@ -13,6 +13,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2013-2017 Wind River Systems, Inc.
+#
 
 """The security groups extension."""
 from oslo_log import log as logging
@@ -136,6 +139,7 @@ class SecurityGroupController(SecurityGroupControllerBase, wsgi.Controller):
                                                               security_group)}
 
     @wsgi.Controller.api_version("2.1", MAX_PROXY_API_SUPPORT_VERSION)
+    @extensions.block_during_upgrade()
     @extensions.expected_errors((400, 404))
     @wsgi.response(202)
     def delete(self, req, id):
@@ -175,6 +179,7 @@ class SecurityGroupController(SecurityGroupControllerBase, wsgi.Controller):
                             key=lambda k: (k['tenant_id'], k['name'])))}
 
     @wsgi.Controller.api_version("2.1", MAX_PROXY_API_SUPPORT_VERSION)
+    @extensions.block_during_upgrade()
     @extensions.expected_errors((400, 403))
     def create(self, req, body):
         """Creates a new security group."""
@@ -200,6 +205,7 @@ class SecurityGroupController(SecurityGroupControllerBase, wsgi.Controller):
                                                               group_ref)}
 
     @wsgi.Controller.api_version("2.1", MAX_PROXY_API_SUPPORT_VERSION)
+    @extensions.block_during_upgrade()
     @extensions.expected_errors((400, 404))
     def update(self, req, id, body):
         """Update a security group."""
@@ -237,6 +243,7 @@ class SecurityGroupRulesController(SecurityGroupControllerBase,
                                    wsgi.Controller):
 
     @wsgi.Controller.api_version("2.1", MAX_PROXY_API_SUPPORT_VERSION)
+    @extensions.block_during_upgrade()
     @extensions.expected_errors((400, 403, 404))
     def create(self, req, body):
         context = _authorize_context(req)
@@ -312,6 +319,7 @@ class SecurityGroupRulesController(SecurityGroupControllerBase,
                                         cidr, ip_protocol, from_port, to_port)
 
     @wsgi.Controller.api_version("2.1", MAX_PROXY_API_SUPPORT_VERSION)
+    @extensions.block_during_upgrade()
     @extensions.expected_errors((400, 404, 409))
     @wsgi.response(202)
     def delete(self, req, id):
@@ -389,6 +397,7 @@ class SecurityGroupActionController(wsgi.Controller):
         instance = common.get_instance(self.compute_api, context, id)
         method(context, instance, group_name)
 
+    @extensions.block_during_upgrade()
     @extensions.expected_errors((400, 404, 409))
     @wsgi.response(202)
     @wsgi.action('addSecurityGroup')
@@ -409,6 +418,7 @@ class SecurityGroupActionController(wsgi.Controller):
                 exception.SecurityGroupExistsForInstance) as exp:
             raise exc.HTTPBadRequest(explanation=exp.format_message())
 
+    @extensions.block_during_upgrade()
     @extensions.expected_errors((400, 404, 409))
     @wsgi.response(202)
     @wsgi.action('removeSecurityGroup')
@@ -464,10 +474,16 @@ class SecurityGroupsOutputController(wsgi.Controller):
                     self.security_group_api
                     .get_instances_security_groups_bindings(context,
                                                                 servers))
-                for server in servers:
-                    groups = sg_instance_bindings.get(server['id'])
-                    if groups:
-                        server[ATTRIBUTE_NAME] = groups
+                # WRS:
+                # only get the security groups if doing a detailed show of a
+                # specific instance, otherwise the retrieval of the port list
+                # from neutron causes a neutron CPU usage to spike when there
+                # are a large number of ports
+                if len(servers) == 1:
+                    for server in servers:
+                        groups = sg_instance_bindings.get(server['id'])
+                        if groups:
+                            server[ATTRIBUTE_NAME] = groups
 
             # In this section of code len(servers) == 1 as you can only POST
             # one server in an API request.

@@ -46,6 +46,9 @@
 # THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 # (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+#
+# Copyright (c) 2016-2017 Wind River Systems, Inc.
+#
 
 
 """
@@ -958,6 +961,33 @@ Error: %s""") % six.text_type(e))
                         'uuid': inst[0].uuid,
                         'node': cn.hypervisor_hostname})
         return 0
+
+    @args('--older-than', metavar='<day(s)>', dest='older_than',
+          default=0, help='Days from today to begin purging')
+    def purge_deleted_instances(self, older_than=0):
+        """Removes soft deleted instance data"""
+        admin_context = context.get_admin_context(read_deleted='yes')
+        instance_count, deleted_rows = db.instances_purge_deleted(
+                                                    admin_context,
+                                                    older_than)
+        if instance_count > 0:
+            print("Purged %d instances and %d records related to these"
+                   " instances from DB." % (instance_count, deleted_rows))
+        else:
+            print(_("No instances are considered for Purge for this run."))
+
+    @args('--keep-time-range', metavar='<day(s)>', dest='keep_time_range',
+          default=5, help='Num days of events to keep')
+    @args('--max-events', dest='max_number',
+          default=1000, help='Max number of action events to keep')
+    def action_events_purge(self, keep_time_range=5, max_number=1000):
+        """Purges action events"""
+        admin_context = context.get_admin_context(read_deleted='yes')
+        deleted_rows = db.action_events_purge(admin_context,
+                                              dry_run=False,
+                                              keep_time_range=keep_time_range,
+                                              max_number=max_number)
+        print("Purged %d action events from DB." % deleted_rows)
 
 
 class ApiDbCommands(object):

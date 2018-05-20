@@ -12,6 +12,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2015-2017 Wind River Systems, Inc.
+#
 
 import mock
 from oslo_serialization import jsonutils
@@ -41,6 +44,10 @@ def fake_create(newflavor):
     newflavor["disabled"] = False
 
 
+def fake_save(context):
+    pass
+
+
 class FlavorManageTestV21(test.NoDBTestCase):
     controller = flavormanage_v21.FlavorManageController()
     validation_error = exception.ValidationError
@@ -49,6 +56,8 @@ class FlavorManageTestV21(test.NoDBTestCase):
     def setUp(self):
         super(FlavorManageTestV21, self).setUp()
         self.stub_out("nova.objects.Flavor.create", fake_create)
+        # WRS: stub out flavor save
+        self.stub_out("nova.objects.Flavor.save", fake_save)
 
         self.request_body = {
             "flavor": {
@@ -90,6 +99,16 @@ class FlavorManageTestV21(test.NoDBTestCase):
         self.assertRaises(webob.exc.HTTPNotFound,
                           self.controller._delete, self._get_http_request(),
                           1234)
+
+    def test_delete_flavor_in_use(self):
+        # Tests that a 400 is returned when trying to delete a flavor in use
+
+        def fake_is_in_use(self):
+            return True
+        self.stub_out("nova.objects.Flavor.is_in_use", fake_is_in_use)
+
+        self.assertRaises(webob.exc.HTTPBadRequest, self.controller._delete,
+                          self._get_http_request(), 1234)
 
     def _test_create_missing_parameter(self, parameter):
         body = {

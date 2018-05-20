@@ -13,6 +13,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2013-2017 Wind River Systems, Inc.
+#
 
 from oslo_log import log as logging
 
@@ -45,6 +48,9 @@ class BaseRamFilter(filters.BaseHostFilter):
                       {'host_state': host_state,
                        'requested_ram': requested_ram,
                        'usable_ram': total_usable_ram_mb})
+            msg = ('Insufficient total RAM: req:%(req)s, avail:%(avail)s MB' %
+                   {'req': requested_ram, 'avail': total_usable_ram_mb})
+            self.filter_reject(host_state, spec_obj, msg)
             return False
 
         ram_allocation_ratio = self._get_ram_allocation_ratio(host_state,
@@ -59,6 +65,9 @@ class BaseRamFilter(filters.BaseHostFilter):
                     {'host_state': host_state,
                      'requested_ram': requested_ram,
                      'usable_ram': usable_ram})
+            msg = ('Insufficient usable RAM: req:%(req)s, avail:%(avail)s MB'
+                   % {'req': requested_ram, 'avail': usable_ram})
+            self.filter_reject(host_state, spec_obj, msg)
             return False
 
         # save oversubscription limit for compute node to test against:

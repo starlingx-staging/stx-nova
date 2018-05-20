@@ -45,6 +45,7 @@ class TestNUMATopologyFilter(test.NoDBTestCase):
         spec_obj = self._get_spec_obj(numa_topology=instance_topology)
         host = fakes.FakeHostState('host1', 'node1',
                                    {'numa_topology': fakes.NUMA_TOPOLOGY,
+                                    'hypervisor_type': fakes.HYPERVISOR_TYPE,
                                     'pci_stats': None,
                                     'cpu_allocation_ratio': 16.0,
                                     'ram_allocation_ratio': 1.5})
@@ -57,13 +58,16 @@ class TestNUMATopologyFilter(test.NoDBTestCase):
                ])
 
         spec_obj = self._get_spec_obj(numa_topology=instance_topology)
-        host = fakes.FakeHostState('host1', 'node1', {'pci_stats': None})
+        host = fakes.FakeHostState('host1', 'node1',
+                                   {'hypervisor_type': fakes.HYPERVISOR_TYPE,
+                                    'pci_stats': None})
         self.assertFalse(self.filt_cls.host_passes(host, spec_obj))
 
     def test_numa_topology_filter_numa_host_no_numa_instance_pass(self):
         spec_obj = self._get_spec_obj(numa_topology=None)
         host = fakes.FakeHostState('host1', 'node1',
-                                   {'numa_topology': fakes.NUMA_TOPOLOGY})
+                                   {'numa_topology': fakes.NUMA_TOPOLOGY,
+                                    'hypervisor_type': fakes.HYPERVISOR_TYPE})
         self.assertTrue(self.filt_cls.host_passes(host, spec_obj))
 
     def test_numa_topology_filter_fail_fit(self):
@@ -75,6 +79,7 @@ class TestNUMATopologyFilter(test.NoDBTestCase):
         spec_obj = self._get_spec_obj(numa_topology=instance_topology)
         host = fakes.FakeHostState('host1', 'node1',
                                    {'numa_topology': fakes.NUMA_TOPOLOGY,
+                                    'hypervisor_type': fakes.HYPERVISOR_TYPE,
                                     'pci_stats': None,
                                     'cpu_allocation_ratio': 16.0,
                                     'ram_allocation_ratio': 1.5})
@@ -89,6 +94,7 @@ class TestNUMATopologyFilter(test.NoDBTestCase):
         spec_obj = self._get_spec_obj(numa_topology=instance_topology)
         host = fakes.FakeHostState('host1', 'node1',
                                    {'numa_topology': fakes.NUMA_TOPOLOGY,
+                                    'hypervisor_type': fakes.HYPERVISOR_TYPE,
                                     'pci_stats': None,
                                     'cpu_allocation_ratio': 16.0,
                                     'ram_allocation_ratio': 1})
@@ -102,6 +108,7 @@ class TestNUMATopologyFilter(test.NoDBTestCase):
         spec_obj = self._get_spec_obj(numa_topology=instance_topology)
         host = fakes.FakeHostState('host1', 'node1',
                                    {'numa_topology': fakes.NUMA_TOPOLOGY,
+                                    'hypervisor_type': fakes.HYPERVISOR_TYPE,
                                     'pci_stats': None,
                                     'cpu_allocation_ratio': 1,
                                     'ram_allocation_ratio': 1.5})
@@ -115,6 +122,7 @@ class TestNUMATopologyFilter(test.NoDBTestCase):
         spec_obj = self._get_spec_obj(numa_topology=instance_topology)
         host = fakes.FakeHostState('host1', 'node1',
                                    {'numa_topology': fakes.NUMA_TOPOLOGY,
+                                    'hypervisor_type': fakes.HYPERVISOR_TYPE,
                                     'pci_stats': None,
                                     'cpu_allocation_ratio': 21,
                                     'ram_allocation_ratio': 1.3})
@@ -153,6 +161,7 @@ class TestNUMATopologyFilter(test.NoDBTestCase):
         ]
         host = fakes.FakeHostState('host1', 'node1', {
             'numa_topology': numa_topology,
+            'hypervisor_type': fakes.HYPERVISOR_TYPE,
             'pci_stats': None,
             'cpu_allocation_ratio': 1,
             'ram_allocation_ratio': 1.5})
@@ -211,6 +220,7 @@ class TestNUMATopologyFilter(test.NoDBTestCase):
         spec_obj = self._get_spec_obj(numa_topology=instance_topology)
         host = fakes.FakeHostState('host1', 'node1',
                                    {'numa_topology': fakes.NUMA_TOPOLOGY,
+                                    'hypervisor_type': fakes.HYPERVISOR_TYPE,
                                     'pci_stats': None,
                                     'cpu_allocation_ratio': 16.0,
                                     'ram_allocation_ratio': 1.5})
@@ -226,6 +236,7 @@ class TestNUMATopologyFilter(test.NoDBTestCase):
         spec_obj = self._get_spec_obj(numa_topology=instance_topology)
         host = fakes.FakeHostState('host1', 'node1',
                                    {'numa_topology': fakes.NUMA_TOPOLOGY,
+                                    'hypervisor_type': fakes.HYPERVISOR_TYPE,
                                     'pci_stats': None,
                                     'cpu_allocation_ratio': 16.0,
                                     'ram_allocation_ratio': 1.5})

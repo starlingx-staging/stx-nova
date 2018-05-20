@@ -1951,6 +1951,7 @@ class LibvirtConfigGuestTest(LibvirtConfigBaseTest):
               <os>
                 <type>exe</type>
                 <init>/sbin/init</init>
+                <bios rebootTimeout="5000"/>
               </os>
               <devices>
                 <filesystem type="mount">
@@ -1996,6 +1997,7 @@ class LibvirtConfigGuestTest(LibvirtConfigBaseTest):
               <os>
                 <type>exe</type>
                 <init>/sbin/init</init>
+                <bios rebootTimeout="5000"/>
               </os>
               <devices>
                 <filesystem type="mount">
@@ -2042,6 +2044,7 @@ class LibvirtConfigGuestTest(LibvirtConfigBaseTest):
                 <kernel>/tmp/vmlinuz</kernel>
                 <initrd>/tmp/ramdisk</initrd>
                 <cmdline>console=xvc0</cmdline>
+                <bios rebootTimeout="5000"/>
               </os>
               <devices>
                 <disk type="file" device="disk">
@@ -2089,6 +2092,7 @@ class LibvirtConfigGuestTest(LibvirtConfigBaseTest):
                 <loader>/usr/lib/xen/boot/hvmloader</loader>
                 <cmdline>console=xvc0</cmdline>
                 <root>root=xvda</root>
+                <bios rebootTimeout="5000"/>
               </os>
               <features>
                 <acpi/>
@@ -2201,7 +2205,9 @@ class LibvirtConfigGuestTest(LibvirtConfigBaseTest):
                 <min_guarantee units="K">2970</min_guarantee>
               </memtune>
               <numatune>
+                <!-- WRS: we no longer emit numatune memory mode
                 <memory mode="preferred" nodeset="0-3,8"/>
+                -->
                 <memnode cellid="0" mode="preferred" nodeset="0-1"/>
                 <memnode cellid="1" mode="preferred" nodeset="2-3"/>
                 <memnode cellid="2" mode="preferred" nodeset="8"/>
@@ -2217,6 +2223,7 @@ class LibvirtConfigGuestTest(LibvirtConfigBaseTest):
               </sysinfo>
               <os>
                 <type>linux</type>
+                <bios rebootTimeout="5000"/>
                 <boot dev="hd"/>
                 <boot dev="cdrom"/>
                 <boot dev="fd"/>
@@ -2253,6 +2260,7 @@ class LibvirtConfigGuestTest(LibvirtConfigBaseTest):
         obj.os_type = "x86_64"
         obj.os_loader = '/tmp/OVMF_CODE.fd'
         obj.os_loader_type = 'pflash'
+        obj.os_nvram = '/foo/bar/instance-00000012_VARS.fd'
         xml = obj.to_xml()
 
         self.assertXmlEqual(xml, """
@@ -2264,6 +2272,8 @@ class LibvirtConfigGuestTest(LibvirtConfigBaseTest):
               <os>
                 <type>x86_64</type>
                 <loader readonly='yes' type='pflash'>/tmp/OVMF_CODE.fd</loader>
+                <nvram>/foo/bar/instance-00000012_VARS.fd</nvram>
+                <bios rebootTimeout="5000"/>
               </os>
             </domain>""")
 
@@ -2286,6 +2296,7 @@ class LibvirtConfigGuestTest(LibvirtConfigBaseTest):
               <vcpu>2</vcpu>
               <os>
                 <type>fake</type>
+                <bios rebootTimeout="5000"/>
                 <bootmenu enable="yes"/>
               </os>
             </domain>""")
@@ -2309,6 +2320,7 @@ class LibvirtConfigGuestTest(LibvirtConfigBaseTest):
               <vcpu>2</vcpu>
               <os>
                 <type>fake</type>
+                <bios rebootTimeout="5000"/>
               </os>
               <perf>
                 <event enabled="yes" name="cmt"/>
@@ -2335,6 +2347,7 @@ class LibvirtConfigGuestTest(LibvirtConfigBaseTest):
               <vcpu>2</vcpu>
               <os>
                 <type machine="fake_machine_type">hvm</type>
+                <bios rebootTimeout="5000"/>
               </os>
             </domain>""")
 
@@ -3116,7 +3129,9 @@ class LibvirtConfigGuestNUMATuneTest(LibvirtConfigBaseTest):
         xml = obj.to_xml()
         self.assertXmlEqual("""
           <numatune>
+            <!-- WRS: We no longer emit numatune memory mode
             <memory mode="strict" nodeset="0-3,8"/>
+            -->
           </numatune>""", xml)
 
     def test_config_numa_tune_memnodes(self):

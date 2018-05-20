@@ -12,7 +12,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
-
+#
+# Copyright (c) 2016-2017 Wind River Systems, Inc.
+#
 import abc
 import base64
 import contextlib
@@ -237,8 +239,10 @@ class Image(object):
                 fetch_func(target=target, *args, **kwargs)
 
         if not self.exists() or not os.path.exists(base):
+            LOG.info('Creating image %(name)s ...', {'name': filename})
             self.create_image(fetch_func_sync, base, size,
                               *args, **kwargs)
+            LOG.info('...done. image %(name)s; ', {'name': filename})
 
         if size:
             # create_image() only creates the base image if needed, so
@@ -470,6 +474,10 @@ class Image(object):
 
         :param name: name of the snapshot
         """
+        pass
+
+    @staticmethod
+    def init_host():
         pass
 
 
@@ -783,6 +791,10 @@ class Lvm(Image):
 
     def get_model(self, connection):
         return imgmodel.LocalBlockImage(self.path)
+
+    @staticmethod
+    def init_host():
+        lvm.create_thinpool_if_needed(CONF.libvirt.images_volume_group)
 
 
 class Rbd(Image):

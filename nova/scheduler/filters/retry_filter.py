@@ -12,6 +12,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2013-2017 Wind River Systems, Inc.
+#
 
 from oslo_log import log as logging
 
@@ -50,6 +53,8 @@ class RetryFilter(filters.BaseHostFilter):
         if not passes:
             LOG.info(_LI("Host %(host)s fails.  Previously tried hosts: "
                      "%(hosts)s"), {'host': host, 'hosts': hosts})
+            msg = ('Previously tried: %(hosts)s' % {'hosts': hosts})
+            self.filter_reject(host_state, spec_obj, msg, append=True)
 
         # Host passes if it's not in the list of previously attempted hosts:
         return passes

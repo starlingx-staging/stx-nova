@@ -72,6 +72,16 @@ quota_sets_policies = [
                 'path': '/os-quota-sets/{tenant_id}/detail'
             }
         ]),
+    policy.DocumentedRuleDefault(
+        POLICY_ROOT % 'list',
+        base.RULE_ADMIN_API,
+        "List all quota information",
+        [
+            {
+                'method': 'GET',
+                'path': '/os-quota-sets'
+            }
+        ]),
 ]
 
 

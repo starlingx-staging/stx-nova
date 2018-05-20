@@ -11,6 +11,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2016-2017 Wind River Systems, Inc.
+#
 
 import os
 
@@ -18,6 +21,7 @@ import mock
 from oslo_concurrency import processutils
 import six
 
+from nova.compute import utils as compute_utils
 from nova import exception
 from nova import test
 from nova import utils
@@ -32,7 +36,7 @@ class QemuTestCase(test.NoDBTestCase):
 
     @mock.patch.object(os.path, 'exists', return_value=True)
     def test_qemu_info_with_errors(self, path_exists):
-        self.assertRaises(exception.InvalidDiskInfo,
+        self.assertRaises(exception.DiskNotFound,
                           images.qemu_img_info,
                           '/fake/path')
 
@@ -45,9 +49,13 @@ class QemuTestCase(test.NoDBTestCase):
         self.assertTrue(image_info)
         self.assertTrue(str(image_info))
 
+    # WRS: mock out disk concurrency sema
+    @mock.patch.object(utils, 'disk_op_sema',
+                       new_callable=compute_utils.UnlimitedSemaphore)
     @mock.patch.object(utils, 'execute',
                        side_effect=processutils.ProcessExecutionError)
-    def test_convert_image_with_errors(self, mocked_execute):
+    def test_convert_image_with_errors(self, mocked_execute,
+                                       mock_disk_op_sema):
         self.assertRaises(exception.ImageUnacceptable,
                           images.convert_image,
                           '/path/that/does/not/exist',

@@ -11,7 +11,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
-
+#
+# Copyright (c) 2016-2017 Wind River Systems, Inc.
+#
 import os
 import re
 
@@ -259,6 +261,42 @@ class CPUAllocationPolicy(BaseNovaEnum):
     ALL = (DEDICATED, SHARED)
 
 
+class CacheTuneType(BaseNovaEnum):
+
+    BOTH = "both"
+    CODE = "code"
+    DATA = "data"
+
+    CDP = (CODE, DATA)
+    ALL = (BOTH, CODE, DATA)
+
+
+class ResctrlType(BaseNovaEnum):
+
+    BOTH = "L3"
+    CODE = "L3CODE"
+    DATA = "L3DATA"
+
+    ALL = (BOTH, CODE, DATA)
+
+
+class PciAllocationPolicy(BaseNovaEnum):
+    """Represents the possible values for pci_numa_affinity."""
+
+    # strict:  (default) Select from host NUMA nodes that have pci on the same
+    # node.
+    STRICT = "strict"
+    # prefer:  Select from host all host NUMA nodes, preferring nodes with pci
+    # on same node.
+    PREFER = "prefer"
+
+    ALL = (STRICT, PREFER)
+
+    def __init__(self):
+        super(PciAllocationPolicy, self).__init__(
+            valid_values=PciAllocationPolicy.ALL)
+
+
 class CPUThreadAllocationPolicy(BaseNovaEnum):
 
     # prefer (default): The host may or may not have hyperthreads. This
@@ -297,6 +335,26 @@ class CPUMode(BaseNovaEnum):
     HOST_PASSTHROUGH = 'host-passthrough'
 
     ALL = (CUSTOM, HOST_MODEL, HOST_PASSTHROUGH)
+
+
+# WRS: List of Intel based guest CPU models that can be selected from a user
+# defined instance type
+class CPUModel(BaseNovaEnum):
+    # We use the ordering of the cpu models to determine whether a
+    # given host can emulate a specified virtual model, so it's not
+    # just an enum.
+    ALL = ("Passthrough",
+           "Conroe",
+           "Penryn",
+           "Nehalem",
+           "Westmere",
+           "SandyBridge",
+           "IvyBridge",
+           "Haswell",
+           "Broadwell-noTSX",
+           "Broadwell",
+           "Skylake-Client",
+           "Skylake-Server")
 
 
 class CPUMatch(BaseNovaEnum):
@@ -390,6 +448,7 @@ class HVType(BaseNovaEnum):
     ALL = (BAREMETAL, BHYVE, DOCKER, FAKE, HYPERV, IRONIC, KQEMU, KVM, LXC,
            LXD, OPENVZ, PARALLELS, PHYP, QEMU, TEST, UML, VBOX, VIRTUOZZO,
            VMWARE, XEN, ZVM, PRSM)
+    LIBVIRT = (QEMU, FAKE)
 
     def coerce(self, obj, attr, value):
         try:
@@ -1083,6 +1142,10 @@ class CPUEmulatorThreadsPolicyField(BaseEnumField):
 
 class CPUModeField(BaseEnumField):
     AUTO_TYPE = CPUMode()
+
+
+class CPUModelField(BaseEnumField):
+    AUTO_TYPE = CPUModel()
 
 
 class CPUMatchField(BaseEnumField):

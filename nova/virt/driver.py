@@ -28,6 +28,7 @@ import six
 
 import nova.conf
 from nova.i18n import _
+from nova import objects
 from nova.virt import event as virtevent
 
 CONF = nova.conf.CONF
@@ -1240,6 +1241,25 @@ class ComputeDriver(object):
         """
         raise NotImplementedError()
 
+    def _has_cachetune_support(self):
+        """Check that host supports Libvirt CacheTune and we see cache bank
+           control with populated fields. This implies resctrl is mounted.
+        """
+        return False
+
+    def _has_cachetune_cdp_support(self):
+        """Check that host supports Libvirt CacheTune and CDP is enabled."""
+        return False
+
+    def _get_host_numa_cachebank_map(self):
+        """Create mapping of Numa Cell id to L3 cache bank id.
+        :return: dictionary d[cell.id] = bank.id
+        """
+        return {}
+
+    def get_actual_free_mempages(self):
+        return {}
+
     def block_stats(self, instance, disk_id):
         """Return performance counters associated with the given disk_id on the
         given instance.  These are returned as [rd_req, rd_bytes, wr_req,
@@ -1608,6 +1628,49 @@ class ComputeDriver(object):
         :returns: a string representing the host ID
         """
         return instance.get('host')
+
+    def scale_cpu_down(self, context, instance):
+        """Hot-remove a cpu from an instance."""
+        raise NotImplementedError()
+
+    def scale_cpu_up(self, context, instance, pcpu, vcpu):
+        """Hot-add a cpu to an instance."""
+        raise NotImplementedError()
+
+    def destroy_name(self, instance_name):
+        """Destroy an instance domain if we only know 'name' and not the full
+        instance (i.e., we lost instance object and it is not in Database).
+        Using this routine is a last resort to reap instances, the preferred
+        method is to use self.destroy(instance).
+
+        This does not unplug VIFs, destroy block devices, or destroy disks.
+        """
+        raise NotImplementedError()
+
+    # WRS: This is used in resource tracker.
+    # Default of empty dict gives original behaviour for testing.
+    def get_local_gb_info(self):
+        return {}
+
+    # WRS: This is used in resource tracker.
+    # Default to return zero for simplified unit testing.
+    def get_disk_available_least(self):
+        return 0
+
+    # WRS: This is used in resource tracker.
+    # Default to return zero for simplified unit testing.
+    def get_l3_closids(self):
+        return 0
+
+    # WRS: This is used in resource tracker.
+    # Default to return zero for simplified unit testing.
+    def get_l3_closids_used(self):
+        return 0
+
+    # WRS: extension
+    def affine_pci_dev_irqs(self, instance, wait_for_irqs=True):
+        """Affine PCI device irqs to VM's pcpus."""
+        raise NotImplementedError()
 
 
 def load_compute_driver(virtapi, compute_driver=None):

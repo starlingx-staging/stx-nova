@@ -13,6 +13,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+#
+# Copyright (c) 2013-2017 Wind River Systems, Inc.
+#
 
 
 import netaddr
@@ -35,6 +38,10 @@ class DifferentHostFilter(filters.BaseHostFilter):
         affinity_uuids = spec_obj.get_scheduler_hint('different_host')
         if affinity_uuids:
             overlap = utils.instance_uuids_overlap(host_state, affinity_uuids)
+            if overlap:
+                msg = ('found in hosts: %(uuids)s' %
+                       {'uuids': ','.join(map(str, affinity_uuids))})
+                self.filter_reject(host_state, spec_obj, msg)
             return not overlap
         # With no different_host key
         return True
@@ -53,6 +60,10 @@ class SameHostFilter(filters.BaseHostFilter):
         affinity_uuids = spec_obj.get_scheduler_hint('same_host')
         if affinity_uuids:
             overlap = utils.instance_uuids_overlap(host_state, affinity_uuids)
+            if not overlap:
+                msg = ('not found in hosts: %(uuids)s' %
+                       {'uuids': ','.join(map(str, affinity_uuids))})
+                self.filter_reject(host_state, spec_obj, msg)
             return overlap
         # With no same_host key
         return True
@@ -73,7 +84,12 @@ class SimpleCIDRAffinityFilter(filters.BaseHostFilter):
             affinity_net = netaddr.IPNetwork(str.join('', (affinity_host_addr,
                                                            affinity_cidr)))
 
-            return netaddr.IPAddress(host_ip) in affinity_net
+            retval = netaddr.IPAddress(host_ip) in affinity_net
+            if not retval:
+                msg = ('host ip %(ip)s not in network %(net)s' %
+                       {'ip': host_ip, 'net': affinity_net})
+                self.filter_reject(host_state, spec_obj, msg)
+            return retval
 
         # We don't have an affinity host address.
         return True
@@ -100,11 +116,22 @@ class _GroupAntiAffinityFilter(filters.BaseHostFilter):
 
         group_hosts = (spec_obj.instance_group.hosts
                        if spec_obj.instance_group else [])
-        LOG.debug("Group anti affinity: check if %(host)s not "
+        LOG.info("Group anti affinity: check if %(host)s not "
                   "in %(configured)s", {'host': host_state.host,
                                         'configured': group_hosts})
         if group_hosts:
-            return host_state.host not in group_hosts
+            retval = host_state.host not in group_hosts
+            if not retval:
+                hints = {}
+                if spec_obj.obj_attr_is_set('scheduler_hints'):
+                    hints = spec_obj.scheduler_hints or {}
+                msg = ('Anti-affinity server group specified, but this host'
+                       ' is already used by that group: '
+                       '%(configured)s, hint=%(hint)s' %
+                       {'configured': ', '.join(map(str, group_hosts)),
+                        'hint': hints})
+                self.filter_reject(host_state, spec_obj, msg)
+            return retval
 
         # No groups configured
         return True
@@ -135,7 +162,15 @@ class _GroupAffinityFilter(filters.BaseHostFilter):
                   "%(configured)s", {'host': host_state.host,
                                      'configured': group_hosts})
         if group_hosts:
-            return host_state.host in group_hosts
+            retval = host_state.host in group_hosts
+            if not retval:
+                filter_properties = spec_obj.to_legacy_filter_properties_dict()
+                hints = filter_properties.get('scheduler_hints', {})
+                msg = ('not found in: %(configured)s, hint=%(hint)s' %
+                       {'configured': ', '.join(map(str, group_hosts)),
+                        'hint': hints})
+                self.filter_reject(host_state, spec_obj, msg)
+            return retval
 
         # No groups configured
         return True

@@ -11,6 +11,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2013-2017 Wind River Systems, Inc.
+#
 
 import sys
 import time
@@ -102,6 +105,15 @@ VIR_MIGRATE_POSTCOPY = 32768
 VIR_NODE_CPU_STATS_ALL_CPUS = -1
 
 VIR_DOMAIN_START_PAUSED = 1
+
+# WRS: add virDomainEventStoppedDetailType enum definitions
+VIR_DOMAIN_EVENT_STOPPED_SHUTDOWN = 0
+VIR_DOMAIN_EVENT_STOPPED_DESTROYED = 1
+VIR_DOMAIN_EVENT_STOPPED_CRASHED = 2
+VIR_DOMAIN_EVENT_STOPPED_MIGRATED = 3
+VIR_DOMAIN_EVENT_STOPPED_SAVED = 4
+VIR_DOMAIN_EVENT_STOPPED_FAILED = 5
+VIR_DOMAIN_EVENT_STOPPED_FROM_SNAPSHOT = 6
 
 # libvirtError enums
 # (Intentionally different from what's in libvirt. We do this to check,

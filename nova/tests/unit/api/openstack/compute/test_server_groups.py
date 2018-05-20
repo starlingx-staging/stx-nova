@@ -12,6 +12,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2016-2017 Wind River Systems, Inc.
+#
 
 import mock
 from oslo_utils import uuidutils
@@ -26,6 +29,7 @@ from nova.policies import server_groups as sg_policies
 from nova import test
 from nova.tests import fixtures
 from nova.tests.unit.api.openstack import fakes
+from nova.tests.unit import fake_build_request
 from nova.tests.unit import policy_fixture
 from nova.tests import uuidsentinel
 
@@ -46,6 +50,8 @@ def server_group_resp_template(**kwargs):
     sgroup.setdefault('name', 'test')
     sgroup.setdefault('policies', [])
     sgroup.setdefault('members', [])
+    # WRS:extension - metadata
+    sgroup.setdefault('metadata', {})
     return sgroup
 
 
@@ -63,6 +69,13 @@ def server_group_db(sg):
         attrs['members'] = members
     else:
         attrs['members'] = []
+
+    # WRS:extension -- metadata, metadetails
+    if 'metadata' in attrs:
+        attrs['metadetails'] = attrs.pop('metadata')
+    else:
+        attrs['metadetails'] = {}
+
     attrs['deleted'] = 0
     attrs['deleted_at'] = None
     attrs['created_at'] = None
@@ -196,6 +209,17 @@ class ServerGroupTestV21(test.NoDBTestCase):
     def _test_list_server_group_offset_and_limit(self, api_version='2.1'):
         self._test_list_server_group(api_version=api_version, limited=True)
 
+    # WRS: add create group with passed in metadetails
+    def _create_groups_and_instances_with_metadata(self, ctx, metadetails):
+        instances = [self._create_instance(ctx, cell=None),
+                     self._create_instance(ctx, cell=None)]
+        members = [instance.uuid for instance in instances]
+        ig = objects.InstanceGroup(context=ctx, name='fake_name',
+                  user_id='fake_user', project_id='fake',
+                  members=members, metadetails=metadetails)
+        ig.create()
+        return ig.uuid
+
     @mock.patch.object(nova.db, 'instance_group_get_all_by_project_id')
     @mock.patch.object(nova.db, 'instance_group_get_all')
     def _test_list_server_group(self, mock_get_all, mock_get_by_project,
@@ -207,6 +231,8 @@ class ServerGroupTestV21(test.NoDBTestCase):
         p_id = fakes.FAKE_PROJECT_ID
         u_id = fakes.FAKE_USER_ID
         if api_version >= '2.13':
+            # WRS:extension - metadata
+            metadata = {'wrs-sg:group_size': '15'}
             sg1 = server_group_resp_template(id=uuidsentinel.sg1_id,
                                             name=names[0],
                                             policies=policies,
@@ -277,6 +303,8 @@ class ServerGroupTestV21(test.NoDBTestCase):
         p_id = fakes.FAKE_PROJECT_ID
         u_id = fakes.FAKE_USER_ID
         if api_version >= '2.13':
+            # WRS:extension - metadata
+            metadata = {'wrs-sg:group_size': '15'}
             sg1 = server_group_resp_template(id=uuidsentinel.sg1_id,
                                             name=names[0],
                                             policies=policies,
@@ -317,6 +345,15 @@ class ServerGroupTestV21(test.NoDBTestCase):
 
     def test_display_members(self):
         ctx = context.RequestContext('fake_user', 'fake')
+        fake_build_req = fake_build_request.fake_req_obj(ctx)
+
+        @staticmethod
+        def _fake_get_by_instance_uuid(context, instance_uuid):
+            return fake_build_req
+
+        self.stub_out('nova.objects.BuildRequest.get_by_instance_uuid',
+                      _fake_get_by_instance_uuid)
+
         (ig_uuid, instances, members) = self._create_groups_and_instances(ctx)
         res_dict = self.controller.show(self.req, ig_uuid)
         result_members = res_dict['server_group']['members']
@@ -324,12 +361,63 @@ class ServerGroupTestV21(test.NoDBTestCase):
         for member in members:
             self.assertIn(member, result_members)
 
+    # WRS: test server group create and query with empty metadetails
+    def test_display_no_metadata(self):
+        ctx = context.RequestContext('fake_user', 'fake')
+        metadetails = None
+        ig_uuid = self._create_groups_and_instances_with_metadata(ctx,
+                                                           metadetails)
+        res_dict = self.controller.show(self.req, ig_uuid)
+        result_metadata = res_dict['server_group']['metadata']
+        self.assertEqual({}, result_metadata)
+
+    # WRS: test server group create and query with metadetails
+    def test_display_with_metadata(self):
+        ctx = context.RequestContext('fake_user', 'fake')
+        metadetails = {'wrs-sg:group_size': '15'}
+        ig_uuid = self._create_groups_and_instances_with_metadata(ctx,
+                                                           metadetails)
+        res_dict = self.controller.show(self.req, ig_uuid)
+        result_metadata = res_dict['server_group']['metadata']
+        self.assertEqual(metadetails, result_metadata)
+
+    # WRS: test changing metadata: add new key, remove existing key and change
+    # value of existing key
+    @mock.patch('nova.compute.utils.notify_about_server_group_update')
+    def test_save_with_metadata(self, mock_notify):
+        ctx = context.RequestContext('fake_user', 'fake')
+        metadetails = {'wrs-sg:group_size': '15',
+                       'wrs-sg:best_effort': 'true'}
+        ig_uuid = self._create_groups_and_instances_with_metadata(ctx,
+                                                           metadetails)
+        ig = objects.InstanceGroup.get_by_uuid(ctx, ig_uuid)
+        metadetails_new = {'wrs-sg:group_size': '25',
+                          'wrs-sg:best_effort': 'false'}
+        ig.metadetails = metadetails_new
+        ig._changed_fields.add('metadetails')
+        ig.save()
+        res_dict = self.controller.show(self.req, ig_uuid)
+        result_metadata = res_dict['server_group']['metadata']
+        self.assertEqual(2, len(result_metadata))
+        for key in metadetails_new:
+            self.assertEqual(result_metadata[key], metadetails_new[key])
+
     def test_display_members_with_nonexistent_group(self):
         self.assertRaises(webob.exc.HTTPNotFound,
                           self.controller.show, self.req, uuidsentinel.group)
 
     def test_display_active_members_only(self):
         ctx = context.RequestContext('fake_user', 'fake')
+
+        fake_build_req = fake_build_request.fake_req_obj(ctx)
+
+        @staticmethod
+        def _fake_get_by_instance_uuid(context, instance_uuid):
+            return fake_build_req
+
+        self.stub_out('nova.objects.BuildRequest.get_by_instance_uuid',
+                      _fake_get_by_instance_uuid)
+
         (ig_uuid, instances, members) = self._create_groups_and_instances(ctx)
 
         # delete an instance
@@ -555,8 +643,10 @@ class ServerGroupTestV21(test.NoDBTestCase):
         self.assertRaises(webob.exc.HTTPNotFound, self.controller.delete,
                           self.req, 'invalid')
 
-    def test_delete_server_group_rbac_default(self):
+    @mock.patch('nova.objects.InstanceGroup.count_members')
+    def test_delete_server_group_rbac_default(self, mock_count_members):
         ctx = context.RequestContext('fake_user', 'fake')
+        mock_count_members.return_value = 0
 
         # test as admin
         ig_uuid = self._create_groups_and_instances(ctx)[0]
@@ -566,8 +656,10 @@ class ServerGroupTestV21(test.NoDBTestCase):
         ig_uuid = self._create_groups_and_instances(ctx)[0]
         self.controller.delete(self.req, ig_uuid)
 
-    def test_delete_server_group_rbac_admin_only(self):
+    @mock.patch('nova.objects.InstanceGroup.count_members')
+    def test_delete_server_group_rbac_admin_only(self, mock_count_members):
         ctx = context.RequestContext('fake_user', 'fake')
+        mock_count_members.return_value = 0
 
         # override policy to restrict to admin
         rule_name = sg_policies.POLICY_ROOT % 'delete'
@@ -585,6 +677,15 @@ class ServerGroupTestV21(test.NoDBTestCase):
         self.assertEqual(
             "Policy doesn't allow %s to be performed." % rule_name,
             exc.format_message())
+
+    # WRS:extension, don't allow deleting group with instances
+    def test_delete_server_group_non_empty(self):
+        ctx = context.RequestContext('fake_user', 'fake')
+
+        # test as admin
+        ig_uuid = self._create_groups_and_instances(ctx)[0]
+        self.assertRaises(webob.exc.HTTPBadRequest, self.controller.delete,
+                          self.req, ig_uuid)
 
 
 class ServerGroupTestV213(ServerGroupTestV21):

@@ -62,6 +62,7 @@ class ImageMetadataController(wsgi.Controller):
             raise exc.HTTPNotFound()
 
     @wsgi.Controller.api_version("2.1", MAX_IMAGE_META_PROXY_API_VERSION)
+    @extensions.block_during_upgrade()
     @extensions.expected_errors((400, 403, 404))
     @validation.schema(image_metadata.create)
     def create(self, req, image_id, body):
@@ -79,6 +80,7 @@ class ImageMetadataController(wsgi.Controller):
         return dict(metadata=image['properties'])
 
     @wsgi.Controller.api_version("2.1", MAX_IMAGE_META_PROXY_API_VERSION)
+    @extensions.block_during_upgrade()
     @extensions.expected_errors((400, 403, 404))
     @validation.schema(image_metadata.update)
     def update(self, req, image_id, id, body):
@@ -102,6 +104,7 @@ class ImageMetadataController(wsgi.Controller):
         return dict(meta=meta)
 
     @wsgi.Controller.api_version("2.1", MAX_IMAGE_META_PROXY_API_VERSION)
+    @extensions.block_during_upgrade()
     @extensions.expected_errors((400, 403, 404))
     @validation.schema(image_metadata.update_all)
     def update_all(self, req, image_id, body):
@@ -118,6 +121,7 @@ class ImageMetadataController(wsgi.Controller):
         return dict(metadata=metadata)
 
     @wsgi.Controller.api_version("2.1", MAX_IMAGE_META_PROXY_API_VERSION)
+    @extensions.block_during_upgrade()
     @extensions.expected_errors((403, 404))
     @wsgi.response(204)
     def delete(self, req, image_id, id):

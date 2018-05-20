@@ -11,6 +11,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2014-2017 Wind River Systems, Inc.
+#
 
 import datetime
 
@@ -76,7 +79,10 @@ def fake_db_instance(**updates):
                   'device_metadata': None,
                  },
         'tags': [],
-        'services': []
+        'services': [],
+        # WRS
+        'min_vcpus': None,
+        'max_vcpus': None
         }
 
     for name, field in objects.Instance.fields.items():

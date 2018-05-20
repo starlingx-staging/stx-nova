@@ -73,6 +73,17 @@ server_groups_policies = [
             }
         ]
     ),
+    policy.DocumentedRuleDefault(
+        POLICY_ROOT % 'set_metadata',
+        BASE_POLICY_RULE,
+        "Set some metadata on a server group",
+        [
+            {
+                'method': 'POST',
+                'path': '/os-server-groups/{server_group_id}'
+                        '/action (set_metadata)'
+            }
+        ]),
 ]
 
 

@@ -12,6 +12,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2016-2017 Wind River Systems, Inc.
+#
 
 from nova.db.sqlalchemy import api_models
 from nova.db.sqlalchemy import models
@@ -41,6 +44,7 @@ class TestSoftDeletesDeprecated(test.NoDBTestCase):
             'instance_extra',
             'instance_faults',
             'instance_group_member',
+            'instance_group_metadata',
             'instance_group_policy',
             'instance_groups',
             'instance_id_mappings',

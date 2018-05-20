@@ -15,6 +15,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2016-2017 Wind River Systems, Inc.
+#
 """
 SQLAlchemy models for nova data.
 """
@@ -130,7 +133,7 @@ class ComputeNode(BASE, NovaBase, models.SoftDeleteMixin):
     vcpus = Column(Integer, nullable=False)
     memory_mb = Column(Integer, nullable=False)
     local_gb = Column(Integer, nullable=False)
-    vcpus_used = Column(Integer, nullable=False)
+    vcpus_used = Column(Float, nullable=False)
     memory_mb_used = Column(Integer, nullable=False)
     local_gb_used = Column(Integer, nullable=False)
     hypervisor_type = Column(MediumText(), nullable=False)
@@ -144,6 +147,10 @@ class ComputeNode(BASE, NovaBase, models.SoftDeleteMixin):
     free_disk_gb = Column(Integer)
     current_workload = Column(Integer)
     running_vms = Column(Integer)
+
+    # L3 CAT Support
+    l3_closids = Column(Integer)
+    l3_closids_used = Column(Integer)
 
     # Note(masumotok): Expected Strings example:
     #
@@ -350,6 +357,10 @@ class Instance(BASE, NovaBase, models.SoftDeleteMixin):
 
     # Records whether an instance has been deleted from disk
     cleaned = Column(Integer, default=0)
+
+    # vm scaling
+    min_vcpus = Column(Integer)
+    max_vcpus = Column(Integer)
 
 
 class InstanceInfoCache(BASE, NovaBase, models.SoftDeleteMixin):
@@ -1370,6 +1381,22 @@ class InstanceGroupPolicy(BASE, NovaBase, models.SoftDeleteMixin):
                       nullable=False)
 
 
+# WRS add metadata table.  Similar to other instance group tables, per move to
+# nova_api database, this is deprecated but required for upgrade.
+class InstanceGroupMetadata(BASE, NovaBase, models.SoftDeleteMixin):
+    """Represents a key/value pair for an instance group."""
+    __tablename__ = 'instance_group_metadata'
+    __table_args__ = (
+        Index('instance_group_metadata_key_idx', 'key'),
+    )
+    id = Column(Integer, primary_key=True, nullable=False)
+    key = Column(String(255))
+    value = Column(String(255))
+
+    group_id = Column(Integer, ForeignKey('instance_groups.id'),
+                      nullable=False)
+
+
 # NOTE(alaski): This table exists in the nova_api database and its usage here
 # is deprecated.
 class InstanceGroup(BASE, NovaBase, models.SoftDeleteMixin):
@@ -1394,6 +1421,13 @@ class InstanceGroup(BASE, NovaBase, models.SoftDeleteMixin):
         'InstanceGroup.id == InstanceGroupPolicy.group_id,'
         'InstanceGroupPolicy.deleted == 0,'
         'InstanceGroup.deleted == 0)')
+
+    # WRS:extension - metadata
+    _metadata = orm.relationship(InstanceGroupMetadata, primaryjoin='and_('
+        'InstanceGroup.id == InstanceGroupMetadata.group_id,'
+        'InstanceGroupMetadata.deleted == 0,'
+        'InstanceGroup.deleted == 0)')
+
     _members = orm.relationship(InstanceGroupMember, primaryjoin='and_('
         'InstanceGroup.id == InstanceGroupMember.group_id,'
         'InstanceGroupMember.deleted == 0,'
@@ -1402,6 +1436,11 @@ class InstanceGroup(BASE, NovaBase, models.SoftDeleteMixin):
     @property
     def policies(self):
         return [p.policy for p in self._policies]
+
+    # WRS:extension - metadetails
+    @property
+    def metadetails(self):
+        return {m.key: m.value for m in self._metadata}
 
     @property
     def members(self):

@@ -11,7 +11,11 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2015-2017 Wind River Systems, Inc.
+#
 
+from oslo_config import cfg
 from oslo_serialization import jsonutils
 from oslo_utils import versionutils
 
@@ -19,6 +23,9 @@ from nova import exception
 from nova.objects import base
 from nova.objects import fields
 from nova.virt import hardware
+
+
+CONF = cfg.CONF
 
 
 def all_things_equal(obj_a, obj_b):
@@ -40,18 +47,64 @@ class NUMACell(base.NovaObject):
     # Version 1.0: Initial version
     # Version 1.1: Added pinned_cpus and siblings fields
     # Version 1.2: Added mempages field
+    #              WRS: Added shared_pcpu
+    #              WRS: Added L3 CAT fields
     VERSION = '1.2'
+    # NOTE(jgauld): R4 to R5 upgrades, Pike still at 1.2. Drop L3 related
+    #               fields with R4/Newton.
+
+    def obj_make_compatible(self, primitive, target_version):
+        super(NUMACell, self).obj_make_compatible(primitive, target_version)
+        target_version = versionutils.convert_version_to_tuple(target_version)
+        if target_version < (1, 2) or CONF.upgrade_levels.compute == 'newton':
+            primitive.pop('l3_cdp', None)
+            primitive.pop('l3_size', None)
+            primitive.pop('l3_granularity', None)
+            primitive.pop('l3_both_used', None)
+            primitive.pop('l3_code_used', None)
+            primitive.pop('l3_data_used', None)
 
     fields = {
         'id': fields.IntegerField(read_only=True),
         'cpuset': fields.SetOfIntegersField(),
         'memory': fields.IntegerField(),
-        'cpu_usage': fields.IntegerField(default=0),
+        'cpu_usage': fields.FloatField(default=0),
         'memory_usage': fields.IntegerField(default=0),
         'pinned_cpus': fields.SetOfIntegersField(),
         'siblings': fields.ListOfSetsOfIntegersField(),
         'mempages': fields.ListOfObjectsField('NUMAPagesTopology'),
-        }
+        'shared_pcpu': fields.IntegerField(default=None, nullable=True),
+        'l3_cdp': fields.BooleanField(nullable=True),
+        'l3_size': fields.IntegerField(nullable=True),
+        'l3_granularity': fields.IntegerField(nullable=True),
+        'l3_both_used': fields.IntegerField(nullable=True),
+        'l3_code_used': fields.IntegerField(nullable=True),
+        'l3_data_used': fields.IntegerField(nullable=True),
+    }
+
+    def __init__(self, **kwargs):
+        super(NUMACell, self).__init__(**kwargs)
+        if 'shared_pcpu' not in kwargs:
+            self.shared_pcpu = None
+            self.obj_reset_changes(['shared_pcpu'])
+        if 'l3_cdp' not in kwargs:
+            self.l3_cdp = None
+            self.obj_reset_changes(['l3_cdp'])
+        if 'l3_size' not in kwargs:
+            self.l3_size = None
+            self.obj_reset_changes(['l3_size'])
+        if 'l3_granularity' not in kwargs:
+            self.l3_granularity = None
+            self.obj_reset_changes(['l3_granularity'])
+        if 'l3_both_used' not in kwargs:
+            self.l3_both_used = None
+            self.obj_reset_changes(['l3_both_used'])
+        if 'l3_code_used' not in kwargs:
+            self.l3_code_used = None
+            self.obj_reset_changes(['l3_code_used'])
+        if 'l3_data_used' not in kwargs:
+            self.l3_data_used = None
+            self.obj_reset_changes(['l3_data_used'])
 
     def __eq__(self, other):
         return all_things_equal(self, other)
@@ -70,56 +123,92 @@ class NUMACell(base.NovaObject):
 
     @property
     def avail_cpus(self):
-        return len(self.free_cpus)
+        cpu_usage = self.cpu_usage if ('cpu_usage' in self) else 0
+        return len(self.cpuset) - cpu_usage
 
     @property
     def avail_memory(self):
         return self.memory - self.memory_usage
 
-    def pin_cpus(self, cpus):
-        if cpus - self.cpuset:
+    @property
+    def avail_cache(self):
+        """Calculate cache available for VMs. Subtract granularity to account
+           for the for resctrl limitation that default CBM cannot be zero.
+        """
+        return (self.l3_size -
+                self.l3_granularity -
+                self.l3_both_used -
+                self.l3_code_used -
+                self.l3_data_used)
+
+    @property
+    def max_l3_allocation(self):
+        """Do not utilize full L3 size as that corresponds to full cbm_mask.
+           Libvirt overloads the full mask to imply an empty bank.
+        """
+        return self.l3_size - self.l3_granularity
+
+    @property
+    def min_l3_allocation(self):
+        return self.l3_granularity
+
+    @property
+    def has_cachetune(self):
+        """Defined ganularity values imply cachetune is supported."""
+        return (self.l3_granularity is not None and self.l3_granularity > 0)
+
+    @property
+    def has_cachetune_cdp(self):
+        return self.l3_cdp
+
+    def pin_cpus(self, cpus, strict=True):
+        if strict and (cpus - self.cpuset):
             raise exception.CPUPinningUnknown(requested=list(cpus),
                                               cpuset=list(self.cpuset))
-        if self.pinned_cpus & cpus:
+        if strict and (self.pinned_cpus & cpus):
             raise exception.CPUPinningInvalid(requested=list(cpus),
                                               free=list(self.cpuset -
                                                         self.pinned_cpus))
-        self.pinned_cpus |= cpus
+        intersect = self.pinned_cpus & (cpus & self.cpuset)
+        self.pinned_cpus |= (cpus & self.cpuset)
+        return intersect
 
-    def unpin_cpus(self, cpus):
-        if cpus - self.cpuset:
+    def unpin_cpus(self, cpus, strict=True):
+        if strict and (cpus - self.cpuset):
             raise exception.CPUUnpinningUnknown(requested=list(cpus),
                                                 cpuset=list(self.cpuset))
-        if (self.pinned_cpus & cpus) != cpus:
+        if strict and (self.pinned_cpus & cpus) != cpus:
             raise exception.CPUUnpinningInvalid(requested=list(cpus),
                                                 pinned=list(self.pinned_cpus))
+        nointersect = cpus - self.pinned_cpus
         self.pinned_cpus -= cpus
+        return nointersect
 
-    def pin_cpus_with_siblings(self, cpus):
+    def pin_cpus_with_siblings(self, cpus, strict=True):
         # NOTE(snikitin): Empty siblings list means that HyperThreading is
         # disabled on the NUMA cell and we must pin CPUs like normal CPUs.
         if not self.siblings:
-            self.pin_cpus(cpus)
+            self.pin_cpus(cpus, strict=strict)
             return
 
         pin_siblings = set()
         for sib in self.siblings:
             if cpus & sib:
                 pin_siblings.update(sib)
-        self.pin_cpus(pin_siblings)
+        return self.pin_cpus(pin_siblings, strict=strict)
 
-    def unpin_cpus_with_siblings(self, cpus):
+    def unpin_cpus_with_siblings(self, cpus, strict=True):
         # NOTE(snikitin): Empty siblings list means that HyperThreading is
         # disabled on the NUMA cell and we must unpin CPUs like normal CPUs.
         if not self.siblings:
-            self.unpin_cpus(cpus)
+            self.unpin_cpus(cpus, strict=strict)
             return
 
         pin_siblings = set()
         for sib in self.siblings:
             if cpus & sib:
                 pin_siblings.update(sib)
-        self.unpin_cpus(pin_siblings)
+        return self.unpin_cpus(pin_siblings, strict=strict)
 
     def _to_dict(self):
         return {
@@ -129,7 +218,17 @@ class NUMACell(base.NovaObject):
             'mem': {
                 'total': self.memory,
                 'used': self.memory_usage},
-            'cpu_usage': self.cpu_usage}
+            'shared_pcpu': self.shared_pcpu,
+            'cpu_usage': self.cpu_usage,
+            'l3_cache': {
+                'cdp': self.has_cachetune_cdp,
+                'size': self.l3_size,
+                'granularity': self.l3_granularity,
+                'both_used': self.l3_both_used,
+                'code_used': self.l3_code_used,
+                'data_used': self.l3_data_used,
+            },
+        }
 
     @classmethod
     def _from_dict(cls, data_dict):
@@ -138,10 +237,27 @@ class NUMACell(base.NovaObject):
         cpu_usage = data_dict.get('cpu_usage', 0)
         memory = data_dict.get('mem', {}).get('total', 0)
         memory_usage = data_dict.get('mem', {}).get('used', 0)
+        shared_pcpu = data_dict.get('shared_pcpu')
+        cache = data_dict.get('l3_cache', {})
+        l3_cdp = cache.get('l3_cdp', False)
+        l3_size = cache.get('l3_size', 0)
+        l3_granularity = cache.get('l3_granularity', 0)
+        l3_both_used = cache.get('l3_both_used', 0)
+        l3_code_used = cache.get('l3_code_used', 0)
+        l3_data_used = cache.get('l3_data_used', 0)
+
         cell_id = data_dict.get('id')
         return cls(id=cell_id, cpuset=cpuset, memory=memory,
                    cpu_usage=cpu_usage, memory_usage=memory_usage,
-                   mempages=[], pinned_cpus=set([]), siblings=[])
+                   mempages=[], pinned_cpus=set([]), siblings=[],
+                   shared_pcpu=shared_pcpu,
+                   l3_cdp=l3_cdp,
+                   l3_size=l3_size,
+                   l3_granularity=l3_granularity,
+                   l3_both_used=l3_both_used,
+                   l3_code_used=l3_code_used,
+                   l3_data_used=l3_data_used,
+                   )
 
     def can_fit_hugepages(self, pagesize, memory):
         """Returns whether memory can fit into hugepages size
@@ -157,6 +273,82 @@ class NUMACell(base.NovaObject):
                 return (memory <= pages.free_kb and
                         (memory % pages.size_kb) == 0)
         raise exception.MemoryPageSizeNotSupported(pagesize=pagesize)
+
+    # WRS: add a readable string representation
+    def __str__(self):
+        return '  {obj_name} (id: {id})\n' \
+               '    cpus: {cpus}\n' \
+               '    mem:\n' \
+               '      total: {total}\n' \
+               '      used: {used}\n' \
+               '    cpu_usage: {cpu_usage}\n' \
+               '    siblings: {siblings}\n' \
+               '    shared_pcpu: {shared_pcpu}\n' \
+               '    pinned_cpus: {pinned_cpus}\n' \
+               '    mempages: {mempages} \n' \
+               '    L3_cache:\n' \
+               '      cdp: {l3_cdp}\n' \
+               '      size: {l3_size}\n' \
+               '      granularity: {l3_granularity}\n' \
+               '      both_used: {l3_both_used}\n' \
+               '      code_used: {l3_code_used}\n' \
+               '      data_used: {l3_data_used}'.format(
+            obj_name=self.obj_name(),
+            id=self.id,
+            cpus=hardware.format_cpu_spec(
+                self.cpuset, allow_ranges=True),
+            total=self.memory,
+            used=self.memory_usage,
+            cpu_usage=self.cpu_usage if ('cpu_usage' in self) else None,
+            siblings=self.siblings,
+            shared_pcpu=self.shared_pcpu,
+            pinned_cpus=hardware.format_cpu_spec(
+                self.pinned_cpus, allow_ranges=True),
+            mempages=self.mempages,
+            l3_cdp=self.l3_cdp,
+            l3_size=self.l3_size,
+            l3_granularity=self.l3_granularity,
+            l3_both_used=self.l3_both_used,
+            l3_code_used=self.l3_code_used,
+            l3_data_used=self.l3_data_used,
+        )
+
+    # WRS: add a readable representation, without newlines
+    def __repr__(self):
+        return '{obj_name} (id: {id}) ' \
+               'cpus: {cpus} ' \
+               'mem: total: {total} used: {used} ' \
+               'cpu_usage: {cpu_usage} ' \
+               'siblings: {siblings} ' \
+               'shared_pcpu: {shared_pcpu} ' \
+               'pinned_cpus: {pinned_cpus} ' \
+               'mempages: {mempages} ' \
+               'L3_cache: ' \
+               'cdp: {l3_cdp} ' \
+               'size: {l3_size} ' \
+               'granularity: {l3_granularity} ' \
+               'both_used: {l3_both_used} ' \
+               'code_used: {l3_code_used} ' \
+               'data_used: {l3_data_used}'.format(
+            obj_name=self.obj_name(),
+            id=self.id,
+            cpus=hardware.format_cpu_spec(
+                self.cpuset, allow_ranges=True),
+            total=self.memory,
+            used=self.memory_usage,
+            cpu_usage=self.cpu_usage if ('cpu_usage' in self) else None,
+            siblings=self.siblings,
+            shared_pcpu=self.shared_pcpu,
+            pinned_cpus=hardware.format_cpu_spec(
+                self.pinned_cpus, allow_ranges=True),
+            mempages=self.mempages,
+            l3_cdp=self.l3_cdp,
+            l3_size=self.l3_size,
+            l3_granularity=self.l3_granularity,
+            l3_both_used=self.l3_both_used,
+            l3_code_used=self.l3_code_used,
+            l3_data_used=self.l3_data_used,
+        )
 
 
 @base.NovaObjectRegistry.register
@@ -193,6 +385,20 @@ class NUMAPagesTopology(base.NovaObject):
             # an updated node we must ensure that this property is defined.
             self.reserved = 0
         return self.total - self.used - self.reserved
+
+    def adjust_used(self, actual_free):
+        """Adjust the number of used pages if there is less actual free pages
+           than what is tracked for VMs.
+        """
+        if not self.obj_attr_is_set('reserved'):
+            # In case where an old compute node is sharing resource to
+            # an updated node we must ensure that this property is defined.
+            self.reserved = 0
+        tracked_free = self.total - self.used - self.reserved
+        used_old = self.used
+        if actual_free < tracked_free:
+            self.used += tracked_free - actual_free
+        return used_old, self.used
 
     @property
     def free_kb(self):
@@ -245,6 +451,18 @@ class NUMATopology(base.NovaObject):
             NUMACell._from_dict(cell_dict)
             for cell_dict in data_dict.get('cells', [])])
 
+    def __str__(self):
+        topology_str = '{obj_name}:'.format(obj_name=self.obj_name())
+        for cell in self.cells:
+            topology_str += '\n' + str(cell)
+        return topology_str
+
+    def __repr__(self):
+        topology_str = '{obj_name}:'.format(obj_name=self.obj_name())
+        for cell in self.cells:
+            topology_str += '\n' + repr(cell)
+        return topology_str
+
 
 @base.NovaObjectRegistry.register
 class NUMATopologyLimits(base.NovaObject):
@@ -265,7 +483,8 @@ class NUMATopologyLimits(base.NovaObject):
                  'mem': {'total': cell.memory,
                          'limit': cell.memory * self.ram_allocation_ratio},
                  'cpu_limit': len(cell.cpuset) * self.cpu_allocation_ratio,
-                 'id': cell.id})
+                 'id': cell.id,
+                })
         return {'cells': cells}
 
     @classmethod

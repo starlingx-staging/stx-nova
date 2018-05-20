@@ -1373,12 +1373,16 @@ class TestComputeNodeToInventoryDict(test.NoDBTestCase):
 
         expected = {
             'VCPU': {
-                'total': compute_node.vcpus,
+                # WRS: dedicated instances will take 16 * vcpus so total and
+                # max_unit must be scaled up and allocation_ratio reduced to 1.
+                'total': compute_node.vcpus *
+                                   compute_node.cpu_allocation_ratio,
                 'reserved': CONF.reserved_host_cpus,
                 'min_unit': 1,
-                'max_unit': compute_node.vcpus,
+                'max_unit': compute_node.vcpus *
+                                   compute_node.cpu_allocation_ratio,
                 'step_size': 1,
-                'allocation_ratio': compute_node.cpu_allocation_ratio,
+                'allocation_ratio': 1
             },
             'MEMORY_MB': {
                 'total': compute_node.memory_mb,
@@ -1427,12 +1431,14 @@ class TestInventory(SchedulerReportClientTestCase):
         mock_erp.assert_called_once_with(cn.uuid, cn.hypervisor_hostname)
         expected_inv_data = {
             'VCPU': {
-                'total': 8,
+                # WRS: dedicated instances will take 16 * vcpus so total and
+                # max_unit must be scaled up and allocation_ratio reduced to 1.
+                'total': 128,
                 'reserved': CONF.reserved_host_cpus,
                 'min_unit': 1,
-                'max_unit': 8,
+                'max_unit': 128,
                 'step_size': 1,
-                'allocation_ratio': 16.0,
+                'allocation_ratio': 1,
             },
             'MEMORY_MB': {
                 'total': 1024,
@@ -1809,12 +1815,16 @@ There was a conflict when trying to complete your request.
             'resource_provider_generation': 43,
             'inventories': {
                 'VCPU': {
-                    'total': 8,
+                    # WRS: dedicated instances will take 16 * vcpus so total
+                    # and max_unit must be scaled up and allocation_ratio
+                    # reduced to 1.
+                    'total': 8 * compute_node.cpu_allocation_ratio,
                     'reserved': CONF.reserved_host_cpus,
                     'min_unit': 1,
-                    'max_unit': compute_node.vcpus,
+                    'max_unit': compute_node.vcpus *
+                                          compute_node.cpu_allocation_ratio,
                     'step_size': 1,
-                    'allocation_ratio': compute_node.cpu_allocation_ratio,
+                    'allocation_ratio': 1,
                 },
                 'MEMORY_MB': {
                     'total': 1024,
@@ -1849,12 +1859,16 @@ There was a conflict when trying to complete your request.
             'resource_provider_generation': 43,
             'inventories': {
                 'VCPU': {
-                    'total': 8,
+                    # WRS: dedicated instances will take 16 * vcpus so total
+                    # and max_unit must be scaled up and allocation_ratio
+                    # reduced to 1.
+                    'total': 8 * compute_node.cpu_allocation_ratio,
                     'reserved': CONF.reserved_host_cpus,
                     'min_unit': 1,
-                    'max_unit': compute_node.vcpus,
+                    'max_unit': compute_node.vcpus *
+                                          compute_node.cpu_allocation_ratio,
                     'step_size': 1,
-                    'allocation_ratio': compute_node.cpu_allocation_ratio,
+                    'allocation_ratio': 1,
                 },
                 'MEMORY_MB': {
                     'total': 1024,
@@ -2258,8 +2272,12 @@ class TestAllocations(SchedulerReportClientTestCase):
                                   ephemeral_gb=100,
                                   memory_mb=1024,
                                   vcpus=2,
-                                  extra_specs={}))
-        result = report._instance_to_allocations_dict(inst)
+                                  extra_specs={}),
+            system_metadata={},
+            vcpus=2,
+            numa_topology=None)
+        self.compute_node.numa_topology = None
+        result = report._instance_to_allocations_dict(inst, self.compute_node)
         expected = {
             'MEMORY_MB': 1024,
             'VCPU': 2,
@@ -2290,8 +2308,13 @@ class TestAllocations(SchedulerReportClientTestCase):
                                   ephemeral_gb=100,
                                   memory_mb=1024,
                                   vcpus=2,
-                                  extra_specs=specs))
-        result = report._instance_to_allocations_dict(inst)
+                                  extra_specs=specs),
+            # WRS: assume our normalization lines up with resources spec
+            vcpus=4,
+            system_metadata={},
+            numa_topology=None)
+        self.compute_node.numa_topology = None
+        result = report._instance_to_allocations_dict(inst, self.compute_node)
         expected = {
             'MEMORY_MB': 1024,
             'VCPU': 4,
@@ -2310,8 +2333,12 @@ class TestAllocations(SchedulerReportClientTestCase):
                                   ephemeral_gb=100,
                                   memory_mb=1024,
                                   vcpus=2,
-                                  extra_specs={}))
-        result = report._instance_to_allocations_dict(inst)
+                                  extra_specs={}),
+            vcpus=2,
+            system_metadata={},
+            numa_topology=None)
+        self.compute_node.numa_topology = None
+        result = report._instance_to_allocations_dict(inst, self.compute_node)
         expected = {
             'MEMORY_MB': 1024,
             'VCPU': 2,
@@ -2329,8 +2356,12 @@ class TestAllocations(SchedulerReportClientTestCase):
                                   ephemeral_gb=0,
                                   memory_mb=1024,
                                   vcpus=2,
-                                  extra_specs={}))
-        result = report._instance_to_allocations_dict(inst)
+                                  extra_specs={}),
+            vcpus=2,
+            system_metadata={},
+            numa_topology=None)
+        self.compute_node.numa_topology = None
+        result = report._instance_to_allocations_dict(inst, self.compute_node)
         expected = {
             'MEMORY_MB': 1024,
             'VCPU': 2,

@@ -11,6 +11,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2016-2017 Wind River Systems, Inc.
+#
 
 import io
 import os
@@ -181,3 +184,11 @@ def get_arch(image_meta):
 
 def last_bytes(file_like_object, num):
     return libvirt_utils.last_bytes(file_like_object, num)
+
+
+def assign_floating_cpusets(domain, instance):
+    pass
+
+
+def path_exists(path):
+    pass

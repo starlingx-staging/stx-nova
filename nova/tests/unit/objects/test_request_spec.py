@@ -11,6 +11,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+#  Copyright (c) 2016-2017 Wind River Systems, Inc.
+#
 
 import mock
 from oslo_serialization import jsonutils
@@ -79,11 +82,16 @@ class _TestRequestSpecObject(object):
         instance.pci_requests = None
         instance.project_id = fakes.FAKE_PROJECT_ID
         instance.availability_zone = 'nova'
+        # WRS extension
+        instance.reject_map = {}
+        instance.id = 1
+        instance.display_name = 'vm-1'
 
         spec = objects.RequestSpec()
         spec._from_instance(instance)
         instance_fields = ['numa_topology', 'pci_requests', 'uuid',
                            'project_id', 'availability_zone']
+        instance_fields.extend(['display_name'])
         for field in instance_fields:
             if field == 'uuid':
                 self.assertEqual(getattr(instance, field),
@@ -281,7 +289,12 @@ class _TestRequestSpecObject(object):
                          numa_topology=None,
                          pci_requests=None,
                          project_id=1,
-                         availability_zone='nova')}
+                         availability_zone='nova',
+                         # WRS extension
+                         reject_map={},
+                         id=1,
+                         display_name='vm-1'),
+                     }
         filt_props = {}
 
         # We seriously don't care about the return values, we just want to make
@@ -430,7 +443,8 @@ class _TestRequestSpecObject(object):
         expected = {'num_instances': 1,
                     'image': fake_image_dict,
                     'instance_properties': fake_instance,
-                    'instance_type': fake_flavor}
+                    'instance_type': fake_flavor,
+                    'offline_cpus': 0}
         self.assertEqual(expected, spec_dict)
 
     def test_to_legacy_request_spec_dict_with_unset_values(self):
@@ -438,7 +452,8 @@ class _TestRequestSpecObject(object):
         self.assertEqual({'num_instances': 1,
                           'image': {},
                           'instance_properties': {},
-                          'instance_type': {}},
+                          'instance_type': {},
+                          'offline_cpus': 0},
                          spec.to_legacy_request_spec_dict())
 
     def test_to_legacy_filter_properties_dict(self):
@@ -459,7 +474,8 @@ class _TestRequestSpecObject(object):
                                            memory_mb=8192.0),
             instance_group=objects.InstanceGroup(hosts=['fake1'],
                                                  policies=['affinity'],
-                                                 members=['inst1', 'inst2']),
+                                                 members=['inst1', 'inst2'],
+                                                 metadetails={}),
             scheduler_hints={'foo': ['bar']},
             requested_destination=fake_dest)
         expected = {'ignore_hosts': ['ignoredhost'],
@@ -475,6 +491,7 @@ class _TestRequestSpecObject(object):
                     'group_hosts': set(['fake1']),
                     'group_policies': set(['affinity']),
                     'group_members': set(['inst1', 'inst2']),
+                    'group_metadetails': {},
                     'scheduler_hints': {'foo': 'bar'},
                     'requested_destination': fake_dest}
         self.assertEqual(expected, spec.to_legacy_filter_properties_dict())

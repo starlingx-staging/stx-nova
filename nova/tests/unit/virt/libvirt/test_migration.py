@@ -91,23 +91,28 @@ class UtilityMigrationTestCase(test.NoDBTestCase):
         self.assertEqual([], ports)
 
     @mock.patch('lxml.etree.tostring')
+    @mock.patch.object(migration, '_update_numa_xml')
     @mock.patch.object(migration, '_update_perf_events_xml')
     @mock.patch.object(migration, '_update_graphics_xml')
     @mock.patch.object(migration, '_update_serial_xml')
     @mock.patch.object(migration, '_update_volume_xml')
     def test_get_updated_guest_xml(
             self, mock_volume, mock_serial, mock_graphics,
-            mock_perf_events_xml, mock_tostring):
+            mock_perf_events_xml, mock_numa, mock_tostring):
         data = objects.LibvirtLiveMigrateData()
         mock_guest = mock.Mock(spec=libvirt_guest.Guest)
-        get_volume_config = mock.MagicMock()
+        driver_interface = mock.Mock(spec=migration.DriverInterface)
+        instance = mock.Mock(spec=objects.Instance)
+
         mock_guest.get_xml_desc.return_value = '<domain></domain>'
 
-        migration.get_updated_guest_xml(mock_guest, data, get_volume_config)
+        migration.get_updated_guest_xml(mock_guest, data, driver_interface,
+                                        instance)
         mock_graphics.assert_called_once_with(mock.ANY, data)
         mock_serial.assert_called_once_with(mock.ANY, data)
-        mock_volume.assert_called_once_with(mock.ANY, data, get_volume_config)
+        mock_volume.assert_called_once_with(mock.ANY, data, driver_interface)
         mock_perf_events_xml.assert_called_once_with(mock.ANY, data)
+        mock_numa.assert_called_once_with(mock.ANY, driver_interface, instance)
         self.assertEqual(1, mock_tostring.called)
 
     def test_update_serial_xml_serial(self):
@@ -235,10 +240,11 @@ class UtilityMigrationTestCase(test.NoDBTestCase):
         conf.source_type = "block"
         conf.source_path = bdm.connection_info['data'].get('device_path')
 
-        get_volume_config = mock.MagicMock(return_value=conf)
+        driver_interface = migration.DriverInterface(
+            mock.MagicMock(return_value=conf), None, None, None)
         doc = etree.fromstring(xml)
         res = etree.tostring(migration._update_volume_xml(
-            doc, data, get_volume_config))
+            doc, data, driver_interface))
         new_xml = xml.replace('ip-1.2.3.4:3260-iqn.abc.12345.opst-lun-X',
                               'ip-1.2.3.4:3260-iqn.cde.67890.opst-lun-Z')
         self.assertThat(res, matchers.XMLMatches(new_xml))
@@ -303,6 +309,12 @@ class UtilityMigrationTestCase(test.NoDBTestCase):
     </perf>
 </domain>"""))
 
+    def test_update_numa_xml(self):
+        # XML update for NUMA topology is closely related to libvirt
+        # driver. See virt/libvirt/test_driver.py,
+        # test_live_migration_update_numa_xml.
+        pass
+
 
 class MigrationMonitorTestCase(test.NoDBTestCase):
     def setUp(self):
@@ -362,6 +374,12 @@ class MigrationMonitorTestCase(test.NoDBTestCase):
         self.host = host.Host("qemu:///system")
         self.guest = libvirt_guest.Guest(self.dom)
 
+    def fault_live_migration_timeout(self, timeout):
+        return "Live migration timeout after %d sec." % timeout
+
+    def fault_live_migration_stuck(self, timeout):
+        return "Live migration stuck for %d sec." % timeout
+
     @mock.patch.object(libvirt_guest.Guest, "is_active", return_value=True)
     def test_live_migration_find_type_active(self, mock_active):
         self.assertEqual(migration.find_job_type(self.guest, self.instance),
@@ -394,51 +412,57 @@ class MigrationMonitorTestCase(test.NoDBTestCase):
 
     def test_live_migration_abort_stuck(self):
         # Progress time exceeds progress timeout
-        self.assertTrue(migration.should_abort(self.instance,
-                                               5000,
-                                               1000, 2000,
-                                               4500, 9000,
-                                               "running"))
+        self.assertEqual(migration.should_abort(self.instance,
+                                                5000,
+                                                1000, 2000,
+                                                4500, 9000,
+                                                "running"),
+                         (True, self.fault_live_migration_stuck(4000)))
 
     def test_live_migration_abort_no_prog_timeout(self):
         # Progress timeout is disabled
-        self.assertFalse(migration.should_abort(self.instance,
+        self.assertEqual(migration.should_abort(self.instance,
                                                 5000,
                                                 1000, 0,
                                                 4500, 9000,
-                                                "running"))
+                                                "running"),
+                         (False, None))
 
     def test_live_migration_abort_not_stuck(self):
         # Progress time is less than progress timeout
-        self.assertFalse(migration.should_abort(self.instance,
+        self.assertEqual(migration.should_abort(self.instance,
                                                 5000,
                                                 4500, 2000,
                                                 4500, 9000,
-                                                "running"))
+                                                "running"),
+                         (False, None))
 
     def test_live_migration_abort_too_long(self):
         # Elapsed time is over completion timeout
-        self.assertTrue(migration.should_abort(self.instance,
+        self.assertEqual(migration.should_abort(self.instance,
                                                5000,
                                                4500, 2000,
                                                4500, 2000,
-                                               "running"))
+                                               "running"),
+                         (True, self.fault_live_migration_timeout(2000)))
 
     def test_live_migration_abort_no_comp_timeout(self):
         # Completion timeout is disabled
-        self.assertFalse(migration.should_abort(self.instance,
+        self.assertEqual(migration.should_abort(self.instance,
                                                 5000,
                                                 4500, 2000,
                                                 4500, 0,
-                                                "running"))
+                                                "running"),
+                         (False, None))
 
     def test_live_migration_abort_still_working(self):
         # Elapsed time is less than completion timeout
-        self.assertFalse(migration.should_abort(self.instance,
+        self.assertEqual(migration.should_abort(self.instance,
                                                 5000,
                                                 4500, 2000,
                                                 4500, 9000,
-                                                "running"))
+                                                "running"),
+                         (False, None))
 
     def test_live_migration_postcopy_switch(self):
         # Migration progress is not fast enough
@@ -565,7 +589,7 @@ class MigrationMonitorTestCase(test.NoDBTestCase):
         self.assertEqual(mig.disk_processed, 10 * units.Gi)
         self.assertEqual(mig.disk_remaining, 14 * units.Gi)
 
-        self.assertEqual(self.instance.progress, 25)
+        self.assertEqual(self.instance.progress, 75)
 
         mock_msave.assert_called_once_with()
         mock_isave.assert_called_once_with()
@@ -730,11 +754,7 @@ class MigrationMonitorTestCase(test.NoDBTestCase):
         self.assertFalse(mock_resume.called)
 
     def test_live_migration_downtime_steps(self):
-        self.flags(live_migration_downtime=400, group='libvirt')
-        self.flags(live_migration_downtime_steps=10, group='libvirt')
-        self.flags(live_migration_downtime_delay=30, group='libvirt')
-
-        steps = migration.downtime_steps(3.0)
+        steps = migration.downtime_steps(1350, 400)
 
         self.assertEqual([
             (0, 40),

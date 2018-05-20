@@ -12,6 +12,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2014-2017 Wind River Systems, Inc.
+#
 
 """
 Track resources like memory and disk for a compute host.  Provides the
@@ -20,17 +23,22 @@ model.
 """
 import collections
 import copy
+import math
+import sys
 
 from oslo_log import log as logging
 from oslo_serialization import jsonutils
+from oslo_utils import units
 
 from nova.compute import claims
 from nova.compute import monitors
+from nova.compute import power_state
 from nova.compute import stats
 from nova.compute import task_states
 from nova.compute import utils as compute_utils
 from nova.compute import vm_states
 import nova.conf
+import nova.context
 from nova import exception
 from nova.i18n import _
 from nova import objects
@@ -39,6 +47,7 @@ from nova.objects import fields
 from nova.objects import migration as migration_obj
 from nova.pci import manager as pci_manager
 from nova.pci import request as pci_request
+from nova.pci import utils as pci_utils
 from nova import rpc
 from nova.scheduler import client as scheduler_client
 from nova.scheduler import utils as scheduler_utils
@@ -50,9 +59,13 @@ CONF = nova.conf.CONF
 LOG = logging.getLogger(__name__)
 COMPUTE_RESOURCE_SEMAPHORE = "compute_resources"
 
+# WRS: tracker debug logging
+_usage_debug = dict()
 
-def _instance_in_resize_state(instance):
-    """Returns True if the instance is in one of the resizing states.
+
+# WRS: migration tracking
+def _instance_in_migration_or_resize_state(instance):
+    """Returns True if the instance is in progress of migrating or resizing.
 
     :param instance: `nova.objects.Instance` object
     """
@@ -65,19 +78,17 @@ def _instance_in_resize_state(instance):
     if (vm in [vm_states.ACTIVE, vm_states.STOPPED]
             and task in [task_states.RESIZE_PREP,
             task_states.RESIZE_MIGRATING, task_states.RESIZE_MIGRATED,
-            task_states.RESIZE_FINISH, task_states.REBUILDING]):
+            task_states.RESIZE_FINISH, task_states.REBUILDING,
+            task_states.MIGRATING]):
+        return True
+
+    # WRS: handle evacuation case where instance is in ERROR state
+    if (vm == vm_states.ERROR and task in [task_states.REBUILDING,
+            task_states.REBUILD_BLOCK_DEVICE_MAPPING,
+            task_states.REBUILD_SPAWNING]):
         return True
 
     return False
-
-
-def _is_trackable_migration(migration):
-    # Only look at resize/migrate migration and evacuation records
-    # NOTE(danms): RT should probably examine live migration
-    # records as well and do something smart. However, ignore
-    # those for now to avoid them being included in below calculations.
-    return migration.migration_type in ('resize', 'migration',
-                                        'evacuation')
 
 
 def _normalize_inventory_from_cn_obj(inv_data, cn):
@@ -102,7 +113,12 @@ def _normalize_inventory_from_cn_obj(inv_data, cn):
     if fields.ResourceClass.VCPU in inv_data:
         cpu_inv = inv_data[fields.ResourceClass.VCPU]
         if 'allocation_ratio' not in cpu_inv:
-            cpu_inv['allocation_ratio'] = cn.cpu_allocation_ratio
+            # WRS: for libvirt driver adjust vcpus by allocation ratio. Leave
+            # the rest (e.g. ironic) alone
+            cpu_inv['total'] = int(cpu_inv['total'] * cn.cpu_allocation_ratio)
+            cpu_inv['max_unit'] = int(cpu_inv['max_unit'] *
+                                                      cn.cpu_allocation_ratio)
+            cpu_inv['allocation_ratio'] = 1
         if 'reserved' not in cpu_inv:
             cpu_inv['reserved'] = CONF.reserved_host_cpus
 
@@ -147,6 +163,168 @@ class ResourceTracker(object):
         self.ram_allocation_ratio = CONF.ram_allocation_ratio
         self.cpu_allocation_ratio = CONF.cpu_allocation_ratio
         self.disk_allocation_ratio = CONF.disk_allocation_ratio
+        self.tracked_in_progress = []
+        self.cached_dal = (self.driver.get_disk_available_least()
+                           if driver else 0)
+
+    def _get_compat_cpu(self, instance, resources):
+        """Helper function to reserve a pcpu from the host
+
+        Search for an unpinned cpu on the same numa node as what the instance
+        is already using.  Use node of vcpu0 for now, will have to get fancier
+        to deal with shared platform CPU, HT siblings, and multi-numa-node
+        instances.
+        """
+        # Make sure we don't squeeze out globally floating instances.
+        # We don't currently support this, but we might eventually.
+        if (resources.vcpus - resources.vcpus_used) < 1:
+            raise exception.ComputeResourcesUnavailable(
+                        reason="no free pcpu available on host")
+
+        vcpu0_cell, vcpu0_phys = hardware.instance_vcpu_to_pcpu(instance, 0)
+        host_numa_topology, jsonify_result = \
+            hardware.host_topology_and_format_from_host(resources)
+
+        for cell in host_numa_topology.cells:
+            if vcpu0_cell.id == cell.id:
+                host_has_threads = (cell.siblings and
+                                    len(cell.siblings[0]) > 1)
+                if (host_has_threads and vcpu0_cell.cpu_thread_policy ==
+                        fields.CPUThreadAllocationPolicy.ISOLATE):
+                    # We need to allocate a set of matched sibling threads,
+                    # and we don't know how many siblings are on a core.
+                    # Also, cell.free_siblings can have empty sets or sets
+                    # with not all siblings free, we need to filter them out.
+                    num_sibs = len(cell.siblings[0])
+                    free_siblings = [sibs for sibs in cell.free_siblings if
+                                     len(sibs) == num_sibs]
+                    if not free_siblings:
+                        raise exception.ComputeResourcesUnavailable(
+                            reason="no free siblings available on NUMA node")
+                    try:
+                        siblings = min(free_siblings)
+                        pcpu = min(siblings)
+                    except ValueError:
+                        # Shouldn't happen given above check of free_siblings
+                        raise exception.ComputeResourcesUnavailable(
+                            reason="unable to find free sibling cpu "
+                                   "on NUMA node")
+                    # Update the host numa topology
+                    cell.pin_cpus(siblings, strict=True)
+                    cell.cpu_usage += len(siblings)
+                    resources.vcpus_used += len(siblings)
+                else:
+                    if cell.avail_cpus < 1:
+                        raise exception.ComputeResourcesUnavailable(
+                            reason="no free pcpu available on NUMA node")
+                    try:
+                        pcpu = min(cell.free_cpus)
+                    except ValueError:
+                        # Shouldn't happen given the above check of avail_cpus
+                        raise exception.ComputeResourcesUnavailable(
+                            reason="unable to find free cpu on NUMA node")
+                    # Update the host numa topology
+                    cell.pin_cpus(set([pcpu]), strict=True)
+                    cell.cpu_usage += 1
+                    resources.vcpus_used += 1
+
+                if jsonify_result:
+                    resources.numa_topology = host_numa_topology._to_json()
+                # WRS: update the affinity of instances with floating CPUs.
+                hardware.update_floating_affinity(resources)
+                return pcpu
+        err = (_("Couldn't find host numa node containing pcpu %d") %
+                 vcpu0_phys)
+        raise exception.InternalError(message=err)
+
+    def _put_compat_cpu(self, instance, pcpu, resources):
+        """Helper function to return a pcpu back to the host """
+        host_numa_topology, jsonify_result = \
+            hardware.host_topology_and_format_from_host(resources)
+        for cell in host_numa_topology.cells:
+            if pcpu in cell.pinned_cpus:
+                thread_policy_is_isolate = (
+                    instance.numa_topology.cells[0].cpu_thread_policy ==
+                    fields.CPUThreadAllocationPolicy.ISOLATE)
+                # Don't assume we know how many siblings are on a core.
+                host_has_threads = (cell.siblings and
+                                    len(cell.siblings[0]) > 1)
+                if (host_has_threads and thread_policy_is_isolate):
+                    # WRS: non-strict pinning accounting when freeing
+                    cell.unpin_cpus_with_siblings(set([pcpu]), strict=False)
+                    cell.cpu_usage -= len(cell.siblings[0])
+                    resources.vcpus_used -= len(cell.siblings[0])
+                else:
+                    # WRS: non-strict pinning accounting when freeing
+                    cell.unpin_cpus(set([pcpu]), strict=False)
+                    cell.cpu_usage -= 1
+                    resources.vcpus_used -= 1
+                if jsonify_result:
+                    resources.numa_topology = host_numa_topology._to_json()
+                # WRS: update the affinity of instances with floating CPUs.
+                hardware.update_floating_affinity(resources)
+                return
+        err = (_("Couldn't find host numa node containing pcpu %d") % pcpu)
+        raise exception.InternalError(message=err)
+
+    @utils.synchronized(COMPUTE_RESOURCE_SEMAPHORE)
+    def get_compat_cpu(self, instance, vcpu_cell, vcpu, nodename):
+        # We hold the semaphore here so we don't race against the
+        # resource audit.
+
+        # Find pcpu and update the CPU usage on the host.
+        cn = self.compute_nodes[nodename]
+        pcpu = self._get_compat_cpu(instance, cn)
+
+        # Update the instance CPU pinning to map the vcpu to the pcpu
+        vcpu_cell.pin(vcpu, pcpu)
+        instance.vcpus += 1
+        instance.save()
+
+        return pcpu
+
+    @utils.synchronized(COMPUTE_RESOURCE_SEMAPHORE)
+    def put_compat_cpu(self, instance, cpu, vcpu_cell, vcpu, vcpu0_phys,
+                       nodename):
+        # We hold the semaphore here so we don't race against the
+        # resource audit.
+
+        # Update the instance NUMA cell CPU pinning to map the vcpu
+        # to the same pCPU as vcpu0.
+        vcpu_cell.pin(vcpu, vcpu0_phys)
+        instance.vcpus -= 1
+        instance.save()
+
+        # Now update the CPU usage on the host
+        cn = self.compute_nodes[nodename]
+        self._put_compat_cpu(instance, cpu, cn)
+
+    def _copy_if_bfv(self, instance, instance_type=None):
+        instance_copy = None
+        instance_type_copy = None
+        if instance.is_volume_backed():
+            instance_copy = instance.obj_clone()
+            instance_copy.flavor.root_gb = 0
+            if instance_type is not None:
+                instance_type_copy = instance_type.obj_clone()
+                instance_type_copy.root_gb = 0
+        if instance_copy is None:
+            # If we didn't need to clone the object, use original
+            instance_copy = instance
+        if instance_type_copy is None:
+            # If we didn't need to clone the object, use original
+            instance_type_copy = instance_type
+        return instance_copy, instance_type_copy
+
+    def _copy_instance_type_if_bfv(self, instance, instance_type):
+        instance_type_copy = None
+        if instance.is_volume_backed():
+            instance_type_copy = instance_type.obj_clone()
+            instance_type_copy.root_gb = 0
+        if instance_type_copy is None:
+            # If we didn't need to clone the object, use original
+            instance_type_copy = instance_type
+        return instance_type_copy
 
     @utils.synchronized(COMPUTE_RESOURCE_SEMAPHORE)
     def instance_claim(self, context, instance, nodename, limits=None):
@@ -189,22 +367,26 @@ class ResourceTracker(object):
                         "until resources have been claimed.",
                         instance=instance)
 
+        # TODO(melwitt/jaypipes): Remove this after resource-providers can
+        # handle claims and reporting for boot-from-volume.
+        inst_copy_zero_disk, _ = self._copy_if_bfv(instance)
+
         # get the overhead required to build this instance:
-        overhead = self.driver.estimate_instance_overhead(instance)
+        overhead = self.driver.estimate_instance_overhead(inst_copy_zero_disk)
         LOG.debug("Memory overhead for %(flavor)d MB instance; %(overhead)d "
-                  "MB", {'flavor': instance.flavor.memory_mb,
+                  "MB", {'flavor': inst_copy_zero_disk.flavor.memory_mb,
                           'overhead': overhead['memory_mb']})
         LOG.debug("Disk overhead for %(flavor)d GB instance; %(overhead)d "
-                  "GB", {'flavor': instance.flavor.root_gb,
+                  "GB", {'flavor': inst_copy_zero_disk.flavor.root_gb,
                          'overhead': overhead.get('disk_gb', 0)})
         LOG.debug("CPU overhead for %(flavor)d vCPUs instance; %(overhead)d "
-                  "vCPU(s)", {'flavor': instance.flavor.vcpus,
+                  "vCPU(s)", {'flavor': inst_copy_zero_disk.flavor.vcpus,
                               'overhead': overhead.get('vcpus', 0)})
 
         cn = self.compute_nodes[nodename]
         pci_requests = objects.InstancePCIRequests.get_by_instance_uuid(
             context, instance.uuid)
-        claim = claims.Claim(context, instance, nodename, self, cn,
+        claim = claims.Claim(context, inst_copy_zero_disk, nodename, self, cn,
                              pci_requests, overhead=overhead, limits=limits)
 
         # self._set_instance_host_and_node() will save instance to the DB
@@ -213,16 +395,33 @@ class ResourceTracker(object):
         # so that the resource audit knows about any cpus we've pinned.
         instance_numa_topology = claim.claimed_numa_topology
         instance.numa_topology = instance_numa_topology
+        inst_copy_zero_disk.numa_topology = instance_numa_topology
+        # NOTE(melwitt): We don't pass the copy with zero disk here to avoid
+        # saving instance.flavor.root_gb=0 to the database.
         self._set_instance_host_and_node(instance, nodename)
 
         if self.pci_tracker:
             # NOTE(jaypipes): ComputeNode.pci_device_pools is set below
             # in _update_usage_from_instance().
-            self.pci_tracker.claim_instance(context, pci_requests,
+            #  NOTE(melwitt): We don't pass the copy with zero disk here to
+            # avoid saving instance.flavor.root_gb=0 to the database.
+            self.pci_tracker.claim_instance(context, instance, pci_requests,
                                             instance_numa_topology)
 
+        # WRS: add claim to tracker's list
+        # tracked_in_progress is a list of instances that are not yet
+        # created but whose resources have been already claimed.
+        # The resource audit needs to know of ongoing claims so that
+        # disk_available_least is adjusted. Note that this is different
+        # from other disk stats like local_gb_used because once the
+        #  instance is created, its disk space, along with its qcow
+        # backup files, is accounted by the driver (get_disk_available_least())
+        # and therefore should no longer be accounted for in _update_usage()
+        self.tracked_in_progress.append(instance.uuid)
+
         # Mark resources in-use and update stats
-        self._update_usage_from_instance(context, instance, nodename)
+        self._update_usage_from_instance(context, inst_copy_zero_disk,
+                                         nodename, strict=True)
 
         elevated = context.elevated()
         # persist changes to the compute node:
@@ -231,10 +430,24 @@ class ResourceTracker(object):
         return claim
 
     @utils.synchronized(COMPUTE_RESOURCE_SEMAPHORE)
+    def live_migration_claim(self, context, instance, nodename, migration=None,
+                             limits=None):
+        """Create a claim for a live_migration operation."""
+        instance_type = instance.flavor
+        image_meta = objects.ImageMeta.from_instance(instance)
+        return self._move_claim(context, instance, instance_type, nodename,
+                                move_type='live-migration', limits=limits,
+                                image_meta=image_meta, migration=migration)
+
+    @utils.synchronized(COMPUTE_RESOURCE_SEMAPHORE)
     def rebuild_claim(self, context, instance, nodename, limits=None,
                       image_meta=None, migration=None):
         """Create a claim for a rebuild operation."""
         instance_type = instance.flavor
+        # WRS: If boot from volume, image_meta will be empty so get from
+        # the instance.
+        if not image_meta:
+            image_meta = objects.ImageMeta.from_instance(instance)
         return self._move_claim(context, instance, instance_type, nodename,
                                 move_type='evacuation', limits=limits,
                                 image_meta=image_meta, migration=migration)
@@ -269,12 +482,16 @@ class ResourceTracker(object):
         should be turned into finalize  a resource claim or free
         resources after the compute operation is finished.
         """
+        # TODO(melwitt/jaypipes): Remove this after resource-providers can
+        # handle claims and reporting for boot-from-volume.
+        inst_copy_zero_disk, new_itype_copy_zero_disk = self._copy_if_bfv(
+            instance, new_instance_type)
         image_meta = image_meta or {}
         if migration:
             self._claim_existing_migration(migration, nodename)
         else:
-            migration = self._create_migration(context, instance,
-                                               new_instance_type,
+            migration = self._create_migration(context, inst_copy_zero_disk,
+                                               new_itype_copy_zero_disk,
                                                nodename, move_type)
 
         if self.disabled(nodename):
@@ -283,15 +500,16 @@ class ResourceTracker(object):
             return claims.NopClaim(migration=migration)
 
         # get memory overhead required to build this instance:
-        overhead = self.driver.estimate_instance_overhead(new_instance_type)
+        overhead = self.driver.estimate_instance_overhead(
+            new_itype_copy_zero_disk)
         LOG.debug("Memory overhead for %(flavor)d MB instance; %(overhead)d "
-                  "MB", {'flavor': new_instance_type.memory_mb,
+                  "MB", {'flavor': new_itype_copy_zero_disk.memory_mb,
                           'overhead': overhead['memory_mb']})
         LOG.debug("Disk overhead for %(flavor)d GB instance; %(overhead)d "
-                  "GB", {'flavor': instance.flavor.root_gb,
+                  "GB", {'flavor': new_itype_copy_zero_disk.root_gb,
                          'overhead': overhead.get('disk_gb', 0)})
         LOG.debug("CPU overhead for %(flavor)d vCPUs instance; %(overhead)d "
-                  "vCPU(s)", {'flavor': instance.flavor.vcpus,
+                  "vCPU(s)", {'flavor': new_itype_copy_zero_disk.vcpus,
                               'overhead': overhead.get('vcpus', 0)})
 
         cn = self.compute_nodes[nodename]
@@ -300,6 +518,8 @@ class ResourceTracker(object):
         # there was no change on resize. This will cause allocating
         # the old/new pci device in the resize phase. In the future
         # we would like to optimise this.
+        # NOTE(melwitt): We don't pass the copy with zero disk here to avoid
+        # saving root_gb=0 to the database.
         new_pci_requests = pci_request.get_pci_requests_from_flavor(
             new_instance_type)
         new_pci_requests.instance_uuid = instance.uuid
@@ -311,9 +531,9 @@ class ResourceTracker(object):
             for request in instance.pci_requests.requests:
                 if request.alias_name is None:
                     new_pci_requests.requests.append(request)
-        claim = claims.MoveClaim(context, instance, nodename,
-                                 new_instance_type, image_meta, self, cn,
-                                 new_pci_requests, overhead=overhead,
+        claim = claims.MoveClaim(context, inst_copy_zero_disk, nodename,
+                                 new_itype_copy_zero_disk, image_meta, self,
+                                 cn, new_pci_requests, overhead=overhead,
                                  limits=limits)
 
         claim.migration = migration
@@ -322,7 +542,8 @@ class ResourceTracker(object):
             # NOTE(jaypipes): ComputeNode.pci_device_pools is set below
             # in _update_usage_from_instance().
             claimed_pci_devices_objs = self.pci_tracker.claim_instance(
-                    context, new_pci_requests, claim.claimed_numa_topology)
+                    context, instance, new_pci_requests,
+                    claim.claimed_numa_topology)
         claimed_pci_devices = objects.PciDeviceList(
                 objects=claimed_pci_devices_objs)
 
@@ -337,14 +558,38 @@ class ResourceTracker(object):
             old_pci_devices=instance.pci_devices,
             new_pci_devices=claimed_pci_devices,
             old_pci_requests=instance.pci_requests,
-            new_pci_requests=new_pci_requests)
+            new_pci_requests=new_pci_requests,
+            new_allowed_cpus=hardware.get_vcpu_pin_set())
+
+        def getter(obj, attr, default=None):
+            """Method to get object attributes without exception."""
+            if hasattr(obj, attr):
+                return getattr(obj, attr, default)
+            else:
+                return default
+
+        # WRS: Log migration context creation.
+        LOG.info(
+            "Migration type:%(ty)s, "
+            "source_compute:%(sc)s source_node:%(sn)s, "
+            "dest_compute:%(dc)s dest_node:%(dn)s, "
+            "new_allowed_cpus=%(allowed)s",
+            {'ty': getter(migration, 'migration_type'),
+             'sc': getter(migration, 'source_compute'),
+             'sn': getter(migration, 'source_node'),
+             'dc': getter(migration, 'dest_compute'),
+             'dn': getter(migration, 'dest_node'),
+             'allowed': getter(mig_context, 'new_allowed_cpus')},
+            instance=instance)
+
         instance.migration_context = mig_context
+        inst_copy_zero_disk.migration_context = mig_context
         instance.save()
 
         # Mark the resources in-use for the resize landing on this
         # compute host:
-        self._update_usage_from_migration(context, instance, migration,
-                                          nodename)
+        self._update_usage_from_migration(context, inst_copy_zero_disk,
+                                          migration, nodename, strict=True)
         elevated = context.elevated()
         self._update(elevated, cn)
 
@@ -408,11 +653,60 @@ class ResourceTracker(object):
         instance.node = None
         instance.save()
 
+    def tracker_dal_update(self, context, instance, going_out=False,
+                           live_mig_rollback=False):
+        # COMPUTE_RESOURCE_SEMAPHORE should already be taken
+        if not instance.node:
+            return
+        nodename = instance.node
+        try:
+            cn = self.compute_nodes[nodename]
+        except KeyError:
+            # Likely we are comming from a host reboot
+            return
+
+        if not self.tracked_in_progress:
+            migrations = objects.MigrationList.\
+                get_in_progress_by_host_and_node(context,
+                                                 self.host, nodename)
+            if not migrations:
+                # we are no longer in cached mode
+                cn.disk_available_least = \
+                    self.get_disk_available_least(migrations)
+                return
+
+        # we are in cached mode
+        if live_mig_rollback:
+            # we are rolling back from a live-migration. We should leave
+            # cached_dal untouched because it was never decremented
+            return
+        disk_space = instance.get('root_gb', 0) + \
+                     instance.get('ephemeral_gb', 0)
+        swap = instance.flavor.get('swap', 0)
+        disk_space += int(math.ceil((swap * units.Mi) / float(units.Gi)))
+        if going_out:
+            self.cached_dal += disk_space
+        else:
+            self.cached_dal -= disk_space
+        cn.disk_available_least = self.cached_dal
+
+    @utils.synchronized(COMPUTE_RESOURCE_SEMAPHORE)
+    def remove_instance_claim(self, context, instance):
+        uuid = instance.get('uuid')
+        if uuid and uuid in self.tracked_in_progress:
+            self.tracked_in_progress.remove(uuid)
+            self.tracker_dal_update(context, instance)
+
     @utils.synchronized(COMPUTE_RESOURCE_SEMAPHORE)
     def abort_instance_claim(self, context, instance, nodename):
         """Remove usage from the given instance."""
+        # WRS: non-strict pinning accounting when freeing
         self._update_usage_from_instance(context, instance, nodename,
-                                         is_removed=True)
+                                         is_removed=True, strict=False)
+
+        uuid = instance.get('uuid')
+        if uuid and uuid in self.tracked_in_progress:
+            self.tracked_in_progress.remove(uuid)
 
         instance.clear_numa_topology()
         self._unset_instance_host_and_node(instance)
@@ -431,9 +725,15 @@ class ResourceTracker(object):
                 dev_pools_obj = self.pci_tracker.stats.to_device_pools_obj()
                 self.compute_nodes[nodename].pci_device_pools = dev_pools_obj
 
+    # WRS: Refactor drop_move_claim to cleanup both tracked_migrations and
+    # tracked_instances.
     @utils.synchronized(COMPUTE_RESOURCE_SEMAPHORE)
     def drop_move_claim(self, context, instance, nodename,
-                        instance_type=None, prefix='new_'):
+                        instance_type=None, prefix='new_',
+                        live_mig_rollback=False):
+        # WRS: get numa_topology based on prefix
+        numa_topology = self._get_migration_context_resource('numa_topology',
+                                  instance, prefix=prefix)
         # Remove usage for an incoming/outgoing migration on the destination
         # node.
         if instance['uuid'] in self.tracked_migrations:
@@ -445,12 +745,16 @@ class ResourceTracker(object):
                                                         migration)
 
             if instance_type is not None:
-                numa_topology = self._get_migration_context_resource(
-                    'numa_topology', instance, prefix=prefix)
+                # TODO(melwitt/jaypipes): Remove this after resource-providers
+                # can handle claims and reporting for boot-from-volume.
+                itype_copy = self._copy_instance_type_if_bfv(instance,
+                                                             instance_type)
                 usage = self._get_usage_dict(
-                        instance_type, numa_topology=numa_topology)
+                        itype_copy, numa_topology=numa_topology)
                 self._drop_pci_devices(instance, nodename, prefix)
-                self._update_usage(usage, nodename, sign=-1)
+                # WRS: non-strict pinning accounting when freeing
+                self._update_usage(usage, nodename, sign=-1, strict=False,
+                                   from_migration=True)
 
                 ctxt = context.elevated()
                 self._update(ctxt, self.compute_nodes[nodename])
@@ -463,6 +767,17 @@ class ResourceTracker(object):
             self._drop_pci_devices(instance, nodename, prefix)
             # TODO(lbeliveau): Validate if numa needs the same treatment.
 
+            if not instance_type:
+                instance_type = instance.flavor
+            # TODO(melwitt/jaypipes): Remove this after resource-providers
+            # can handle claims and reporting for boot-from-volume.
+            itype_copy = self._copy_instance_type_if_bfv(instance,
+                                                         instance_type)
+            usage = self._get_usage_dict(
+                        itype_copy, numa_topology=numa_topology)
+            # WRS: non-strict pinning accounting when freeing
+            self._update_usage(usage, nodename, sign=-1, strict=False,
+                               from_migration=True)
             ctxt = context.elevated()
             self._update(ctxt, self.compute_nodes[nodename])
 
@@ -478,7 +793,23 @@ class ResourceTracker(object):
         # the source host and shared providers for a revert_resize operation..
         my_resources = scheduler_utils.resources_from_flavor(instance,
             instance_type or instance.flavor)
-        cn_uuid = self.compute_nodes[nodename].uuid
+
+        # WRS: need to make sure we're dropping resources based on the correct
+        # numa_topology either old or new
+        cn = self.compute_nodes[nodename]
+        flavor = instance_type or instance.flavor
+        num_offline_cpus = scheduler_utils.determine_offline_cpus(flavor,
+                                                             numa_topology)
+        vcpus = flavor.vcpus - num_offline_cpus
+        system_metadata = instance.system_metadata
+        image_meta = utils.get_image_from_system_metadata(system_metadata)
+        image_props = image_meta.get('properties', {})
+
+        normalized_resources = \
+              scheduler_utils.normalized_resources_for_placement_claim(
+                  my_resources, cn, vcpus, flavor.extra_specs, image_props,
+                  numa_topology)
+
         operation = 'Confirming'
         source_or_dest = 'source'
         if prefix == 'new_':
@@ -486,14 +817,14 @@ class ResourceTracker(object):
             source_or_dest = 'destination'
         LOG.debug("%s resize on %s host. Removing resources claimed on "
                   "provider %s from allocation",
-                  operation, source_or_dest, cn_uuid, instance=instance)
+                  operation, source_or_dest, cn.uuid, instance=instance)
         res = self.reportclient.remove_provider_from_instance_allocation(
-            instance.uuid, cn_uuid, instance.user_id,
-            instance.project_id, my_resources)
+            instance.uuid, cn.uuid, instance.user_id,
+            instance.project_id, normalized_resources)
         if not res:
             LOG.error("Failed to save manipulated allocation when "
                       "%s resize on %s host %s.",
-                      operation.lower(), source_or_dest, cn_uuid,
+                      operation.lower(), source_or_dest, cn.uuid,
                       instance=instance)
 
     @utils.synchronized(COMPUTE_RESOURCE_SEMAPHORE)
@@ -509,12 +840,35 @@ class ResourceTracker(object):
         # don't update usage for this instance unless it submitted a resource
         # claim first:
         if uuid in self.tracked_instances:
-            self._update_usage_from_instance(context, instance, nodename)
+            self._update_usage_from_instance(context, instance, nodename,
+                                             strict=False)
             self._update(context.elevated(), self.compute_nodes[nodename])
 
     def disabled(self, nodename):
         return (nodename not in self.compute_nodes or
                 not self.driver.node_is_available(nodename))
+
+    def destroy_instance_and_update_tracker(self, context,
+        instance, network_info, block_device_info):
+
+        self.driver.destroy(context, instance, network_info,
+                    block_device_info)
+
+        @utils.synchronized(COMPUTE_RESOURCE_SEMAPHORE)
+        def _update_dal():
+            self.tracker_dal_update(context, instance, going_out=True)
+        _update_dal()
+
+    def spawn_instance_and_update_tracker(self, context, instance, image_meta,
+                                          injected_files, admin_password,
+                                          network_info,
+                                          block_device_info):
+
+        self.driver.spawn(context, instance, image_meta,
+                                          injected_files, admin_password,
+                                          network_info=network_info,
+                                          block_device_info=block_device_info)
+        self.remove_instance_claim(context, instance)
 
     def _init_compute_node(self, context, resources):
         """Initialize the compute node if it does not already exist.
@@ -538,7 +892,10 @@ class ResourceTracker(object):
             cn = self.compute_nodes[nodename]
             self._copy_resources(cn, resources)
             self._setup_pci_tracker(context, cn, resources)
-            self._update(context, cn)
+            # WRS: Do not update database here by calling _update().
+            # The host numa_topology usage was cleared by _copy_resources(),
+            # and we need this recalculated by resource tracker audit.
+            # self._update(context, cn)
             return
 
         # now try to get the compute node record from the
@@ -548,7 +905,10 @@ class ResourceTracker(object):
             self.compute_nodes[nodename] = cn
             self._copy_resources(cn, resources)
             self._setup_pci_tracker(context, cn, resources)
-            self._update(context, cn)
+            # WRS: Do not update database here by calling _update().
+            # The host numa_topology usage was cleared by _copy_resources(),
+            # and we need this recalculated by resource tracker audit.
+            # self._update(context, cn)
             return
 
         # there was no local copy and none in the database
@@ -556,6 +916,8 @@ class ResourceTracker(object):
         # to be initialized with resource values.
         cn = objects.ComputeNode(context)
         cn.host = self.host
+        # WRS: host mapping is already done at service_create
+        cn.mapped = 1
         self._copy_resources(cn, resources)
         self.compute_nodes[nodename] = cn
         cn.create()
@@ -634,7 +996,7 @@ class ResourceTracker(object):
                          baremetal resource nodes are handled like any other
                          resource in the system.
         """
-        LOG.debug("Auditing locally available compute resources for "
+        LOG.info("Auditing locally available compute resources for "
                   "%(host)s (node: %(node)s)",
                  {'node': nodename,
                   'host': self.host})
@@ -653,7 +1015,6 @@ class ResourceTracker(object):
         self._verify_resources(resources)
 
         self._report_hypervisor_resource_view(resources)
-
         self._update_available_resource(context, resources)
 
     def _pair_instances_to_migrations(self, migrations, instances):
@@ -673,20 +1034,33 @@ class ResourceTracker(object):
                               'another host\'s instance!',
                           {'uuid': migration.instance_uuid})
 
+    def get_disk_available_least(self, migrations):
+        # if tracked_in_progress is not empty, there is an ongoing instance
+        # launch. We avoid reading disk_available_least from the driver here
+        # because it could be stale. It is better to use the last good
+        # reading and adjust its value in _update_usage()
+
+        # We purge migrations in the "done" status here because that is the
+        # state they become after an evacuation, and remain in that state
+        # until the source host recovers and re-initializes. If the source
+        # host never recovers we would be never coming out of the cached state.
+        migrations_in_progress = []
+        for migration in migrations:
+            if _instance_in_migration_or_resize_state(migration.instance):
+                mig_info = {'instance_uuid': migration.instance_uuid}
+                mig_info['status'] = migration.status
+                migrations_in_progress.append(mig_info)
+        if not (self.tracked_in_progress or migrations_in_progress):
+            self.cached_dal = self.driver.get_disk_available_least()
+        else:
+            LOG.info("disk_available_least in cached mode. "
+                     "In progress instances:%s migrations:%s",
+                     self.tracked_in_progress, migrations_in_progress)
+        return self.cached_dal
+
     @utils.synchronized(COMPUTE_RESOURCE_SEMAPHORE)
     def _update_available_resource(self, context, resources):
-
-        # initialize the compute node object, creating it
-        # if it does not already exist.
-        self._init_compute_node(context, resources)
-
         nodename = resources['hypervisor_hostname']
-
-        # if we could not init the compute node the tracker will be
-        # disabled and we should quit now
-        if self.disabled(nodename):
-            return
-
         # Grab all instances assigned to this node:
         instances = objects.InstanceList.get_by_host_and_node(
             context, self.host, nodename,
@@ -694,14 +1068,33 @@ class ResourceTracker(object):
                             'numa_topology',
                             'flavor', 'migration_context'])
 
-        # Now calculate usage based on instance utilization:
-        self._update_usage_from_instances(context, instances, nodename)
-
         # Grab all in-progress migrations:
+        # WRS: Move this up as close as possible after the call to
+        # get_by_host_and_node() because there is a window where an instance
+        # is in the RESIZE_MIGRATED state during the above call but the
+        # resize finishes and gets confirmed before this call.
+        # If that happens the result is that the instance gets missed by
+        # the resource audit.
         migrations = objects.MigrationList.get_in_progress_by_host_and_node(
                 context, self.host, nodename)
-
         self._pair_instances_to_migrations(migrations, instances)
+
+        # WRS: needs to be set before init_compute_node in order to be included
+        # in compute_node's _changed_fields
+        resources['disk_available_least'] = \
+            self.get_disk_available_least(migrations)
+
+        # initialize the compute node object, creating it
+        # if it does not already exist.
+        self._init_compute_node(context, resources)
+
+        # if we could not init the compute node the tracker will be
+        # disabled and we should quit now
+        if self.disabled(nodename):
+            return
+
+        # Now calculate usage based on instance utilization:
+        self._update_usage_from_instances(context, instances, nodename)
         self._update_usage_from_migrations(context, migrations, nodename)
 
         # Detect and account for orphaned instances that may exist on the
@@ -710,6 +1103,7 @@ class ResourceTracker(object):
         self._update_usage_from_orphans(orphans, nodename)
 
         cn = self.compute_nodes[nodename]
+        # TODO(jgauld): May need to include L3 CAT size for orphans.
 
         # NOTE(yjiang5): Because pci device tracker status is not cleared in
         # this periodic task, and also because the resource tracker is not
@@ -719,17 +1113,98 @@ class ResourceTracker(object):
         dev_pools_obj = self.pci_tracker.stats.to_device_pools_obj()
         cn.pci_device_pools = dev_pools_obj
 
-        self._report_final_resource_view(nodename)
-
         metrics = self._get_host_metrics(context, nodename)
         # TODO(pmurray): metrics should not be a json string in ComputeNode,
         # but it is. This should be changed in ComputeNode
         cn.metrics = jsonutils.dumps(metrics)
 
+        # WRS: If the actual free disk space is less than calculated or the
+        # actual used disk space is more than calculated, update it so the
+        # scheduler doesn't think we have more space than we do.
+        local_gb_info = self.driver.get_local_gb_info()
+        local_gb_used = local_gb_info.get('used')
+        if (local_gb_used is not None and
+                    local_gb_used > cn.local_gb_used):
+            cn.local_gb_used = local_gb_used
+        local_gb_free = local_gb_info.get('free')
+        if (local_gb_free is not None and
+                    local_gb_free < cn.free_disk_gb):
+            cn.free_disk_gb = local_gb_free
+
+        # WRS: Adjust the view of pages used to account for unexpected usages
+        # (e.g., orphans, platform overheads) that would make the actual free
+        # memory less than what is resource tracked.
+        if CONF.adjust_actual_mem_usage:
+            self._adjust_actual_mem_usage(context, nodename)
+
         # update the compute_node
         self._update(context, cn)
-        LOG.debug('Compute_service record updated for %(host)s:%(node)s',
+        LOG.info('Compute_service record updated for %(host)s:%(node)s',
                   {'host': self.host, 'node': nodename})
+
+        # WRS - move _report_final to reflect _update and metrics
+        self._report_final_resource_view(nodename)
+
+    def _add_numa_usage_into_stats(self, compute_node):
+        host_numa_topology, jsonify_result = \
+            hardware.host_topology_and_format_from_host(compute_node)
+        if host_numa_topology:
+            vcpus_by_node = {}
+            vcpus_used_by_node = {}
+            memory_mb_by_node = {}
+            memory_mb_used_by_node = {}
+            l3_cache_granularity = None
+            l3_cache_by_node = {}
+            l3_cache_used_by_node = {}
+            for cell in host_numa_topology.cells:
+                pinned = set(cell.pinned_cpus)
+                cpuset = set(cell.cpuset)
+                shared = cell.cpu_usage - len(pinned)
+                vcpus_by_node[cell.id] = len(cpuset)
+                vcpus_used_by_node[cell.id] = \
+                    {"shared": shared, "dedicated": len(pinned)}
+                mem = {}
+                mem_used = {}
+                for M in cell.mempages:
+                    unit = 'K'
+                    size = M.size_kb
+                    if M.size_kb >= units.Ki and M.size_kb < units.Mi:
+                        unit = 'M'
+                        size = M.size_kb / units.Ki
+                    if M.size_kb >= units.Mi:
+                        unit = 'G'
+                        size = M.size_kb / units.Mi
+                    mem_unit = "%(sz)s%(U)s" % {'sz': size, 'U': unit}
+                    mem[mem_unit] = M.size_kb * M.total / units.Ki
+                    mem_used[mem_unit] = M.size_kb * M.used / units.Ki
+                memory_mb_by_node[cell.id] = mem
+                memory_mb_used_by_node[cell.id] = mem_used
+                l3_cache_used = {}
+                if cell.l3_size is not None:
+                    l3_cache_by_node[cell.id] = cell.l3_size
+                    if cell.has_cachetune_cdp:
+                        if cell.l3_code_used is not None:
+                            l3_cache_used[fields.CacheTuneType.CODE] = \
+                                cell.l3_code_used
+                        if cell.l3_data_used is not None:
+                            l3_cache_used[fields.CacheTuneType.DATA] = \
+                                cell.l3_data_used
+                    else:
+                        if cell.l3_both_used is not None:
+                            l3_cache_used[fields.CacheTuneType.BOTH] = \
+                                cell.l3_both_used
+                l3_cache_used_by_node[cell.id] = l3_cache_used
+                l3_cache_granularity = cell.l3_granularity
+
+            self.stats.vcpus_by_node = jsonutils.dumps(vcpus_by_node)
+            self.stats.vcpus_used_by_node = jsonutils.dumps(vcpus_used_by_node)
+            self.stats.memory_mb_by_node = jsonutils.dumps(memory_mb_by_node)
+            self.stats.memory_mb_used_by_node = \
+                jsonutils.dumps(memory_mb_used_by_node)
+            self.stats.l3_cache_granularity = l3_cache_granularity
+            self.stats.l3_cache_by_node = jsonutils.dumps(l3_cache_by_node)
+            self.stats.l3_cache_used_by_node = \
+                jsonutils.dumps(l3_cache_used_by_node)
 
     def _get_compute_node(self, context, nodename):
         """Returns compute node for the host and nodename."""
@@ -793,6 +1268,7 @@ class ResourceTracker(object):
         else:
             tcpu = 0
             ucpu = 0
+            LOG.info(_("Free VCPU information unavailable"))
         pci_stats = (list(cn.pci_device_pools) if
             cn.pci_device_pools else [])
         LOG.info("Final resource view: "
@@ -801,6 +1277,7 @@ class ResourceTracker(object):
                  "used_ram=%(used_ram)sMB "
                  "phys_disk=%(phys_disk)sGB "
                  "used_disk=%(used_disk)sGB "
+                 "free_disk=%(free_disk)sGB "
                  "total_vcpus=%(total_vcpus)s "
                  "used_vcpus=%(used_vcpus)s "
                  "pci_stats=%(pci_stats)s",
@@ -809,9 +1286,96 @@ class ResourceTracker(object):
                   'used_ram': cn.memory_mb_used,
                   'phys_disk': cn.local_gb,
                   'used_disk': cn.local_gb_used,
+                  'free_disk': cn.free_disk_gb,
                   'total_vcpus': tcpu,
                   'used_vcpus': ucpu,
                   'pci_stats': pci_stats})
+
+        # WRS - Ignore printing extended resources
+        if not utils.is_libvirt_compute(cn):
+            return
+
+        # WRS - display per-numa resources
+        host_numa_topology, jsonify_result = \
+            hardware.host_topology_and_format_from_host(cn)
+        if host_numa_topology is None:
+            host_numa_topology = objects.NUMATopology(cells=[])
+
+        # WRS - display per-numa memory usage
+        for cell in host_numa_topology.cells:
+            LOG.info(
+                'Numa node=%(node)d; '
+                'memory: %(T)5d MiB total, %(A)5d MiB avail',
+                {'node': cell.id, 'T': cell.memory, 'A': cell.avail_memory})
+        for cell in host_numa_topology.cells:
+            mem = []
+            for M in cell.mempages:
+                unit = 'K'
+                size = M.size_kb
+                if M.size_kb >= units.Ki and M.size_kb < units.Mi:
+                    unit = 'M'
+                    size = M.size_kb / units.Ki
+                if M.size_kb >= units.Mi:
+                    unit = 'G'
+                    size = M.size_kb / units.Mi
+                m = '%(sz)s%(U)s: %(T).0f MiB total, %(A).0f MiB avail' % \
+                    {'sz': size, 'U': unit,
+                     'T': M.size_kb * M.total / units.Ki,
+                     'A': M.size_kb * (M.total - M.used) / units.Ki,
+                     }
+                mem.append(m)
+            LOG.info('Numa node=%(node)d; per-pgsize: %(pgsize)s',
+                     {'node': cell.id, 'pgsize': '; '.join(mem)})
+
+        # WRS - display per-numa cpu usage
+        for cell in host_numa_topology.cells:
+            cpuset = set(cell.cpuset)
+            pinned = set(cell.pinned_cpus)
+            unpinned = cpuset - pinned
+            shared = cell.cpu_usage - len(pinned)
+            LOG.info(
+                'Numa node=%(node)d; cpu_usage:%(usage).3f, pcpus:%(pcpus)d, '
+                'pinned:%(P)d, shared:%(S).3f, unpinned:%(U)d; '
+                'pinned_cpulist:%(LP)s, '
+                'unpinned_cpulist:%(LU)s',
+                {'usage': cell.cpu_usage,
+                 'node': cell.id, 'pcpus': len(cpuset),
+                 'P': len(pinned), 'S': shared, 'U': len(unpinned),
+                 'LP': utils.list_to_range(sorted(list(pinned))) or '-',
+                 'LU': utils.list_to_range(sorted(list(unpinned))) or '-',
+                 })
+
+        # L3 CAT Support
+        if ((cn.l3_closids is not None) and
+                (cn.l3_closids_used is not None) and
+                host_numa_topology.cells and
+                host_numa_topology.cells[0].has_cachetune):
+            LOG.info(_('L3 CAT: closids: %(total)d total, %(avail)d avail'),
+                      {'total': cn.l3_closids,
+                       'avail': (cn.l3_closids -
+                                 cn.l3_closids_used),
+                       })
+            for cell in host_numa_topology.cells:
+                if cell.has_cachetune_cdp:
+                    used = '{code} KiB code used, {data} KiB data used'.\
+                        format(code=cell.l3_code_used, data=cell.l3_data_used)
+                else:
+                    used = '{both} KiB both used'.\
+                        format(both=cell.l3_both_used)
+                LOG.info(_(
+                    'L3 CAT: Numa node=%(node)d; '
+                    '%(size)d KiB total, '
+                    '%(avail)d KiB avail, '
+                    '%(gran)d KiB gran; '
+                    '%(used)s'),
+                    {'node': cell.id,
+                     'size': cell.l3_size,
+                     'avail': cell.avail_cache,
+                     'gran': cell.l3_granularity,
+                     'used': used,
+                     })
+        else:
+            LOG.info(_("L3 CAT unavailable"))
 
     def _resource_change(self, compute_node):
         """Check to see if any resources have changed."""
@@ -825,6 +1389,8 @@ class ResourceTracker(object):
 
     def _update(self, context, compute_node):
         """Update partial stats locally and populate them to Scheduler."""
+        self._add_numa_usage_into_stats(compute_node)
+        compute_node.stats = copy.deepcopy(self.stats)
         if not self._resource_change(compute_node):
             return
         nodename = compute_node.hypervisor_hostname
@@ -847,10 +1413,133 @@ class ResourceTracker(object):
         if self.pci_tracker:
             self.pci_tracker.save(context)
 
-    def _update_usage(self, usage, nodename, sign=1):
+    # WRS:extension - normalized vCPU accounting
+    def normalized_vcpus(self, usage, nodename):
+        """Return normalized vCPUs
+
+        Determine the fractional number of vCPUs used for an instance
+        based on normalized accounting.
+        """
+        cn = self.compute_nodes[nodename]
+        vcpus = float(usage.get('vcpus', 0))
+        if vcpus == 0:
+            return 0
+
+        # 'usage' can be instance or flavor, want to get at
+        # extra_specs as efficiently as possible.
+        if 'extra_specs' in usage:
+            extra_specs = usage['extra_specs']
+        else:
+            if 'flavor' in usage:
+                extra_specs = usage['flavor'].get('extra_specs', {})
+            elif 'instance_type_id' in usage:
+                flavor = objects.Flavor.get_by_id(
+                    nova.context.get_admin_context(read_deleted='yes'),
+                    usage['instance_type_id'])
+                extra_specs = flavor.extra_specs
+            else:
+                extra_specs = {}
+
+        # Get instance numa topology
+        instance_numa_topology = None
+        if 'numa_topology' in usage:
+            instance_numa_topology = usage.get('numa_topology')
+
+        if 'hw:cpu_policy' not in extra_specs \
+            and instance_numa_topology \
+            and instance_numa_topology.cells[0].cpu_policy:
+            extra_specs['hw:cpu_policy'] = \
+                instance_numa_topology.cells[0].cpu_policy
+
+        # WRS: When called from _update_usage_from_migration(), the 'usage'
+        # arg comes from a flavor, so it doesn't have system_metadata.
+        # However in that case numa_topology will have the correct cpu_policy
+        # and cpu_thread_policy so add them to image properties.
+        image_props = {}
+        if 'system_metadata' in usage:
+            system_metadata = usage['system_metadata']
+            image_meta = utils.get_image_from_system_metadata(system_metadata)
+            image_props = image_meta.get('properties', {})
+        elif instance_numa_topology:
+            image_props['hw_cpu_policy'] = \
+                instance_numa_topology.cells[0].cpu_policy
+            image_props['hw_cpu_thread_policy'] = \
+                instance_numa_topology.cells[0].cpu_thread_policy
+
+        # Get host numa topology
+        host_numa_topology, _fmt = hardware.host_topology_and_format_from_host(
+            cn)
+
+        # Get set of reserved thread sibling pcpus that cannot be allocated
+        # when using 'isolate' cpu_thread_policy.
+        reserved = hardware.get_reserved_thread_sibling_pcpus(
+                instance_numa_topology, host_numa_topology)
+        threads_per_core = hardware._get_threads_per_core(host_numa_topology)
+
+        # Normalize vcpus accounting
+        vcpus = hardware.normalized_vcpus(vcpus=vcpus,
+                                          reserved=reserved,
+                                          extra_specs=extra_specs,
+                                          image_props=image_props,
+                                          ratio=CONF.cpu_allocation_ratio,
+                                          threads_per_core=threads_per_core)
+        return vcpus
+
+    # WRS: add update_affinity
+    def _update_usage(self, usage, nodename, sign=1, update_affinity=True,
+                      strict=True, from_migration=False):
+        # WRS: tracker debug logging
+        if CONF.compute_resource_debug:
+            # Get parent calling functions
+            p5_fname = sys._getframe(5).f_code.co_name
+            p4_fname = sys._getframe(4).f_code.co_name
+            p3_fname = sys._getframe(3).f_code.co_name
+            p2_fname = sys._getframe(2).f_code.co_name
+            p1_fname = sys._getframe(1).f_code.co_name
+            LOG.info(
+                '_update_usage: '
+                'caller=%(p5)s / %(p4)s / %(p3)s / %(p2)s / %(p1)s, '
+                'sign=%(sign)r, USAGE: host:%(host)s uuid:%(uuid)s '
+                'name:%(name)s display_name:%(display_name)s '
+                'min_vcpus:%(min_vcpus)s vcpus:%(vcpus)s '
+                'max_vcpus:%(max_vcpus)s '
+                'memory_mb:%(memory_mb)s root_gb:%(root_gb)s '
+                'ephemeral_gb:%(ephemeral_gb)s '
+                'instance_type_id:%(instance_type_id)s '
+                'old_flavor:%(old_flavor)s new_flavor:%(new_flavor)s '
+                'vm_mode:%(vm_mode)s task_state:%(task_state)s '
+                'vm_state:%(vm_state)s power_state:%(power_state)s '
+                'launched_at:%(launched_at)s terminated_at:%(terminated_at)s '
+                '%(numa_topology)r',
+                {'p5': p5_fname, 'p4': p4_fname, 'p3': p3_fname,
+                 'p2': p2_fname, 'p1': p1_fname,
+                 'sign': sign,
+                 'host': usage.get('host'),
+                 'uuid': usage.get('uuid'),
+                 'name': usage.get('name'),
+                 'display_name': usage.get('display_name'),
+                 'min_vcpus': usage.get('min_vcpus'),
+                 'vcpus': usage.get('vcpus'),
+                 'max_vcpus': usage.get('max_vcpus'),
+                 'memory_mb': usage.get('memory_mb'),
+                 'root_gb': usage.get('root_gb'),
+                 'ephemeral_gb': usage.get('ephemeral_gb'),
+                 'instance_type_id': usage.get('instance_type_id'),
+                 'old_flavor': usage.get('old_flavor'),
+                 'new_flavor': usage.get('new_flavor'),
+                 'vm_mode': usage.get('vm_mode'),
+                 'task_state': usage.get('task_state'),
+                 'vm_state': usage.get('vm_state'),
+                 'power_state': usage.get('power_state'),
+                 'launched_at': usage.get('launched_at'),
+                 'terminated_at': usage.get('terminated_at'),
+                 'numa_topology': usage.get('numa_topology'),
+                 })
+            self._populate_usage(nodename, id=0)
+
         mem_usage = usage['memory_mb']
         disk_usage = usage.get('root_gb', 0)
-        vcpus_usage = usage.get('vcpus', 0)
+        vcpus_usage = self.normalized_vcpus(usage, nodename)
 
         overhead = self.driver.estimate_instance_overhead(usage)
         mem_usage += overhead['memory_mb']
@@ -863,6 +1552,22 @@ class ResourceTracker(object):
         cn.local_gb_used += sign * usage.get('ephemeral_gb', 0)
         cn.vcpus_used += sign * vcpus_usage
 
+        # L3 CAT Support
+        numa_topology = usage.get('numa_topology')
+        if ((numa_topology is not None) and
+                any(cell.cachetune_requested
+                    for cell in numa_topology.cells)):
+            cn.l3_closids_used += sign * 1
+
+        if usage.get('uuid') in self.tracked_in_progress or from_migration:
+            cn.disk_available_least -= \
+                sign * usage.get('root_gb', 0)
+            cn.disk_available_least -= \
+                sign * usage.get('ephemeral_gb', 0)
+            swap = usage.get('swap', 0)
+            cn.disk_available_least -= \
+                sign * int(math.ceil((swap * units.Mi) / float(units.Gi)))
+
         # free ram and disk may be negative, depending on policy:
         cn.free_ram_mb = cn.memory_mb - cn.memory_mb_used
         cn.free_disk_gb = cn.local_gb - cn.local_gb_used
@@ -872,8 +1577,149 @@ class ResourceTracker(object):
         # Calculate the numa usage
         free = sign == -1
         updated_numa_topology = hardware.get_host_numa_usage_from_instance(
-                cn, usage, free)
+                cn, usage, free, strict=strict)
         cn.numa_topology = updated_numa_topology
+
+        # WRS: update the affinity of instances with non-dedicated CPUs.
+        if update_affinity:
+            hardware.update_floating_affinity(cn)
+
+        # WRS: tracker debug logging
+        if CONF.compute_resource_debug:
+            self._populate_usage(nodename, id=1)
+            self._display_usage()
+
+    # WRS: tracker debug logging
+    def _populate_usage(self, nodename, id=0):
+        """populate before and after usage display lines"""
+        global _usage_debug
+        _usage_debug[id] = list()
+
+        reference = str(id)
+        if id == 0:
+            reference = 'BEFORE: '
+        elif id == 1:
+            reference = 'AFTER:  '
+
+        cn = self.compute_nodes[nodename]
+
+        line = (
+            '%(ref)s'
+            'workload: %(workload)s, vms: %(vms)s, '
+            'vcpus: %(vcpu_used).3f used, %(vcpu_tot).3f total' %
+            {'ref': reference,
+             'workload': cn.current_workload,
+             'vms': cn.running_vms,
+             'vcpu_tot': cn.vcpus,
+             'vcpu_used': cn.vcpus_used,
+             })
+        _usage_debug[id].append(line)
+
+        line = (
+            '%(ref)s'
+            'memory: %(mem_used)6d used, %(mem_tot)6d total (MiB); '
+            'disk: %(disk_used)3d used, %(disk_tot)3d total, '
+            '%(disk_free)3d free, %(disk_least)3d least_avail (GiB)' %
+            {'ref': reference,
+             'mem_tot': cn.memory_mb,
+             'mem_used': cn.memory_mb_used,
+             'disk_tot': cn.local_gb,
+             'disk_used': cn.local_gb_used,
+             'disk_free': cn.free_disk_gb,
+             'disk_least': cn.disk_available_least or 0,
+             })
+        _usage_debug[id].append(line)
+        line = (
+            '%(ref)s'
+            'L3-closids: %(closids_used)2d used, %(closids_tot)2d total' %
+            {'ref': reference,
+             'closids_tot': cn.l3_closids,
+             'closids_used': cn.l3_closids_used,
+             })
+        _usage_debug[id].append(line)
+
+        host_numa_topology, jsonify_result = \
+            hardware.host_topology_and_format_from_host(cn)
+        if host_numa_topology is None:
+            host_numa_topology = objects.NUMATopology(cells=[])
+        for cell in host_numa_topology.cells:
+            line = (
+                '%(ref)sNuma node=%(node)d; '
+                'memory: %(T)5d MiB total, %(A)5d MiB avail' %
+                {'ref': reference,
+                 'node': cell.id,
+                 'T': cell.memory, 'A': cell.avail_memory})
+            _usage_debug[id].append(line)
+
+        for cell in host_numa_topology.cells:
+            mem = []
+            for M in cell.mempages:
+                unit = 'K'
+                size = M.size_kb
+                if M.size_kb >= units.Ki and M.size_kb < units.Mi:
+                    unit = 'M'
+                    size = M.size_kb / units.Ki
+                if M.size_kb >= units.Mi:
+                    unit = 'G'
+                    size = M.size_kb / units.Mi
+                m = '%(sz)s%(U)s: %(T)5.0f MiB total, %(A)5.0f MiB avail' % \
+                    {'sz': size, 'U': unit,
+                     'T': M.size_kb * M.total / units.Ki,
+                     'A': M.size_kb * (M.total - M.used) / units.Ki}
+                mem.append(m)
+            line = (
+                '%(ref)sNuma node=%(node)d; per-pgsize: %(pgsize)s' %
+                {'ref': reference,
+                 'node': cell.id,
+                 'pgsize': '; '.join(mem)})
+            _usage_debug[id].append(line)
+
+        for cell in host_numa_topology.cells:
+            cpuset = set(cell.cpuset)
+            pinned = set(cell.pinned_cpus)
+            unpinned = cpuset - pinned
+            shared = cell.cpu_usage - len(pinned)
+            line = (
+                '%(ref)sNuma node=%(node)d; cpu_usage:%(usage)6.3f, '
+                'pcpus:%(pcpus)2d, '
+                'pinned:%(P)2d, shared:%(S)6.3f, unpinned:%(U)2d; map:%(M)s; '
+                'pinned_cpulist:%(LP)s, '
+                'unpinned_cpulist:%(LU)s' %
+                {'ref': reference,
+                 'usage': cell.cpu_usage,
+                 'node': cell.id,
+                 'pcpus': len(cpuset),
+                 'P': len(pinned), 'S': shared,
+                 'U': len(unpinned),
+                 'M': ''.join(
+                     'P' if s in pinned else 'U' for s in cpuset) or '-',
+                 'LP': utils.list_to_range(sorted(list(pinned))) or '-',
+                 'LU': utils.list_to_range(sorted(list(unpinned))) or '-',
+                 })
+            _usage_debug[id].append(line)
+
+        for cell in host_numa_topology.cells:
+            line = (
+                '%(ref)sNuma node=%(node)d; L3-cache-usage: '
+                '%(B)6d both KiB, %(C)6d code KiB, %(D)6d data KiB' %
+                {'ref': reference,
+                 'usage': cell.cpu_usage,
+                 'node': cell.id,
+                 'B': cell.l3_both_used,
+                 'C': cell.l3_code_used,
+                 'D': cell.l3_data_used,
+                 })
+            _usage_debug[id].append(line)
+
+    # WRS: tracker debug logging
+    def _display_usage(self):
+        """display before and after usage, one line at a time"""
+        global _usage_debug
+        if not (_usage_debug[0] and _usage_debug[1]):
+            return
+        for (before, after) in zip(_usage_debug[0], _usage_debug[1]):
+            LOG.info(before)
+            LOG.info(after)
 
     def _get_migration_context_resource(self, resource, instance,
                                         prefix='new_'):
@@ -884,15 +1730,18 @@ class ResourceTracker(object):
         return None
 
     def _update_usage_from_migration(self, context, instance, migration,
-                                     nodename):
+                                     nodename, strict=True):
         """Update usage for a single migration.  The record may
         represent an incoming or outbound migration.
         """
-        if not _is_trackable_migration(migration):
-            return
+        def getter(obj, attr, default=None):
+            """Method to get object attributes without exception."""
+            if hasattr(obj, attr):
+                return getattr(obj, attr, default)
+            else:
+                return default
 
         uuid = migration.instance_uuid
-        LOG.info("Updating from migration %s", uuid)
 
         incoming = (migration.dest_compute == self.host and
                     migration.dest_node == nodename)
@@ -904,6 +1753,7 @@ class ResourceTracker(object):
         itype = None
         numa_topology = None
         sign = 0
+        same_node_old = False
         if same_node:
             # Same node resize. Record usage for the 'new_' resources.  This
             # is executed on resize_claim().
@@ -930,6 +1780,7 @@ class ResourceTracker(object):
                         migration)
                 numa_topology = self._get_migration_context_resource(
                     'numa_topology', instance, prefix='old_')
+                same_node_old = True
 
         elif incoming and not record:
             # instance has not yet migrated here:
@@ -949,12 +1800,17 @@ class ResourceTracker(object):
 
         if itype:
             cn = self.compute_nodes[nodename]
+            # TODO(melwitt/jaypipes): Remove this after resource-providers
+            # can handle claims and reporting for boot-from-volume.
+            itype_copy = self._copy_instance_type_if_bfv(instance, itype)
+
             usage = self._get_usage_dict(
-                        itype, numa_topology=numa_topology)
+                        itype_copy, numa_topology=numa_topology)
             if self.pci_tracker and sign:
                 self.pci_tracker.update_pci_for_instance(
                     context, instance, sign=sign)
-            self._update_usage(usage, nodename)
+            self._update_usage(usage, nodename, strict=strict,
+                               from_migration=(incoming and not same_node_old))
             if self.pci_tracker:
                 obj = self.pci_tracker.stats.to_device_pools_obj()
                 cn.pci_device_pools = obj
@@ -962,6 +1818,46 @@ class ResourceTracker(object):
                 obj = objects.PciDevicePoolList()
                 cn.pci_device_pools = obj
             self.tracked_migrations[uuid] = migration
+
+            # WRS: Display migrations that audit includes via _update_usage.
+            change = None
+            if incoming:
+                change = 'incoming'
+            if outbound:
+                change = 'outbound'
+            if same_node:
+                change = 'same_node'
+            topo = utils.format_instance_numa_topology(
+                numa_topology=numa_topology, instance=instance, delim=', ')
+            # Get pci_devices associated with this 'host' and 'nodename'.
+            pci_devices = pci_manager.get_instance_pci_devs_by_host_and_node(
+                instance, request_id='all', host=self.host, nodename=nodename)
+            if pci_devices:
+                devs = '; pci_devices='
+                devs += pci_utils.format_instance_pci_devices(
+                    pci_devices=pci_devices, delim='; ')
+            else:
+                devs = ''
+            LOG.info(
+                'Migration(id=%(mid)s, change=%(change)s, '
+                'status=%(status)s, type=%(type)s); '
+                'sign=%(sign)d, id=%(name)s, name=%(display_name)s, '
+                'source_compute=%(sc)s, source_node=%(sn)s, '
+                'dest_compute=%(dc)s, dest_node=%(dn)s, '
+                'numa_topology=%(topo)s, %(pci_devs)s',
+                {'mid': migration.id, 'change': change,
+                 'status': migration.status,
+                 'type': migration.migration_type,
+                 'sign': 1,
+                 'name': getter(instance, 'name'),
+                 'display_name': getter(instance, 'display_name'),
+                 'sc': migration.source_compute,
+                 'sn': migration.source_node,
+                 'dc': migration.dest_compute,
+                 'dn': migration.dest_node,
+                 'topo': topo,
+                 'pci_devs': devs,
+                 }, instance=instance)
 
     def _update_usage_from_migrations(self, context, migrations, nodename):
         filtered = {}
@@ -981,9 +1877,18 @@ class ResourceTracker(object):
                 LOG.debug('Migration instance not found: %s', e)
                 continue
 
-            # skip migration if instance isn't in a resize state:
-            if not _instance_in_resize_state(instances[uuid]):
-                LOG.warning("Instance not resizing, skipping migration.",
+            # skip migration if instance isn't in a migration or resize state:
+            if not _instance_in_migration_or_resize_state(instances[uuid]):
+                id = migration.id if hasattr(migration, 'id') else None
+                type = (migration.migration_type
+                        if hasattr(migration, 'migration_type') else None)
+                status = (migration.status
+                          if hasattr(migration, 'status') else None)
+                LOG.warning("Instance not migrating, skipping migration: "
+                            "id=%(id)s, type=%(type)s, status=%(status)s",
+                            {'id': id,
+                            'type': type,
+                            'status': status},
                             instance_uuid=uuid)
                 continue
 
@@ -1001,17 +1906,38 @@ class ResourceTracker(object):
 
         for migration in filtered.values():
             instance = instances[migration.instance_uuid]
+            # Skip migration if it doesn't match the instance migration id.
+            # This can happen if we have a stale migration record.
+            # We want to proceed if instance.migration_context is None
+            # (see test_update_available_resources_migration_no_context).
+            if (instance.migration_context is not None and
+                    instance.migration_context.migration_id != migration.id):
+                LOG.warning("Instance migration %(im)s doesn't match "
+                            "migration %(m)s, skipping migration.",
+                     {'im': instance.migration_context.migration_id,
+                     'm': migration.id})
+                continue
+
             try:
+                # WRS: non-strict pinning accounting for resource audit
                 self._update_usage_from_migration(context, instance, migration,
-                                                  nodename)
+                                                  nodename, strict=False)
             except exception.FlavorNotFound:
                 LOG.warning("Flavor could not be found, skipping migration.",
                             instance_uuid=instance.uuid)
                 continue
 
+    # WRS: add update_affinity
     def _update_usage_from_instance(self, context, instance, nodename,
-            is_removed=False, require_allocation_refresh=False):
+            is_removed=False, require_allocation_refresh=False,
+            update_affinity=True, strict=True):
         """Update usage for a single instance."""
+        def getter(obj, attr, default=None):
+            """Method to get object attributes without exception."""
+            if hasattr(obj, attr):
+                return getattr(obj, attr, default)
+            else:
+                return default
 
         uuid = instance['uuid']
         is_new_instance = uuid not in self.tracked_instances
@@ -1020,62 +1946,82 @@ class ResourceTracker(object):
         is_removed_instance = not is_new_instance and (is_removed or
             instance['vm_state'] in vm_states.ALLOW_RESOURCE_REMOVAL)
 
+        # Avoid changing the original instance in the case of boot from volume
+        inst_copy_zero_disk = None
+
         if is_new_instance:
-            self.tracked_instances[uuid] = obj_base.obj_to_primitive(instance)
+            # TODO(melwitt/jaypipes): Remove this after resource-providers
+            # can handle claims and reporting for boot-from-volume.
+            inst_copy_zero_disk, _ = self._copy_if_bfv(instance)
+
+            self.tracked_instances[uuid] = obj_base.obj_to_primitive(
+                    inst_copy_zero_disk)
             sign = 1
 
         if is_removed_instance:
+            # TODO(melwitt/jaypipes): Remove this after resource-providers
+            # can handle claims and reporting for boot-from-volume.
+            inst_copy_zero_disk, _ = self._copy_if_bfv(instance)
+
             self.tracked_instances.pop(uuid)
             sign = -1
 
         cn = self.compute_nodes[nodename]
-        self.stats.update_stats_for_instance(instance, is_removed_instance)
-        cn.stats = copy.deepcopy(self.stats)
+        self.stats.update_stats_for_instance(inst_copy_zero_disk or instance,
+                                             is_removed_instance)
 
         # if it's a new or deleted instance:
         if is_new_instance or is_removed_instance:
             if self.pci_tracker:
+                # NOTE(melwitt): We don't pass the copy with zero disk here to
+                # avoid saving instance.flavor.root_gb=0 to the database.
                 self.pci_tracker.update_pci_for_instance(context,
                                                          instance,
                                                          sign=sign)
-            if require_allocation_refresh:
-                LOG.debug("Auto-correcting allocations to handle Ocata "
-                          "assumptions.")
-                self.reportclient.update_instance_allocation(cn, instance,
-                                                             sign)
-            else:
-                # NOTE(jaypipes): We're on a Pike compute host or later in
-                # a deployment with all compute hosts upgraded to Pike or
-                # later
-                #
-                # If that is the case, then we know that the scheduler will
-                # have properly created an allocation and that the compute
-                # hosts have not attempted to overwrite allocations
-                # **during the periodic update_available_resource() call**.
-                # However, Pike compute hosts may still rework an
-                # allocation for an instance in a move operation during
-                # confirm_resize() on the source host which will remove the
-                # source resource provider from any allocation for an
-                # instance.
-                #
-                # In Queens and beyond, the scheduler will understand when
-                # a move operation has been requested and instead of
-                # creating a doubled-up allocation that contains both the
-                # source and destination host, the scheduler will take the
-                # original allocation (against the source host) and change
-                # the consumer ID of that allocation to be the migration
-                # UUID and not the instance UUID. The scheduler will
-                # allocate the resources for the destination host to the
-                # instance UUID.
-                LOG.debug("We're on a Pike compute host in a deployment "
-                          "with all Pike compute hosts. Skipping "
-                          "auto-correction of allocations.")
-
+            # WRS: This covers rare cases where scheduler allocation is
+            # incorrect and needs to be auto-corrected on the next resource
+            # audit. However if the instance is migrating, leave the
+            # allocations alone.
+            if not _instance_in_migration_or_resize_state(instance):
+                self.scheduler_client.reportclient.update_instance_allocation(
+                    cn, instance, sign)
             # new instance, update compute node resource usage:
-            self._update_usage(self._get_usage_dict(instance), nodename,
-                               sign=sign)
+            self._update_usage(self._get_usage_dict(inst_copy_zero_disk),
+                               nodename, sign=sign,
+                               update_affinity=update_affinity, strict=strict)
+
+            # WRS: Display instances that audit includes via _update_usage.
+            pstate = instance.get('power_state')
+            if pstate is None:
+                pstate = power_state.NOSTATE
+            topo = utils.format_instance_numa_topology(
+                numa_topology=instance.get('numa_topology'),
+                instance=instance, delim='; ')
+            # Get pci_devices associated with this instance
+            pci_devices = pci_manager.get_instance_pci_devs_by_host_and_node(
+                instance, request_id='all', host=self.host, nodename=nodename)
+            if pci_devices:
+                devs = '; pci_devices='
+                devs += pci_utils.format_instance_pci_devices(
+                    pci_devices=pci_devices, delim='; ')
+            else:
+                devs = ''
+            LOG.info(
+                'sign=%(sign)s, id=%(name)s, name=%(display_name)s, '
+                'vm_mode=%(vm)s, task_state=%(task)s, power_state=%(power)s, '
+                'numa_topology=%(topo)s, %(pci_devs)s',
+                {'sign': sign,
+                'name': getter(instance, 'name'),
+                'display_name': getter(instance, 'display_name'),
+                'vm': instance.get('vm_state'),
+                'task': instance.get('task_state'),
+                'power': power_state.STATE_MAP[pstate],
+                'topo': topo,
+                'pci_devs': devs,
+                }, instance=instance)
 
         cn.current_workload = self.stats.calculate_workload()
+
         if self.pci_tracker:
             obj = self.pci_tracker.stats.to_device_pools_obj()
             cn.pci_device_pools = obj
@@ -1140,12 +2086,44 @@ class ResourceTracker(object):
             has_ocata_computes or
             self.driver.requires_allocation_refresh)
 
+        # L3 CAT Support - include default CLOS
+        has_cachetune = self.driver._has_cachetune_support()
+        if has_cachetune:
+            cn.l3_closids_used = 1
+        else:
+            cn.l3_closids_used = 0
+
         for instance in instances:
+            if instance.task_state == task_states.RESIZE_MIGRATED:
+                # WRS: We need to ignore these instances because
+                # instance.nova_topology still points at the old value.
+                # _update_usage_from_migrations() will handle them.
+                LOG.debug("Instance %s task state is RESIZE_MIGRATED, "
+                          "ignoring in _update_usage_from_instances().",
+                          instance.uuid)
+                continue
+            # WRS: During post live migration, destination host will update
+            # instance host and numa_topology but it seems that these are
+            # separate db operations.  If this is happening just as the
+            # resource audit on the source host is getting the list of
+            # instances from the db, the instance numa_topology can be updated
+            # to the destination but the host is not.  So skip those cases here
+            # based on MIGRATING state and available migration context and let
+            # the migration part of the audit update the resource accounting.
+            if instance.task_state == task_states.MIGRATING and \
+                   instance.migration_context is not None:
+                LOG.debug("Instance %s task state is MIGRATING, "
+                          "ignoring in _update_usage_from_instances().",
+                          instance.uuid)
+                continue
             if instance.vm_state not in vm_states.ALLOW_RESOURCE_REMOVAL:
                 self._update_usage_from_instance(context, instance, nodename,
-                    require_allocation_refresh=require_allocation_refresh)
+                    require_allocation_refresh=require_allocation_refresh,
+                    strict=False)
 
         self._remove_deleted_instances_allocations(context, cn)
+        # WRS: update the affinity of instances with non-dedicated CPUs.
+        hardware.update_floating_affinity(cn)
 
     def _remove_deleted_instances_allocations(self, context, cn):
         # NOTE(jaypipes): All of this code sucks. It's basically dealing with
@@ -1229,32 +2207,56 @@ class ResourceTracker(object):
                           "There are allocations remaining against the source "
                           "host that might need to be removed: %s.",
                           instance_uuid, instance.host, instance.node, alloc)
+                # WRS: remove allocations if instance is not in migrating state
+                if not _instance_in_migration_or_resize_state(instance):
+                    self.reportclient.remove_provider_from_instance_allocation(
+                             instance.uuid, cn.uuid, instance.user_id,
+                             instance.project_id, alloc['resources'])
+                continue
 
-    def delete_allocation_for_evacuated_instance(self, instance, node,
+    def delete_allocation_for_evacuated_instance(self, context, instance, node,
                                                  node_type='source'):
-        self._delete_allocation_for_moved_instance(
+        self._delete_allocation_for_moved_instance(context,
             instance, node, 'evacuated', node_type)
 
-    def delete_allocation_for_migrated_instance(self, instance, node):
-        self._delete_allocation_for_moved_instance(instance, node, 'migrated')
+    def delete_allocation_for_migrated_instance(self, context, instance, node):
+        self._delete_allocation_for_moved_instance(context, instance, node,
+                                                   'migrated')
 
     def _delete_allocation_for_moved_instance(
-            self, instance, node, move_type, node_type='source'):
+            self, context, instance, node, move_type, node_type='source'):
         # Clean up the instance allocation from this node in placement
         my_resources = scheduler_utils.resources_from_flavor(
             instance, instance.flavor)
 
-        cn_uuid = self.compute_nodes[node].uuid
+        if node not in self.compute_nodes:
+            # WRS: during evacuation, this is called before
+            # _init_compute_node() so compute_nodes may not be initialized
+            # TODO(GK) with fix in fb968e18 this may not be required anymore
+            self.compute_nodes[node] = \
+                self._get_compute_node(context, node)
+
+        # WRS: Use instance fields as instance was not resized
+        cn = self.compute_nodes[node]
+        system_metadata = instance.system_metadata
+        image_meta = utils.get_image_from_system_metadata(system_metadata)
+        image_props = image_meta.get('properties', {})
+        normalized_resources = \
+              scheduler_utils.normalized_resources_for_placement_claim(
+                  my_resources, cn, instance.vcpus,
+                  instance.flavor.extra_specs, image_props,
+                  instance.numa_topology)
 
         res = self.reportclient.remove_provider_from_instance_allocation(
-            instance.uuid, cn_uuid, instance.user_id,
-            instance.project_id, my_resources)
+            instance.uuid, cn.uuid, instance.user_id,
+            instance.project_id, normalized_resources)
         if not res:
             LOG.error("Failed to clean allocation of %s "
                       "instance on the %s node %s",
-                      move_type, node_type, cn_uuid, instance=instance)
+                      move_type, node_type, cn.uuid, instance=instance)
 
-    def delete_allocation_for_failed_resize(self, instance, node, flavor):
+    def delete_allocation_for_failed_resize(self, instance, node, flavor,
+                                            image):
         """Delete instance allocations for the node during a failed resize
 
         :param instance: The instance being resized/migrated.
@@ -1265,9 +2267,22 @@ class ResourceTracker(object):
         """
         resources = scheduler_utils.resources_from_flavor(instance, flavor)
         cn = self.compute_nodes[node]
+
+        # WRS: as resize failed prior to finishing undo the resource claim
+        # based on the new flavor to reverse what was done in the scheduler
+        offline_cpus = scheduler_utils.determine_offline_cpus(flavor,
+                                                     instance.numa_topology)
+        vcpus = flavor.vcpus - offline_cpus
+        image_meta_obj = objects.ImageMeta.from_dict(image)
+        numa_topology = hardware.numa_get_constraints(flavor, image_meta_obj)
+        normalized_resources = \
+              scheduler_utils.normalized_resources_for_placement_claim(
+                  resources, cn, vcpus, flavor.extra_specs,
+                  image['properties'], numa_topology)
+
         res = self.reportclient.remove_provider_from_instance_allocation(
             instance.uuid, cn.uuid, instance.user_id, instance.project_id,
-            resources)
+            normalized_resources)
         if not res:
             if instance.instance_type_id == flavor.id:
                 operation = 'migration'
@@ -1296,7 +2311,6 @@ class ResourceTracker(object):
 
         orphan_uuids = vuuids - uuids
         orphans = [usage[uuid] for uuid in orphan_uuids]
-
         return orphans
 
     def _update_usage_from_orphans(self, orphans, nodename):
@@ -1307,10 +2321,12 @@ class ResourceTracker(object):
             LOG.warning("Detected running orphan instance: %(uuid)s "
                         "(consuming %(memory_mb)s MB memory)",
                         {'uuid': orphan['uuid'], 'memory_mb': memory_mb})
+            if CONF.adjust_actual_mem_usage:
+                continue
 
             # just record memory usage for the orphan
             usage = {'memory_mb': memory_mb}
-            self._update_usage(usage, nodename)
+            self._update_usage(usage, nodename, strict=False)
 
     def delete_allocation_for_shelve_offloaded_instance(self, instance):
         self.reportclient.delete_allocation_for_instance(instance.uuid)
@@ -1342,7 +2358,7 @@ class ResourceTracker(object):
         Accepts a dict or an Instance or Flavor object, and a set of updates.
         Converts the object to a dict and applies the updates.
 
-        :param object_or_dict: instance or flavor as an object or just a dict
+        param object_or_dict: instance or flavor as an object or just a dict
         :param updates: key-value pairs to update the passed object.
                         Currently only considers 'numa_topology', all other
                         keys are ignored.
@@ -1353,10 +2369,27 @@ class ResourceTracker(object):
         usage = {}
         if isinstance(object_or_dict, objects.Instance):
             usage = {'memory_mb': object_or_dict.flavor.memory_mb,
-                     'vcpus': object_or_dict.flavor.vcpus,
+                     # WRS: get vcpus from instance object directly so that
+                     # it reflects actual used vcpus after scaling
+                     'vcpus': object_or_dict.vcpus,
                      'root_gb': object_or_dict.flavor.root_gb,
                      'ephemeral_gb': object_or_dict.flavor.ephemeral_gb,
-                     'numa_topology': object_or_dict.numa_topology}
+                     'numa_topology': object_or_dict.numa_topology,
+                     'uuid': object_or_dict.uuid}
+            # WRS: need to add in flavor and system_metadata so we
+            # can properly normalize vcpu usage
+            usage['flavor'] = object_or_dict.flavor
+            if 'system_metadata' in object_or_dict:
+                usage['system_metadata'] = object_or_dict.system_metadata
+
+            for field in ['host', 'name', 'display_name', 'min_vcpus',
+                          'max_vcpus', 'instance_type_id', 'old_flavor',
+                          'new_flavor', 'vm_mode', 'task_state', 'vm_state',
+                          'power_state', 'launched_at', 'terminated_at']:
+                if hasattr(object_or_dict, field):
+                    usage[field] = getattr(object_or_dict, field)
+                else:
+                    usage[field] = None
         elif isinstance(object_or_dict, objects.Flavor):
             usage = obj_base.obj_to_primitive(object_or_dict)
         else:
@@ -1366,3 +2399,73 @@ class ResourceTracker(object):
             if key in updates:
                 usage[key] = updates[key]
         return usage
+
+    def _adjust_actual_mem_usage(self, context, nodename):
+        """Adjust host numa topology view of pages 'used' when the actual free
+        pages available is less than what is resource tracked. This accounts
+        for orphans, excessive qemu overheads, and runaway platform resources.
+        """
+        cn = self.compute_nodes[nodename]
+
+        host_numa_topology, jsonify_result = \
+            hardware.host_topology_and_format_from_host(cn)
+        # NOTE(jgauld): We don't expect to return here on real hardware.
+        if host_numa_topology is None:
+            return
+        if not jsonify_result:
+            return
+
+        # Get dictionary of actual free memory pages per numa-cell, per-pgsize
+        actual_free_mempages = self.driver.get_actual_free_mempages()
+        # NOTE(jgauld): We don't expect to return here on real hardware.
+        if not actual_free_mempages:
+            return
+
+        update_numa_topology = False
+        for cell in host_numa_topology.cells:
+            mem = []
+            for mempage in cell.mempages:
+                try:
+                    actual_free = \
+                        actual_free_mempages[cell.id][mempage.size_kb]
+                except KeyError:
+                    actual_free = None
+                    LOG.error('Could not get actual_free_mempages: '
+                              'cellid=%(node)s, pgsize=%(size)s',
+                              {'node': cell.id,
+                               'size': mempage.size_kb})
+                if actual_free is not None:
+                    used_old, used_adjusted = mempage.adjust_used(actual_free)
+                    if used_old != used_adjusted:
+                        update_numa_topology = True
+                        adjust_MiB = mempage.size_kb * (used_adjusted -
+                                                        used_old) / units.Ki
+                        cn.memory_mb_used += adjust_MiB
+                        cn.free_ram_mb -= adjust_MiB
+
+                        unit = 'K'
+                        size = mempage.size_kb
+                        if ((mempage.size_kb >= units.Ki) and
+                            (mempage.size_kb < units.Mi)):
+                            unit = 'M'
+                            size = mempage.size_kb / units.Ki
+                        if mempage.size_kb >= units.Mi:
+                            unit = 'G'
+                            size = mempage.size_kb / units.Mi
+                        m = '%(sz)s%(U)s: %(old).0f MiB used, ' \
+                            '%(adj).0f MiB used adj, %(A).0f MiB avail adj' % \
+                            {'sz': size, 'U': unit,
+                             'old': mempage.size_kb * used_old / units.Ki,
+                             'adj': mempage.size_kb * mempage.used / units.Ki,
+                             'A': mempage.size_kb *
+                                  (mempage.total - mempage.used) / units.Ki,
+                            }
+                        mem.append(m)
+            if mem:
+                LOG.warning(
+                    'Numa node=%(node)d; Adjusted memory: '
+                    'per-pgsize: %(pgsize)s',
+                    {'node': cell.id, 'pgsize': '; '.join(mem)})
+
+        if update_numa_topology:
+            cn.numa_topology = host_numa_topology._to_json()

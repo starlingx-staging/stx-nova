@@ -12,10 +12,12 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2013-2017 Wind River Systems, Inc.
+#
 
 from oslo_log import log as logging
 
-from nova.i18n import _LW
 from nova.scheduler import filters
 from nova import servicegroup
 
@@ -40,10 +42,15 @@ class ComputeFilter(filters.BaseHostFilter):
             LOG.debug("%(host_state)s is disabled, reason: %(reason)s",
                       {'host_state': host_state,
                        'reason': service.get('disabled_reason')})
+            msg = ('host is disabled, reason: %(reason)s' %
+                   {'reason': service.get('disabled_reason')})
+            self.filter_reject(host_state, spec_obj, msg)
             return False
         else:
             if not self.servicegroup_api.service_is_up(service):
-                LOG.warning(_LW("%(host_state)s has not been heard from in a "
-                                "while"), {'host_state': host_state})
+                LOG.debug("%(host_state)s has not been heard from in a while",
+                          {'host_state': host_state})
+                msg = 'host has not been heard from in a while'
+                self.filter_reject(host_state, spec_obj, msg)
                 return False
         return True

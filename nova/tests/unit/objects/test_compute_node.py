@@ -91,6 +91,8 @@ fake_compute_node = {
     'ram_allocation_ratio': 1.5,
     'disk_allocation_ratio': 1.0,
     'mapped': 0,
+    'l3_closids': 16,
+    'l3_closids_used': 1,
     }
 # FIXME(sbauza) : For compatibility checking, to be removed once we are sure
 # that all computes are running latest DB version with host field in it.

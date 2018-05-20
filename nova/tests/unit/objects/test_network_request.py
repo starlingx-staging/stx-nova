@@ -11,6 +11,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2013-2017 Wind River Systems, Inc.
+#
 
 import mock
 
@@ -43,7 +46,7 @@ class _TestNetworkRequestObject(object):
                                          port_id=FAKE_UUID,
                                      )
         with mock.patch('nova.utils.is_neutron', return_value=True):
-            self.assertEqual(('123', '1.2.3.4', FAKE_UUID, None),
+            self.assertEqual(('123', '1.2.3.4', FAKE_UUID, None, None),
                              request.to_tuple())
 
     def test_to_tuple_nova(self):
@@ -56,7 +59,7 @@ class _TestNetworkRequestObject(object):
 
     def test_from_tuples_neutron(self):
         requests = objects.NetworkRequestList.from_tuples(
-            [('123', '1.2.3.4', FAKE_UUID, None)])
+            [('123', '1.2.3.4', FAKE_UUID, None, None)])
         self.assertEqual(1, len(requests))
         self.assertEqual('123', requests[0].network_id)
         self.assertEqual('1.2.3.4', str(requests[0].address))
@@ -77,7 +80,7 @@ class _TestNetworkRequestObject(object):
             objects=[objects.NetworkRequest(network_id='123'),
                      objects.NetworkRequest(network_id='456')])
         self.assertEqual(
-            [('123', None, None, None), ('456', None, None, None)],
+            [('123', None, None, None, None), ('456', None, None, None, None)],
              requests.as_tuples())
 
     def test_is_single_unspecified(self):

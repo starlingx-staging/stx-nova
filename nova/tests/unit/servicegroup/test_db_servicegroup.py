@@ -86,7 +86,7 @@ class DBServiceGroupTestCase(test.NoDBTestCase):
                                  service_ref=service_ref)
         fn = self.servicegroup_api._driver._report_state
         fn(service)
-        upd_mock.assert_called_once_with()
+        upd_mock.assert_called_once_with(wrs_rpc_timeout=30)
         self.assertEqual(11, service_ref.report_count)
         self.assertFalse(service.model_disconnected)
 

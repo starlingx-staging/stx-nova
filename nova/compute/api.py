@@ -15,6 +15,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2013-2017 Wind River Systems, Inc.
+#
 
 """Handles all requests relating to compute resources (e.g. guest VMs,
 networking and storage of VMs, and compute hosts on which they run)."""
@@ -71,6 +74,7 @@ from nova.objects import fields as fields_obj
 from nova.objects import keypair as keypair_obj
 from nova.objects import quotas as quotas_obj
 from nova.pci import request as pci_request
+from nova.pci import utils as pci_utils
 import nova.policy
 from nova import profiler
 from nova import rpc
@@ -80,6 +84,9 @@ from nova import servicegroup
 from nova import utils
 from nova.virt import hardware
 from nova.volume import cinder
+
+# WRS - network provider filter
+from nova import context as novacontext
 
 LOG = logging.getLogger(__name__)
 
@@ -850,6 +857,7 @@ class API(base.Base):
             'instance_type_id': instance_type['id'],
             'memory_mb': instance_type['memory_mb'],
             'vcpus': instance_type['vcpus'],
+            'max_vcpus': instance_type['vcpus'],
             'root_gb': instance_type['root_gb'],
             'ephemeral_gb': instance_type['ephemeral_gb'],
             'display_name': display_name,
@@ -867,6 +875,13 @@ class API(base.Base):
             'pci_requests': pci_request_info,
             'numa_topology': numa_topology,
             'system_metadata': system_metadata}
+
+        # Get min_vcpus from flavor if possible
+        try:
+            base_options['min_vcpus'] = \
+                instance_type['extra_specs']['hw:wrs:min_vcpus']
+        except KeyError:
+            base_options['min_vcpus'] = base_options['vcpus']
 
         options_from_image = self._inherit_properties_from_image(
                 boot_meta, auto_disk_config)
@@ -906,6 +921,8 @@ class API(base.Base):
                 # spec as this is how the conductor knows how many were in this
                 # batch.
                 req_spec.num_instances = num_instances
+                req_spec.min_num_instances = min_count
+                req_spec.display_name = base_options['display_name']
                 req_spec.create()
 
                 # Create an instance object, but do not store in db yet.
@@ -1066,7 +1083,9 @@ class API(base.Base):
         # Normalize and setup some parameters
         if reservation_id is None:
             reservation_id = utils.generate_uid('r')
-        security_groups = security_groups or ['default']
+        # WRS: DO NOT SET A DEFAULT SECURITY GROUP
+        # security_groups = security_groups or ['default']
+        security_groups = security_groups or []
         min_count = min_count or 1
         max_count = max_count or min_count
         block_device_mapping = block_device_mapping or []
@@ -1112,6 +1131,136 @@ class API(base.Base):
         self._checks_for_create_and_rebuild(context, image_id, boot_meta,
                 instance_type, metadata, injected_files,
                 block_device_mapping.root_bdm())
+
+        # WRS - provider physical network
+        if requested_networks:
+            if context.is_admin:
+                admin_context = context
+            else:
+                admin_context = novacontext.get_admin_context()
+            physkey = 'provider:physical_network'
+            hint = {physkey: set()}
+
+            hw_vif_model = None
+            properties = boot_meta.get('properties', {})
+            if properties:
+                hw_vif_model = properties.get('hw_vif_model')
+            if hw_vif_model is None:
+                hw_vif_model = CONF.default_vif_model
+            for ntwk in requested_networks:
+                network_uuid = ntwk.network_id
+                # WRS CGTS-3631
+                # If port_id specified but not network_uuid
+                # determine the network from the port to determine provider
+                # network info.
+                if ntwk.port_id is not None and network_uuid is None:
+                    # determine network_id from port_id
+                    try:
+                        port_info = self.network_api.show_port(admin_context,
+                                                               ntwk.port_id)
+                    except Exception as e:
+                        LOG.warning("Cannot get network from port (%r)", e)
+                        raise
+                    network_uuid = port_info['port']['network_id']
+                    vnic_type = port_info['port'].get('binding:vnic_type')
+                    port_vif_model = port_info['port'].get(
+                        'wrs-binding:vif_model'
+                    )
+
+                    # WRS: Validate vif_model if specified.
+                    if ((vnic_type ==
+                            network_model.VNIC_TYPE_DIRECT and
+                            ntwk.vif_model not in [None,
+                                  network_model.VIF_MODEL_PCI_SRIOV]) or
+                        (vnic_type ==
+                            network_model.VNIC_TYPE_DIRECT_PHYSICAL and
+                            ntwk.vif_model not in [None,
+                                  network_model.VIF_MODEL_PCI_PASSTHROUGH]) or
+                        (vnic_type ==
+                            network_model.VNIC_TYPE_NORMAL and
+                            ntwk.vif_model in
+                                [network_model.VIF_MODEL_PCI_SRIOV,
+                                 network_model.VIF_MODEL_PCI_PASSTHROUGH])):
+                        msg = (_("Invalid vif_model %(vif_model)s for "
+                                 "vnic type %(vnic_type)s.") %
+                               {'vif_model': ntwk.vif_model,
+                                'vnic_type': vnic_type})
+                        raise exception.InvalidInput(reason=msg)
+
+                    # WRS: Change vif-model to 'pci-sriov' for ports that
+                    # are directly created with neutron ('neutron
+                    # port-create') with 'binding:vnic_type direct'.
+                    # The compute API will set the vif_model to
+                    # CONF.default_vif_model (default is virtio) if it's
+                    # not specified.
+                    if (vnic_type ==
+                            network_model.VNIC_TYPE_DIRECT):
+                        ntwk.vif_model = \
+                            network_model.VIF_MODEL_PCI_SRIOV
+                    if (vnic_type ==
+                            network_model.VNIC_TYPE_DIRECT_PHYSICAL):
+                        ntwk.vif_model = \
+                            network_model.VIF_MODEL_PCI_PASSTHROUGH
+
+                    # WRS: use vif_model set on port if none specified
+                    # for network.
+                    if port_vif_model and not ntwk.vif_model:
+                        ntwk.vif_model = port_vif_model
+
+                if ntwk.vif_model is None:
+                    ntwk.vif_model = hw_vif_model
+
+                vif_model = ntwk.vif_model
+                try:
+                    network_info = self.network_api.get_dict(admin_context,
+                                                             network_uuid)
+                    physnet = network_info.get(physkey, None)
+                    # Only set provider network scheduler hint
+                    # if interface is virtual.
+                    # PCI passthrough devices will be filtered
+                    # based on the PCI requests.
+                    if pci_utils.vif_model_pci_passthrough(vif_model):
+                        # If a port is specified, PCI requests are already
+                        # created for network requests in
+                        # create_pci_requests_for_sriov_ports().
+                        if not ntwk.port_id:
+                            if vif_model == network_model.VIF_MODEL_PCI_SRIOV:
+                                request = objects.InstancePCIRequest(
+                                    count=1,
+                                    spec=[{pci_request.PCI_NET_TAG: physnet,
+                                           'dev_type': 'type-VF'}],
+                                    alias_name=None,
+                                    request_id=uuidutils.generate_uuid())
+                            elif (vif_model ==
+                                    network_model.VIF_MODEL_PCI_PASSTHROUGH):
+                                request = objects.InstancePCIRequest(
+                                    count=1,
+                                    spec=[{pci_request.PCI_NET_TAG: physnet,
+                                          'dev_type': 'type-PF'}],
+                                    alias_name=None,
+                                    request_id=uuidutils.generate_uuid())
+                            else:
+                                msg = _('Invalid vif-model %s.') % vif_model
+                                raise exception.InvalidInput(reason=msg)
+
+                            requests = base_options.get('pci_requests')
+                            requests.requests.append(request)
+                            ntwk.pci_request_id = request.request_id
+                    else:
+                        if physnet is not None:
+                            hint[physkey].update([physnet])
+                except Exception as err:
+                    LOG.warning("Cannot get %(physkey)r "
+                                "from network=%(network_uuid)r, "
+                                "error=%(err)r",
+                                {'physkey': physkey,
+                                 'network_uuid': network_uuid,
+                                 'err': err})
+            if len(hint[physkey]) > 0:
+                scheduler_hints = \
+                      filter_properties.get('scheduler_hints') or {}
+                scheduler_hints.update({physkey: list(hint[physkey])})
+                filter_properties['scheduler_hints'] = scheduler_hints
 
         instance_group = self._get_requested_instance_group(context,
                                    filter_properties)
@@ -1349,6 +1498,13 @@ class API(base.Base):
                         volume = self._check_attach(context, volume_id,
                                                     instance)
                     bdm.volume_size = volume.get('size')
+
+                    # NOTE(mnaser): If we end up reserving the volume, it will
+                    #               not have an attachment_id which is needed
+                    #               for cleanups.  This can be removed once
+                    #               all calls to reserve_volume are gone.
+                    if 'attachment_id' not in bdm:
+                        bdm.attachment_id = None
                 except (exception.CinderConnectionFailed,
                         exception.InvalidVolume):
                     raise
@@ -1777,6 +1933,11 @@ class API(base.Base):
             # instance is now in a cell and the delete needs to proceed
             # normally.
             return False
+
+        # We need to detach from any volumes so they aren't orphaned.
+        self._local_cleanup_bdm_volumes(
+            build_req.block_device_mappings, instance, context)
+
         return True
 
     def _delete(self, context, instance, delete_type, cb, **instance_attrs):
@@ -1785,12 +1946,12 @@ class API(base.Base):
             return
 
         cell = None
-        # If there is an instance.host (or the instance is shelved-offloaded),
-        # the instance has been scheduled and sent to a cell/compute which
-        # means it was pulled from the cell db.
+        # If there is an instance.host (or the instance is shelved-offloaded or
+        # in error state), the instance has been scheduled and sent to a
+        # cell/compute which means it was pulled from the cell db.
         # Normal delete should be attempted.
-        if not (instance.host or
-                instance.vm_state == vm_states.SHELVED_OFFLOADED):
+        may_have_ports_or_volumes = self._may_have_ports_or_volumes(instance)
+        if not instance.host and not may_have_ports_or_volumes:
             try:
                 if self._delete_while_booting(context, instance):
                     return
@@ -1827,6 +1988,23 @@ class API(base.Base):
                 if not instance:
                     # Instance is already deleted
                     return
+
+        # WRS: if this instance is in the middle of a resize/migrate, we can't
+        # safely delete it.  (Theoretically we could fix the
+        # _confirm_resize_on_deleting() code to handle this case but it'd
+        # be more risky and more work to validate.
+        if instance.task_state in (task_states.RESIZE_PREP,
+                                   task_states.RESIZE_MIGRATING,
+                                   task_states.RESIZE_MIGRATED,
+                                   task_states.RESIZE_FINISH):
+            LOG.warning("Unable to delete instance since a "
+                        "resize/migration  is in progress",
+                        instance=instance)
+            raise exception.InstanceInvalidState(
+                    instance_uuid = instance.uuid,
+                    attr = 'task_state',
+                    state = instance.task_state,
+                    method = 'delete')
 
         bdms = objects.BlockDeviceMappingList.get_by_instance_uuid(
                 context, instance.uuid)
@@ -1869,9 +2047,7 @@ class API(base.Base):
                 # which will cause a cast to the child cell.
                 cb(context, instance, bdms)
                 return
-            shelved_offloaded = (instance.vm_state
-                                 == vm_states.SHELVED_OFFLOADED)
-            if not instance.host and not shelved_offloaded:
+            if not instance.host and not may_have_ports_or_volumes:
                 try:
                     compute_utils.notify_about_instance_usage(
                             self.notifier, context, instance,
@@ -1886,7 +2062,12 @@ class API(base.Base):
                              {'state': instance.vm_state},
                               instance=instance)
                     return
-                except exception.ObjectActionError:
+                except exception.ObjectActionError as ex:
+                    # The instance's host likely changed under us as
+                    # this instance could be building and has since been
+                    # scheduled. Continue with attempts to delete it.
+                    LOG.debug('Refreshing instance because: %s', ex,
+                              instance=instance)
                     instance.refresh()
 
             if instance.vm_state == vm_states.RESIZED:
@@ -1894,7 +2075,8 @@ class API(base.Base):
 
             is_local_delete = True
             try:
-                if not shelved_offloaded:
+                # instance.host must be set in order to look up the service.
+                if instance.host is not None:
                     service = objects.Service.get_by_compute_host(
                         context.elevated(), instance.host)
                     is_local_delete = not self.servicegroup_api.service_is_up(
@@ -1911,7 +2093,9 @@ class API(base.Base):
 
                     cb(context, instance, bdms)
             except exception.ComputeHostNotFound:
-                pass
+                LOG.debug('Compute host %s not found during service up check, '
+                          'going to local delete instance', instance.host,
+                          instance=instance)
 
             if is_local_delete:
                 # If instance is in shelved_offloaded state or compute node
@@ -1937,6 +2121,16 @@ class API(base.Base):
         except exception.InstanceNotFound:
             # NOTE(comstud): Race condition. Instance already gone.
             pass
+
+    def _may_have_ports_or_volumes(self, instance):
+        # NOTE(melwitt): When an instance build fails in the compute manager,
+        # the instance host and node are set to None and the vm_state is set
+        # to ERROR. In the case, the instance with host = None has actually
+        # been scheduled and may have ports and/or volumes allocated on the
+        # compute node.
+        if instance.vm_state in (vm_states.SHELVED_OFFLOADED, vm_states.ERROR):
+            return True
+        return False
 
     def _confirm_resize_on_deleting(self, context, instance):
         # If in the middle of a resize, use confirm_resize to
@@ -1993,6 +2187,14 @@ class API(base.Base):
                           'the instance host %(instance_host)s.',
                           {'connector_host': connector.get('host'),
                            'instance_host': instance.host}, instance=instance)
+                if (instance.host is None and
+                        self._may_have_ports_or_volumes(instance)):
+                    LOG.debug('Allowing use of stashed volume connector with '
+                              'instance host None because instance with '
+                              'vm_state %(vm_state)s has been scheduled in '
+                              'the past.', {'vm_state': instance.vm_state},
+                              instance=instance)
+                    return connector
 
     def _local_cleanup_bdm_volumes(self, bdms, instance, context):
         """The method deletes the bdm records and, if a bdm is a volume, call
@@ -2027,7 +2229,12 @@ class API(base.Base):
                 except Exception as exc:
                     LOG.warning("Ignoring volume cleanup failure due to %s",
                                 exc, instance=instance)
-            bdm.destroy()
+            # If we're cleaning up volumes from an instance that wasn't yet
+            # created in a cell, i.e. the user deleted the server while
+            # the BuildRequest still existed, then the BDM doesn't actually
+            # exist in the DB to destroy it.
+            if 'id' in bdm:
+                bdm.destroy()
 
     def _local_delete(self, context, instance, bdms, delete_type, cb):
         if instance.vm_state == vm_states.SHELVED_OFFLOADED:
@@ -2374,19 +2581,24 @@ class API(base.Base):
         # [sorted instances with no host] + [sorted instances with host].
         # This means BuildRequest and cell0 instances first, then cell
         # instances
-        try:
-            build_requests = objects.BuildRequestList.get_by_filters(
-                context, filters, limit=limit, marker=marker,
-                sort_keys=sort_keys, sort_dirs=sort_dirs)
-            # If we found the marker in we need to set it to None
-            # so we don't expect to find it in the cells below.
-            marker = None
-        except exception.MarkerNotFound:
-            # If we didn't find the marker in the build requests then keep
-            # looking for it in the cells.
-            build_requests = objects.BuildRequestList()
-        build_req_instances = objects.InstanceList(
-            objects=[build_req.instance for build_req in build_requests])
+
+        # WRS: GTS-7372 Remove buildrequests from api get_all queries
+        #      to fix pagination
+        # try:
+        #     build_requests = objects.BuildRequestList.get_by_filters(
+        #         context, filters, limit=limit, marker=marker,
+        #         sort_keys=sort_keys, sort_dirs=sort_dirs)
+        #     # If we found the marker in we need to set it to None
+        #     # so we don't expect to find it in the cells below.
+        #     marker = None
+        # except exception.MarkerNotFound:
+        #     # If we didn't find the marker in the build requests then keep
+        #     # looking for it in the cells.
+        #     build_requests = objects.BuildRequestList()
+        # build_req_instances = objects.InstanceList(
+        #     objects=[build_req.instance for build_req in build_requests])
+        build_req_instances = objects.InstanceList(objects=[])
+
         # Only subtract from limit if it is not None
         limit = (limit - len(build_req_instances)) if limit else limit
 
@@ -2917,6 +3129,7 @@ class API(base.Base):
         """Rebuild the given instance with the provided attributes."""
         files_to_inject = files_to_inject or []
         metadata = kwargs.get('metadata', {})
+        userdata = kwargs.get('userdata', None)
         preserve_ephemeral = kwargs.get('preserve_ephemeral', False)
         auto_disk_config = kwargs.get('auto_disk_config')
 
@@ -2929,7 +3142,8 @@ class API(base.Base):
         root_bdm = compute_utils.get_root_bdm(context, instance, bdms)
 
         # Check to see if the image is changing and we have a volume-backed
-        # server.
+        # server. The compute doesn't support changing the image in the
+        # root disk of a volume-backed server, so we need to just fail fast.
         is_volume_backed = compute_utils.is_volume_backed_instance(
             context, instance, bdms)
         if is_volume_backed:
@@ -2947,6 +3161,17 @@ class API(base.Base):
             volume = self.volume_api.get(context, root_bdm.volume_id)
             volume_image_metadata = volume.get('volume_image_metadata', {})
             orig_image_ref = volume_image_metadata.get('image_id')
+
+            if orig_image_ref != image_href:
+                # Leave a breadcrumb.
+                LOG.debug('Requested to rebuild instance with a new image %s '
+                          'for a volume-backed server with image %s in its '
+                          'root volume which is not supported.', image_href,
+                          orig_image_ref, instance=instance)
+                msg = _('Unable to rebuild with a different image for a '
+                        'volume-backed server.')
+                raise exception.ImageUnacceptable(
+                    image_id=image_href, reason=msg)
         else:
             orig_image_ref = instance.image_ref
 
@@ -2989,11 +3214,17 @@ class API(base.Base):
         instance.update(options_from_image)
 
         instance.task_state = task_states.REBUILDING
-        instance.image_ref = image_href
+        # An empty instance.image_ref is currently used as an indication
+        # of BFV.  Preserve that over a rebuild to not break users.
+        if not is_volume_backed:
+            instance.image_ref = image_href
         instance.kernel_id = kernel_id or ""
         instance.ramdisk_id = ramdisk_id or ""
         instance.progress = 0
         instance.update(kwargs)
+        if userdata is not None:
+            LOG.info("Updating the userdata")
+            instance.user_data = userdata
         instance.save(expected_task_state=[None])
 
         # On a rebuild, since we're potentially changing images, we need to
@@ -3125,8 +3356,20 @@ class API(base.Base):
         # a confirm resize is just a clean up of the migration objects and a
         # state change in compute.
         if migration is None:
-            migration = objects.Migration.get_by_instance_and_status(
-                elevated, instance.uuid, 'finished')
+            # Look for migrations in confirming state as well as finished to
+            # handle cases where the confirm did not complete (eg. because
+            # the compute node went away during the confirm).
+            for status in ('finished', 'confirming'):
+                try:
+                    migration = objects.Migration.get_by_instance_and_status(
+                        elevated, instance.uuid, status)
+                    break
+                except exception.MigrationNotFoundByStatus:
+                    pass
+
+            if migration is None:
+                raise exception.MigrationNotFoundByStatus(
+                    instance_id=instance.uuid, status='finished|confirming')
 
         migration.status = 'confirming'
         migration.save()
@@ -3182,11 +3425,17 @@ class API(base.Base):
         else:
             new_instance_type = flavors.get_flavor_by_flavor_id(
                     flavor_id, read_deleted="no")
-            if (new_instance_type.get('root_gb') == 0 and
-                current_instance_type.get('root_gb') != 0 and
+            if (new_instance_type.get('root_gb') <
+                current_instance_type.get('root_gb') and
                 not compute_utils.is_volume_backed_instance(context,
                     instance)):
-                reason = _('Resize to zero disk flavor is not allowed.')
+                reason = _('Resize to smaller disk flavor is not allowed.')
+                raise exception.CannotResizeDisk(reason=reason)
+
+            if (new_instance_type.get('ephemeral_gb') <
+                    current_instance_type.get('ephemeral_gb')):
+                reason = _('Resize to smaller ephemeral flavor'
+                           ' is not allowed.')
                 raise exception.CannotResizeDisk(reason=reason)
 
         if not new_instance_type:
@@ -3217,6 +3466,31 @@ class API(base.Base):
                                          current_instance_type,
                                          new_instance_type)
 
+        # Various sanity checks for resizing scaled-down instances
+        if not same_instance_type and instance.numa_topology is not None:
+            new_min_vcpus = \
+                new_instance_type['extra_specs'].get('hw:wrs:min_vcpus')
+            if new_min_vcpus:
+                # The new flavor specifies min_vcpus, make sure we can
+                # satisfy it given that when resizing a scaled-down instance
+                # any cpus that are scaled down will stay scaled down.
+                # (Unless we resize down and they get removed.)
+                new_flavor_cpus = set(range(new_instance_type['vcpus']))
+                # This is a difference of sets, not normal subtraction.
+                new_online_cpus = (new_flavor_cpus -
+                                   instance.numa_topology.offline_cpus)
+                if len(new_online_cpus) < int(new_min_vcpus):
+                    reason = _("Unable to resize, wouldn't meet new min_vcpus."
+                               " Scale up and try again or adjust min_vcpus.")
+                    raise exception.ResizeError(reason=reason)
+            else:
+                # New flavor doesn't support CPU scaling, make sure we're not
+                # currently scaled-down.
+                if len(instance.numa_topology.offline_cpus) > 0:
+                    reason = _("Unable to resize to non-scalable flavor with "
+                               "scaled-down vCPUs.  Scale up and retry.")
+                    raise exception.ResizeError(reason=reason)
+
         instance.task_state = task_states.RESIZE_PREP
         instance.progress = 0
         instance.update(extra_instance_updates)
@@ -3224,7 +3498,11 @@ class API(base.Base):
 
         filter_properties = {'ignore_hosts': []}
 
-        if not CONF.allow_resize_to_same_host:
+        # WRS: exclude current host if migrate (no flavor_id)
+        # Upstream supports ability to migrate to same host depending on
+        # hypervisor. However since libvirt doesn't support this, we can save
+        # the overhead and just add it to ignore_hosts here.
+        if not CONF.allow_resize_to_same_host or not flavor_id:
             filter_properties['ignore_hosts'].append(instance.host)
 
         if self.cell_type == 'api':
@@ -3263,6 +3541,25 @@ class API(base.Base):
                 flavor=new_instance_type,
                 clean_shutdown=clean_shutdown,
                 request_spec=request_spec)
+
+    @check_instance_lock
+    @check_instance_cell
+    @check_instance_state(vm_state=[vm_states.ACTIVE], task_state=[None])
+    def scale(self, context, instance, resource, direction):
+        """Scale a running instance up or down.
+
+        This will dynamically add/remove resources (cpu only for now)
+        to/from a running instance.
+        """
+
+        if resource == 'cpu':
+            if ((direction == 'up' and instance.vcpus == instance.max_vcpus) or
+               (direction == 'down' and instance.vcpus == instance.min_vcpus)):
+                raise exception.CannotScaleBeyondLimits()
+
+        self._record_action_start(context, instance, instance_actions.SCALE)
+        self.compute_rpcapi.scale_instance(context, instance,
+                                           resource, direction)
 
     @check_instance_lock
     @check_instance_state(vm_state=[vm_states.ACTIVE, vm_states.STOPPED,
@@ -3817,11 +4114,11 @@ class API(base.Base):
                                     vm_states.STOPPED],
                           task_state=[None])
     def attach_interface(self, context, instance, network_id, port_id,
-                         requested_ip, tag=None):
+                         requested_ip, vif_model, tag=None):
         """Use hotplug to add an network adapter to an instance."""
         return self.compute_rpcapi.attach_interface(context,
             instance=instance, network_id=network_id, port_id=port_id,
-            requested_ip=requested_ip, tag=tag)
+            requested_ip=requested_ip, vif_model=vif_model, tag=tag)
 
     @check_instance_lock
     @check_instance_state(vm_state=[vm_states.ACTIVE, vm_states.PAUSED,
@@ -3917,9 +4214,19 @@ class API(base.Base):
             # to them, we need to support the old way
             request_spec = None
 
+        # WRS drop support for forced destinations to make sure we always go
+        # through scheduler
+        force = False
+
         # NOTE(sbauza): Force is a boolean by the new related API version
         if force is False and host_name:
-            nodes = objects.ComputeNodeList.get_all_by_host(context, host_name)
+            try:
+                nodes = objects.ComputeNodeList.get_all_by_host(context,
+                                                                host_name)
+            except exception.ComputeHostNotFound:
+                with excutils.save_and_reraise_exception():
+                    instance.task_state = None
+                    instance.save()
             # Unset the host to make sure we call the scheduler
             # from the conductor LiveMigrationTask. Yes this is tightly-coupled
             # to behavior in conductor and not great.
@@ -4092,7 +4399,7 @@ class API(base.Base):
                        new_pass=admin_password,
                        injected_files=None,
                        image_ref=None,
-                       orig_image_ref=None,
+                       orig_image_ref=instance.image_ref,
                        orig_sys_metadata=None,
                        bdms=None,
                        recreate=True,
@@ -4365,6 +4672,7 @@ class HostAPI(base.Base):
     def __init__(self, rpcapi=None):
         self.rpcapi = rpcapi or compute_rpcapi.ComputeAPI()
         self.servicegroup_api = servicegroup.API()
+        self.scheduler_client = scheduler_client.SchedulerClient()
         super(HostAPI, self).__init__()
 
     def _assert_host_exists(self, context, host_name, must_be_up=False):
@@ -4502,12 +4810,57 @@ class HostAPI(base.Base):
         return self._service_update(context, host_name, binary,
                                     params_to_update)
 
+    # WRS: extension
+    def service_create(self, context, host, binary):
+        """Create the specified binary on the specified host.  Currently
+         only used to force the creation of the nova-compute database
+         entry so that other stuff can find it.
+         """
+        if binary == 'nova-compute':
+            try:
+                compute_service = objects.Service(context)
+                # Set the fields like _create_service_ref() in nova/service.py
+                # but with the service disabled since it's not running.
+                compute_service.host = host
+                compute_service.binary = binary
+                compute_service.topic = 'compute'
+                compute_service.report_count = 0
+                compute_service.disabled = True
+                compute_service.create()
+            except (exception.ServiceBinaryExists,
+                    exception.ServiceTopicExists):
+                # Not an error if the service exists already.
+                pass
+
+            # host_mapping already exists for a host reinstall
+            try:
+                objects.HostMapping.get_by_host(context, host)
+            except exception.HostMappingNotFound:
+                LOG.info("Creating host mapping for compute host "
+                         "'%(host)s'", {'host': host})
+
+                cell_mappings = objects.CellMappingList.get_all(context)
+                for cm in cell_mappings:
+                    if not cm.is_cell0():
+                        host_mapping = objects.HostMapping(context, host=host,
+                                                           cell_mapping=cm)
+                        host_mapping.create()
+                        break
+
     def _service_delete(self, context, service_id):
         """Performs the actual Service deletion operation."""
         try:
             service = _find_service_in_cell(context, service_id=service_id)
         except exception.NotFound:
             raise exception.ServiceNotFound(service_id=service_id)
+        # WRS: if service is a compute, make sure resource provider and host
+        # mapping are deleted.
+        if hasattr(service, 'compute_node'):
+            self.scheduler_client.reportclient.delete_resource_provider(
+                              context, service.compute_node, cascade=True)
+            host_mapping = objects.HostMapping.get_by_host(context,
+                              service.compute_node.host)
+            host_mapping.destroy()
         service.destroy()
 
     def service_delete(self, context, service_id):

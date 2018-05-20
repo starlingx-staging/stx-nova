@@ -13,6 +13,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from oslo_log import log as logging
 from oslo_utils import strutils
 
 import six.moves.urllib.parse as urlparse
@@ -40,6 +41,7 @@ QUOTAS = quota.QUOTAS
 
 FILTERED_QUOTAS = ["fixed_ips", "floating_ips", "networks",
                    "security_group_rules", "security_groups"]
+LOG = logging.getLogger(__name__)
 
 
 class QuotaSetsController(wsgi.Controller):
@@ -106,6 +108,28 @@ class QuotaSetsController(wsgi.Controller):
             self._get_quotas(context, id, user_id=user_id),
             filtered_quotas=filtered_quotas)
 
+    @extensions.expected_errors(())
+    def index(self, req):
+        """Returns a list of modified quotas."""
+        context = req.environ['nova.context']
+        context.can(qs_policies.POLICY_ROOT % 'list')
+        user_quotas = QUOTAS.get_all_project_user_quotas(context)
+        quotas = QUOTAS.get_all_project_quotas(context)
+
+        # "quotas" is a dict where the keys are project IDs and the values are
+        # dicts of individual quotas.
+        result = {'project_quotas': [
+            {'project_id': project, 'quotas': quotas[project]}
+            for project in quotas]}
+        # "user_quotas" is a dict where the keys are project IDs and the
+        # values are dicts where the keys are user IDs and the values are
+        # dicts of individual quotas.
+        result['project_user_quotas'] = [
+            {'project_id': project, 'user_quotas': [
+                {'user_id': user, 'quotas': user_quotas[project][user]}
+                for user in user_quotas[project]]} for project in user_quotas]
+        return result
+
     @wsgi.Controller.api_version("2.1", MAX_PROXY_API_SUPPORT_VERSION)
     @extensions.expected_errors(400)
     def detail(self, req, id):
@@ -128,6 +152,7 @@ class QuotaSetsController(wsgi.Controller):
             filtered_quotas=filtered_quotas)
 
     @wsgi.Controller.api_version("2.1", MAX_PROXY_API_SUPPORT_VERSION)
+    @extensions.block_during_upgrade()
     @extensions.expected_errors(400)
     @validation.schema(quota_sets.update)
     def update(self, req, id, body):
@@ -188,8 +213,23 @@ class QuotaSetsController(wsgi.Controller):
                 objects.Quotas.create_limit(context, project_id,
                                             key, value, user_id=user_id)
             except exception.QuotaExists:
-                objects.Quotas.update_limit(context, project_id,
-                                            key, value, user_id=user_id)
+                try:
+                    objects.Quotas.update_limit(context, project_id,
+                                                key, value, user_id=user_id)
+                except exception.ProjectQuotaNotFound:
+                    # NOTE: When a race condition what DELETE this quota
+                    # just before this update_limit, this exception happens.
+                    # This is a super rare case on productions because there
+                    # are different guys(one is deleting its quota, the other
+                    # is updateing the same quota on the same project). It is
+                    # ok to ignore such exception here. see bug 1552622 for
+                    # more detail.
+                    LOG.debug('Possible race condition encountered when doing '
+                              'update for project:%(project_id)s, '
+                              'user:%(user_id)s, key:%(key)s',
+                              {'project_id': project_id,
+                               'user_id': user_id,
+                               'key': key})
         # Note(gmann): Removed 'id' from update's response to make it same
         # as V2. If needed it can be added with microversion.
         return self._format_quota_set(
@@ -219,6 +259,7 @@ class QuotaSetsController(wsgi.Controller):
     # TODO(oomichi): Here should be 204(No Content) instead of 202 by v2.1
     # +microversions because the resource quota-set has been deleted completely
     # when returning a response.
+    @extensions.block_during_upgrade()
     @extensions.expected_errors(())
     @wsgi.response(202)
     def delete(self, req, id):

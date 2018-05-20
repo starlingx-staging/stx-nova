@@ -130,6 +130,16 @@ class Quotas(base.NovaObject):
         return result
 
     @staticmethod
+    @db_api.api_context_manager.reader
+    def _get_all_project_quotas(context):
+        return context.session.query(api_models.Quota).all()
+
+    @staticmethod
+    @db_api.api_context_manager.reader
+    def _get_all_project_user_quotas(context):
+        return context.session.query(api_models.ProjectUserQuota).all()
+
+    @staticmethod
     @db_api.api_context_manager.writer
     def _destroy_all_in_db_by_project(context, project_id):
         per_project = context.session.query(api_models.Quota).\
@@ -457,6 +467,22 @@ class Quotas(base.NovaObject):
         for k, v in api_db_quotas_dict.items():
             main_db_quotas_dict[k] = v
         return main_db_quotas_dict
+
+    @classmethod
+    def get_all_project_quotas(cls, context):
+        api_db_quotas_dict = cls._get_all_project_quotas(context)
+        main_db_quotas_dict = db.quota_really_get_all(context)
+        # As of Pike we don't expect there to be any quota stuff
+        # in the main DB.
+        return main_db_quotas_dict + api_db_quotas_dict
+
+    @classmethod
+    def get_all_project_user_quotas(cls, context):
+        api_db_quotas_dict = cls._get_all_project_user_quotas(context)
+        main_db_quotas_dict = db.quota_user_really_get_all(context)
+        # As of Pike we don't expect there to be any quota stuff
+        # in the main DB.
+        return main_db_quotas_dict + api_db_quotas_dict
 
     @classmethod
     def destroy_all_by_project(cls, context, project_id):

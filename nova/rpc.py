@@ -365,6 +365,7 @@ class LegacyValidatingNotifier(object):
         'servergroup.addmember',
         'servergroup.create',
         'servergroup.delete',
+        'servergroup.update',
         'volume.usage',
     ]
 

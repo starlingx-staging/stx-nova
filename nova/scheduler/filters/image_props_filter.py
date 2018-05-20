@@ -14,6 +14,10 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2013-2017 Wind River Systems, Inc.
+#
+
 from distutils import versionpredicate
 
 from oslo_log import log as logging
@@ -42,7 +46,7 @@ class ImagePropertiesFilter(filters.BaseHostFilter):
     run_filter_once_per_request = True
 
     def _instance_supported(self, host_state, image_props,
-                            hypervisor_version):
+                            hypervisor_version, spec_obj):
         img_arch = image_props.get('hw_architecture')
         img_h_type = image_props.get('img_hv_type')
         img_vm_mode = image_props.get('hw_vm_mode')
@@ -64,6 +68,8 @@ class ImagePropertiesFilter(filters.BaseHostFilter):
                         "but no corresponding supported_instances are "
                         "advertised by the compute node",
                       {'image_props': image_props})
+            msg = 'No supported instances'
+            self.filter_reject(host_state, spec_obj, msg)
             return False
 
         def _compare_props(props, other_props):
@@ -93,6 +99,14 @@ class ImagePropertiesFilter(filters.BaseHostFilter):
                   {'image_props': image_props,
                    'supp_instances': supp_instances,
                    'hypervisor_version': hypervisor_version})
+        msg = ("Instance contains properties %(image_props)s "
+               "that are not provided by the compute node "
+               "supported_instances %(supp_instances)s or "
+               "hypervisor version %(hypervisor_version)s do not match" %
+               {'image_props': image_props,
+                'supp_instances': supp_instances,
+                'hypervisor_version': hypervisor_version})
+        self.filter_reject(host_state, spec_obj, msg)
         return False
 
     def host_passes(self, host_state, spec_obj):
@@ -104,7 +118,8 @@ class ImagePropertiesFilter(filters.BaseHostFilter):
         image_props = spec_obj.image.properties if spec_obj.image else {}
 
         if not self._instance_supported(host_state, image_props,
-                                        host_state.hypervisor_version):
+                                        host_state.hypervisor_version,
+                                        spec_obj):
             LOG.debug("%(host_state)s does not support requested "
                         "instance_properties", {'host_state': host_state})
             return False

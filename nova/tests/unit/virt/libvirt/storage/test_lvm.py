@@ -12,7 +12,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
-
+#
+# Copyright (c) 2016-2017 Wind River Systems, Inc.
+#
 import mock
 from oslo_concurrency import processutils
 from oslo_config import cfg
@@ -75,6 +77,16 @@ class LvmTestCase(test.NoDBTestCase):
         self.stub_out('nova.virt.libvirt.storage.lvm.get_volume_size',
                       fake_lvm_size)
         self.stub_out('nova.utils.execute', fake_execute)
+
+        # One test for thin volumes
+        CONF.set_override('thin_logical_volumes', True, 'libvirt')
+        executes = []
+        expected_commands = []
+        lvm.clear_volume('/dev/v1')
+        self.assertEqual(expected_commands, executes)
+
+        # Explicitly set fat volumes for the rest of the tests.
+        CONF.set_override('thin_logical_volumes', False, 'libvirt')
 
         # Test the correct dd commands are run for various sizes
         lvm_size = 1

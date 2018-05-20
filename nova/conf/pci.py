@@ -22,6 +22,7 @@ pci_group = cfg.OptGroup(
 
 pci_opts = [
     cfg.MultiStrOpt('alias',
+        mutable=True,
         default=[],
         deprecated_name='pci_alias',
         deprecated_group='DEFAULT',
@@ -81,6 +82,7 @@ Possible values:
     PCI devices have a name.
   * "<tag>": Additional <tag> and <tag_value> used for matching PCI devices.
     Supported <tag>: "physical_network".
+                     "class_id"
 
   The address key supports traditional glob style and regular expression
   syntax. Valid examples are:

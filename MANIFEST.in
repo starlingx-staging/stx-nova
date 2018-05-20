@@ -1,0 +1,21 @@
+include AUTHORS
+include babel.cfg
+include ChangeLog
+include CONTRIBUTING.rst
+include LICENSE
+include HACKING.rst
+include README.rst
+include openstack-common.conf
+include run_tests.sh
+include setup.cfg
+include setup.py
+include tox.ini
+include etc/*
+include httpd/*
+graft bin
+graft doc
+graft nova/tests
+graft tools
+graft examples
+recursive-include nova *.json *.xml *.cfg *.pem README *.po *.mo *.sql
+global-exclude *.pyc *.sdx *.log *.db *.swp nova/tests/tmp/*

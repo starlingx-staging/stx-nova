@@ -11,6 +11,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2013-2017 Wind River Systems, Inc.
+#
 
 import copy
 
@@ -21,6 +24,7 @@ from sqlalchemy.orm import contains_eager
 from sqlalchemy.orm import joinedload
 
 from nova.compute import utils as compute_utils
+from nova.compute import vm_states
 from nova import db
 from nova.db.sqlalchemy import api as db_api
 from nova.db.sqlalchemy import api_models
@@ -35,9 +39,11 @@ LAZY_LOAD_FIELDS = ['hosts']
 
 
 def _instance_group_get_query(context, id_field=None, id=None):
+    # WRS extension -- metadata
     query = context.session.query(api_models.InstanceGroup).\
             options(joinedload('_policies')).\
-            options(joinedload('_members'))
+            options(joinedload('_members')).\
+            options(joinedload('_metadata'))
     if not context.is_admin:
         query = query.filter_by(project_id=context.project_id)
     if id and id_field:
@@ -79,6 +85,41 @@ def _instance_group_policies_add(context, group, policies):
     return _instance_group_model_add(context, api_models.InstanceGroupPolicy,
                                      policies, query.all(), 'policy', group.id,
                                      append_to_models=group._policies)
+
+
+# WRS extension to update metadata.  Based on provided metadata, key/value
+# pairs will be added, updated or deleted.
+def _instance_group_metadata_add(context, group, metadata, update_group=False):
+    query = _instance_group_model_get_query(context,
+                                            api_models.InstanceGroupMetadata,
+                                            group.id)
+    metadata_new = []
+    already_existing_keys = set()
+    group_metadata = group._metadata
+    for meta_ref in query.all():
+        key = meta_ref.key
+        if key in metadata:
+            meta_ref['value'] = metadata[key]
+            already_existing_keys.add(key)
+            metadata_new.append(meta_ref)
+        else:
+            context.session.delete(meta_ref)
+            if update_group:
+                group_metadata.remove(meta_ref)
+
+    for key, value in metadata.items():
+        if key in already_existing_keys:
+            continue
+        meta_ref = api_models.InstanceGroupMetadata()
+        meta_ref.update({'key': key,
+                         'value': value,
+                         'group_id': id})
+        context.session.add(meta_ref)
+        if update_group:
+            group_metadata.append(meta_ref)
+        metadata_new.append(meta_ref)
+
+    return metadata_new
 
 
 def _instance_group_members_add(context, group, members):
@@ -134,6 +175,10 @@ class InstanceGroup(base.NovaPersistentObject, base.NovaObject,
         'name': fields.StringField(nullable=True),
 
         'policies': fields.ListOfStringsField(nullable=True),
+
+        # WRS:extension -- 'metadetails' is deprecated, but we still need it
+        'metadetails': fields.DictOfStringsField(nullable=True),
+
         'members': fields.ListOfStringsField(nullable=True),
         'hosts': fields.ListOfStringsField(nullable=True),
         }
@@ -221,6 +266,8 @@ class InstanceGroup(base.NovaPersistentObject, base.NovaObject,
         values_copy = copy.copy(values)
         policies = values_copy.pop('policies', None)
         members = values_copy.pop('members', None)
+        # WRS extension -- metadata
+        metadata = values_copy.pop('metadata', None)
 
         grp.update(values_copy)
 
@@ -228,12 +275,18 @@ class InstanceGroup(base.NovaPersistentObject, base.NovaObject,
             _instance_group_policies_add(context, grp, policies)
         if members is not None:
             _instance_group_members_add(context, grp, members)
+        # WRS extension -- metadata
+        if metadata is not None:
+            _instance_group_metadata_add(context, grp, metadata,
+                                         update_group=True)
 
         return grp
 
+    # WRS extension -- metadata
     @staticmethod
     @db_api.api_context_manager.writer
-    def _create_in_db(context, values, policies=None, members=None):
+    def _create_in_db(context, values, policies=None, members=None,
+                      metadata=None):
         try:
             group = api_models.InstanceGroup()
             group.update(values)
@@ -253,6 +306,12 @@ class InstanceGroup(base.NovaPersistentObject, base.NovaObject,
         else:
             group._members = []
 
+        if metadata:
+            group._metadata = _instance_group_metadata_add(context, group,
+                                                         metadata)
+        else:
+            group._metadata = []
+
         return group
 
     @staticmethod
@@ -267,6 +326,8 @@ class InstanceGroup(base.NovaPersistentObject, base.NovaObject,
         # Delete policies and members
         group_id = qry.first().id
         instance_models = [api_models.InstanceGroupPolicy,
+                           # WRS extension -- metadata
+                           api_models.InstanceGroupMetadata,
                            api_models.InstanceGroupMember]
         for model in instance_models:
             context.session.query(model).filter_by(group_id=group_id).delete()
@@ -364,6 +425,11 @@ class InstanceGroup(base.NovaPersistentObject, base.NovaObject,
         if not updates:
             return
 
+        # WRS:extension
+        if 'metadetails' in updates:
+            metadata = updates.pop('metadetails')
+            updates.update({'metadata': metadata})
+
         payload = dict(updates)
         payload['server_group_id'] = self.uuid
 
@@ -397,6 +463,8 @@ class InstanceGroup(base.NovaPersistentObject, base.NovaObject,
         updates.pop('id', None)
         policies = updates.pop('policies', None)
         members = updates.pop('members', None)
+        # WRS:extension -- metadetails
+        metadetails = updates.pop('metadetails', None)
 
         if 'uuid' not in updates:
             self.uuid = uuidutils.generate_uuid()
@@ -412,7 +480,9 @@ class InstanceGroup(base.NovaPersistentObject, base.NovaObject,
                 pass
         db_group = self._create_in_db(self._context, updates,
                                       policies=policies,
-                                      members=members)
+                                      members=members,
+                                      # WRS:extension -- metadetails
+                                      metadata=metadetails)
         self._from_db_object(self._context, self, db_group)
         payload['server_group_id'] = self.uuid
         compute_utils.notify_about_server_group_update(self._context,
@@ -474,6 +544,67 @@ class InstanceGroup(base.NovaPersistentObject, base.NovaObject,
         instances = objects.InstanceList.get_by_filters(self._context,
                                                         filters=filters)
         return len(instances)
+
+    # WRS:extension
+    @base.remotable
+    def get_older_member_hosts(self, instance_uuid):
+        """Get a list of hosts for older non-deleted instances in the group
+
+        This method allows you to get a list of the hosts where instances in
+        this group are currently running.  Two categories of instances are
+        considered: instances which were created before the specified instance
+        (based on db id), and instances with a more recent id, but are further
+        ahead in their task state transition.
+        """
+        filter_uuids = self.members
+        filters = {'uuid': filter_uuids, 'deleted': False}
+        instances = objects.InstanceList.get_by_filters(self._context,
+                                                        filters=filters)
+        # Determine the id of "instance_uuid"
+        instance_id = next(i.id for i in instances
+                                if i.uuid == instance_uuid)
+
+        return list(set([i.host for i in instances
+                                if i.host and (i.id < instance_id or
+                                (i.id > instance_id and
+                                 not (i.vm_state == vm_states.BUILDING
+                                      and i.task_state is None)))]))
+
+    # WRS:extension
+    @base.remotable
+    def count_members(self):
+        """Count the number of instances in a group.
+        This includes instances that:
+        - have launched
+        - are building (i.e.. not yet launched)
+        - never launched and are in error state
+        """
+        filter_uuids = self.members
+        filters = {'uuid': filter_uuids, 'deleted': False}
+        instances = objects.InstanceList.get_by_filters(self._context,
+                                                        filters=filters)
+        return len(instances)
+
+    # WRS:extension
+    @base.remotable
+    def get_members_launched(self, exclude=None):
+        """Get the instances in a group that have launched.
+
+        This includes all instances that:
+        - have launched
+        - are building (i.e.. not yet launched)
+
+        This excludes instances that never launched are are in error state.
+        """
+        filter_uuids = self.members
+        filters = {'uuid': filter_uuids, 'deleted': False}
+        instances = objects.InstanceList.get_by_filters(self._context,
+                                                        filters=filters)
+        members = []
+        {members.append(I.uuid) for I in instances if
+            I['vm_state'] == vm_states.BUILDING or
+            I['launched_at']}
+        return members
 
 
 @base.NovaObjectRegistry.register
@@ -556,6 +687,7 @@ class InstanceGroupList(base.ObjectListBase, base.NovaObject):
 def _get_main_instance_groups(context, limit):
     return context.session.query(main_models.InstanceGroup).\
         options(joinedload('_policies')).\
+        options(joinedload('_metadata')).\
         options(joinedload('_members')).\
         filter_by(deleted=0).\
         limit(limit).\
@@ -572,6 +704,7 @@ def migrate_instance_groups_to_api_db(context, count):
                                       uuid=db_group.uuid,
                                       name=db_group.name,
                                       policies=db_group.policies,
+                                      metadetails=db_group.metadetails,
                                       members=db_group.members)
         try:
             group._create(skipcheck=True)

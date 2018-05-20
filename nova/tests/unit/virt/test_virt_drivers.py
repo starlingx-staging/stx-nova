@@ -11,6 +11,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2016-2017 Wind River Systems, Inc.
+#
 
 import base64
 from collections import deque
@@ -27,7 +30,9 @@ from oslo_utils import importutils
 from oslo_utils import timeutils
 import six
 
+from nova.compute import cgcs_messaging
 from nova.compute import manager
+from nova.compute import power_state
 from nova.console import type as ctype
 from nova import context
 from nova import exception
@@ -67,6 +72,43 @@ def catch_notimplementederror(f):
     wrapped_func.__name__ = f.__name__
     wrapped_func.__doc__ = f.__doc__
     return wrapped_func
+
+
+def create_compute_node(values=None):
+    compute = {
+        "id": 1,
+        "service_id": 1,
+        "host": "fakehost",
+        "vcpus": 1,
+        "memory_mb": 1,
+        "local_gb": 1,
+        "vcpus_used": 1,
+        "memory_mb_used": 1,
+        "local_gb_used": 1,
+        "free_ram_mb": 1,
+        "free_disk_gb": 1,
+        "current_workload": 1,
+        "running_vms": 0,
+        "cpu_info": None,
+        "numa_topology": None,
+        "stats": '{"num_instances": "1"}',
+        "hypervisor_hostname": "fakenode",
+        'hypervisor_version': 1,
+        'hypervisor_type': 'fake-hyp',
+        'disk_available_least': None,
+        'host_ip': None,
+        'metrics': None,
+        'created_at': None,
+        'updated_at': None,
+        'deleted_at': None,
+        'deleted': False,
+        'disk_allocation_ratio': 1.0,
+        'cpu_allocation_ratio': 16.0,
+        'ram_allocation_ratio': 1.5,
+    }
+    if values:
+        compute.update(values)
+    return compute
 
 
 class _FakeDriverBackendTestCase(object):
@@ -136,7 +178,10 @@ class _FakeDriverBackendTestCase(object):
             pass
 
         def fake_detach_device_with_retry(_self, get_device_conf_func, device,
-                                          live, *args, **kwargs):
+                                          host, *args, **kwargs):
+            state = _self.get_power_state(host)
+            live = state in (power_state.RUNNING, power_state.PAUSED)
+
             # Still calling detach, but instead of returning function
             # that actually checks if device is gone from XML, just continue
             # because XML never gets updated in these tests
@@ -201,6 +246,11 @@ class VirtDriverLoaderTestCase(_FakeDriverBackendTestCase, test.TestCase):
         }
 
     def test_load_new_drivers(self):
+        def fake_do_setup(_self, compute_task_api):
+            pass
+
+        self.stubs.Set(cgcs_messaging.CGCSMessaging,
+                       '_do_setup', fake_do_setup)
         for cls, driver in self.new_drivers.items():
             self.flags(compute_driver=cls)
             # NOTE(sdague) the try block is to make it easier to debug a
@@ -240,6 +290,14 @@ class _VirtDriverTestCase(_FakeDriverBackendTestCase):
                        imagebackend.Image._get_driver_format)
         os_vif.initialize()
 
+        self.stubs.Set(objects.ComputeNode, 'get_by_host_and_nodename',
+                self._fake_compute_node_get_by_host_and_nodename)
+
+    def _fake_compute_node_get_by_host_and_nodename(self, ctx, host,
+                                                    nodename):
+        self.compute = create_compute_node()
+        return self.compute
+
     def _get_running_instance(self, obj=True):
         instance_ref = test_utils.get_test_instance(obj=obj)
         network_info = test_utils.get_test_network_info()
@@ -252,6 +310,18 @@ class _VirtDriverTestCase(_FakeDriverBackendTestCase):
 
     @catch_notimplementederror
     def test_init_host(self):
+        def fake_backend(self):
+            class FakeImage(imagebackend.Image):
+                def create_image(self, prepare_template, base,
+                                 size, *args, **kwargs):
+                    pass
+
+                def resize_image(self, size):
+                    pass
+            return FakeImage
+
+        self.stubs.Set(imagebackend.Backend, 'backend',
+                       fake_backend)
         self.connection.init_host('myhostname')
 
     @catch_notimplementederror
@@ -654,8 +724,17 @@ class _VirtDriverTestCase(_FakeDriverBackendTestCase):
         migrate_data = objects.LibvirtLiveMigrateData(
             migration=migration, bdms=[], block_migration=False,
             serial_listen_addr='127.0.0.1')
+
+        # WRS: Need to fake as _update_numa_xml now accesses migration_context
+        def fake_update_numa_xml(xml_doc, driver_interface, instance):
+            return xml_doc
+
+        self.stubs.Set(libvirt.migration, '_update_numa_xml',
+                       fake_update_numa_xml)
+
         self.connection.live_migration(self.ctxt, instance_ref, 'otherhost',
-                                       lambda *a: None, lambda *a: None,
+                                       lambda *a: None,
+                                       lambda *a, **kwargs: None,
                                        migrate_data=migrate_data)
 
     @catch_notimplementederror
@@ -673,7 +752,7 @@ class _VirtDriverTestCase(_FakeDriverBackendTestCase):
     def _check_available_resource_fields(self, host_status):
         keys = ['vcpus', 'memory_mb', 'local_gb', 'vcpus_used',
                 'memory_mb_used', 'hypervisor_type', 'hypervisor_version',
-                'hypervisor_hostname', 'cpu_info', 'disk_available_least',
+                'hypervisor_hostname', 'cpu_info',
                 'supported_instances']
         for key in keys:
             self.assertIn(key, host_status)

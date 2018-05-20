@@ -10,6 +10,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2013-2017 Wind River Systems, Inc.
+#
 
 """
 Client side of the compute RPC API.
@@ -328,6 +331,10 @@ class ComputeAPI(object):
         * 4.15 - Add tag argument to reserve_block_device_name()
         * 4.16 - Add tag argument to attach_interface()
         * 4.17 - Add new_attachment_id to swap_volume.
+        WRS: live migrate resource tracking was backported to R3 Mitaka so
+        we'll set this to 4.11
+        * 4.11 - Add migration and limits arguments to
+                 check_can_live_migrate_destination
     '''
 
     VERSION_ALIASES = {
@@ -423,9 +430,10 @@ class ComputeAPI(object):
                    instance=instance, network_id=network_id)
 
     def attach_interface(self, ctxt, instance, network_id, port_id,
-                         requested_ip, tag=None):
+                         requested_ip, vif_model=None, tag=None):
         kw = {'instance': instance, 'network_id': network_id,
               'port_id': port_id, 'requested_ip': requested_ip,
+              'vif_model': vif_model,
               'tag': tag}
         version = '4.16'
 
@@ -458,9 +466,29 @@ class ComputeAPI(object):
                    instance=instance, diff=diff)
 
     def check_can_live_migrate_destination(self, ctxt, instance, destination,
-                                           block_migration, disk_over_commit):
+                                           block_migration, disk_over_commit,
+                                           migration=None, limits=None):
+        # WRS: upstream proposed change has this set to 4.14, but we already
+        # backported a version of this to R3/Mitaka so the added parameters
+        # migration & limits are supported with 4.11.
         version = '4.11'
         client = self.router.client(ctxt)
+        kw = {'instance': instance,
+              'block_migration': block_migration,
+              'disk_over_commit': disk_over_commit,
+              'migration': migration,
+              'limits': limits}
+        if not client.can_send_version(version):
+            # WRS: would not expect to see this case as R3/Mitaka supports
+            # version 4.11
+            # NOTE(ndipanov): If we are talking to an older compute node that
+            # will not do the claim properly, we need to update the migration
+            # record in the conductor (that is to say - here)
+            if migration:
+                migration.dest_compute = destination
+                migration.save()
+            kw.pop('migration')
+            kw.pop('limits')
         if not client.can_send_version(version):
             # NOTE(eliqiao): This is a new feature that is only available
             # once all compute nodes support at least version 4.11.
@@ -471,12 +499,8 @@ class ComputeAPI(object):
                 raise exception.LiveMigrationWithOldNovaNotSupported()
             else:
                 version = '4.0'
-
         cctxt = client.prepare(server=destination, version=version)
-        result = cctxt.call(ctxt, 'check_can_live_migrate_destination',
-                            instance=instance,
-                            block_migration=block_migration,
-                            disk_over_commit=disk_over_commit)
+        result = cctxt.call(ctxt, 'check_can_live_migrate_destination', **kw)
         if isinstance(result, migrate_data_obj.LiveMigrateData):
             return result
         elif result:
@@ -724,8 +748,9 @@ class ComputeAPI(object):
     def post_live_migration_at_destination(self, ctxt, instance,
             block_migration, host):
         version = '4.0'
+        # CGTS-7010 - Increase RPC timeout to handle VMs with lots of VIFs
         cctxt = self.router.client(ctxt).prepare(
-                server=host, version=version)
+                server=host, version=version, timeout=120)
         return cctxt.call(ctxt, 'post_live_migration_at_destination',
             instance=instance, block_migration=block_migration)
 
@@ -738,7 +763,29 @@ class ComputeAPI(object):
             version = '4.0'
             if migrate_data:
                 migrate_data = migrate_data.to_legacy_dict()
-        cctxt = client.prepare(server=host, version=version)
+
+        # Base RPC timeout is 60 sec.  This is normally set in oslo.messaging
+        # which makes this kind of gross.
+        timeout = 60
+
+        # Regarding the following changes...upstream nova would rather see
+        # generic heartbeating for long-running call() operations added to
+        # oslo.messaging.
+
+        # WRS: CGTS-6633 increase RPC msg timeout from 1 minute to 5 minutes
+        # for block migration, in case glance image download takes too long at
+        # destination
+        if (migrate_data and 'block_migration' in migrate_data and
+                migrate_data.block_migration):
+            timeout = 300
+
+        # CGTS-8835: add a bit of time for each vif.  AIO labs are resource-
+        # constrained, have been observed to take 5sec per vif so we allow
+        # a little more than that.
+        num_vifs = len(instance.get_network_info())
+        timeout += num_vifs * 6
+
+        cctxt = client.prepare(server=host, version=version, timeout=timeout)
         result = cctxt.call(ctxt, 'pre_live_migration',
                             instance=instance,
                             block_migration=block_migration,
@@ -1097,6 +1144,17 @@ class ComputeAPI(object):
                    volume_id=volume_id, snapshot_id=snapshot_id,
                    delete_info=delete_info)
 
+    # WRS: add server group messaging, support Kilo compatible version
+    def send_server_group_msg(self, ctxt, host, instance_name_list, data):
+        """Forward the data to all the instances in the list."""
+        LOG.debug('Sending server group message to %s on host %s: %s',
+                  (str(instance_name_list), host, repr(data)))
+        version = '4.0'
+        cctxt = self.router.client(ctxt).prepare(
+                server=host, version=version)
+        cctxt.cast(ctxt, 'send_server_group_msg',
+                   instance_name_list=instance_name_list, data=data)
+
     def external_instance_event(self, ctxt, instances, events, host=None):
         instance = instances[0]
         cctxt = self.router.client(ctxt).prepare(
@@ -1122,6 +1180,13 @@ class ComputeAPI(object):
                 security_groups=security_groups,
                 block_device_mapping=block_device_mapping, node=node,
                 limits=limits)
+
+    def scale_instance(self, ctxt, instance, resource, direction):
+        version = '4.0'
+        cctxt = self.router.client(ctxt).prepare(
+                server=_compute_host(None, instance), version=version)
+        return cctxt.call(ctxt, 'scale_instance', instance=instance,
+                   resource=resource, direction=direction)
 
     def quiesce_instance(self, ctxt, instance):
         version = '4.0'

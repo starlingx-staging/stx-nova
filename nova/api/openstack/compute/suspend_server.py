@@ -11,6 +11,9 @@
 #   WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #   License for the specific language governing permissions and limitations
 #   under the License.
+#
+# Copyright (c) 2017 Wind River Systems, Inc.
+#
 
 from webob import exc
 
@@ -38,7 +41,8 @@ class SuspendServerController(wsgi.Controller):
             context.can(ss_policies.POLICY_ROOT % 'suspend',
                         target={'user_id': server.user_id,
                                 'project_id': server.project_id})
-            self.compute_api.suspend(context, server)
+            # WRS: suspend operation stubbed for pause
+            self.compute_api.pause(context, server)
         except exception.InstanceUnknownCell as e:
             raise exc.HTTPNotFound(explanation=e.format_message())
         except exception.InstanceIsLocked as e:
@@ -56,7 +60,8 @@ class SuspendServerController(wsgi.Controller):
         context.can(ss_policies.POLICY_ROOT % 'resume')
         server = common.get_instance(self.compute_api, context, id)
         try:
-            self.compute_api.resume(context, server)
+            # WRS: suspend operation stubbed for pause
+            self.compute_api.unpause(context, server)
         except exception.InstanceUnknownCell as e:
             raise exc.HTTPNotFound(explanation=e.format_message())
         except exception.InstanceIsLocked as e:

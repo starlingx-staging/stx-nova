@@ -121,6 +121,7 @@ class NetworkController(wsgi.Controller):
         return {'network': network_dict(context, network)}
 
     @wsgi.Controller.api_version("2.1", MAX_PROXY_API_SUPPORT_VERSION)
+    @extensions.block_during_upgrade()
     @wsgi.response(202)
     @extensions.expected_errors((404, 409))
     def delete(self, req, id):
@@ -136,6 +137,7 @@ class NetworkController(wsgi.Controller):
             raise exc.HTTPNotFound(explanation=msg)
 
     @wsgi.Controller.api_version("2.1", MAX_PROXY_API_SUPPORT_VERSION)
+    @extensions.block_during_upgrade()
     @extensions.expected_errors((400, 409, 501))
     @validation.schema(schema.create)
     def create(self, req, body):

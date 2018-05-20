@@ -13,6 +13,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2013-2017 Wind River Systems, Inc.
+#
 
 from oslo_log import log as logging
 
@@ -37,6 +40,8 @@ class ExactCoreFilter(filters.BaseHostFilter):
         if not host_state.vcpus_total:
             # Fail safe
             LOG.warning(_LW("VCPUs not set; assuming CPU collection broken"))
+            msg = "VCPUs not set; assuming CPU collection broken"
+            self.filter_reject(host_state, spec_obj, msg)
             return False
 
         required_vcpus = spec_obj.vcpus
@@ -49,6 +54,9 @@ class ExactCoreFilter(filters.BaseHostFilter):
                       {'host_state': host_state,
                        'requested_vcpus': required_vcpus,
                        'usable_vcpus': usable_vcpus})
+            msg = ('vcpus mismatch: req:%(req)s != usable:%(avail)s' %
+                   {'req': required_vcpus, 'avail': usable_vcpus})
+            self.filter_reject(host_state, spec_obj, msg)
             return False
 
         # NOTE(mgoddard): Setting the limit ensures that it is enforced in

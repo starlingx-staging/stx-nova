@@ -34,6 +34,7 @@ CONF = nova.conf.CONF
 
 def _fake_resources():
     resources = {
+        'hypervisor_type': 'fake',
         'memory_mb': 2048,
         'memory_mb_used': 0,
         'free_ram_mb': 2048,
@@ -41,7 +42,9 @@ def _fake_resources():
         'local_gb_used': 0,
         'free_disk_gb': 20,
         'vcpus': 2,
-        'vcpus_used': 0
+        'vcpus_used': 0,
+        'l3_closids': 16,
+        'l3_closids_used': 1,
     }
     return objects.ComputeNode(**resources)
 

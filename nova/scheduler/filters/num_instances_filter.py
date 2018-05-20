@@ -12,6 +12,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2013-2017 Wind River Systems, Inc.
+#
 
 from oslo_log import log as logging
 
@@ -43,6 +46,9 @@ class NumInstancesFilter(filters.BaseHostFilter):
                         "instances per host is set to %(max_instances)s",
                         {'host_state': host_state,
                          'max_instances': max_instances})
+            msg = ('Num instances:%(num)s, Max per host:%(max)s' %
+                   {'num': num_instances, 'max': max_instances})
+            self.filter_reject(host_state, spec_obj, msg)
         return passes
 
 

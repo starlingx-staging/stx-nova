@@ -15,6 +15,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2016-2017 Wind River Systems, Inc.
+#
 
 from oslo_config import cfg
 from oslo_log import log as logging
@@ -301,7 +304,8 @@ class API(base_api.NetworkAPI):
     # NOTE(danms): Here for neutron compatibility
     def allocate_port_for_instance(self, context, instance, port_id,
                                    network_id=None, requested_ip=None,
-                                   bind_host_id=None, tag=None):
+                                   bind_host_id=None, vif_model=None,
+                                   tag=None):
         raise NotImplementedError()
 
     # NOTE(danms): Here for neutron compatibility

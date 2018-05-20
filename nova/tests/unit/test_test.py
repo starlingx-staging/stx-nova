@@ -13,9 +13,13 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2016-2017 Wind River Systems, Inc.
+#
 
 """Tests for the testing base code."""
 
+import mock
 from oslo_log import log as logging
 import oslo_messaging as messaging
 import six
@@ -38,7 +42,9 @@ class IsolationTestCase(test.TestCase):
     of other tests should fail.
 
     """
-    def test_service_isolation(self):
+    # WRS: mock out server group messaging
+    @mock.patch('nova.compute.cgcs_messaging.CGCSMessaging._do_setup')
+    def test_service_isolation(self, mock_do_setup):
         self.useFixture(fixtures.ServiceFixture('compute'))
 
     def test_rpc_consumer_isolation(self):

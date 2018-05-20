@@ -14,6 +14,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2013-2017 Wind River Systems, Inc.
+#
 
 """Utilities and helper functions."""
 
@@ -23,6 +26,7 @@ import datetime
 import functools
 import hashlib
 import inspect
+import math
 import os
 import pyclbr
 import random
@@ -35,6 +39,7 @@ import tempfile
 import time
 
 import eventlet
+from itertools import groupby
 import netaddr
 from oslo_concurrency import lockutils
 from oslo_concurrency import processutils
@@ -55,6 +60,7 @@ import nova.conf
 from nova import exception
 from nova.i18n import _, _LE, _LI, _LW
 import nova.network
+from nova import objects
 from nova import safe_utils
 
 profiler = importutils.try_import('osprofiler.profiler')
@@ -74,6 +80,9 @@ TIME_UNITS = {
 
 
 _IS_NEUTRON = None
+_IS_LOWLATENCY = None
+
+PLATFORM_CONF = "/etc/platform/platform.conf"
 
 synchronized = lockutils.synchronized_with_prefix('nova-')
 
@@ -98,6 +107,226 @@ VIM_IMAGE_ATTRIBUTES = (
 )
 
 _FILE_CACHE = {}
+
+# WRS: used to enforce a limit on disk-IO-intensive operations
+# (image downloads, image conversions) at any given time.
+disk_op_sema = None
+
+
+# WRS:extension
+def list_to_range(input_list=None):
+    """Convert a list into a string of comma separate ranges.
+       E.g.,  [1,2,3,8,9,15] is converted to '1-3,8-9,15'
+    """
+    if input_list is None:
+        return ''
+    if len(input_list) < 3:
+        return ','.join(str(x) for x in input_list)
+    else:
+        G = (list(x) for _, x in groupby(enumerate(input_list),
+                                         lambda (i, x): i - x))
+        return ','.join(
+            '-'.join(map(str, (g[0][1], g[-1][1])[:len(g)])) for g in G)
+
+
+# WRS:extension
+def range_to_list(csv_range=None):
+    """Convert a string of comma separate ranges into an expanded list of
+       integers.  E.g., '1-3,8-9,15' is converted to [1,2,3,8,9,15]
+    """
+    if not csv_range:
+        return []
+    ranges = [(lambda L: range(L[0], L[-1] + 1))(map(int, r.split('-')))
+               for r in csv_range.split(',')]
+    return [y for x in ranges for y in x]
+
+
+# WRS:extension
+def format_instance_numa_topology(numa_topology=None, instance=None,
+                                  delim='\n'):
+    """Returns True if the instance is in one of the resizing states.
+
+    :param numa_topology: `nova.objects.InstanceNUMATopology` object
+    :param instance: `nova.objects.Instance` object
+    :param delim: string delimiter between Numa Cells
+    """
+    if numa_topology is None:
+        return ''
+
+    sz_1M = 1024
+    sz_1G = 1024 * 1024
+
+    # Create a summary line per numa cell. Print known information only.
+    topology = []
+    for cell in numa_topology.cells:
+        cell_str = 'node:%s' % (cell.id)
+
+        if cell.memory > 0:
+            cell_str += ', %5dMB' % (cell.memory)
+
+        if cell.pagesize <= 0:
+            cell.pagesize = 4  # assume 4K pages
+        if cell.pagesize > 0 and cell.pagesize < sz_1M:
+            cell_str += ', pgsize:%sK' % (cell.pagesize)
+        if cell.pagesize >= sz_1M and cell.pagesize < sz_1G:
+            cell_str += ', pgsize:%sM' % (int(cell.pagesize / sz_1M))
+        if cell.pagesize >= sz_1G:
+            cell_str += ', pgsize:%sG' % (int(cell.pagesize / sz_1G))
+
+        try:
+            sockets = cell.cpu_topology.sockets
+            cores = cell.cpu_topology.cores
+            threads = cell.cpu_topology.threads
+            cell_str += (', %(S)ss,%(C)sc,%(T)st' %
+                         {'S': sockets, 'C': cores, 'T': threads}
+                         )
+        except Exception as ex:
+            if cell.cpu_topology is not None:
+                LOG.error(_LE('cannot get cell.cpu_topology field, '
+                              'error = %(err)s'), {'err': ex})
+
+        if len(cell.cpuset) > 0:
+            cpuset = list_to_range(list(cell.cpuset))
+        else:
+            cpuset = '-'
+
+        try:
+            if cell.cpu_pinning:
+                vcpus = cell.cpu_pinning.keys() or []
+                pinned = cell.cpu_pinning.values() or []
+                if vcpus:
+                    cell_str += ', vcpus:%s' % (
+                        list_to_range(vcpus)
+                    )
+                if pinned:
+                    cell_str += ', pcpus:%s' % (
+                        list_to_range(pinned)
+                    )
+            else:
+                if instance is not None and instance['launched_at'] is None:
+                    cell_str += ', vcpus:%s, unallocated' % (cpuset)
+                else:
+                    cell_str += ', vcpus:%s' % (cpuset)
+        except Exception:
+            cell_str += ', vcpus:%s' % (cpuset)
+
+        try:
+            if cell.shared_vcpu is not None:
+                cell_str += ', shared_pcpu:%s' \
+                            % (cell.shared_pcpu_for_vcpu)
+        except Exception:
+            pass
+
+        if len(cell.siblings) > 0:
+            cell_str += ', siblings:%s' % (
+                ','.join('{' + list_to_range(list(S)) + '}'
+                         for S in cell.siblings)
+            )
+
+        try:
+            if cell.cpu_policy is not None:
+                cell_str += ', pol:%s' % (cell.cpu_policy[:3])
+                try:
+                    if cell.cpu_thread_policy is not None:
+                        cell_str += ', thr:%s' % (
+                            cell.cpu_thread_policy[:3])
+                    else:
+                        # None and 'prefer' have same behaviour in Mitaka.
+                        cell_str += ', thr:pre'
+                except Exception:
+                    pass
+            else:
+                cell_str += ', pol:sha'
+        except Exception:
+            pass
+
+        # L3 CAT Support
+        if cell.l3_cpuset is not None:
+            if len(cell.l3_cpuset) > 0:
+                cell_str += ', CAT:vcpus:%s' % (
+                    list_to_range(list(cell.l3_cpuset)))
+        if cell.l3_both_size is not None:
+            cell_str += ', both:%sK' % (cell.l3_both_size)
+        if cell.l3_code_size is not None:
+            cell_str += ', code:%sK' % (cell.l3_code_size)
+        if cell.l3_data_size is not None:
+            cell_str += ', data:%sK' % (cell.l3_data_size)
+
+        topology.append(cell_str)
+
+    return '%s' % (delim.join(topology))
+
+
+def roundup(x, base):
+    """Mathematically roundup 'x' to next multiple of 'base'
+
+    :param x: input value (float, or integer)
+    :param base: integer multiple
+    :return: integer rounded up value
+    """
+    return int(math.ceil(x / float(base))) * int(base)
+
+
+# WRS - helper functions to initialize details dictionary
+_DETAILS_INIT = 'Uninitialized'
+
+
+def details_initialize(details=None):
+    if details is None:
+        details = {'reason': [_DETAILS_INIT]}
+    return details
+
+
+# WRS - helper functions to append to details dictionary
+def details_append(details, message):
+    if details is None:
+        details = {'reason': []}
+    if details['reason']:
+        first = details['reason'].pop(0)
+        if first != _DETAILS_INIT:
+            details['reason'].insert(0, first)
+    details['reason'].append(message)
+    return details
+
+
+# WRS - append filter rejection message to RequestSpec object
+def filter_reject(classname, host_obj, spec_obj, description, append=False):
+    if isinstance(spec_obj, objects.RequestSpec):
+        # get the rejection map from the object
+        if spec_obj.obj_attr_is_set('reject_map'):
+            reject_map = spec_obj.reject_map
+        else:
+            spec_obj.reject_map = {}
+            reject_map = spec_obj.reject_map
+    else:
+        # no persistent error messages
+        return
+
+    if hasattr(host_obj, 'nodename'):
+        nodename = str(host_obj.nodename)
+    else:
+        nodename = ''
+
+    if (not append) or (nodename not in reject_map):
+        reject_map[nodename] = []
+
+    if isinstance(description, str) or isinstance(description, unicode):
+        desc = description
+    elif isinstance(description, list):
+        desc = ', '.join(description)
+    else:
+        LOG.error('Invalid filter_reject message = %(msg)r, type = %(typ)s',
+                  {'msg': description, 'typ': type(description)})
+        desc = 'unknown'
+    rmsg = ('(%(class)s) %(desc)s' %
+            {'class': classname,
+             'desc': desc})
+    lmsg = ('%(class)s: (%(node)s) REJECT: %(desc)s' %
+            {'class': classname,
+             'node': nodename,
+             'desc': desc})
+    reject_map[nodename].append(rmsg)
+    LOG.info(lmsg)
 
 
 def vpn_ping(address, port, timeout=0.05, session_id=None):
@@ -542,6 +771,17 @@ def safe_ip_format(ip):
         if netaddr.IPAddress(ip).version == 6:
             return '[%s]' % ip
     except (TypeError, netaddr.AddrFormatError):  # hostname
+        # In TiC, we set up ssh keys for passwordless ssh between
+        # computes. If we have an infra interface present, the keys
+        # will be associated with that interface rather than the
+        # mgmt interface. We also always provide hostname
+        # resolution for the mgmt interface (compute-n) and the
+        # infra interface (compute-n-infra) irrespective of the
+        # infra interface actually being provisioned. By ensuring
+        # that we use the infra interface hostname we guarantee we
+        # will align with the ssh keys.
+        if '-infra' not in ip:
+            return '%s-infra' % ip
         pass
     # it's IPv4 or hostname
     return ip
@@ -1051,6 +1291,29 @@ def is_neutron():
     return _IS_NEUTRON
 
 
+def is_host_lowlatency():
+    global _IS_LOWLATENCY
+
+    if _IS_LOWLATENCY is not None:
+        return _IS_LOWLATENCY
+
+    _IS_LOWLATENCY = _get_host_lowlatency_info()
+    return _IS_LOWLATENCY
+
+
+def _get_host_lowlatency_info():
+    try:
+        with open(PLATFORM_CONF) as f:
+            for line in f:
+                if 'subfunction' in line:
+                    return 'lowlatency' in line
+
+    except IOError as e:
+        LOG.error('Cannot open: %(file)s, error = %(err)s',
+                  {'file': PLATFORM_CONF, 'err': e})
+    return False
+
+
 def is_auto_disk_config_disabled(auto_disk_config_raw):
     auto_disk_config_disabled = False
     if auto_disk_config_raw is not None:
@@ -1417,3 +1680,20 @@ def validate_args(fn, *args, **kwargs):
     missing = [arg for arg in required_args if arg not in kwargs]
     missing = missing[len(args):]
     return missing
+
+
+# WRS: Hybrid hypervisor support (eg, libvirt + baremetal)
+def is_libvirt_compute(host_state):
+    """Tests that hypervisor requires backing by libvirt driver.
+
+    Returns True if host_state requires backing by libvirt driver.
+    """
+    if host_state.hypervisor_type is None:
+        return False
+    return host_state.hypervisor_type.lower() in objects.fields.HVType.LIBVIRT
+
+
+def is_ironic_compute(host_state):
+    if host_state.hypervisor_type is None:
+        return False
+    return host_state.hypervisor_type == objects.fields.HVType.IRONIC

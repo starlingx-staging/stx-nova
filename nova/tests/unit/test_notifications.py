@@ -12,6 +12,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2013-2017 Wind River Systems, Inc.
+#
 
 """Tests for common notifications."""
 
@@ -630,8 +633,10 @@ class NotificationsTestCase(test.TestCase):
 class NotificationsFormatTestCase(test.NoDBTestCase):
 
     def test_state_computation(self):
+        # WRS: add power_state
         instance = {'vm_state': mock.sentinel.vm_state,
-                    'task_state': mock.sentinel.task_state}
+                    'task_state': mock.sentinel.task_state,
+                    'power_state': None}
         states = notifications._compute_states_payload(instance)
         self.assertEqual(mock.sentinel.vm_state, states['state'])
         self.assertEqual(mock.sentinel.vm_state, states['old_state'])

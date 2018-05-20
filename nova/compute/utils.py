@@ -11,6 +11,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2013-2017 Wind River Systems, Inc.
+#
 
 """Compute-related Utilities and helpers."""
 
@@ -24,9 +27,11 @@ import traceback
 
 import netifaces
 from oslo_log import log
+from oslo_utils import encodeutils
 import six
 
 from nova import block_device
+from nova.compute import cgcs_messaging
 from nova.compute import power_state
 from nova.compute import task_states
 import nova.conf
@@ -48,13 +53,16 @@ CONF = nova.conf.CONF
 LOG = log.getLogger(__name__)
 
 
+# WRS:extension -- pass through 'details'
 def exception_to_dict(fault, message=None):
     """Converts exceptions to a dict for use in notifications."""
     # TODO(johngarbutt) move to nova/exception.py to share with wrap_exception
 
     code = 500
+    details = ''
     if hasattr(fault, "kwargs"):
         code = fault.kwargs.get('code', 500)
+        details = fault.kwargs.get('details', '')
 
     # get the message from the exception that was thrown
     # if that does not exist, use the name of the exception class itself
@@ -74,14 +82,25 @@ def exception_to_dict(fault, message=None):
     # MySQL silently truncates overly long messages, but PostgreSQL throws an
     # error if we don't truncate it.
     u_message = utils.safe_truncate(message, 255)
+    b_details = encodeutils.safe_encode(details)
+
+    decode_ok = False
+    while not decode_ok:
+        try:
+            u_details = encodeutils.safe_decode(b_details)
+            decode_ok = True
+        except UnicodeDecodeError:
+            b_details = b_details[:-1]
+
     fault_dict = dict(exception=fault)
     fault_dict["message"] = u_message
+    fault_dict["details"] = u_details
     fault_dict["code"] = code
     return fault_dict
 
 
-def _get_fault_details(exc_info, error_code):
-    details = ''
+# WRS:extension -- pass through 'details'
+def _get_fault_details(exc_info, error_code, details=''):
     if exc_info and error_code == 500:
         tb = exc_info[2]
         if tb:
@@ -89,6 +108,7 @@ def _get_fault_details(exc_info, error_code):
     return six.text_type(details)
 
 
+# WRS:extension -- pass through 'details'
 def add_instance_fault_from_exc(context, instance, fault, exc_info=None,
                                 fault_message=None):
     """Adds the specified fault to the database."""
@@ -98,7 +118,8 @@ def add_instance_fault_from_exc(context, instance, fault, exc_info=None,
     fault_obj.instance_uuid = instance.uuid
     fault_obj.update(exception_to_dict(fault, message=fault_message))
     code = fault_obj.code
-    fault_obj.details = _get_fault_details(exc_info, code)
+    details = str(fault_obj.details)
+    fault_obj.details = _get_fault_details(exc_info, code, details=details)
     fault_obj.create()
 
 
@@ -332,6 +353,15 @@ def notify_about_instance_usage(notifier, context, instance, event_suffix,
         method = notifier.error
     else:
         method = notifier.info
+
+    # WRS: send server group notifications
+    try:
+        objects.InstanceGroup.get_by_instance_uuid(context, instance.uuid)
+        cgcs_messaging.send_server_grp_notification(
+            context, 'compute.instance.%s' % event_suffix, usage_info,
+            instance.uuid)
+    except exception.InstanceGroupNotFound:
+        pass
 
     method(context, 'compute.instance.%s' % event_suffix, usage_info)
 

@@ -13,6 +13,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2013-2017 Wind River Systems, Inc.
+#
 
 """Functionality related to notifications common to multiple layers of
 the system.
@@ -26,6 +29,7 @@ from oslo_utils import excutils
 from oslo_utils import timeutils
 import six
 
+from nova.compute import cgcs_messaging
 import nova.conf
 import nova.context
 from nova import exception
@@ -208,11 +212,14 @@ def _compute_states_payload(instance, old_vm_state=None,
     if old_task_state is None:
         old_task_state = instance["task_state"]
 
+    # WRS: add instance power_state to states_payload
+    power_state = instance["power_state"]
     states_payload = {
         "old_state": old_vm_state,
         "state": new_vm_state,
         "old_task_state": old_task_state,
         "new_task_state": new_task_state,
+        "power_state": power_state,
     }
     return states_payload
 
@@ -249,6 +256,15 @@ def send_instance_update_notification(context, instance, old_vm_state=None,
                                          'compute.instance.update', payload)
 
     _send_versioned_instance_update(context, instance, payload, host, service)
+
+    # WRS: server group notification
+    try:
+        objects.InstanceGroup.get_by_instance_uuid(context, instance.uuid)
+        cgcs_messaging.send_server_grp_notification(context,
+                                                    'compute.instance.update',
+                                                    payload, instance.uuid)
+    except exception.InstanceGroupNotFound:
+        pass
 
 
 @rpc.if_notifications_enabled

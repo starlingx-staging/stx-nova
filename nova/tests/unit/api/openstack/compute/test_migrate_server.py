@@ -62,9 +62,11 @@ class MigrateServerTestsV21(admin_only_action_common.CommonTests):
         args_map = {'_migrate_live': ((False, self.disk_over_commit,
                                        'hostname', self.force, self.async),
                                       {})}
+        expected_attrs_map = {'_migrate': ['pci_requests']}
         self._test_actions(['_migrate', '_migrate_live'], body_map=body_map,
                            method_translations=method_translations,
-                           args_map=args_map)
+                           args_map=args_map,
+                           expected_attrs_map=expected_attrs_map)
 
     def test_migrate_none_hostname(self):
         method_translations = {'_migrate': 'resize',
@@ -73,14 +75,18 @@ class MigrateServerTestsV21(admin_only_action_common.CommonTests):
         args_map = {'_migrate_live': ((False, self.disk_over_commit, None,
                                        self.force, self.async),
                                       {})}
+        expected_attrs_map = {'_migrate': ['pci_requests']}
         self._test_actions(['_migrate', '_migrate_live'], body_map=body_map,
                            method_translations=method_translations,
-                           args_map=args_map)
+                           args_map=args_map,
+                           expected_attrs_map=expected_attrs_map)
 
     def test_migrate_with_non_existed_instance(self):
         body_map = self._get_migration_body(host='hostname')
+        expected_attrs_map = {'_migrate': ['pci_requests']}
         self._test_actions_with_non_existed_instance(
-            ['_migrate', '_migrate_live'], body_map=body_map)
+            ['_migrate', '_migrate_live'], body_map=body_map,
+            expected_attrs_map=expected_attrs_map)
 
     def test_migrate_raise_conflict_on_invalid_state(self):
         method_translations = {'_migrate': 'resize',
@@ -91,10 +97,12 @@ class MigrateServerTestsV21(admin_only_action_common.CommonTests):
                                       {})}
         exception_arg = {'_migrate': 'migrate',
                          '_migrate_live': 'os-migrateLive'}
+        expected_attrs_map = {'_migrate': ['pci_requests']}
         self._test_actions_raise_conflict_on_invalid_state(
             ['_migrate', '_migrate_live'], body_map=body_map,
             args_map=args_map, method_translations=method_translations,
-            exception_args=exception_arg)
+            exception_args=exception_arg,
+            expected_attrs_map=expected_attrs_map)
 
     def test_actions_with_locked_instance(self):
         method_translations = {'_migrate': 'resize',
@@ -105,13 +113,15 @@ class MigrateServerTestsV21(admin_only_action_common.CommonTests):
         args_map = {'_migrate_live': ((False, self.disk_over_commit,
                                        'hostname', self.force, self.async),
                                       {})}
+        expected_attrs_map = {'_migrate': ['pci_requests']}
         self._test_actions_with_locked_instance(
             ['_migrate', '_migrate_live'], body_map=body_map,
-            args_map=args_map, method_translations=method_translations)
+            args_map=args_map, method_translations=method_translations,
+            expected_attrs_map=expected_attrs_map)
 
     def _test_migrate_exception(self, exc_info, expected_result):
         self.mox.StubOutWithMock(self.compute_api, 'resize')
-        instance = self._stub_instance_get()
+        instance = self._stub_instance_get(expected_attrs=['pci_requests'])
         self.compute_api.resize(self.context, instance).AndRaise(exc_info)
 
         self.mox.ReplayAll()

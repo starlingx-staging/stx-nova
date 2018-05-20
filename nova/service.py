@@ -185,12 +185,31 @@ class Service(service.Service):
         # Add service to the ServiceGroup membership group.
         self.servicegroup_api.join(self.host, self.topic, self)
 
+        # WRS: Write volatile flag file indicating service has started.
+        if CONF.service_enabled_flag:
+            volatile_dir = '/var/run/nova'
+            if os.path.isdir(volatile_dir):
+                flag = "{}/.nova_{}_enabled".format(volatile_dir, self.topic)
+                try:
+                    open(flag, 'w').close()
+                    LOG.info('service %(topic)s ready',
+                             {'topic': self.topic})
+                except Exception as e:
+                    LOG.error(
+                        'Cannot create file: %(file)s, error=%(error)s',
+                        {'file': flag, 'error': e})
+
         if self.periodic_enable:
             if self.periodic_fuzzy_delay:
                 initial_delay = random.randint(0, self.periodic_fuzzy_delay)
             else:
                 initial_delay = None
 
+            # WRS - Do not delay start of non-compute services. This improves
+            # responsiveness of no-reboot-patching of controllers by making
+            # the nova-scheduler weigher patch audit run immediately.
+            if 'compute' not in self.binary:
+                initial_delay = None
             self.tg.add_dynamic_timer(self.periodic_tasks,
                                      initial_delay=initial_delay,
                                      periodic_interval_max=

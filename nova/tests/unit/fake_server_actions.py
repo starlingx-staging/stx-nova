@@ -70,6 +70,7 @@ FAKE_EVENTS = {
                        'updated_at': None,
                        'deleted_at': None,
                        'deleted': False,
+                       'details': None,
                       },
                       {'id': 2,
                        'action_id': FAKE_ACTION_ID1,
@@ -84,6 +85,7 @@ FAKE_EVENTS = {
                        'updated_at': None,
                        'deleted_at': None,
                        'deleted': False,
+                       'details': None,
                        }
     ],
     FAKE_ACTION_ID2: [{'id': 3,

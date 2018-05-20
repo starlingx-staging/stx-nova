@@ -83,6 +83,62 @@ class Stats(dict):
         key = "num_os_type_%s" % os_type
         return self.get(key, 0)
 
+    @property
+    def vcpus_by_node(self):
+        return self.get("vcpus_by_node", {})
+
+    @vcpus_by_node.setter
+    def vcpus_by_node(self, value):
+        self['vcpus_by_node'] = value
+
+    @property
+    def vcpus_used_by_node(self):
+        return self.get("vcpus_used_by_node", {})
+
+    @vcpus_used_by_node.setter
+    def vcpus_used_by_node(self, value):
+        self['vcpus_used_by_node'] = value
+
+    @property
+    def memory_mb_by_node(self):
+        return self.get("memory_mb_by_node", {})
+
+    @memory_mb_by_node.setter
+    def memory_mb_by_node(self, value):
+        self['memory_mb_by_node'] = value
+
+    @property
+    def memory_mb_used_by_node(self):
+        return self.get("memory_mb_used_by_node", {})
+
+    @memory_mb_used_by_node.setter
+    def memory_mb_used_by_node(self, value):
+        self['memory_mb_used_by_node'] = value
+
+    @property
+    def l3_cache_granularity(self):
+        return self.get("l3_cache_granularity", None)
+
+    @l3_cache_granularity.setter
+    def l3_cache_granularity(self, value):
+        self['l3_cache_granularity'] = value
+
+    @property
+    def l3_cache_by_node(self):
+        return self.get("l3_cache_by_node", {})
+
+    @l3_cache_by_node.setter
+    def l3_cache_by_node(self, value):
+        self['l3_cache_by_node'] = value
+
+    @property
+    def l3_cache_used_by_node(self):
+        return self.get("l3_cache_used_by_node", {})
+
+    @l3_cache_used_by_node.setter
+    def l3_cache_used_by_node(self, value):
+        self['l3_cache_used_by_node'] = value
+
     def update_stats_for_instance(self, instance, is_removed=False):
         """Update stats after an instance is changed."""
 

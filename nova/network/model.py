@@ -12,6 +12,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2013-2017 Wind River Systems, Inc.
+#
 
 import functools
 
@@ -128,6 +131,13 @@ VIF_MODEL_SRIOV = 'sriov'
 VIF_MODEL_VMXNET = 'vmxnet'
 VIF_MODEL_VMXNET3 = 'vmxnet3'
 
+VIF_MODEL_PCI_SRIOV = 'pci-sriov'
+VIF_MODEL_PCI_PASSTHROUGH = 'pci-passthrough'
+
+
+# WRS: change supported vif_models from upstream
+#   removed: VIF_MODEL_NETFRONT, VIF_MODEL_SPAPR_VLAN, VIF_MODEL_VMXNET,
+#            VIF_MODEL_VMXNET3
 VIF_MODEL_ALL = (
     VIF_MODEL_VIRTIO,
     VIF_MODEL_NE2K_PCI,
@@ -135,12 +145,10 @@ VIF_MODEL_ALL = (
     VIF_MODEL_RTL8139,
     VIF_MODEL_E1000,
     VIF_MODEL_E1000E,
-    VIF_MODEL_NETFRONT,
-    VIF_MODEL_SPAPR_VLAN,
     VIF_MODEL_LAN9118,
     VIF_MODEL_SRIOV,
-    VIF_MODEL_VMXNET,
-    VIF_MODEL_VMXNET3,
+    VIF_MODEL_PCI_SRIOV,
+    VIF_MODEL_PCI_PASSTHROUGH,
 )
 
 # these types have been leaked to guests in network_data.json
@@ -153,6 +161,13 @@ LEGACY_EXPOSED_VIF_TYPES = (
     VIF_TYPE_TAP,
     VIF_TYPE_VHOSTUSER,
     VIF_TYPE_VIF,
+)
+
+# WRS: vif_models that support interface attach/detach operations
+VIF_MODEL_HOTPLUGGABLE = (
+    VIF_MODEL_VIRTIO,
+    VIF_MODEL_RTL8139,
+    VIF_MODEL_E1000,
 )
 
 # Constant for max length of network interface names
@@ -378,7 +393,8 @@ class VIF(Model):
                  details=None, devname=None, ovs_interfaceid=None,
                  qbh_params=None, qbg_params=None, active=False,
                  vnic_type=VNIC_TYPE_NORMAL, profile=None,
-                 preserve_on_delete=False, **kwargs):
+                 mtu=None, vif_model=None,
+                 preserve_on_delete=False, host_id=None, **kwargs):
         super(VIF, self).__init__()
 
         self['id'] = id
@@ -395,6 +411,12 @@ class VIF(Model):
         self['vnic_type'] = vnic_type
         self['profile'] = profile
         self['preserve_on_delete'] = preserve_on_delete
+        # WRS extension: add mtu & vif_model
+        self['mtu'] = mtu
+        self['vif_model'] = vif_model
+        # WRS: Store host_id when comparing PCI devices.  This is used to
+        # detect if the instance was rebooted on a different host.
+        self['host_id'] = host_id
 
         self._set_meta(kwargs)
 

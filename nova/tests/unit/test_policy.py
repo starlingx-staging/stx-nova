@@ -12,6 +12,10 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2016-2017 Wind River Systems, Inc.
+#
+
 
 """Test of Policy Engine For Nova."""
 
@@ -329,6 +333,7 @@ class RealRolePolicyTestCase(test.NoDBTestCase):
 "os_compute_api:os-networks-associate",
 "os_compute_api:os-quota-sets:update",
 "os_compute_api:os-quota-sets:delete",
+"os_compute_api:os-quota-sets:list",
 "os_compute_api:os-security-group-default-rules",
 "os_compute_api:os-server-diagnostics",
 "os_compute_api:os-services",
@@ -435,6 +440,7 @@ class RealRolePolicyTestCase(test.NoDBTestCase):
 "os_compute_api:os-server-groups:show",
 "os_compute_api:os-server-groups:create",
 "os_compute_api:os-server-groups:delete",
+"os_compute_api:os-server-groups:set_metadata",
 "os_compute_api:os-shelve:shelve",
 "os_compute_api:os-shelve:unshelve",
 "os_compute_api:os-virtual-interfaces",
@@ -444,6 +450,11 @@ class RealRolePolicyTestCase(test.NoDBTestCase):
 "os_compute_api:os-volumes-attachments:create",
 "os_compute_api:os-volumes-attachments:delete",
 "os_compute_api:os-availability-zone:list",
+"os_compute_api:wrs-if",
+"os_compute_api:wrs-sg",
+"os_compute_api:wrs-res",
+"os_compute_api:wrs-providernet",
+"os_compute_api:wrs-pci",
 )
 
         self.non_admin_only_rules = (

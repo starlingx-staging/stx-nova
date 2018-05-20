@@ -11,6 +11,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2016-2017 Wind River Systems, Inc.
+#
 
 from oslo_serialization import jsonutils
 from oslo_utils import versionutils
@@ -27,7 +30,8 @@ from nova.scheduler import utils as scheduler_utils
 from nova.virt import hardware
 
 REQUEST_SPEC_OPTIONAL_ATTRS = ['requested_destination',
-                               'security_groups']
+                               'security_groups',
+                               'offline_cpus']
 
 
 @base.NovaObjectRegistry.register
@@ -41,6 +45,11 @@ class RequestSpec(base.NovaObject):
     # Version 1.6: Added requested_destination
     # Version 1.7: Added destroy()
     # Version 1.8: Added security_groups
+    #              WRS: add min_num_instances
+    #              WRS: add display_name
+    #              WRS: add name
+    #              WRS: add reject_map
+    #              WRS: add offline_cpus
     VERSION = '1.8'
 
     fields = {
@@ -77,6 +86,11 @@ class RequestSpec(base.NovaObject):
         'scheduler_hints': fields.DictOfListOfStringsField(nullable=True),
         'instance_uuid': fields.UUIDField(),
         'security_groups': fields.ObjectField('SecurityGroupList'),
+        'min_num_instances': fields.IntegerField(default=1),
+        'display_name': fields.StringField(nullable=True),
+        'name': fields.StringField(nullable=True),
+        'reject_map': fields.DictOfListOfStringsField(nullable=True),
+        'offline_cpus': fields.IntegerField(default=0),
     }
 
     def obj_make_compatible(self, primitive, target_version):
@@ -154,6 +168,8 @@ class RequestSpec(base.NovaObject):
 
         instance_fields = ['numa_topology', 'pci_requests', 'uuid',
                            'project_id', 'availability_zone']
+        # WRS extension
+        instance_fields.extend(['display_name', 'name'])
         for field in instance_fields:
             if field == 'uuid':
                 setattr(self, 'instance_uuid', getter(instance, field))
@@ -205,9 +221,13 @@ class RequestSpec(base.NovaObject):
             policies = list(filter_properties.get('group_policies'))
             hosts = list(filter_properties.get('group_hosts'))
             members = list(filter_properties.get('group_members'))
+            name = filter_properties.get('group_name')
+            md = filter_properties.get('group_metadetails')
             self.instance_group = objects.InstanceGroup(policies=policies,
                                                         hosts=hosts,
-                                                        members=members)
+                                                        members=members,
+                                                        name=name,
+                                                        metadetails=md)
             # hosts has to be not part of the updates for saving the object
             self.instance_group.obj_reset_changes(['hosts'])
         else:
@@ -268,6 +288,10 @@ class RequestSpec(base.NovaObject):
         spec._from_hints(scheduler_hints)
         spec.requested_destination = filter_properties.get(
             'requested_destination')
+        spec.min_num_instances = filter_properties.get('min_num_instances',
+                                                       num_instances)
+        spec.reject_map = filter_properties.get('reject_map', {})
+        spec.offline_cpus = request_spec.get('offline_cpus', 0)
 
         # NOTE(sbauza): Default the other fields that are not part of the
         # original contract
@@ -304,6 +328,8 @@ class RequestSpec(base.NovaObject):
         instance = {}
         instance_fields = ['numa_topology', 'pci_requests',
                            'project_id', 'availability_zone', 'instance_uuid']
+        # WRS extension
+        instance_fields.extend(['display_name', 'name', 'reject_map'])
         for field in instance_fields:
             if not self.obj_attr_is_set(field):
                 continue
@@ -322,10 +348,14 @@ class RequestSpec(base.NovaObject):
         # NOTE(sbauza): Since this is only needed until the AffinityFilters are
         # modified by using directly the RequestSpec object, we need to keep
         # the existing dictionary as a primitive.
+        # WRS: add metadetails as this will be needed by
+        # _populate_group_info() when called by the scheduler during upgrade
+        # from 15.12.
         return {'group_updated': True,
                 'group_hosts': set(self.instance_group.hosts),
                 'group_policies': set(self.instance_group.policies),
-                'group_members': set(self.instance_group.members)}
+                'group_members': set(self.instance_group.members),
+                'group_metadetails': self.instance_group.metadetails}
 
     def to_legacy_request_spec_dict(self):
         """Returns a legacy request_spec dict from the RequestSpec object.
@@ -347,6 +377,12 @@ class RequestSpec(base.NovaObject):
             req_spec['instance_type'] = self.flavor
         else:
             req_spec['instance_type'] = {}
+        if self.obj_attr_is_set('offline_cpus'):
+            req_spec['offline_cpus'] = self.offline_cpus
+        else:
+            req_spec['offline_cpus'] = 0
+        if self.obj_attr_is_set('min_num_instances'):
+            req_spec['min_num_instances'] = self.min_num_instances
         return req_spec
 
     def to_legacy_filter_properties_dict(self):
@@ -379,6 +415,8 @@ class RequestSpec(base.NovaObject):
         if self.obj_attr_is_set('requested_destination'
                                 ) and self.requested_destination:
             filt_props['requested_destination'] = self.requested_destination
+        if self.obj_attr_is_set('reject_map') and self.reject_map:
+            filt_props['reject_map'] = self.reject_map
         return filt_props
 
     @classmethod
@@ -428,7 +466,12 @@ class RequestSpec(base.NovaObject):
             spec_obj.security_groups = security_groups
         spec_obj.requested_destination = filter_properties.get(
             'requested_destination')
-
+        spec_obj.min_num_instances = filter_properties.get(
+                         'min_num_instances', spec_obj.num_instances)
+        spec_obj.display_name = ''
+        spec_obj.name = ''
+        spec_obj.reject_map = filter_properties.get('reject_map', {})
+        spec_obj.offline_cpus = 0
         # NOTE(sbauza): Default the other fields that are not part of the
         # original contract
         spec_obj.obj_set_defaults()
@@ -594,6 +637,9 @@ def _create_minimal_request_spec(context, instance):
         project_id=instance.project_id
     )
     scheduler_utils.setup_instance_group(context, request_spec)
+    # WRS: do not want to store host information in db as it will become stale
+    if request_spec.instance_group:
+        request_spec.instance_group.hosts = []
     request_spec.create()
 
 

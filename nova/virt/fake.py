@@ -92,21 +92,26 @@ class Resources(object):
     vcpus_used = 0
     memory_mb_used = 0
     local_gb_used = 0
+    l3_closids = 0
+    l3_closids_used = 0
 
-    def __init__(self, vcpus=8, memory_mb=8000, local_gb=500):
+    def __init__(self, vcpus=8, memory_mb=8000, local_gb=500, l3_closids=16):
         self.vcpus = vcpus
         self.memory_mb = memory_mb
         self.local_gb = local_gb
+        self.l3_closids = l3_closids
 
-    def claim(self, vcpus=0, mem=0, disk=0):
+    def claim(self, vcpus=0, mem=0, disk=0, l3_closids=0):
         self.vcpus_used += vcpus
         self.memory_mb_used += mem
         self.local_gb_used += disk
+        self.l3_closids_used += l3_closids
 
-    def release(self, vcpus=0, mem=0, disk=0):
+    def release(self, vcpus=0, mem=0, disk=0, l3_closids=0):
         self.vcpus_used -= vcpus
         self.memory_mb_used -= mem
         self.local_gb_used -= disk
+        self.l3_closids_used -= l3_closids
 
     def dump(self):
         return {
@@ -115,7 +120,9 @@ class Resources(object):
             'local_gb': self.local_gb,
             'vcpus_used': self.vcpus_used,
             'memory_mb_used': self.memory_mb_used,
-            'local_gb_used': self.local_gb_used
+            'local_gb_used': self.local_gb_used,
+            'l3_closids': self.l3_closids,
+            'l3_closids_used': self.l3_closids_used
         }
 
 
@@ -135,6 +142,7 @@ class FakeDriver(driver.ComputeDriver):
     vcpus = 1000
     memory_mb = 800000
     local_gb = 600000
+    l3_closids = 16
 
     """Fake hypervisor driver."""
 
@@ -144,7 +152,8 @@ class FakeDriver(driver.ComputeDriver):
         self.resources = Resources(
             vcpus=self.vcpus,
             memory_mb=self.memory_mb,
-            local_gb=self.local_gb)
+            local_gb=self.local_gb,
+            l3_closids=self.l3_closids)
         self.host_status_base = {
             'hypervisor_type': 'fake',
             'hypervisor_version': versionutils.convert_version_to_int('1.0'),
@@ -604,6 +613,7 @@ class SmallFakeDriver(FakeDriver):
     vcpus = 1
     memory_mb = 8192
     local_gb = 1028
+    l3_closids = 16
 
 
 class MediumFakeDriver(FakeDriver):
@@ -613,6 +623,7 @@ class MediumFakeDriver(FakeDriver):
     vcpus = 10
     memory_mb = 8192
     local_gb = 1028
+    l3_closids = 16
 
 
 class FakeRescheduleDriver(FakeDriver):

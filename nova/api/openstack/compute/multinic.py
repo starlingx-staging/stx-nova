@@ -35,6 +35,7 @@ class MultinicController(wsgi.Controller):
         self.compute_api = compute.API()
 
     @wsgi.Controller.api_version("2.1", "2.43")
+    @extensions.block_during_upgrade()
     @wsgi.response(202)
     @wsgi.action('addFixedIp')
     @extensions.expected_errors((400, 404))
@@ -54,6 +55,7 @@ class MultinicController(wsgi.Controller):
             raise exc.HTTPBadRequest(explanation=e.format_message())
 
     @wsgi.Controller.api_version("2.1", "2.43")
+    @extensions.block_during_upgrade()
     @wsgi.response(202)
     @wsgi.action('removeFixedIp')
     @extensions.expected_errors((400, 404))

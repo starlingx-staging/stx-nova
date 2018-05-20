@@ -30,27 +30,33 @@ class CommonMixin(object):
         self.req = fakes.HTTPRequest.blank('')
         self.context = self.req.environ['nova.context']
 
-    def _stub_instance_get(self, uuid=None):
+    def _stub_instance_get(self, uuid=None, expected_attrs=None):
         if uuid is None:
             uuid = uuidutils.generate_uuid()
         instance = fake_instance.fake_instance_obj(self.context,
                 id=1, uuid=uuid, vm_state=vm_states.ACTIVE,
                 task_state=None, launched_at=timeutils.utcnow())
         self.compute_api.get(
-            self.context, uuid, expected_attrs=None).AndReturn(instance)
+            self.context, uuid,
+            expected_attrs=expected_attrs).AndReturn(instance)
+        instance.pci_devices = None
         return instance
 
-    def _stub_instance_get_failure(self, exc_info, uuid=None):
+    def _stub_instance_get_failure(self, exc_info, uuid=None,
+                                   expected_attrs=None):
         if uuid is None:
             uuid = uuidutils.generate_uuid()
         self.compute_api.get(
-            self.context, uuid, expected_attrs=None).AndRaise(exc_info)
+            self.context, uuid,
+            expected_attrs=expected_attrs).AndRaise(exc_info)
         return uuid
 
-    def _test_non_existing_instance(self, action, body_map=None):
+    def _test_non_existing_instance(self, action, body_map=None,
+                                    expected_attrs=None):
         uuid = uuidutils.generate_uuid()
         self._stub_instance_get_failure(
-                exception.InstanceNotFound(instance_id=uuid), uuid=uuid)
+                exception.InstanceNotFound(instance_id=uuid), uuid=uuid,
+                expected_attrs=expected_attrs)
 
         self.mox.ReplayAll()
         controller_function = getattr(self.controller, action)
@@ -63,12 +69,12 @@ class CommonMixin(object):
         self.mox.UnsetStubs()
 
     def _test_action(self, action, body=None, method=None,
-                     compute_api_args_map=None):
+                     compute_api_args_map=None, expected_attrs=None):
         if method is None:
             method = action.replace('_', '')
         compute_api_args_map = compute_api_args_map or {}
 
-        instance = self._stub_instance_get()
+        instance = self._stub_instance_get(expected_attrs=expected_attrs)
         args, kwargs = compute_api_args_map.get(action, ((), {}))
         getattr(self.compute_api, method)(self.context, instance, *args,
                                           **kwargs)
@@ -112,7 +118,7 @@ class CommonMixin(object):
 
     def _test_invalid_state(self, action, method=None, body_map=None,
                             compute_api_args_map=None,
-                            exception_arg=None):
+                            exception_arg=None, expected_attrs=None):
         if method is None:
             method = action.replace('_', '')
         if body_map is None:
@@ -120,7 +126,7 @@ class CommonMixin(object):
         if compute_api_args_map is None:
             compute_api_args_map = {}
 
-        instance = self._stub_instance_get()
+        instance = self._stub_instance_get(expected_attrs=expected_attrs)
 
         args, kwargs = compute_api_args_map.get(action, ((), {}))
 
@@ -145,12 +151,13 @@ class CommonMixin(object):
         self.mox.UnsetStubs()
 
     def _test_locked_instance(self, action, method=None, body=None,
-                              compute_api_args_map=None):
+                              compute_api_args_map=None,
+                              expected_attrs=None):
         if method is None:
             method = action.replace('_', '')
 
         compute_api_args_map = compute_api_args_map or {}
-        instance = self._stub_instance_get()
+        instance = self._stub_instance_get(expected_attrs=expected_attrs)
 
         args, kwargs = compute_api_args_map.get(action, ((), {}))
         getattr(self.compute_api, method)(self.context, instance, *args,
@@ -195,17 +202,21 @@ class CommonMixin(object):
 
 class CommonTests(CommonMixin, test.NoDBTestCase):
     def _test_actions(self, actions, method_translations=None, body_map=None,
-                      args_map=None):
+                      args_map=None, expected_attrs_map=None):
         method_translations = method_translations or {}
         body_map = body_map or {}
         args_map = args_map or {}
+        expected_attrs_map = expected_attrs_map or {}
         for action in actions:
+            expected_attrs = expected_attrs_map.get(action)
+
             method = method_translations.get(action)
             body = body_map.get(action)
             self.mox.StubOutWithMock(self.compute_api,
                                      method or action.replace('_', ''))
             self._test_action(action, method=method, body=body,
-                              compute_api_args_map=args_map)
+                              compute_api_args_map=args_map,
+                              expected_attrs=expected_attrs)
             # Re-mock this.
             self.mox.StubOutWithMock(self.compute_api, 'get')
 
@@ -226,22 +237,30 @@ class CommonTests(CommonMixin, test.NoDBTestCase):
             # Re-mock this.
             self.mox.StubOutWithMock(self.compute_api, 'get')
 
-    def _test_actions_with_non_existed_instance(self, actions, body_map=None):
+    def _test_actions_with_non_existed_instance(self, actions, body_map=None,
+                                                expected_attrs_map=None):
         body_map = body_map or {}
+        expected_attrs_map = expected_attrs_map or {}
         for action in actions:
+            expected_attrs = expected_attrs_map.get(action)
+
             self._test_non_existing_instance(action,
-                                             body_map=body_map)
+                                             body_map=body_map,
+                                             expected_attrs=expected_attrs)
             # Re-mock this.
             self.mox.StubOutWithMock(self.compute_api, 'get')
 
     def _test_actions_raise_conflict_on_invalid_state(
             self, actions, method_translations=None, body_map=None,
-            args_map=None, exception_args=None):
+            args_map=None, exception_args=None, expected_attrs_map=None):
         method_translations = method_translations or {}
         body_map = body_map or {}
         args_map = args_map or {}
         exception_args = exception_args or {}
+        expected_attrs_map = expected_attrs_map or {}
         for action in actions:
+            expected_attrs = expected_attrs_map.get(action)
+
             method = method_translations.get(action)
             exception_arg = exception_args.get(action)
             self.mox.StubOutWithMock(self.compute_api,
@@ -249,22 +268,28 @@ class CommonTests(CommonMixin, test.NoDBTestCase):
             self._test_invalid_state(action, method=method,
                                      body_map=body_map,
                                      compute_api_args_map=args_map,
-                                     exception_arg=exception_arg)
+                                     exception_arg=exception_arg,
+                                     expected_attrs=expected_attrs)
             # Re-mock this.
             self.mox.StubOutWithMock(self.compute_api, 'get')
 
     def _test_actions_with_locked_instance(self, actions,
                                            method_translations=None,
-                                           body_map=None, args_map=None):
+                                           body_map=None, args_map=None,
+                                           expected_attrs_map=None):
         method_translations = method_translations or {}
         body_map = body_map or {}
         args_map = args_map or {}
+        expected_attrs_map = expected_attrs_map or {}
         for action in actions:
+            expected_attrs = expected_attrs_map.get(action)
+
             method = method_translations.get(action)
             body = body_map.get(action)
             self.mox.StubOutWithMock(self.compute_api,
                                      method or action.replace('_', ''))
             self._test_locked_instance(action, method=method, body=body,
-                                       compute_api_args_map=args_map)
+                                       compute_api_args_map=args_map,
+                                       expected_attrs=expected_attrs)
             # Re-mock this.
             self.mox.StubOutWithMock(self.compute_api, 'get')

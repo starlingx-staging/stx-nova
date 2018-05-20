@@ -22,6 +22,7 @@ from oslo_log import log as logging
 from nova import exception
 from nova.i18n import _
 from nova import objects
+from nova import utils
 from nova.virt import hardware
 
 
@@ -47,6 +48,10 @@ class NopClaim(object):
     def vcpus(self):
         return 0
 
+    @property
+    def closids(self):
+        return 0
+
     def __enter__(self):
         return self
 
@@ -58,8 +63,10 @@ class NopClaim(object):
         pass
 
     def __str__(self):
-        return "[Claim: %d MB memory, %d GB disk]" % (self.memory_mb,
-                self.disk_gb)
+        return "[Claim: %d MB memory, %d GB disk, %d vcpus, %d closids " \
+               "numa_topology=%r]" \
+               % (self.memory_mb, self.disk_gb, self.vcpus, self.closids,
+                  self.claimed_numa_topology)
 
 
 class Claim(NopClaim):
@@ -94,6 +101,12 @@ class Claim(NopClaim):
         # Raise exception ComputeResourcesUnavailable if claim failed
         self._claim_test(resources, limits)
 
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if exc_type is not None:
+            self.abort()
+        else:
+            self.tracker.remove_instance_claim(self.context, self.instance)
+
     @property
     def disk_gb(self):
         return (self.instance.flavor.root_gb +
@@ -106,7 +119,22 @@ class Claim(NopClaim):
 
     @property
     def vcpus(self):
-        return self.instance.flavor.vcpus
+        retval = self.tracker.normalized_vcpus(self.instance, self.nodename)
+        return retval
+
+    @property
+    def closids(self):
+        requested_topology = self.numa_topology
+        if ((requested_topology is not None) and
+                any(cell.l3_cpuset is not None
+                    for cell in requested_topology.cells)):
+            return 1
+        else:
+            return 0
+
+    @property
+    def flavor(self):
+        return self.instance.flavor
 
     @property
     def numa_topology(self):
@@ -120,7 +148,8 @@ class Claim(NopClaim):
         """Compute operation requiring claimed resources has failed or
         been aborted.
         """
-        LOG.debug("Aborting claim: %s", self, instance=self.instance)
+        # WRS: Promote this log to info.
+        LOG.info("Aborting claim: %s", self, instance=self.instance)
         self.tracker.abort_instance_claim(self.context, self.instance,
                                           self.nodename)
 
@@ -142,26 +171,36 @@ class Claim(NopClaim):
         memory_mb_limit = limits.get('memory_mb')
         disk_gb_limit = limits.get('disk_gb')
         vcpus_limit = limits.get('vcpu')
+        closids_limit = limits.get('closids')
         numa_topology_limit = limits.get('numa_topology')
 
+        # WRS: Ensure print formats display even with None value.
         LOG.info("Attempting claim on node %(node)s: "
-                 "memory %(memory_mb)d MB, "
-                 "disk %(disk_gb)d GB, vcpus %(vcpus)d CPU",
+                 "memory %(memory_mb)s MB, "
+                 "disk %(disk_gb)s GB, vcpus %(vcpus)s CPU, "
+                 "closids %(closids)s",
                  {'node': self.nodename, 'memory_mb': self.memory_mb,
-                  'disk_gb': self.disk_gb, 'vcpus': self.vcpus},
-                 instance=self.instance)
+                  'disk_gb': self.disk_gb, 'vcpus': self.vcpus,
+                  'closids': self.closids,
+                 }, instance=self.instance)
 
         reasons = [self._test_memory(resources, memory_mb_limit),
                    self._test_disk(resources, disk_gb_limit),
-                   self._test_vcpus(resources, vcpus_limit),
-                   self._test_numa_topology(resources, numa_topology_limit),
-                   self._test_pci()]
+                   self._test_vcpus(resources, vcpus_limit)]
+        if utils.is_libvirt_compute(resources):
+            reasons.extend(
+                [self._test_closids(resources, closids_limit),
+                 self._test_numa_topology(resources, numa_topology_limit),
+                 self._test_pci()])
         reasons = [r for r in reasons if r is not None]
         if len(reasons) > 0:
+            LOG.error('Claim unsuccessful on node %s: %s', self.nodename,
+                      "; ".join(reasons), instance=self.instance)
             raise exception.ComputeResourcesUnavailable(reason=
                     "; ".join(reasons))
 
-        LOG.info('Claim successful on node %s', self.nodename,
+        # WRS: Log the claim attributes
+        LOG.info('Claim successful on node %s: %s', self.nodename, self,
                  instance=self.instance)
 
     def _test_memory(self, resources, limit):
@@ -191,6 +230,15 @@ class Claim(NopClaim):
 
         return self._test(type_, unit, total, used, requested, limit)
 
+    def _test_closids(self, resources, limit):
+        type_ = _("closids")
+        unit = "cnt"
+        total = resources.l3_closids
+        used = resources.l3_closids_used
+        requested = self.closids
+
+        return self._test(type_, unit, total, used, requested, limit)
+
     def _test_pci(self):
         pci_requests = self._pci_requests
         if pci_requests.requests:
@@ -203,6 +251,12 @@ class Claim(NopClaim):
                          if 'numa_topology' in resources else None)
         requested_topology = self.numa_topology
         if host_topology:
+            # WRS - numa affinity requires extra_specs
+            # NOTE(jgauld): Require the old fix 32558ef to define self.flavor,
+            # based on 132eae7 Bug 181 fix: claim _test_numa_topology() to look
+            # into destination extra_spec.
+            extra_specs = self.flavor.get('extra_specs', {})
+
             host_topology = objects.NUMATopology.obj_from_db_obj(
                     host_topology)
             pci_requests = self._pci_requests
@@ -210,14 +264,28 @@ class Claim(NopClaim):
             if pci_requests.requests:
                 pci_stats = self.tracker.pci_tracker.stats
 
+            # WRS: Support strict vs prefer allocation of PCI devices.
+            # If strict fails, fallback to prefer.
+            pci_numa_affinity = extra_specs.get('hw:wrs:pci_numa_affinity',
+                                                'strict')
+            pci_strict = False if pci_numa_affinity == 'prefer' else True
+
+            details = utils.details_initialize(details=None)
             instance_topology = (
                     hardware.numa_fit_instance_to_host(
                         host_topology, requested_topology,
                         limits=limit,
                         pci_requests=pci_requests.requests,
-                        pci_stats=pci_stats))
+                        pci_stats=pci_stats,
+                        details=details,
+                        pci_strict=pci_strict))
 
             if requested_topology and not instance_topology:
+                msg = details.get('reason', [])
+                LOG.info('%(class)s: (%(node)s) REJECT: %(desc)s',
+                         {'class': self.__class__.__name__,
+                          'node': self.nodename,
+                          'desc': ', '.join(msg)})
                 if pci_requests.requests:
                     return (_("Requested instance NUMA topology together with"
                               " requested PCI devices cannot fit the given"
@@ -226,12 +294,31 @@ class Claim(NopClaim):
                     return (_("Requested instance NUMA topology cannot fit "
                           "the given host NUMA topology"))
             elif instance_topology:
+                # Adjust the claimed pCPUs to handle scaled-down instances
+                # Catch exceptions here so that claims will return with
+                # fail message when there is an underlying pinning issue.
+                try:
+                    orig_instance_topology = \
+                        hardware.instance_topology_from_instance(self.instance)
+                    if orig_instance_topology is not None:
+                        offline_cpus = orig_instance_topology.offline_cpus
+                        instance_topology.set_cpus_offline(offline_cpus)
+                except Exception as e:
+                    LOG.error('Cannot query offline_cpus from requested '
+                              'instance NUMA topology, err=%(err)s',
+                              {'err': e}, self.instance)
+                    return (_('Cannot query offline cpus from requested '
+                              'instance NUMA topology'))
                 self.claimed_numa_topology = instance_topology
 
     def _test(self, type_, unit, total, used, requested, limit):
         """Test if the given type of resource needed for a claim can be safely
         allocated.
         """
+        # WRS: Ignore tests that are not configured, eg, Ironic.
+        if total is None or used is None:
+            return
+
         LOG.info('Total %(type)s: %(total)d %(unit)s, used: %(used).02f '
                  '%(unit)s',
                   {'type': type_, 'total': total, 'unit': unit, 'used': used},
@@ -287,18 +374,25 @@ class MoveClaim(Claim):
 
     @property
     def vcpus(self):
-        return self.instance_type.vcpus
+        retval = self.tracker.normalized_vcpus(self.instance_type,
+                                               self.nodename)
+        return retval
 
     @property
     def numa_topology(self):
         return hardware.numa_get_constraints(self.instance_type,
                                              self.image_meta)
 
+    @property
+    def flavor(self):
+        return self.instance_type
+
     def abort(self):
         """Compute operation requiring claimed resources has failed or
         been aborted.
         """
-        LOG.debug("Aborting claim: %s", self, instance=self.instance)
+        # WRS: Promote this log to info.
+        LOG.info("Aborting claim: %s", self, instance=self.instance)
         self.tracker.drop_move_claim(
             self.context,
             self.instance, self.nodename,

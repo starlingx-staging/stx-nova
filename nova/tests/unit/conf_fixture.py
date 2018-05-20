@@ -13,6 +13,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2016 Wind River Systems, Inc.
+#
 
 from oslo_config import fixture as config_fixture
 from oslo_policy import opts as policy_opts
@@ -89,3 +92,9 @@ class ConfFixture(config_fixture.Config):
         policy_opts.set_defaults(self.conf)
         self.addCleanup(utils.cleanup_dns_managers)
         self.addCleanup(ipv6.api.reset_backend)
+
+        # WRS extension
+        self.conf.set_default('normalize_weigher', True, group='scheduler')
+        self.conf.set_default('compute_vm_4K_pages', '16908243,16348416')
+        self.conf.set_default('compute_vswitch_2M_pages', '0,0')
+        self.conf.set_default('compute_vswitch_1G_pages', '1,1')

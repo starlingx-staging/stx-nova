@@ -179,14 +179,9 @@ class LibvirtBlockInfoTest(test.NoDBTestCase):
         instance_ref = objects.Instance(**self.test_instance)
         image_meta = objects.ImageMeta.from_dict(self.test_image_meta)
 
-        with mock.patch.object(instance_ref, 'get_flavor',
-                               return_value=instance_ref.flavor) as get_flavor:
-            mapping = blockinfo.get_disk_mapping("kvm", instance_ref,
-                                                 "virtio", "ide",
-                                                 image_meta)
-        # Since there was no block_device_info passed to get_disk_mapping we
-        # expect to get the swap info from the flavor in the instance.
-        get_flavor.assert_called_once_with()
+        mapping = blockinfo.get_disk_mapping("kvm", instance_ref,
+                                             "virtio", "ide",
+                                             image_meta)
 
         expect = {
             'disk': {'bus': 'virtio', 'dev': 'vda',
@@ -499,6 +494,11 @@ class LibvirtBlockInfoTest(test.NoDBTestCase):
             'swap': {'device_name': '/dev/vdb',
                      'swap_size': 10},
             }
+
+        # NOTE (knasim): ensure that the swap size is also
+        # set in the instance flavor as this will now be checked
+        instance_ref.flavor.swap = block_device_info['swap']['swap_size']
+
         mapping = blockinfo.get_disk_mapping("kvm", instance_ref,
                                              "virtio", "ide",
                                              image_meta,
@@ -508,6 +508,34 @@ class LibvirtBlockInfoTest(test.NoDBTestCase):
             'disk': {'bus': 'virtio', 'dev': 'vda',
                      'type': 'disk', 'boot_index': '1'},
             'disk.swap': {'bus': 'virtio', 'dev': 'vdb', 'type': 'disk'},
+            'root': {'bus': 'virtio', 'dev': 'vda',
+                     'type': 'disk', 'boot_index': '1'},
+            }
+        self.assertEqual(expect, mapping)
+
+    def test_get_disk_mapping_no_swap_in_instance_flavor(self):
+        # A disk mapping with a swap device at position vdb but
+        # no swap specified in instance flavor should cause
+        # disk.swap to not be present in the mapping
+
+        instance_ref = objects.Instance(**self.test_instance)
+        image_meta = objects.ImageMeta.from_dict(self.test_image_meta)
+
+        block_device_info = {
+            'swap': {'device_name': '/dev/vdb',
+                     'swap_size': 10},
+            }
+
+        instance_ref.flavor.swap = 0
+
+        mapping = blockinfo.get_disk_mapping("kvm", instance_ref,
+                                             "virtio", "ide",
+                                             image_meta,
+                                             block_device_info)
+
+        expect = {
+            'disk': {'bus': 'virtio', 'dev': 'vda',
+                     'type': 'disk', 'boot_index': '1'},
             'root': {'bus': 'virtio', 'dev': 'vda',
                      'type': 'disk', 'boot_index': '1'},
             }
@@ -656,6 +684,11 @@ class LibvirtBlockInfoTest(test.NoDBTestCase):
                  'delete_on_termination': True},
                 ]
             }
+
+        # NOTE (knasim): ensure that the swap size is also
+        # set in the instance flavor as this will now be checked
+        instance_ref.flavor.swap = block_device_info['swap']['swap_size']
+
         mapping = blockinfo.get_disk_mapping("kvm", instance_ref,
                                              "virtio", "ide",
                                              image_meta,
@@ -704,14 +737,14 @@ class LibvirtBlockInfoTest(test.NoDBTestCase):
                         'disk_bus': 'virtio',
                         'delete_on_termination': True}
 
-        with mock.patch.object(instance_ref, 'get_flavor') as get_flavor_mock:
-            blockinfo.get_disk_mapping("kvm", instance_ref,
-                                       "virtio", "ide",
-                                       image_meta,
-                                       block_device_info)
-        # we should have gotten the swap info from block_device_info rather
-        # than the flavor information on the instance
-        self.assertFalse(get_flavor_mock.called)
+        # NOTE (knasim): ensure that the swap size is also
+        # set in the instance flavor as this will now be checked
+        instance_ref.flavor.swap = block_device_info['swap']['swap_size']
+
+        blockinfo.get_disk_mapping("kvm", instance_ref,
+                                   "virtio", "ide",
+                                   image_meta,
+                                   block_device_info)
 
         self.assertEqual(expected_swap, block_device_info['swap'])
         self.assertEqual(expected_ephemeral,

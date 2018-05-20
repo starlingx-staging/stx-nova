@@ -13,6 +13,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2016-2017 Wind River Systems, Inc.
+#
 
 import eventlet
 from eventlet import greenthread
@@ -212,6 +215,44 @@ class HostTestCase(test.NoDBTestCase):
                          "cef19ce0-0ca2-11df-855d-b19fbce37686")
         self.assertEqual(got_events[0].transition,
                          event.EVENT_LIFECYCLE_STOPPED)
+
+    # WRS: add testcase for crashed event
+    def test_event_lifecycle_crashed(self):
+        got_events = []
+
+        def handler(event):
+            got_events.append(event)
+
+        hostimpl = host.Host("qemu:///system",
+                             lifecycle_event_handler=handler)
+
+        conn = hostimpl.get_connection()
+        hostimpl._init_events_pipe()
+
+        fake_dom_xml = """
+                <domain type='kvm'>
+                  <uuid>cef19ce0-0ca2-11df-855d-b19fbce37686</uuid>
+                  <devices>
+                    <disk type='file'>
+                      <source file='filename'/>
+                    </disk>
+                  </devices>
+                </domain>
+            """
+        dom = fakelibvirt.Domain(conn,
+                                 fake_dom_xml,
+                                 False)
+        hostimpl._event_lifecycle_callback(
+            conn, dom, fakelibvirt.VIR_DOMAIN_EVENT_STOPPED,
+                       fakelibvirt.VIR_DOMAIN_EVENT_STOPPED_FAILED, hostimpl)
+        hostimpl._dispatch_events()
+
+        self.assertEqual(len(got_events), 1)
+        self.assertIsInstance(got_events[0], event.LifecycleEvent)
+        self.assertEqual(got_events[0].uuid,
+                         "cef19ce0-0ca2-11df-855d-b19fbce37686")
+        self.assertEqual(got_events[0].transition,
+                         event.EVENT_LIFECYCLE_CRASHED)
 
     def test_event_emit_delayed_call_delayed(self):
         ev = event.LifecycleEvent(
@@ -691,13 +732,58 @@ class HostTestCase(test.NoDBTestCase):
             mock_conn().getInfo.return_value = ['zero', 'one', 'two']
             self.assertEqual('two', self.host.get_cpu_count())
 
+    # WRS - memory accounting
     def test_get_memory_total(self):
-        with mock.patch.object(host.Host, "get_connection") as mock_conn:
-            mock_conn().getInfo.return_value = ['zero', 'one', 'two']
-            self.assertEqual('one', self.host.get_memory_mb_total())
+        self.assertEqual(4096, self.host.get_memory_mb_total())
 
+    # WRS - memory accounting
+    def test_get_capabilities_memtotal_exclude_overheads(self):
+        """Tests that we can calculate memory total with exclusions.
+        """
+        fake_caps_xml = '''
+<capabilities>
+  <host>
+    <uuid>cef19ce0-0ca2-11df-855d-b19fbce37686</uuid>
+    <cpu>
+      <arch>x86_64</arch>
+      <vendor>Intel</vendor>
+      <pages unit='KiB' size='4'/>
+      <pages unit='KiB' size='2048'/>
+      <pages unit='KiB' size='1048576'/>
+    </cpu>
+    <topology>
+      <cells num='2'>
+        <cell id='0'>
+          <memory unit='KiB'>134090572</memory>
+          <pages unit='KiB' size='4'>32273363</pages>
+          <pages unit='KiB' size='2048'>5000</pages>
+          <pages unit='KiB' size='1048576'>51</pages>
+        </cell>
+        <cell id='1'>
+          <memory unit='KiB'>134217728</memory>
+          <pages unit='KiB' size='4'>32305152</pages>
+          <pages unit='KiB' size='2048'>10000</pages>
+          <pages unit='KiB' size='1048576'>41</pages>
+        </cell>
+      </cells>
+    </topology>
+  </host>
+</capabilities>'''
+        with mock.patch.object(fakelibvirt.virConnect, 'getCapabilities',
+                               return_value=fake_caps_xml):
+            MiB = 0
+            MiB += 4 * 16908243 / 1024 + 2 * (5000 - 0) + 1024 * (51 - 1)
+            MiB += 4 * 16348416 / 1024 + 2 * (10000 - 0) + 1024 * (41 - 1)
+            self.assertEqual(MiB, self.host.get_memory_mb_total())
+
+    # WRS - memory accounting
     def test_get_memory_used(self):
-        m = mock.mock_open(read_data="""
+        real_open = six.moves.builtins.open
+
+        def fake_open(filename, *args, **kwargs):
+            if filename == "/proc/meminfo":
+                h = mock.MagicMock()
+                h.read.return_value = """
 MemTotal:       16194180 kB
 MemFree:          233092 kB
 MemAvailable:    8892356 kB
@@ -705,17 +791,33 @@ Buffers:          567708 kB
 Cached:          8362404 kB
 SwapCached:            0 kB
 Active:          8381604 kB
-""")
+"""
+                h.__enter__.return_value = h
+                return h
+            if "/nr_hugepages" in filename:
+                h = mock.MagicMock()
+                h.read.return_value = "0"
+                h.__enter__.return_value = h
+                return h
+            if "/free_hugepages" in filename:
+                h = mock.MagicMock()
+                h.read.return_value = "0"
+                h.__enter__.return_value = h
+                return h
+            return real_open(filename, *args, **kwargs)
+
         with test.nested(
-                mock.patch.object(six.moves.builtins, "open", m, create=True),
+                mock.patch.object(six.moves.builtins, "open", create=True),
                 mock.patch.object(host.Host,
                                   "get_connection"),
                 mock.patch('sys.platform', 'linux2'),
                 ) as (mock_file, mock_conn, mock_platform):
+            mock_file.side_effect = fake_open
             mock_conn().getInfo.return_value = [
                 obj_fields.Architecture.X86_64, 15814, 8, 1208, 1, 1, 4, 2]
 
-            self.assertEqual(6866, self.host.get_memory_mb_used())
+            MiB = 6866 - 2 * 1024
+            self.assertEqual(MiB, self.host.get_memory_mb_used())
 
     def test_get_memory_used_xen(self):
         self.flags(virt_type='xen', group='libvirt')

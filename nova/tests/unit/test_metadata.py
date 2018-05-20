@@ -94,7 +94,10 @@ def fake_inst_obj(context):
         default_swap_device=None,
         system_metadata={},
         security_groups=objects.SecurityGroupList(),
-        availability_zone='fake-az')
+        availability_zone='fake-az',
+        numa_topology=objects.InstanceNUMATopology(
+            cells=[objects.InstanceNUMACell(
+                id=1, cpuset=set([1, 2]), memory=512)]))
     inst.keypairs = objects.KeyPairList(objects=[
             fake_keypair_obj(inst.key_name, inst.key_data)])
 

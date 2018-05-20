@@ -32,6 +32,7 @@ class NetworkAssociateActionController(wsgi.Controller):
         self.network_api = network_api or network.API()
 
     @wsgi.Controller.api_version("2.1", MAX_PROXY_API_SUPPORT_VERSION)
+    @extensions.block_during_upgrade()
     @wsgi.action("disassociate_host")
     @wsgi.response(202)
     @extensions.expected_errors((404, 501))
@@ -47,6 +48,7 @@ class NetworkAssociateActionController(wsgi.Controller):
             common.raise_feature_not_supported()
 
     @wsgi.Controller.api_version("2.1", MAX_PROXY_API_SUPPORT_VERSION)
+    @extensions.block_during_upgrade()
     @wsgi.action("disassociate_project")
     @wsgi.response(202)
     @extensions.expected_errors((404, 501))
@@ -62,6 +64,7 @@ class NetworkAssociateActionController(wsgi.Controller):
             common.raise_feature_not_supported()
 
     @wsgi.Controller.api_version("2.1", MAX_PROXY_API_SUPPORT_VERSION)
+    @extensions.block_during_upgrade()
     @wsgi.action("associate_host")
     @wsgi.response(202)
     @extensions.expected_errors((404, 501))

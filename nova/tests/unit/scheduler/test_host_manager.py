@@ -365,7 +365,7 @@ class HostManagerTestCase(test.NoDBTestCase):
                 'get_filtered_objects') as fake_filter:
             result = self.host_manager.get_filtered_hosts(self.fake_hosts,
                     fake_properties)
-            self.assertFalse(fake_filter.called)
+            self.assertTrue(fake_filter.called)
 
         self._verify_result(info, result, False)
 
@@ -1096,7 +1096,8 @@ class HostStateTestCase(test.NoDBTestCase):
             hypervisor_version=hyper_ver_int, numa_topology=None,
             pci_device_pools=None, metrics=None,
             cpu_allocation_ratio=16.0, ram_allocation_ratio=1.5,
-            disk_allocation_ratio=1.0)
+            disk_allocation_ratio=1.0,
+            l3_closids=16, l3_closids_used=1)
 
         host = host_manager.HostState("fakehost", "fakenode", uuids.cell)
         host.update(compute=compute)
@@ -1140,7 +1141,8 @@ class HostStateTestCase(test.NoDBTestCase):
             hypervisor_version=hyper_ver_int, numa_topology=None,
             pci_device_pools=None, metrics=None,
             cpu_allocation_ratio=16.0, ram_allocation_ratio=1.5,
-            disk_allocation_ratio=1.0)
+            disk_allocation_ratio=1.0,
+            l3_closids=16, l3_closids_used=1)
 
         host = host_manager.HostState("fakehost", "fakenode", uuids.cell)
         host.update(compute=compute)
@@ -1174,7 +1176,8 @@ class HostStateTestCase(test.NoDBTestCase):
             hypervisor_version=hyper_ver_int, numa_topology=None,
             pci_device_pools=None, metrics=None,
             cpu_allocation_ratio=16.0, ram_allocation_ratio=1.5,
-            disk_allocation_ratio=1.0)
+            disk_allocation_ratio=1.0,
+            l3_closids=16, l3_closids_used=1)
 
         host = host_manager.HostState("fakehost", "fakenode", uuids.cell)
         host.update(compute=compute)
@@ -1199,7 +1202,8 @@ class HostStateTestCase(test.NoDBTestCase):
                                             sync_mock):
         fake_numa_topology = objects.InstanceNUMATopology(
             cells=[objects.InstanceNUMACell()])
-        fake_host_numa_topology = mock.Mock()
+        # WRS - need iterable host numa topology
+        fake_host_numa_topology = fakes.NUMA_TOPOLOGY
         fake_instance = objects.Instance(numa_topology=fake_numa_topology)
         host_topo_mock.return_value = (fake_host_numa_topology, True)
         numa_usage_mock.return_value = fake_host_numa_topology
@@ -1208,18 +1212,27 @@ class HostStateTestCase(test.NoDBTestCase):
         spec_obj = objects.RequestSpec(
             instance_uuid=uuids.instance,
             flavor=objects.Flavor(root_gb=0, ephemeral_gb=0, memory_mb=0,
-                                  vcpus=0),
+                                  vcpus=0,
+                                  # WRS - numa affinity
+                                  extra_specs={}),
+            image=objects.ImageMeta(properties=objects.ImageMetaProps()),
             numa_topology=fake_numa_topology,
             pci_requests=objects.InstancePCIRequests(requests=[]))
         host = host_manager.HostState("fakehost", "fakenode", uuids.cell)
+        # WRS: cpu_allocation_ratio is now needed
+        host.cpu_allocation_ratio = 16
 
         self.assertIsNone(host.updated)
         host.consume_from_request(spec_obj)
+        # WRS - pass through metrics, strict vswitch, strict avs/pci
         numa_fit_mock.assert_called_once_with(fake_host_numa_topology,
                                               fake_numa_topology,
-                                              limits=None, pci_requests=None,
-                                              pci_stats=None)
-        numa_usage_mock.assert_called_once_with(host, fake_instance)
+                                              limits=None,
+                                              pci_requests=None,
+                                              pci_stats=None,
+                                              pci_strict=True)
+        numa_usage_mock.assert_called_once_with(host, fake_instance,
+                                                strict=True)
         sync_mock.assert_called_once_with(("fakehost", "fakenode"))
         self.assertEqual(fake_host_numa_topology, host.numa_topology)
         self.assertIsNotNone(host.updated)
@@ -1229,7 +1242,10 @@ class HostStateTestCase(test.NoDBTestCase):
         spec_obj = objects.RequestSpec(
             instance_uuid=uuids.instance,
             flavor=objects.Flavor(root_gb=0, ephemeral_gb=0, memory_mb=0,
-                                  vcpus=0),
+                                  vcpus=0,
+                                  # WRS - numa affinity
+                                  extra_specs={}),
+            image=objects.ImageMeta(properties=objects.ImageMetaProps()),
             numa_topology=second_numa_topology,
             pci_requests=objects.InstancePCIRequests(requests=[]))
         second_host_numa_topology = mock.Mock()
@@ -1240,7 +1256,9 @@ class HostStateTestCase(test.NoDBTestCase):
         self.assertEqual(2, host.num_instances)
         self.assertEqual(2, host.num_io_ops)
         self.assertEqual(2, numa_usage_mock.call_count)
-        self.assertEqual(((host, fake_instance),), numa_usage_mock.call_args)
+        self.assertEqual(((host, fake_instance),
+                          {'strict': True}),
+                         numa_usage_mock.call_args)
         self.assertEqual(second_host_numa_topology, host.numa_topology)
         self.assertIsNotNone(host.updated)
 
@@ -1265,7 +1283,10 @@ class HostStateTestCase(test.NoDBTestCase):
             flavor=objects.Flavor(root_gb=0,
                                   ephemeral_gb=0,
                                   memory_mb=512,
-                                  vcpus=1))
+                                  vcpus=1,
+                                  # WRS - numa affinity
+                                  extra_specs={}),
+            image=objects.ImageMeta(properties=objects.ImageMetaProps()))
         host = host_manager.HostState("fakehost", "fakenode", uuids.cell)
         self.assertIsNone(host.updated)
         host.pci_stats = pci_stats.PciDeviceStats(
@@ -1274,13 +1295,54 @@ class HostStateTestCase(test.NoDBTestCase):
                                                              numa_node=1,
                                                              count=1)])
         host.numa_topology = fakes.NUMA_TOPOLOGY
+        # WRS: cpu_allocation_ratio is now needed
+        host.cpu_allocation_ratio = 16.0
         host.consume_from_request(req_spec)
         self.assertIsInstance(req_spec.numa_topology,
                               objects.InstanceNUMATopology)
 
         self.assertEqual(512, host.numa_topology.cells[1].memory_usage)
-        self.assertEqual(1, host.numa_topology.cells[1].cpu_usage)
+        self.assertEqual(1 / host.cpu_allocation_ratio,
+                         host.numa_topology.cells[1].cpu_usage)
         self.assertEqual(0, len(host.pci_stats.pools))
+        self.assertIsNotNone(host.updated)
+
+    def test_stat_consumption_ram_disk_cpu_from_instance(self):
+        inst_topology = objects.InstanceNUMATopology(
+                            cells = [objects.InstanceNUMACell(
+                                                      cpuset=set([0]),
+                                                      memory=512, id=0)])
+
+        fake_requests = [{'request_id': uuids.request_id, 'count': 1,
+                          'spec': [{'vendor_id': '8086'}]}]
+
+        req_spec = objects.RequestSpec(
+            instance_uuid=uuids.instance,
+            project_id='12345',
+            numa_topology=inst_topology,
+            pci_requests=None,
+            flavor=objects.Flavor(root_gb=1,
+                                  ephemeral_gb=0,
+                                  memory_mb=512,
+                                  vcpus=1,
+                                  # WRS - numa affinity
+                                  extra_specs={}),
+            image=objects.ImageMeta(properties=objects.ImageMetaProps()))
+        host = host_manager.HostState("fakehost", "fakenode", uuids.cell)
+        host.free_disk_mb = 1024
+        host.free_ram_mb = 512
+        self.assertIsNone(host.updated)
+
+        host.numa_topology = fakes.NUMA_TOPOLOGY
+        # WRS: cpu_allocation_ratio is now needed
+        host.cpu_allocation_ratio = 1.0
+        host.consume_from_request(req_spec)
+        self.assertIsInstance(req_spec.numa_topology,
+                              objects.InstanceNUMATopology)
+
+        self.assertEqual(0, host.free_ram_mb)
+        self.assertEqual(1, host.vcpus_used)
+        self.assertEqual(0, host.free_disk_mb)
         self.assertIsNotNone(host.updated)
 
     def test_stat_consumption_from_instance_with_pci_exception(self):
@@ -1298,7 +1360,10 @@ class HostStateTestCase(test.NoDBTestCase):
             flavor=objects.Flavor(root_gb=0,
                                   ephemeral_gb=0,
                                   memory_mb=1024,
-                                  vcpus=1))
+                                  vcpus=1,
+                                  # WRS - numa affinity
+                                  extra_specs={}),
+            image=objects.ImageMeta(properties=objects.ImageMetaProps()))
         host = host_manager.HostState("fakehost", "fakenode", uuids.cell)
         self.assertIsNone(host.updated)
         fake_updated = mock.sentinel.fake_updated
@@ -1336,7 +1401,8 @@ class HostStateTestCase(test.NoDBTestCase):
             numa_topology=fakes.NUMA_TOPOLOGY._to_json(),
             stats=None, pci_device_pools=None,
             cpu_allocation_ratio=16.0, ram_allocation_ratio=1.5,
-            disk_allocation_ratio=1.0)
+            disk_allocation_ratio=1.0,
+            l3_closids=16, l3_closids_used=1)
         host = host_manager.HostState("fakehost", "fakenode", uuids.cell)
         host.update(compute=compute)
 
@@ -1352,6 +1418,7 @@ class HostStateTestCase(test.NoDBTestCase):
 
     def test_stat_consumption_from_compute_node_not_ready(self):
         compute = objects.ComputeNode(free_ram_mb=100,
+            l3_closids=16, l3_closids_used=1,
             uuid=uuids.compute_node_uuid)
 
         host = host_manager.HostState("fakehost", "fakenode", uuids.cell)

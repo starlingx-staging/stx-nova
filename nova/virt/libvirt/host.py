@@ -17,6 +17,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2013-2017 Wind River Systems, Inc.
+#
 
 """
 Manages information about the host OS and hypervisor.
@@ -29,6 +32,7 @@ the other libvirt related classes
 
 import operator
 import os
+import re
 import socket
 import sys
 import threading
@@ -64,6 +68,10 @@ native_Queue = patcher.original("Queue" if six.PY2 else "queue")
 
 CONF = nova.conf.CONF
 
+# WRS - memory accounting - constants (KiB)
+MEMPAGE_SZ_4K = 4
+MEMPAGE_SZ_2M = 2048
+MEMPAGE_SZ_1G = 1048576
 
 # This list is for libvirt hypervisor drivers that need special handling.
 # This is *not* the complete list of supported hypervisor drivers.
@@ -165,7 +173,11 @@ class Host(object):
         uuid = dom.UUIDString()
         transition = None
         if event == libvirt.VIR_DOMAIN_EVENT_STOPPED:
-            transition = virtevent.EVENT_LIFECYCLE_STOPPED
+            # WRS: transition to crashed if stop failed
+            if detail == libvirt.VIR_DOMAIN_EVENT_STOPPED_FAILED:
+                transition = virtevent.EVENT_LIFECYCLE_CRASHED
+            else:
+                transition = virtevent.EVENT_LIFECYCLE_STOPPED
         elif event == libvirt.VIR_DOMAIN_EVENT_STARTED:
             transition = virtevent.EVENT_LIFECYCLE_STARTED
         elif event == libvirt.VIR_DOMAIN_EVENT_SUSPENDED:
@@ -561,6 +573,29 @@ class Host(object):
                     'ex': ex})
             raise exception.InternalError(msg)
 
+    # WRS - routine is removed upstream, but needed by orphan cleanup audit
+    def _get_domain_by_name(self, instance_name):
+        """Retrieve libvirt domain object given an instance name.
+
+        All libvirt error handling should be handled in this method and
+        relevant nova exceptions should be raised in response.
+
+        """
+        try:
+            conn = self.get_connection()
+            return conn.lookupByName(instance_name)
+        except libvirt.libvirtError as ex:
+            error_code = ex.get_error_code()
+            if error_code == libvirt.VIR_ERR_NO_DOMAIN:
+                raise exception.InstanceNotFound(instance_id=instance_name)
+
+            msg = (_('Error from libvirt while looking up %(instance_name)s: '
+                     '[Error Code %(error_code)s] %(ex)s') %
+                   {'instance_name': instance_name,
+                    'error_code': error_code,
+                    'ex': ex})
+            raise exception.NovaException(msg)
+
     def list_guests(self, only_running=True, only_guests=True):
         """Get a list of Guest objects for nova instances
 
@@ -622,6 +657,25 @@ class Host(object):
 
         return online_cpus
 
+    # WRS - memory accounting
+    def _get_configured_pages(self, csv=None):
+        """Get number of configured hugepages per numa node.
+
+        :param: comma-separated-list of configured values
+
+        :returns: list of number of configured hugepages per numa node
+
+        """
+        if csv is None:
+            return []
+        values = csv.strip()
+        if not values:
+            return []
+        pages = []
+        for value in values.split(','):
+            pages.append(int(value))
+        return pages
+
     def get_capabilities(self):
         """Returns the host capabilities information
 
@@ -660,7 +714,111 @@ class Host(object):
                                      {'uri': self._uri, 'error': ex})
                     else:
                         raise
+
+            # WRS - Simplify memory accounting by engineering out of maximum
+            # VM available memory instead of total physical memory.
+            # After this adjustment, cell.mempages[] only represents VM memory
+            # and corresponds exactly match compute-huge.
+            # The following adjustment also removes vswitch hugepages overheads
+            # and 4K pages overheads from accounting.
+            # Important: cell.memory obtained from getCapabilities() is KiB.
+            # The NumaCell.memory field is in MiB as converted by routine
+            # virt/libvirt/driver.py: _get_host_numa_topology().  This is
+            # confusing since both use same variable name.
+            topology = self._caps.host.topology
+            if topology is None or not topology.cells:
+                return self._caps
+            vm_4K_nodes = self._get_configured_pages(
+                csv=CONF.compute_vm_4K_pages)
+            vs_2M_nodes = self._get_configured_pages(
+                csv=CONF.compute_vswitch_2M_pages)
+            vs_1G_nodes = self._get_configured_pages(
+                csv=CONF.compute_vswitch_1G_pages)
+            for cell in topology.cells:
+                msg = []
+                cell.memory = 0
+                for k, pages in enumerate(cell.mempages):
+                    pg = cell.mempages[k]
+                    if pages.size == MEMPAGE_SZ_4K and vm_4K_nodes:
+                        vm_4K = vm_4K_nodes[cell.id]
+                        oh_4K = pg.total - vm_4K
+                        pg.total -= oh_4K
+                        cell.memory += (pg.total * pg.size)
+                        MiB = oh_4K * MEMPAGE_SZ_4K // units.Ki
+                        msg.append('%d MiB 4K overhead' % (MiB))
+                    if pages.size == MEMPAGE_SZ_2M and vs_2M_nodes:
+                        vs_2M = vs_2M_nodes[cell.id]
+                        pg.total -= vs_2M
+                        cell.memory += (pg.total * pg.size)
+                        MiB = vs_2M * MEMPAGE_SZ_2M // units.Ki
+                        msg.append('%d MiB 2M vswitch' % (MiB))
+                    if pages.size == MEMPAGE_SZ_1G and vs_1G_nodes:
+                        vs_1G = vs_1G_nodes[cell.id]
+                        pg.total -= vs_1G
+                        cell.memory += (pg.total * pg.size)
+                        MiB = vs_1G * MEMPAGE_SZ_1G // units.Ki
+                        msg.append('%d MiB 1G vswitch' % (MiB))
+                LOG.info("cell:%(id)s exclude: %(msg)s",
+                         {'id': cell.id, 'msg': '; '.join(msg)})
         return self._caps
+
+    def get_actual_free_mempages(self):
+        """Get the host actual free memory pages used per cell per pagesize.
+
+        :returns: dictionary of actual free mempages used per cell per pagesize
+        """
+        free_mempages = {}
+        caps = self.get_capabilities()
+        topology = caps.host.topology
+        if topology is None or not topology.cells:
+            return free_mempages
+
+        # Extract meminfo fields that may be treated as available memory,
+        # including linux free, file cached, and reclaimable.
+        re_node_MemFree = re.compile(r'^Node\s+\d+\s+MemFree:\s+(\d+)')
+        re_node_FilePages = re.compile(r'^Node\s+\d+\s+FilePages:\s+(\d+)')
+        re_node_SReclaim = re.compile(r'^Node\s+\d+\s+SReclaimable:\s+(\d+)')
+
+        for cell in topology.cells:
+            SYSNODE = '/sys/devices/system/node/node%d' % (cell.id)
+            free_mempages[cell.id] = {}
+            for k, pages in enumerate(cell.mempages):
+                pg = cell.mempages[k]
+
+                if pages.size == MEMPAGE_SZ_4K:
+                    free_KiB = 0
+                    meminfo = SYSNODE + '/meminfo'
+                    try:
+                        with open(meminfo, 'r') as infile:
+                            for line in infile:
+                                match = re_node_MemFree.search(line)
+                                if match:
+                                    free_KiB += int(match.group(1))
+                                    continue
+                                match = re_node_FilePages.search(line)
+                                if match:
+                                    free_KiB += int(match.group(1))
+                                    continue
+                                match = re_node_SReclaim.search(line)
+                                if match:
+                                    free_KiB += int(match.group(1))
+                                    continue
+                    except IOError:
+                        pass
+                    free_pages = free_KiB // pages.size
+                    free_mempages[cell.id][pg.size] = free_pages
+
+                else:
+                    f_sz = SYSNODE + '/hugepages/hugepages-%dkB' % (pages.size)
+                    f_nf = f_sz + '/free_hugepages'
+                    try:
+                        with open(f_nf) as f:
+                            free_pages = int(f.read().strip())
+                    except IOError:
+                        free_pages = 0
+                    free_mempages[cell.id][pg.size] = free_pages
+
+        return free_mempages
 
     def get_driver_type(self):
         """Get hypervisor type.
@@ -774,7 +932,17 @@ class Host(object):
 
         :returns: the total amount of memory(MB).
         """
-        return self._get_hardware_info()[1]
+        # WRS - Get the total reserved memory.  Note that cell.memory values
+        # have already excluded Linux and vswitch overheads.
+        # Important: cell.memory obtained from getCapabilities() is KiB.
+        caps = self.get_capabilities()
+        topology = caps.host.topology
+        if topology is None or not topology.cells:
+            return self._get_hardware_info()[1]
+        memory = 0
+        for cell in topology.cells:
+            memory += int(cell.memory)
+        return memory // units.Ki
 
     def get_memory_mb_used(self):
         """Get the used memory size(MB) of physical computer.
@@ -814,8 +982,61 @@ class Host(object):
             return used // units.Ki
         else:
             avail = (int(m[idx1 + 1]) + int(m[idx2 + 1]) + int(m[idx3 + 1]))
+            # WRS: memory accounting
             # Convert it to MB
-            return self.get_memory_mb_total() - avail // units.Ki
+            # return self.get_memory_mb_total() - avail // units.Ki
+
+            # Used amount of 2M hugepages
+            vs_2M_nodes = self._get_configured_pages(
+                csv=CONF.compute_vswitch_2M_pages)
+            vs_2M = 0
+            for pages in vs_2M_nodes:
+                vs_2M += pages
+            f_2M = '/sys/kernel/mm/hugepages/hugepages-%dkB' % (MEMPAGE_SZ_2M)
+            f_nr = f_2M + '/nr_hugepages'
+            f_nf = f_2M + '/free_hugepages'
+            try:
+                with open(f_nr) as f:
+                    h_Total = int(f.read().strip())
+                with open(f_nf) as f:
+                    h_Free = int(f.read().strip())
+            except IOError:
+                h_Total = 0
+                h_Free = 0
+                vs_2M = 0
+            Used_2M_MiB = int((h_Total - vs_2M - h_Free) *
+                              MEMPAGE_SZ_2M / units.Ki)
+            HTot_2M_MiB = int(h_Total) * MEMPAGE_SZ_2M // units.Ki
+
+            # Used amount of 1G hugepages
+            vs_1G_nodes = self._get_configured_pages(
+                csv=CONF.compute_vswitch_1G_pages)
+            vs_1G = 0
+            for pages in vs_1G_nodes:
+                vs_1G += pages
+            f_1G = '/sys/kernel/mm/hugepages/hugepages-%dkB' % (MEMPAGE_SZ_1G)
+            f_nr = f_1G + '/nr_hugepages'
+            f_nf = f_1G + '/free_hugepages'
+            try:
+                with open(f_nr) as f:
+                    h_Total = int(f.read().strip())
+                with open(f_nf) as f:
+                    h_Free = int(f.read().strip())
+            except IOError:
+                h_Total = 0
+                h_Free = 0
+                vs_1G = 0
+            Used_1G_MiB = int((h_Total - vs_1G - h_Free) *
+                              MEMPAGE_SZ_1G / units.Ki)
+            HTot_1G_MiB = int(h_Total) * MEMPAGE_SZ_1G // units.Ki
+
+            # Used amount of 4K pages: including linux base + VMs
+            Total_MiB = self._get_hardware_info()[1]
+            Total_4K_MiB = Total_MiB - HTot_2M_MiB - HTot_1G_MiB
+            Used_4K_MiB = Total_4K_MiB - avail // units.Ki
+
+            Used_MiB = Used_4K_MiB + Used_2M_MiB + Used_1G_MiB
+            return Used_MiB
 
     def get_cpu_stats(self):
         """Returns the current CPU state of the host with frequency."""

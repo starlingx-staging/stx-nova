@@ -11,7 +11,11 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2013-2017 Wind River Systems, Inc.
+#
 
+from oslo_config import cfg
 from oslo_serialization import jsonutils
 from oslo_utils import versionutils
 
@@ -20,6 +24,9 @@ from nova import exception
 from nova.objects import base
 from nova.objects import fields as obj_fields
 from nova.virt import hardware
+
+
+CONF = cfg.CONF
 
 
 # TODO(berrange): Remove NovaObjectDictCompat
@@ -31,6 +38,8 @@ class InstanceNUMACell(base.NovaObject,
     # Version 1.2: Add cpu_pinning_raw and topology fields
     # Version 1.3: Add cpu_policy and cpu_thread_policy fields
     # Version 1.4: Add cpuset_reserved field
+    #              WRS: Add physnode
+    #              WRS: Add shared_vcpu and shared_pcpu_for_vcpu
     VERSION = '1.4'
 
     def obj_make_compatible(self, primitive, target_version):
@@ -43,20 +52,36 @@ class InstanceNUMACell(base.NovaObject,
         if target_version < (1, 3):
             primitive.pop('cpu_policy', None)
             primitive.pop('cpu_thread_policy', None)
+        # NOTE(jgauld): R4 to R5 upgrades, Pike upversion to 1.4. Drop L3
+        #               related fields with R4/Newton.
+        if target_version < (1, 4) or CONF.upgrade_levels.compute == 'newton':
+            primitive.pop('l3_cpuset', None)
+            primitive.pop('l3_both_size', None)
+            primitive.pop('l3_code_size', None)
+            primitive.pop('l3_data_size', None)
 
     fields = {
         'id': obj_fields.IntegerField(),
         'cpuset': obj_fields.SetOfIntegersField(),
         'memory': obj_fields.IntegerField(),
+        'physnode': obj_fields.IntegerField(nullable=True),
         'pagesize': obj_fields.IntegerField(nullable=True),
         'cpu_topology': obj_fields.ObjectField('VirtCPUTopology',
                                                nullable=True),
         'cpu_pinning_raw': obj_fields.DictOfIntegersField(nullable=True),
+        'shared_vcpu': obj_fields.IntegerField(nullable=True),
+        'shared_pcpu_for_vcpu': obj_fields.IntegerField(nullable=True),
         'cpu_policy': obj_fields.CPUAllocationPolicyField(nullable=True),
         'cpu_thread_policy': obj_fields.CPUThreadAllocationPolicyField(
             nullable=True),
         # These physical CPUs are reserved for use by the hypervisor
         'cpuset_reserved': obj_fields.SetOfIntegersField(nullable=True),
+
+        # L3 CAT
+        'l3_cpuset': obj_fields.SetOfIntegersField(nullable=True),
+        'l3_both_size': obj_fields.IntegerField(nullable=True),
+        'l3_code_size': obj_fields.IntegerField(nullable=True),
+        'l3_data_size': obj_fields.IntegerField(nullable=True),
     }
 
     cpu_pinning = obj_fields.DictProxyField('cpu_pinning_raw')
@@ -66,6 +91,9 @@ class InstanceNUMACell(base.NovaObject,
         if 'pagesize' not in kwargs:
             self.pagesize = None
             self.obj_reset_changes(['pagesize'])
+        if 'cpu_topology' not in kwargs:
+            self.cpu_topology = None
+            self.obj_reset_changes(['cpu_topology'])
         if 'cpu_pinning' not in kwargs:
             self.cpu_pinning = None
             self.obj_reset_changes(['cpu_pinning_raw'])
@@ -78,6 +106,27 @@ class InstanceNUMACell(base.NovaObject,
         if 'cpuset_reserved' not in kwargs:
             self.cpuset_reserved = None
             self.obj_reset_changes(['cpuset_reserved'])
+        if 'physnode' not in kwargs:
+            self.physnode = None
+            self.obj_reset_changes(['physnode'])
+        if 'shared_vcpu' not in kwargs:
+            self.shared_vcpu = None
+            self.obj_reset_changes(['shared_vcpu'])
+        if 'shared_pcpu_for_vcpu' not in kwargs:
+            self.shared_pcpu_for_vcpu = None
+            self.obj_reset_changes(['shared_pcpu_for_vcpu'])
+        if 'l3_cpuset' not in kwargs:
+            self.l3_cpuset = None
+            self.obj_reset_changes(['l3_cpuset'])
+        if 'l3_both_size' not in kwargs:
+            self.l3_both_size = None
+            self.obj_reset_changes(['l3_both_size'])
+        if 'l3_code_size' not in kwargs:
+            self.l3_code_size = None
+            self.obj_reset_changes(['l3_code_size'])
+        if 'l3_data_size' not in kwargs:
+            self.l3_data_size = None
+            self.obj_reset_changes(['l3_data_size'])
 
     def __len__(self):
         return len(self.cpuset)
@@ -137,6 +186,95 @@ class InstanceNUMACell(base.NovaObject,
         self.id = -1
         self.cpu_pinning = {}
         return self
+
+    @property
+    def cachetune_requested(self):
+        return (self.l3_cpuset is not None) and (len(self.l3_cpuset) > 0)
+
+    # WRS extension
+    @property
+    def numa_pinning_requested(self):
+        return self.physnode is not None
+
+    # WRS: add a readable string representation
+    def __str__(self):
+        return '  {obj_name} (id: {id})\n' \
+               '    cpuset: {cpuset}\n' \
+               '    shared_vcpu: {shared_vcpu}\n' \
+               '    shared_pcpu_for_vcpu: {shared_pcpu_for_vcpu}\n' \
+               '    memory: {memory}\n' \
+               '    physnode: {physnode}\n' \
+               '    pagesize: {pagesize}\n' \
+               '    cpu_topology: {cpu_topology}\n' \
+               '    cpu_pinning: {cpu_pinning}\n' \
+               '    siblings: {siblings}\n' \
+               '    cpu_policy: {cpu_policy}\n' \
+               '    cpu_thread_policy: {cpu_thread_policy}\n' \
+               '    l3_cpuset: {l3_cpuset}\n' \
+               '    l3_both_size: {l3_both_size}\n' \
+               '    l3_code_size: {l3_code_size}\n' \
+               '    l3_data_size: {l3_data_size}'.format(
+            obj_name=self.obj_name(),
+            id=self.id if ('id' in self) else None,
+            cpuset=hardware.format_cpu_spec(
+                self.cpuset, allow_ranges=True),
+            shared_vcpu=self.shared_vcpu,
+            shared_pcpu_for_vcpu=self.shared_pcpu_for_vcpu,
+            memory=self.memory,
+            physnode=self.physnode,
+            pagesize=self.pagesize,
+            cpu_topology=self.cpu_topology if (
+                'cpu_topology' in self) else None,
+            cpu_pinning=self.cpu_pinning,
+            siblings=self.siblings,
+            cpu_policy=self.cpu_policy,
+            cpu_thread_policy=self.cpu_thread_policy,
+            l3_cpuset=hardware.format_cpu_spec(
+                self.l3_cpuset or [], allow_ranges=True),
+            l3_both_size=self.l3_both_size,
+            l3_code_size=self.l3_code_size,
+            l3_data_size=self.l3_data_size,
+        )
+
+    # WRS: add a readable representation, without newlines
+    def __repr__(self):
+        return '{obj_name} (id: {id}) ' \
+               'cpuset: {cpuset} ' \
+               'shared_vcpu: {shared_vcpu} ' \
+               'shared_pcpu_for_vcpu: {shared_pcpu_for_vcpu} ' \
+               'memory: {memory} ' \
+               'physnode: {physnode} ' \
+               'pagesize: {pagesize} ' \
+               'cpu_topology: {cpu_topology} ' \
+               'cpu_pinning: {cpu_pinning} ' \
+               'siblings: {siblings} ' \
+               'cpu_policy: {cpu_policy} ' \
+               'cpu_thread_policy: {cpu_thread_policy} ' \
+               'l3_cpuset: {l3_cpuset} ' \
+               'l3_both_size: {l3_both_size} ' \
+               'l3_code_size: {l3_code_size} ' \
+               'l3_data_size: {l3_data_size}'.format(
+            obj_name=self.obj_name(),
+            id=self.id if ('id' in self) else None,
+            cpuset=hardware.format_cpu_spec(
+                self.cpuset, allow_ranges=True),
+            shared_vcpu=self.shared_vcpu,
+            shared_pcpu_for_vcpu=self.shared_pcpu_for_vcpu,
+            memory=self.memory,
+            physnode=self.physnode,
+            pagesize=self.pagesize,
+            cpu_topology=self.cpu_topology if (
+                'cpu_topology' in self) else None,
+            cpu_pinning=self.cpu_pinning,
+            siblings=self.siblings,
+            cpu_policy=self.cpu_policy,
+            cpu_thread_policy=self.cpu_thread_policy,
+            l3_cpuset=hardware.format_cpu_spec(
+                self.l3_cpuset or [], allow_ranges=True),
+            l3_both_size=self.l3_both_size,
+            l3_code_size=self.l3_code_size,
+            l3_data_size=self.l3_data_size,
+        )
 
 
 # TODO(berrange): Remove NovaObjectDictCompat
@@ -244,9 +382,63 @@ class InstanceNUMATopology(base.NovaObject,
             cell.clear_host_pinning()
         return self
 
+    def __str__(self):
+        topology_str = '{obj_name}:'.format(obj_name=self.obj_name())
+        for cell in self.cells:
+            topology_str += '\n' + str(cell)
+        return topology_str
+
+    def __repr__(self):
+        topology_str = '{obj_name}: '.format(obj_name=self.obj_name())
+        topology_str += ', '.join(repr(cell) for cell in self.cells)
+        return topology_str
+
     @property
     def emulator_threads_isolated(self):
         """Determines whether emulator threads should be isolated"""
         return (self.obj_attr_is_set('emulator_threads_policy')
                 and (self.emulator_threads_policy
                      == obj_fields.CPUEmulatorThreadsPolicy.ISOLATE))
+
+    @property
+    def numa_pinning_requested(self):
+        return all(cell.numa_pinning_requested for cell in self.cells)
+
+    def vcpu_to_pcpu(self, vcpu):
+        for cell in self.cells:
+            if vcpu in cell.cpu_pinning.keys():
+                return cell, cell.cpu_pinning[vcpu]
+            if vcpu == cell.shared_vcpu:
+                return cell, cell.shared_pcpu_for_vcpu
+        raise KeyError('Unable to find pCPU for vCPU %d' % vcpu)
+
+    @property
+    def offline_cpus(self):
+        offline_cpuset = set()
+        if not self.cpu_pinning_requested:
+            return offline_cpuset
+        # The offline vCPUs will be pinned the same as vCPU0
+        # or the shared vcpu index if it is assigned
+        for cell in self.cells:
+            online_index = 0
+            if cell.shared_vcpu is not None:
+                online_index = cell.shared_vcpu
+            vcpu0_cell, vcpu0_phys = self.vcpu_to_pcpu(online_index)
+            for vcpu in cell.cpuset:
+                if (vcpu != online_index
+                    and cell.cpu_pinning[vcpu] == vcpu0_phys):
+                    offline_cpuset |= {vcpu}
+        return offline_cpuset
+
+    def set_cpus_offline(self, offline_cpus):
+        if not self.cpu_pinning_requested:
+            return
+        # The offline vCPUs will be pinned the same as vCPU0
+        for cell in self.cells:
+            online_index = 0
+            if cell.shared_vcpu is not None:
+                online_index = cell.shared_vcpu
+            vcpu0_cell, vcpu0_phys = self.vcpu_to_pcpu(online_index)
+            for vcpu in cell.cpuset:
+                if vcpu in offline_cpus:
+                    cell.pin(vcpu, vcpu0_phys)

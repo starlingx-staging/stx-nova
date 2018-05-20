@@ -39,6 +39,7 @@ from nova import objects
 from nova.pci import stats as pci_stats
 from nova.scheduler import filters
 from nova.scheduler import weights
+from nova import software_mgmt
 from nova import utils
 from nova.virt import hardware
 
@@ -47,6 +48,7 @@ CONF = nova.conf.CONF
 
 LOG = logging.getLogger(__name__)
 HOST_INSTANCE_SEMAPHORE = "host_instance"
+SUBFUNCTION_COMPUTE = "compute"
 
 
 class ReadOnlyDict(IterableUserDict):
@@ -123,6 +125,8 @@ class HostState(object):
         self.vcpus_used = 0
         self.pci_stats = None
         self.numa_topology = None
+        # L3 CAT Support
+        self.l3_closids_used = 0
 
         # Additional host information from the compute node stats:
         self.num_instances = 0
@@ -155,15 +159,20 @@ class HostState(object):
 
         # Host cell (v2) membership
         self.cell_uuid = cell_uuid
+        # WRS extension
+        self.patch_prefer = None
+        self.upgrade_prefer = None
+        self.is_ironic = False
 
         self.updated = None
 
     def update(self, compute=None, service=None, aggregates=None,
-            inst_dict=None):
+            inst_dict=None, patch_prefer=None, upgrade_prefer=None):
         """Update all information about a host."""
 
         @utils.synchronized(self._lock_name)
-        def _locked_update(self, compute, service, aggregates, inst_dict):
+        def _locked_update(self, compute, service, aggregates, inst_dict,
+                           patch_prefer, upgrade_prefer):
             # Scheduler API is inherently multi-threaded as every incoming RPC
             # message will be dispatched in it's own green thread. So the
             # shared host state should be updated in a consistent way to make
@@ -180,8 +189,17 @@ class HostState(object):
             if inst_dict is not None:
                 LOG.debug("Update host state with instances: %s", inst_dict)
                 self.instances = inst_dict
+            if patch_prefer is not None:
+                LOG.debug("Update host state with patch_prefer: %s",
+                          patch_prefer)
+                self.patch_prefer = patch_prefer
+            if upgrade_prefer is not None:
+                LOG.debug("Update host state with upgrade_prefer: %s",
+                         upgrade_prefer)
+                self.upgrade_prefer = upgrade_prefer
 
-        return _locked_update(self, compute, service, aggregates, inst_dict)
+        return _locked_update(self, compute, service, aggregates, inst_dict,
+                              patch_prefer, upgrade_prefer)
 
     def _update_from_compute_node(self, compute):
         """Update information about a host from a ComputeNode object."""
@@ -202,6 +220,9 @@ class HostState(object):
         # Assume virtual size is all consumed by instances if use qcow2 disk.
         free_gb = compute.free_disk_gb
         least_gb = compute.disk_available_least
+        self.is_ironic = utils.is_ironic_compute(compute)
+        if self.is_ironic:
+            least_gb = None
         if least_gb is not None:
             if least_gb > free_gb:
                 # can occur when an instance in database is not on host
@@ -226,6 +247,10 @@ class HostState(object):
         self.numa_topology = compute.numa_topology
         self.pci_stats = pci_stats.PciDeviceStats(
             compute.pci_device_pools)
+
+        # L3 CAT Support
+        self.l3_closids = compute.l3_closids
+        self.l3_closids_used = compute.l3_closids_used
 
         # All virt drivers report host_ip
         self.host_ip = compute.host_ip
@@ -276,9 +301,10 @@ class HostState(object):
                    spec_obj.ephemeral_gb) * 1024
         ram_mb = spec_obj.memory_mb
         vcpus = spec_obj.vcpus
-        self.free_ram_mb -= ram_mb
-        self.free_disk_mb -= disk_mb
-        self.vcpus_used += vcpus
+
+        # WRS - extra_specs are needed in multiple places below
+        extra_specs = spec_obj.flavor.extra_specs
+        image_props = spec_obj.image.properties
 
         # Track number of instances on host
         self.num_instances += 1
@@ -289,6 +315,11 @@ class HostState(object):
         else:
             pci_requests = None
 
+        # WRS: Support strict vs prefer allocation of PCI devices.
+        pci_numa_affinity = extra_specs.get('hw:wrs:pci_numa_affinity',
+            'strict')
+        pci_strict = False if pci_numa_affinity == 'prefer' else True
+
         # Calculate the numa usage
         host_numa_topology, _fmt = hardware.host_topology_and_format_from_host(
                                 self)
@@ -297,12 +328,15 @@ class HostState(object):
         spec_obj.numa_topology = hardware.numa_fit_instance_to_host(
             host_numa_topology, instance_numa_topology,
             limits=self.limits.get('numa_topology'),
-            pci_requests=pci_requests, pci_stats=self.pci_stats)
+            pci_requests=pci_requests, pci_stats=self.pci_stats,
+            pci_strict=pci_strict)
         if pci_requests:
             instance_cells = None
             if spec_obj.numa_topology:
                 instance_cells = spec_obj.numa_topology.cells
-            self.pci_stats.apply_requests(pci_requests, instance_cells)
+            self.pci_stats.apply_requests(pci_requests,
+                                          instance_cells,
+                                          pci_strict=pci_strict)
 
         # NOTE(sbauza): Yeah, that's crap. We should get rid of all of those
         # NUMA helpers because now we're 100% sure that spec_obj.numa_topology
@@ -315,21 +349,57 @@ class HostState(object):
         instance = objects.Instance(numa_topology=spec_obj.numa_topology)
 
         self.numa_topology = hardware.get_host_numa_usage_from_instance(
-                self, instance)
+                self, instance, strict=True)
+
+        if self.is_ironic:
+            # Consume node's entire resources regardless of instance request
+            self.free_ram_mb = 0
+            self.free_disk_mb = 0
+            self.vcpus_used = self.vcpus_total
+        else:
+            # Get set of reserved thread sibling pcpus that cannot be allocated
+            # when using 'isolate' cpu_thread_policy.
+            reserved = hardware.get_reserved_thread_sibling_pcpus(
+                instance_numa_topology, host_numa_topology)
+            threads_per_core = hardware._get_threads_per_core(
+                host_numa_topology)
+
+            # WRS - normalized vCPU accounting
+            vcpus = hardware.normalized_vcpus(
+                vcpus=vcpus,
+                reserved=reserved,
+                extra_specs=extra_specs,
+                image_props=image_props,
+                ratio=self.cpu_allocation_ratio,
+                threads_per_core=threads_per_core)
+
+            self.free_ram_mb -= ram_mb
+            self.free_disk_mb -= disk_mb
+            self.vcpus_used += vcpus
 
         # NOTE(sbauza): By considering all cases when the scheduler is called
         # and when consume_from_request() is run, we can safely say that there
         # is always an IO operation because we want to move the instance
         self.num_io_ops += 1
 
+        # L3 CAT Support
+        if ((instance.numa_topology is not None) and
+            any(cell.cachetune_requested
+                for cell in instance.numa_topology.cells)):
+            self.l3_closids_used += 1
+
     def __repr__(self):
-        return ("(%(host)s, %(node)s) ram: %(free_ram)sMB "
+        return ("(%(host)s, %(node)s, %(hypervisor_type)s) "
+                "ram: %(free_ram)sMB "
                 "disk: %(free_disk)sMB io_ops: %(num_io_ops)s "
+                "closids: %(l3_closids_used)s "
                 "instances: %(num_instances)s" %
                 {'host': self.host, 'node': self.nodename,
+                 'hypervisor_type': self.hypervisor_type,
                  'free_ram': self.free_ram_mb, 'free_disk': self.free_disk_mb,
                  'num_io_ops': self.num_io_ops,
-                 'num_instances': self.num_instances})
+                 'num_instances': self.num_instances,
+                 'l3_closids_used': self.l3_closids_used})
 
 
 class HostManager(object):
@@ -364,6 +434,10 @@ class HostManager(object):
         self._instance_info = {}
         if self.track_instance_changes:
             self._init_instance_info()
+
+        # WRS extension
+        self.host_patch_prefer_map = {}
+        self.host_upgrade_prefer_map = {}
 
     def _load_filters(self):
         return CONF.filter_scheduler.enabled_filters
@@ -577,17 +651,20 @@ class HostManager(object):
                 _match_forced_hosts(name_to_cls_map, force_hosts)
             if force_nodes:
                 _match_forced_nodes(name_to_cls_map, force_nodes)
-            check_type = ('scheduler_hints' in spec_obj and
-                          spec_obj.scheduler_hints.get('_nova_check_type'))
-            if not check_type and (force_hosts or force_nodes):
-                # NOTE(deva,dansmith): Skip filters when forcing host or node
-                # unless we've declared the internal check type flag, in which
-                # case we're asking for a specific host and for filtering to
-                # be done.
-                if name_to_cls_map:
-                    return name_to_cls_map.values()
-                else:
-                    return []
+            # WRS: Always evaluate scheduler filters so we prevent launches on
+            # hosts that do not support the VM.  Note the commented out
+            # original code skips scheduler filters.
+            # check_type = ('scheduler_hints' in spec_obj and
+            #               spec_obj.scheduler_hints.get('_nova_check_type'))
+            # if not check_type and (force_hosts or force_nodes):
+            #    # NOTE(deva,dansmith): Skip filters when forcing host or node
+            #    # unless we've declared the internal check type flag, in which
+            #    # case we're asking for a specific host and for filtering to
+            #    # be done.
+            #    if name_to_cls_map:
+            #        return name_to_cls_map.values()
+            #    else:
+            #        return []
             hosts = six.itervalues(name_to_cls_map)
 
         return self.filter_handler.get_filtered_objects(self.enabled_filters,
@@ -661,6 +738,86 @@ class HostManager(object):
             context, cells, compute_uuids=compute_uuids)
         return self._get_host_states(context, compute_nodes, services)
 
+    def get_all_wrs_host_patch_prefer(self, context):
+        """Returns the list of Hosts that are patch current while some hosts
+        are not yet current. This populates host_patch_prefer_map with the
+        current prefered state.
+        """
+        # Query WRS patching state information for all hosts
+        data = software_mgmt.patch_query_hosts()
+
+        # Determine whether all compute hosts are patch-current
+        all_patch_current = True
+        for agent in data['data']:
+            if SUBFUNCTION_COMPUTE in agent["subfunctions"]:
+                if not agent["patch_current"]:
+                    all_patch_current = False
+                    break
+
+        # Update prefer map, and add preferred compute hosts to the set
+        preferred = set()
+        if all_patch_current:
+            prefer = False
+            for agent in data['data']:
+                if SUBFUNCTION_COMPUTE in agent["subfunctions"]:
+                    host = agent["hostname"]
+                    self.host_patch_prefer_map[host] = prefer
+        else:
+            for agent in data['data']:
+                if SUBFUNCTION_COMPUTE in agent["subfunctions"]:
+                    prefer = agent["patch_current"]
+                    host = agent["hostname"]
+                    self.host_patch_prefer_map[host] = prefer
+                    if prefer:
+                        preferred.add(host)
+
+        # remove compute hosts that are no longer preferred
+        expired = set(self.host_patch_prefer_map.keys()) - preferred
+        for host in expired:
+            del self.host_patch_prefer_map[host]
+
+        return six.iterkeys(self.host_patch_prefer_map)
+
+    def get_all_wrs_host_upgrade_prefer(self, context):
+        """Returns the list of Hosts that are upgrades current while in
+        progress of upgrades. This populates host_upgrade_prefer_map with the
+        current upgraded state.
+        """
+        upgrades = []
+        is_upgrading = False
+        to_release = None
+        try:
+            with software_mgmt.SysinvClient() as cc:
+                upgrades = cc.sysinv.upgrade.list()
+                if upgrades:
+                    is_upgrading = True
+                    to_release = upgrades[0].to_release
+        except Exception as e:
+            LOG.error('sysinv client error = %(err)s', {'err': e})
+
+        # Query hosts from sysinv to deduce upgrades state.
+        preferred = set()
+        hosts = []
+        if is_upgrading:
+            try:
+                with software_mgmt.SysinvClient() as cc:
+                    hosts = cc.sysinv.ihost.list()
+            except Exception as e:
+                LOG.error('sysinv client error = %(err)s', {'err': e})
+        for host in hosts:
+            if SUBFUNCTION_COMPUTE in host.subfunctions:
+                prefer = is_upgrading and (host.software_load == to_release)
+                self.host_upgrade_prefer_map[host.hostname] = prefer
+                if prefer:
+                    preferred.add(host.hostname)
+
+        # remove compute hosts that are no longer preferred
+        expired = set(self.host_upgrade_prefer_map.keys()) - preferred
+        for hostname in expired:
+            del self.host_upgrade_prefer_map[hostname]
+
+        return six.iterkeys(self.host_upgrade_prefer_map)
+
     def get_all_host_states(self, context):
         """Returns a generator of HostStates that represents all the hosts
         the HostManager knows about. Also, each of the consumable resources
@@ -703,7 +860,9 @@ class HostManager(object):
                 host_state.update(compute,
                                   dict(service),
                                   self._get_aggregates_info(host),
-                                  self._get_instance_info(context, compute))
+                                  self._get_instance_info(context, compute),
+                                  self._get_wrs_patch_prefer_state(host),
+                                  self._get_wrs_upgrade_prefer_state(host))
 
                 seen_nodes.add(state_key)
 
@@ -759,6 +918,14 @@ class HostManager(object):
             # Host is running old version, or updates aren't flowing.
             inst_dict = self._get_instances_by_host(context, host_name)
         return inst_dict
+
+    def _get_wrs_patch_prefer_state(self, host_name):
+        """Get the host patch prefer state for the specified host."""
+        return self.host_patch_prefer_map.get(host_name, False)
+
+    def _get_wrs_upgrade_prefer_state(self, host_name):
+        """Get the host upgrade prefer state for the specified host."""
+        return self.host_upgrade_prefer_map.get(host_name, False)
 
     def _recreate_instance_info(self, context, host_name):
         """Get the InstanceList for the specified host, and store it in the

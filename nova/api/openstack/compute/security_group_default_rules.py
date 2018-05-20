@@ -33,6 +33,7 @@ class SecurityGroupDefaultRulesController(sg.SecurityGroupControllerBase,
             openstack_driver.get_openstack_security_group_driver())
 
     @wsgi.Controller.api_version("2.1", MAX_PROXY_API_SUPPORT_VERSION)
+    @extensions.block_during_upgrade()
     @extensions.expected_errors((400, 409, 501))
     def create(self, req, body):
         context = req.environ['nova.context']
@@ -90,6 +91,7 @@ class SecurityGroupDefaultRulesController(sg.SecurityGroupControllerBase,
         return {"security_group_default_rule": fmt_rule}
 
     @wsgi.Controller.api_version("2.1", MAX_PROXY_API_SUPPORT_VERSION)
+    @extensions.block_during_upgrade()
     @extensions.expected_errors((400, 404, 501))
     @wsgi.response(204)
     def delete(self, req, id):

@@ -13,6 +13,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2013-2017 Wind River Systems, Inc.
+#
 
 from oslo_log import log as logging
 
@@ -53,6 +56,9 @@ class TypeAffinityFilter(filters.BaseHostFilter):
         instance_type_id = instance_type.id
         other_types_on_host = utils.other_types_on_host(host_state,
                                                         instance_type_id)
+        if other_types_on_host:
+            msg = 'found instances of other instance type'
+            self.filter_reject(host_state, spec_obj, msg)
         return not other_types_on_host
 
 
@@ -78,4 +84,8 @@ class AggregateTypeAffinityFilter(filters.BaseHostFilter):
             if (instance_type.name in
                     [x.strip() for x in val.split(',')]):
                 return True
+        if aggregate_vals:
+            msg = ('%(name)s not found in: %(agg)s' %
+                   {'name': instance_type.name, 'agg': aggregate_vals})
+            self.filter_reject(host_state, spec_obj, msg)
         return not aggregate_vals

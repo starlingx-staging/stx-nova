@@ -58,6 +58,12 @@ class ExtendedHypervisorsTestV21(test.NoDBTestCase):
                            'status': 'enabled',
                            'service': dict(id=2, host='compute2',
                                         disabled_reason=None)})
+    del DETAIL_HYPERS_DICTS[0]['stats']
+    del DETAIL_HYPERS_DICTS[1]['stats']
+    DETAIL_HYPERS_DICTS[0].update(
+        test_hypervisors.FAKE_VIRT_NUMA_TOPOLOGY_STATS)
+    DETAIL_HYPERS_DICTS[1].update(
+        test_hypervisors.FAKE_VIRT_NUMA_TOPOLOGY_STATS)
 
     def _set_up_controller(self):
         self.controller = hypervisors_v21.HypervisorsController()

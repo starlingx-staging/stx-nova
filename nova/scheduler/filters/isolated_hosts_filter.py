@@ -12,6 +12,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2013-2017 Wind River Systems, Inc.
+#
 
 import nova.conf
 from nova.scheduler import filters
@@ -56,14 +59,26 @@ class IsolatedHostsFilter(filters.BaseHostFilter):
             # As there are no images to match, return True if the filter is
             # not restrictive otherwise return False if the host is in the
             # isolation list.
-            return ((not restrict_isolated_hosts_to_isolated_images) or
-                   (host_state.host not in isolated_hosts))
+            retval = ((not restrict_isolated_hosts_to_isolated_images) or
+                      (host_state.host not in isolated_hosts))
+            if not retval:
+                msg = 'host in isolation'
+                self.filter_reject(host_state, spec_obj, msg)
+            return retval
 
         image_ref = spec_obj.image.id if spec_obj.image else None
         image_isolated = image_ref in isolated_images
         host_isolated = host_state.host in isolated_hosts
 
         if restrict_isolated_hosts_to_isolated_images:
-            return (image_isolated == host_isolated)
+            retval = (image_isolated == host_isolated)
+            if not retval:
+                msg = 'image does not match host in isolation'
+                self.filter_reject(host_state, spec_obj, msg)
+            return retval
         else:
-            return (not image_isolated) or host_isolated
+            retval = (not image_isolated) or host_isolated
+            if not retval:
+                msg = 'image isolated or host not isolated'
+                self.filter_reject(host_state, spec_obj, msg)
+            return retval

@@ -10,11 +10,15 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2014-2017 Wind River Systems, Inc.
+#
 
 """Unit tests for compute API."""
 
 import contextlib
 import datetime
+import testtools
 
 import ddt
 import iso8601
@@ -106,11 +110,12 @@ class _ComputeAPIUnitTestMixIn(object):
                   'created_at': datetime.datetime(2012, 1, 19, 18,
                                                   49, 30, 877329),
                   'updated_at': None,
+                  'extra_specs': {'foo': 'bar'},
                  }
         if updates:
             flavor.update(updates)
         return objects.Flavor._from_db_object(self.context, objects.Flavor(),
-                                              flavor)
+                                       flavor, expected_attrs=['extra_specs'])
 
     def _create_instance_obj(self, params=None, flavor=None):
         """Create a test instance."""
@@ -142,6 +147,8 @@ class _ComputeAPIUnitTestMixIn(object):
         instance.ami_launch_index = 0
         instance.memory_mb = 0
         instance.vcpus = 0
+        instance.max_vcpus = instance.vcpus
+        instance.min_vcpus = instance.vcpus
         instance.root_gb = 0
         instance.ephemeral_gb = 0
         instance.architecture = fields_obj.Architecture.X86_64
@@ -154,6 +161,7 @@ class _ComputeAPIUnitTestMixIn(object):
         instance.info_cache = objects.InstanceInfoCache()
         instance.flavor = flavor
         instance.old_flavor = instance.new_flavor = None
+        instance.numa_topology = None
 
         if params:
             instance.update(params)
@@ -191,8 +199,10 @@ class _ComputeAPIUnitTestMixIn(object):
 
         port = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
         address = '10.0.0.1'
+        network_id = 'fake'
         requested_networks = objects.NetworkRequestList(
-            objects=[objects.NetworkRequest(address=address,
+            objects=[objects.NetworkRequest(network_id=network_id,
+                                            address=address,
                                             port_id=port)])
 
         with mock.patch.object(self.compute_api.network_api,
@@ -867,7 +877,8 @@ class _ComputeAPIUnitTestMixIn(object):
         inst.save()
 
         updates.update({'deleted_at': delete_time,
-                        'deleted': True})
+                        'deleted': True,
+                        'uuid': inst.uuid})
         fake_inst = fake_instance.fake_db_instance(**updates)
         self.compute_api._local_cleanup_bdm_volumes([], inst, self.context)
         db.instance_destroy(self.context, inst.uuid,
@@ -952,7 +963,7 @@ class _ComputeAPIUnitTestMixIn(object):
         if self.cell_type != 'api':
             if inst.vm_state == vm_states.RESIZED:
                 self._test_delete_resized_part(inst)
-            if inst.vm_state != vm_states.SHELVED_OFFLOADED:
+            if inst.host is not None:
                 self.context.elevated().AndReturn(self.context)
                 objects.Service.get_by_compute_host(self.context,
                         inst.host).AndReturn(objects.Service())
@@ -960,9 +971,7 @@ class _ComputeAPIUnitTestMixIn(object):
                         mox.IsA(objects.Service)).AndReturn(
                                 inst.host != 'down-host')
 
-            if (inst.host == 'down-host' or
-                    inst.vm_state == vm_states.SHELVED_OFFLOADED):
-
+            if inst.host == 'down-host' or inst.host is None:
                 self._test_downed_host_part(inst, updates, delete_time,
                                             delete_type)
                 cast = False
@@ -996,10 +1005,20 @@ class _ComputeAPIUnitTestMixIn(object):
         self._test_delete('delete', launched_at=None)
 
     def test_delete_in_resizing(self):
-        old_flavor = objects.Flavor(vcpus=1, memory_mb=512, extra_specs={})
-        self._test_delete('delete',
-                          task_state=task_states.RESIZE_FINISH,
-                          old_flavor=old_flavor)
+        # WRS: the delete code has been changed to raise an exception if a
+        # resize is in progress due to a race condition that can potentially
+        # lead to leaked vswitch ports on the source host.
+        inst = self._create_instance_obj()
+        attrs = {'task_state': task_states.RESIZE_FINISH}
+        inst.update(attrs)
+        inst._context = self.context
+        self.mox.ReplayAll()
+
+        self.assertRaises(exception.InstanceInvalidState,
+                          getattr(self.compute_api, 'delete'),
+                          self.context, inst)
+
+        self.mox.UnsetStubs()
 
     def test_delete_in_resized(self):
         self._test_delete('delete', vm_state=vm_states.RESIZED)
@@ -1789,11 +1808,13 @@ class _ComputeAPIUnitTestMixIn(object):
                                    'user': user_count}
 
         cur_flavor = objects.Flavor(id=1, name='foo', vcpus=1, memory_mb=512,
-                                    root_gb=10, disabled=False)
+                                    root_gb=10, disabled=False,
+                                    ephemeral_gb=10)
         fake_inst = self._create_instance_obj()
         fake_inst.flavor = cur_flavor
         new_flavor = objects.Flavor(id=2, name='bar', vcpus=1, memory_mb=2048,
-                                    root_gb=10, disabled=False)
+                                    root_gb=10, disabled=False,
+                                    ephemeral_gb=10)
         mock_get.return_value = new_flavor
         mock_check.side_effect = exception.OverQuota(
                 overs=['ram'], quotas={'cores': 1, 'ram': 2048},
@@ -1814,8 +1835,9 @@ class _ComputeAPIUnitTestMixIn(object):
     def test_migrate_with_kwargs(self):
         self._test_migrate(extra_kwargs=dict(cow='moo'))
 
-    def test_migrate_same_host_and_allowed(self):
-        self._test_migrate(same_host=True, allow_same_host=True)
+    # WRS: remove testcase, migration to same host not supported
+    # def test_migrate_same_host_and_allowed(self):
+    #     self._test_migrate(same_host=True, allow_same_host=True)
 
     def test_migrate_same_host_and_not_allowed(self):
         self._test_migrate(same_host=True, allow_same_host=False)
@@ -2114,18 +2136,24 @@ class _ComputeAPIUnitTestMixIn(object):
         instance = self._create_instance_obj(params=paused_state)
         self._live_migrate_instance(instance)
 
+    @mock.patch.object(objects.ComputeNodeList, 'get_all_by_host')
     @mock.patch.object(compute_utils, 'add_instance_fault_from_exc')
     @mock.patch.object(objects.RequestSpec, 'get_by_instance_uuid')
     @mock.patch.object(objects.InstanceAction, 'action_start')
     @mock.patch.object(objects.Instance, 'save')
     def test_live_migrate_messaging_timeout(self, _save, _action, get_spec,
-                                            add_instance_fault_from_exc):
+                                            add_instance_fault_from_exc,
+                                            get_all_by_host):
         instance = self._create_instance_obj()
         if self.cell_type == 'api':
             api = self.compute_api.cells_rpcapi
         else:
             api = conductor.api.ComputeTaskAPI
 
+        get_all_by_host.return_value = objects.ComputeNodeList(
+            objects=[objects.ComputeNode(
+                host='fake_dest_host',
+                hypervisor_hostname='fake_dest_node')])
         with mock.patch.object(api, 'live_migrate_instance',
                                side_effect=oslo_exceptions.MessagingTimeout):
             self.assertRaises(oslo_exceptions.MessagingTimeout,
@@ -2139,9 +2167,29 @@ class _ComputeAPIUnitTestMixIn(object):
                 mock.ANY)
 
     @mock.patch.object(objects.RequestSpec, 'get_by_instance_uuid')
+    @mock.patch.object(objects.InstanceAction, 'action_start')
+    @mock.patch.object(objects.Instance, 'save')
+    @mock.patch.object(objects.ComputeNodeList, 'get_all_by_host')
+    def test_live_migrate_computehost_notfound(self, mock_nodelist, mock_save,
+                                               mock_action,
+                                               mock_get_spec):
+        instance = self._create_instance_obj()
+        mock_nodelist.side_effect = exception.ComputeHostNotFound('fake_host')
+        self.assertRaises(exception.ComputeHostNotFound,
+                          self.compute_api.live_migrate,
+                          self.context, instance,
+                          host_name='fake_host',
+                          block_migration=True, disk_over_commit=True,
+                          force=False)
+        self.assertEqual(instance.vm_state, vm_states.ACTIVE)
+        self.assertIsNone(instance.task_state)
+
+    @mock.patch.object(objects.ComputeNodeList, 'get_all_by_host')
+    @mock.patch.object(objects.RequestSpec, 'get_by_instance_uuid')
     @mock.patch.object(objects.Instance, 'save')
     @mock.patch.object(objects.InstanceAction, 'action_start')
-    def _live_migrate_instance(self, instance, _save, _action, get_spec):
+    def _live_migrate_instance(self, instance, _save, _action, get_spec,
+                               get_all_by_host):
         # TODO(gilliard): This logic is upside-down (different
         # behaviour depending on which class this method is mixed-into. Once
         # we have cellsv2 we can remove this kind of logic from this test
@@ -2151,6 +2199,10 @@ class _ComputeAPIUnitTestMixIn(object):
             api = conductor.api.ComputeTaskAPI
         fake_spec = objects.RequestSpec()
         get_spec.return_value = fake_spec
+        get_all_by_host.return_value = objects.ComputeNodeList(
+            objects=[objects.ComputeNode(
+                host='fake_dest_host',
+                hypervisor_hostname='fake_dest_node')])
         with mock.patch.object(api, 'live_migrate_instance') as task:
             self.compute_api.live_migrate(self.context, instance,
                                           block_migration=True,
@@ -2158,7 +2210,7 @@ class _ComputeAPIUnitTestMixIn(object):
                                           host_name='fake_dest_host')
             self.assertEqual(task_states.MIGRATING, instance.task_state)
             task.assert_called_once_with(self.context, instance,
-                                         'fake_dest_host',
+                                         None,
                                          block_migration=True,
                                          disk_over_commit=True,
                                          request_spec=fake_spec,
@@ -3160,6 +3212,63 @@ class _ComputeAPIUnitTestMixIn(object):
         self.assertNotEqual(orig_system_metadata, instance.system_metadata)
         bdm_get_by_instance_uuid.assert_called_once_with(
             self.context, instance.uuid)
+
+    # New WRS tox test
+    @mock.patch.object(objects.RequestSpec, 'get_by_instance_uuid')
+    @mock.patch.object(objects.Instance, 'save')
+    @mock.patch.object(objects.Instance, 'get_flavor')
+    @mock.patch.object(objects.BlockDeviceMappingList, 'get_by_instance_uuid')
+    @mock.patch.object(compute_api.API, '_get_image')
+    @mock.patch.object(compute_api.API, '_check_auto_disk_config')
+    @mock.patch.object(compute_api.API, '_checks_for_create_and_rebuild')
+    @mock.patch.object(compute_api.API, '_record_action_start')
+    def test_rebuild_change_userdata(self, _record_action_start,
+            _checks_for_create_and_rebuild, _check_auto_disk_config,
+            _get_image, bdm_get_by_instance_uuid, get_flavor, instance_save,
+            req_spec_get_by_inst_uuid):
+        orig_system_metadata = {}
+        instance = fake_instance.fake_instance_obj(self.context,
+                vm_state=vm_states.ACTIVE, cell_name='fake-cell',
+                launched_at=timeutils.utcnow(),
+                system_metadata=orig_system_metadata,
+                image_ref='foo',
+                expected_attrs=['system_metadata'])
+        get_flavor.return_value = test_flavor.fake_flavor
+        flavor = instance.get_flavor()
+        image_href = 'foo'
+        image = {"min_ram": 10, "min_disk": 1,
+                 "properties": {'architecture':
+                                    fields_obj.Architecture.X86_64}}
+        admin_pass = ''
+        files_to_inject = []
+        bdms = objects.BlockDeviceMappingList()
+
+        _get_image.return_value = (None, image)
+        bdm_get_by_instance_uuid.return_value = bdms
+
+        fake_spec = objects.RequestSpec()
+        req_spec_get_by_inst_uuid.return_value = fake_spec
+
+        with mock.patch.object(self.compute_api.compute_task_api,
+                'rebuild_instance') as rebuild_instance:
+            self.compute_api.rebuild(self.context, instance, image_href,
+                    admin_pass, files_to_inject, userdata="foo")
+
+            rebuild_instance.assert_called_once_with(self.context,
+                    instance=instance, new_pass=admin_pass,
+                    injected_files=files_to_inject, image_ref=image_href,
+                    orig_image_ref=image_href,
+                    orig_sys_metadata=orig_system_metadata, bdms=bdms,
+                    preserve_ephemeral=False, host=instance.host,
+                    request_spec=fake_spec,
+                    kwargs={"userdata": "foo"})
+
+        # WRS note:  kwargs are passed into _check_auto_disk_config
+        _check_auto_disk_config.assert_called_once_with(image=image,
+                                                        userdata="foo")
+        _checks_for_create_and_rebuild.assert_called_once_with(self.context,
+                None, image, flavor, {}, [], None)
+        self.assertNotEqual(orig_system_metadata, instance.system_metadata)
 
     @mock.patch.object(objects.RequestSpec, 'save')
     @mock.patch.object(objects.RequestSpec, 'get_by_instance_uuid')
@@ -4607,6 +4716,7 @@ class _ComputeAPIUnitTestMixIn(object):
             )
         return instances
 
+    @testtools.skip('build requests filtering dupes break pagination')
     @mock.patch.object(objects.BuildRequestList, 'get_by_filters')
     @mock.patch.object(objects.CellMapping, 'get_by_uuid',
                        side_effect=exception.CellMappingNotFound(uuid='fake'))
@@ -4640,6 +4750,7 @@ class _ComputeAPIUnitTestMixIn(object):
             for i, instance in enumerate(build_req_instances + cell_instances):
                 self.assertEqual(instance, instances[i])
 
+    @testtools.skip('build requests filtering dupes break pagination')
     @mock.patch.object(objects.BuildRequestList, 'get_by_filters')
     @mock.patch.object(objects.CellMapping, 'get_by_uuid',
                        side_effect=exception.CellMappingNotFound(uuid='fake'))
@@ -4674,6 +4785,7 @@ class _ComputeAPIUnitTestMixIn(object):
             for i, instance in enumerate(build_req_instances + cell_instances):
                 self.assertEqual(instance, instances[i])
 
+    @testtools.skip('build requests filtering dupes break pagination')
     @mock.patch.object(objects.BuildRequestList, 'get_by_filters')
     @mock.patch.object(objects.CellMapping, 'get_by_uuid',
                        side_effect=exception.CellMappingNotFound(uuid='fake'))
@@ -4762,6 +4874,7 @@ class _ComputeAPIUnitTestMixIn(object):
             for i, instance in enumerate(cell0_instances + cell_instances):
                 self.assertEqual(instance, instances[i])
 
+    @testtools.skip('build requests filtering dupes break pagination')
     @mock.patch.object(context, 'target_cell')
     @mock.patch.object(objects.BuildRequestList, 'get_by_filters')
     @mock.patch.object(objects.CellMapping, 'get_by_uuid')
@@ -5226,10 +5339,11 @@ class ComputeAPIUnitTestCase(_ComputeAPIUnitTestMixIn, test.NoDBTestCase):
     def test_tagged_interface_attach(self, mock_attach):
         instance = self._create_instance_obj()
         self.compute_api.attach_interface(self.context, instance, None, None,
-                                          None, tag='foo')
+                                          None, None, tag='foo')
         mock_attach.assert_called_with(self.context, instance=instance,
                                        network_id=None, port_id=None,
-                                       requested_ip=None, tag='foo')
+                                       requested_ip=None, vif_model=None,
+                                       tag='foo')
 
 
 class ComputeAPIAPICellUnitTestCase(_ComputeAPIUnitTestMixIn,

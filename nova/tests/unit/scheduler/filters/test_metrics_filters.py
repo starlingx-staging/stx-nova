@@ -9,12 +9,16 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2013-2017 Wind River Systems, Inc.
+#
 
 import datetime
 
 from nova import objects
 from nova.scheduler.filters import metrics_filter
 from nova import test
+from nova.tests.unit import fake_request_spec
 from nova.tests.unit.scheduler import fakes
 
 
@@ -36,7 +40,8 @@ class TestMetricsFilter(test.NoDBTestCase):
         filt_cls = metrics_filter.MetricsFilter()
         host = fakes.FakeHostState('host1', 'node1',
                                    attribute_dict={'metrics': metrics_list})
-        self.assertTrue(filt_cls.host_passes(host, None))
+        spec_obj = fake_request_spec.fake_spec_obj()
+        self.assertTrue(filt_cls.host_passes(host, spec_obj))
 
     def test_metrics_filter_missing_metrics(self):
         _ts_now = datetime.datetime(2015, 11, 11, 11, 0, 0)
@@ -49,4 +54,5 @@ class TestMetricsFilter(test.NoDBTestCase):
         filt_cls = metrics_filter.MetricsFilter()
         host = fakes.FakeHostState('host1', 'node1',
                                    attribute_dict={'metrics': metrics_list})
-        self.assertFalse(filt_cls.host_passes(host, None))
+        spec_obj = fake_request_spec.fake_spec_obj()
+        self.assertFalse(filt_cls.host_passes(host, spec_obj))

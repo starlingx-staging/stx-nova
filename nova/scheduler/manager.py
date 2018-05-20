@@ -36,6 +36,8 @@ from nova.objects import host_mapping as host_mapping_obj
 from nova import quota
 from nova.scheduler import client as scheduler_client
 from nova.scheduler import utils
+from nova import utils as nova_utils
+from nova.virt import hardware
 
 
 LOG = logging.getLogger(__name__)
@@ -119,9 +121,41 @@ class SchedulerManager(manager.Manager):
                                                            request_spec,
                                                            filter_properties)
         resources = utils.resources_from_request_spec(spec_obj)
+
+        # WRS: Determine resources consumed for placement candidate check,
+        vcpus = spec_obj.flavor.vcpus
+        extra_specs = spec_obj.flavor.extra_specs
+        image_props = spec_obj.image.properties
+
+        # WRS: The request_spec has stale numa_topology, so must be updated.
+        # We can get stale numa_topology if we do an evacuation or
+        # live-migration after a resize,
+        instance_type = spec_obj.flavor
+        image_meta = objects.ImageMeta(properties=image_props)
+        try:
+            spec_obj.numa_topology = \
+                hardware.numa_get_constraints(instance_type, image_meta)
+        except Exception as ex:
+            LOG.error("Cannot get numa constraints, error=%(err)r",
+                      {'err': ex})
+
+        instance_numa_topology = spec_obj.numa_topology
+        # WRS: If cpu_thread_policy is ISOLATE and compute has hyperthreading
+        # enabled, vcpus claim will be double flavor.vcpus.  Since we don't
+        # know the compute node at this point, we'll just request flavor.vcpus
+        # and let the numa_topology filter sort this out.
+        numa_cell = objects.NUMACell(siblings=[])
+        numa_topology = objects.NUMATopology(cells=[numa_cell])._to_json()
+        computenode = objects.ComputeNode(numa_topology=numa_topology)
+        normalized_resources = \
+                  utils.normalized_resources_for_placement_claim(
+                             resources, computenode, vcpus, extra_specs,
+                             image_props, instance_numa_topology)
+
         alloc_reqs_by_rp_uuid, provider_summaries = None, None
         if self.driver.USES_ALLOCATION_CANDIDATES:
-            res = self.placement_client.get_allocation_candidates(resources)
+            res = self.placement_client.get_allocation_candidates(
+                                                         normalized_resources)
             if res is None:
                 # We have to handle the case that we failed to connect to the
                 # Placement service and the safe_connect decorator on
@@ -134,7 +168,30 @@ class SchedulerManager(manager.Manager):
                           "API. This may be a temporary occurrence as compute "
                           "nodes start up and begin reporting inventory to "
                           "the Placement service.")
-                raise exception.NoValidHost(reason="")
+
+                # Determine the rejection reasons for all hosts based on
+                # placement vcpu, memory, and disk criteria. This is done
+                # after-the-fact since the placement query does not return
+                # any reasons.
+                reasons = self.placement_client.get_rejection_reasons(
+                    requested=normalized_resources)
+                if reasons is None:
+                    reasons = {}
+
+                # Populate per-host rejection map based on placement criteria.
+                host_states = self.driver.host_manager.get_all_host_states(
+                    ctxt)
+                for host_state in host_states:
+                    if host_state.uuid in reasons:
+                        msg = reasons[host_state.uuid]
+                        if msg:
+                            nova_utils.filter_reject('Placement',
+                                                     host_state, spec_obj, msg,
+                                                     append=False)
+
+                reason = 'Placement service found no hosts.'
+                filter_properties = spec_obj.to_legacy_filter_properties_dict()
+                utils.NoValidHost_extend(filter_properties, reason=reason)
             else:
                 # Build a dict of lists of allocation requests, keyed by
                 # provider UUID, so that when we attempt to claim resources for

@@ -11,12 +11,17 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2015-2017 Wind River Systems, Inc.
+#
 
 import copy
 
 import mock
 from oslo_utils import timeutils
 
+from nova.compute import task_states
+from nova.compute import vm_states
 from nova import exception
 from nova import objects
 from nova.tests.unit.objects import test_objects
@@ -35,6 +40,7 @@ _INST_GROUP_DB = {
     'name': 'fake_name',
     'policies': ['policy1', 'policy2'],
     'members': ['instance_id1', 'instance_id2'],
+    'metadetails': {'key11': 'value1', 'key12': 'value2'},
     'deleted': False,
     'created_at': _TS_NOW,
     'updated_at': _TS_NOW,
@@ -52,6 +58,7 @@ class _TestInstanceGroupObject(object):
                                                        _DB_UUID)
         mock_db_get.assert_called_once_with(self.context, _DB_UUID)
         self.assertEqual(_INST_GROUP_DB['members'], obj.members)
+        self.assertEqual(_INST_GROUP_DB['metadetails'], obj.metadetails)
         self.assertEqual(_INST_GROUP_DB['policies'], obj.policies)
         self.assertEqual(_DB_UUID, obj.uuid)
         self.assertEqual(_INST_GROUP_DB['project_id'], obj.project_id)
@@ -132,6 +139,7 @@ class _TestInstanceGroupObject(object):
         obj.user_id = _INST_GROUP_DB['user_id']
         obj.project_id = _INST_GROUP_DB['project_id']
         obj.members = _INST_GROUP_DB['members']
+        obj.metadetails = _INST_GROUP_DB['metadetails']
         obj.policies = _INST_GROUP_DB['policies']
         obj.updated_at = _TS_NOW
         obj.created_at = _TS_NOW
@@ -150,6 +158,7 @@ class _TestInstanceGroupObject(object):
              'deleted': False,
              },
             members=_INST_GROUP_DB['members'],
+            metadata=_INST_GROUP_DB['metadetails'],
             policies=_INST_GROUP_DB['policies'])
         mock_notify.assert_called_once_with(
             self.context, "create",
@@ -162,6 +171,7 @@ class _TestInstanceGroupObject(object):
              'deleted_at': None,
              'deleted': False,
              'members': _INST_GROUP_DB['members'],
+             'metadetails': _INST_GROUP_DB['metadetails'],
              'policies': _INST_GROUP_DB['policies'],
              'server_group_id': _DB_UUID})
 
@@ -262,6 +272,79 @@ class _TestInstanceGroupObject(object):
     def test_load_anything_else_but_hosts(self):
         obj = objects.InstanceGroup(self.context)
         self.assertRaises(exception.ObjectActionError, getattr, obj, 'members')
+
+    # WRS: add testcase for get_older members
+    @mock.patch.object(objects.InstanceList, 'get_by_filters')
+    def test_get_older_member_hosts(self, mock_get_by_filt):
+        mock_get_by_filt.return_value = [
+            objects.Instance(id=1, uuid='uuid1', host='host1',
+                             vm_state=vm_states.BUILDING, task_state=None),
+            objects.Instance(id=2, uuid='uuid2', host='host2',
+                             vm_state=vm_states.BUILDING, task_state=None),
+            objects.Instance(id=3, uuid='uuid3', host='host2',
+                             vm_state=vm_states.BUILDING, task_state=None)]
+
+        obj = objects.InstanceGroup(mock.sentinel.ctx,
+                                    members=['uuid1', 'uuid2', 'uuid3'])
+
+        hosts = obj.get_older_member_hosts('uuid1')
+        self.assertEqual(0, len(hosts))
+        hosts = obj.get_older_member_hosts('uuid2')
+        self.assertEqual(1, len(hosts))
+        self.assertIn('host1', hosts)
+        hosts = obj.get_older_member_hosts('uuid3')
+        self.assertEqual(2, len(hosts))
+        self.assertIn('host1', hosts)
+        self.assertIn('host2', hosts)
+
+    @mock.patch.object(objects.InstanceList, 'get_by_filters')
+    def test_get_older_member_hosts_with_some_none(self, mock_get_by_filt):
+        mock_get_by_filt.return_value = [
+            objects.Instance(id=1, uuid='uuid1', host=None,
+                             vm_state=vm_states.BUILDING, task_state=None),
+            objects.Instance(id=2, uuid='uuid2', host='host2',
+                             vm_state=vm_states.BUILDING, task_state=None),
+            objects.Instance(id=3, uuid='uuid3', host='host3',
+                             vm_state=vm_states.BUILDING, task_state=None)]
+
+        obj = objects.InstanceGroup(mock.sentinel.ctx,
+                                    members=['uuid1', 'uuid2', 'uuid3'])
+
+        hosts = obj.get_older_member_hosts('uuid1')
+        self.assertEqual(0, len(hosts))
+        hosts = obj.get_older_member_hosts('uuid2')
+        self.assertEqual(0, len(hosts))
+        hosts = obj.get_older_member_hosts('uuid3')
+        self.assertEqual(1, len(hosts))
+        self.assertIn('host2', hosts)
+
+    @mock.patch.object(objects.InstanceList, 'get_by_filters')
+    def test_get_older_member_hosts_inverted_id(self, mock_get_by_filt):
+        mock_get_by_filt.return_value = [
+            objects.Instance(id=1, uuid='uuid1', host='host1',
+                             vm_state=vm_states.BUILDING, task_state=None),
+            objects.Instance(id=2, uuid='uuid2', host='host2',
+                             vm_state=vm_states.BUILDING, task_state=None),
+            # setting task_state to spawning will force execution
+            # of code that adds host for more recent id=3,
+            objects.Instance(id=3, uuid='uuid3', host='host2',
+                             vm_state=vm_states.BUILDING,
+                             task_state=task_states.SPAWNING)]
+
+        obj = objects.InstanceGroup(mock.sentinel.ctx,
+                                    members=['uuid1', 'uuid2', 'uuid3'])
+
+        hosts = obj.get_older_member_hosts('uuid1')
+        self.assertEqual(1, len(hosts))
+        self.assertIn('host2', hosts)
+        hosts = obj.get_older_member_hosts('uuid2')
+        self.assertEqual(2, len(hosts))
+        self.assertIn('host1', hosts)
+        self.assertIn('host2', hosts)
+        hosts = obj.get_older_member_hosts('uuid3')
+        self.assertEqual(2, len(hosts))
+        self.assertIn('host1', hosts)
+        self.assertIn('host2', hosts)
 
 
 class TestInstanceGroupObject(test_objects._LocalTest,

@@ -25,6 +25,10 @@ from oslo_config import cfg
 
 from nova.conf import paths
 
+# memory page size for 1G
+MEM_PAGE_SIZE_1G = 1048576
+# cpu flag for 1G pages
+CPU_FLAG_1G = 'pdpe1gb'
 
 libvirt_group = cfg.OptGroup("libvirt",
                              title="Libvirt Options",
@@ -744,6 +748,17 @@ Related options:
 * volume_clear - must be set and the value must be different than ``none``
   for this option to have any impact
 """),
+    cfg.BoolOpt('thin_logical_volumes',
+                default=True,
+                help="""
+Create thin logical volumes if this flag is set to True.  This will also skip
+zeroing/shredding the volume regardless of the volume_clear setting.
+"""),
+    cfg.StrOpt('thinpool_suffix',
+               default='-pool',
+               help="""
+The suffix to generate the thinpool name from the VG.
+"""),
 ]
 
 libvirt_utils_opts = [
@@ -1040,6 +1055,19 @@ Related options:
 ),
 ]
 
+# WRS: add options for PCI IRQ affinity, msi irq detection parameters
+libvirt_pci_irq_opts = [
+    cfg.IntOpt('msi_irq_timeout',
+               default=45,
+               help='Number of seconds to wait for msi irq configuration'),
+    cfg.IntOpt('msi_irq_since',
+               default=6,
+               help='Number of seconds to wait for msi irqs to stabilize.'),
+    cfg.IntOpt('msi_irq_check_interval',
+               default=2,
+               help='Check interval in seconds for msi irqs to stabilize.'),
+]
+
 ALL_OPTS = list(itertools.chain(
     libvirt_general_opts,
     libvirt_imagebackend_opts,
@@ -1057,6 +1085,7 @@ ALL_OPTS = list(itertools.chain(
     libvirt_volume_smbfs_opts,
     libvirt_remotefs_opts,
     libvirt_volume_vzstorage_opts,
+    libvirt_pci_irq_opts,
 ))
 
 

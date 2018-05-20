@@ -11,6 +11,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2014-2017 Wind River Systems, Inc.
+#
 
 import contextlib
 
@@ -29,6 +32,7 @@ from nova.cells import opts as cells_opts
 from nova.cells import rpcapi as cells_rpcapi
 from nova.cells import utils as cells_utils
 from nova.compute import task_states
+from nova.compute import utils as compute_utils
 from nova.compute import vm_states
 from nova import db
 from nova.db.sqlalchemy import api as db_api
@@ -198,6 +202,10 @@ class Instance(base.NovaPersistentObject, base.NovaObject,
 
         'cleaned': fields.BooleanField(default=False),
 
+        # vm scaling
+        'min_vcpus': fields.IntegerField(nullable=True),
+        'max_vcpus': fields.IntegerField(nullable=True),
+
         'pci_devices': fields.ObjectField('PciDeviceList', nullable=True),
         'numa_topology': fields.ObjectField('InstanceNUMATopology',
                                             nullable=True),
@@ -231,6 +239,7 @@ class Instance(base.NovaPersistentObject, base.NovaObject,
     def __init__(self, *args, **kwargs):
         super(Instance, self).__init__(*args, **kwargs)
         self._reset_metadata_tracking()
+        self._is_volume_backed = None
 
     @property
     def image_meta(self):
@@ -664,7 +673,8 @@ class Instance(base.NovaPersistentObject, base.NovaObject,
 
     @base.remotable
     def save(self, expected_vm_state=None,
-             expected_task_state=None, admin_state_reset=False):
+             expected_task_state=None, admin_state_reset=False,
+             force_system_metadata_update=False):
         """Save updates to this instance
 
         Column-wise updates will be made based on the result of
@@ -765,6 +775,10 @@ class Instance(base.NovaPersistentObject, base.NovaObject,
             updates['expected_task_state'] = expected_task_state
         if expected_vm_state is not None:
             updates['expected_vm_state'] = expected_vm_state
+
+        if force_system_metadata_update:
+            if 'system_metadata' in self:
+                updates['system_metadata'] = self.system_metadata
 
         expected_attrs = [attr for attr in _INSTANCE_OPTIONAL_JOINED_FIELDS
                                if self.obj_attr_is_set(attr)]
@@ -1174,6 +1188,12 @@ class Instance(base.NovaPersistentObject, base.NovaObject,
     def get_bdms(self):
         return objects.BlockDeviceMappingList.get_by_instance_uuid(
             self._context, self.uuid)
+
+    def is_volume_backed(self):
+        if self._is_volume_backed is None:
+            self._is_volume_backed = compute_utils.is_volume_backed_instance(
+                self._context, self)
+        return self._is_volume_backed
 
 
 def _make_instance_list(context, inst_list, db_inst_list, expected_attrs):

@@ -406,10 +406,10 @@ class _TestServiceObject(object):
     def test_create_below_minimum(self, mock_get):
         with mock.patch('nova.objects.service.SERVICE_VERSION',
                         new=1):
-            self.assertRaises(exception.ServiceTooOld,
-                              objects.Service(context=self.context,
-                                              binary='nova-compute',
-                                              ).create)
+            # WRS: CGTS-6904: ignoring ServiceTooOld exception for
+            # nova-compute.
+            objects.Service(context=self.context,
+                 binary='nova-compute', host='compute-1').create()
 
     @mock.patch('nova.objects.base.NovaObject'
                 '.obj_make_compatible_from_manifest', new=mock.Mock())

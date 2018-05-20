@@ -93,6 +93,11 @@ from nova.api.openstack.compute import used_limits
 from nova.api.openstack.compute import versionsV21
 from nova.api.openstack.compute import virtual_interfaces
 from nova.api.openstack.compute import volumes
+from nova.api.openstack.compute import wrs_pci
+from nova.api.openstack.compute import wrs_providernets
+from nova.api.openstack.compute import wrs_server_groups
+from nova.api.openstack.compute import wrs_server_if
+from nova.api.openstack.compute import wrs_server_resources
 from nova.api.openstack import wsgi
 import nova.conf
 from nova import wsgi as base_wsgi
@@ -286,6 +291,9 @@ server_controller = functools.partial(_create_controller,
         keypairs.Controller,
         security_groups.SecurityGroupsOutputController,
         server_usage.ServerUsageController,
+        wrs_server_if.WrsServerIfController,
+        wrs_server_groups.WrsServerGroupController,
+        wrs_server_resources.WrsServerResourcesController
     ],
     [
         admin_actions.AdminActionsController,
@@ -303,7 +311,8 @@ server_controller = functools.partial(_create_controller,
         rescue.RescueController,
         security_groups.SecurityGroupActionController,
         shelve.ShelveController,
-        suspend_server.SuspendServerController
+        suspend_server.SuspendServerController,
+        wrs_server_resources.WrsServerResourcesController
     ]
 )
 
@@ -386,6 +395,12 @@ virtual_interfaces_controller = functools.partial(_create_controller,
 
 volumes_controller = functools.partial(_create_controller,
     volumes.VolumeController, [], [])
+
+wrs_pci_controller = functools.partial(_create_controller,
+    wrs_pci.WrsPciController, [], [])
+
+wrs_providernets_controller = functools.partial(_create_controller,
+    wrs_providernets.WrsController, [], [])
 
 
 # NOTE(alex_xu): This is structure of this route list as below:
@@ -667,6 +682,9 @@ ROUTE_LIST = (
         'GET': [quota_classes_controller, 'show'],
         'PUT': [quota_classes_controller, 'update']
     }),
+    ('/os-quota-sets', {
+        'GET': [quota_set_controller, 'index'],
+    }),
     ('/os-quota-sets/{id}', {
         'GET': [quota_set_controller, 'show'],
         'PUT': [quota_set_controller, 'update'],
@@ -711,6 +729,9 @@ ROUTE_LIST = (
     ('/os-server-groups/{id}', {
         'GET': [server_groups_controller, 'show'],
         'DELETE': [server_groups_controller, 'delete']
+    }),
+    ('/os-server-groups/{id}/action', {
+        'POST': [server_groups_controller, 'action']
     }),
     ('/os-services', {
         'GET': [services_controller, 'index']
@@ -869,6 +890,15 @@ ROUTE_LIST = (
         'GET': [server_tags_controller, 'show'],
         'PUT': [server_tags_controller, 'update'],
         'DELETE': [server_tags_controller, 'delete']
+    }),
+    ('/wrs-pci', {
+        'GET': [wrs_pci_controller, 'index']
+    }),
+    ('/wrs-pci/{id}', {
+        'GET': [wrs_pci_controller, 'show']
+    }),
+    ('/wrs-providernet/{id}', {
+        'GET': [wrs_providernets_controller, 'show']
     }),
 )
 

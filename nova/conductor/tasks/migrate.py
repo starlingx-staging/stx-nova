@@ -12,6 +12,7 @@
 
 from oslo_log import log as logging
 from oslo_serialization import jsonutils
+from oslo_utils import strutils
 
 from nova import availability_zones
 from nova.conductor.tasks import base
@@ -40,6 +41,45 @@ class MigrationTask(base.TaskBase):
         legacy_spec = self.request_spec.to_legacy_request_spec_dict()
         legacy_props = self.request_spec.to_legacy_filter_properties_dict()
         scheduler_utils.setup_instance_group(self.context, self.request_spec)
+
+        # WRS: add hosts to Server group host list for group members
+        # that are migrating in progress
+        if 'group_members' in legacy_props:
+            metadetails = self.request_spec.instance_group['metadetails']
+            is_best_effort = strutils.bool_from_string(
+                metadetails.get('wrs-sg:best_effort', 'False'))
+
+            if ('anti-affinity' in self.request_spec.instance_group['policies']
+                    and not is_best_effort):
+                group_members = self.request_spec.instance_group['members']
+
+                for instance_uuid in group_members:
+                    filters = {
+                        'migration_type': 'migration',
+                        'instance_uuid': instance_uuid,
+                        'status': ['queued', 'pre-migrating', 'migrating',
+                                   'post-migrating', 'finished']
+                    }
+
+                    migrations = objects.MigrationList.get_by_filters(
+                                                         self.context, filters)
+
+                    for migration in migrations:
+                        if migration['source_compute'] not in \
+                                self.request_spec.instance_group['hosts']:
+                            self.request_spec.instance_group['hosts'].append(
+                                                   migration['source_compute'])
+                        if (migration['dest_compute'] and (
+                                migration['dest_compute'] not in
+                                   self.request_spec.instance_group['hosts'])):
+                            self.request_spec.instance_group['hosts'].append(
+                                                     migration['dest_compute'])
+
+                # refresh legacy_spec and legacy_props with latest request_spec
+                legacy_spec = self.request_spec.to_legacy_request_spec_dict()
+                legacy_props = self.\
+                    request_spec.to_legacy_filter_properties_dict()
+
         scheduler_utils.populate_retry(legacy_props,
                                        self.instance.uuid)
 
@@ -65,8 +105,27 @@ class MigrationTask(base.TaskBase):
                 cell=instance_mapping.cell_mapping)
 
         self.request_spec.ensure_project_id(self.instance)
+
+        # WRS: determine offline cpus due to scaling to be used to calculate
+        # placement service resource claim in scheduler
+        self.request_spec.offline_cpus = \
+                  scheduler_utils.determine_offline_cpus(
+                         self.flavor, self.instance.numa_topology)
+        # NOTE(danms): We don't pass enough information to the scheduler to
+        # know that we have a boot-from-volume request.
+        # TODO(danms): We need to pass more context to the scheduler here
+        # in order to (a) handle boot-from-volume instances, as well as
+        # (b) know which volume provider to request resource from.
+        request_spec_copy = self.request_spec
+        if self.instance.is_volume_backed():
+            LOG.debug('Requesting zero root disk for '
+                      'boot-from-volume instance')
+            # Clone this so we don't mutate the RequestSpec that was passed in
+            request_spec_copy = self.request_spec.obj_clone()
+            request_spec_copy.flavor.root_gb = 0
+
         hosts = self.scheduler_client.select_destinations(
-            self.context, self.request_spec, [self.instance.uuid])
+            self.context, request_spec_copy, [self.instance.uuid])
         host_state = hosts[0]
 
         scheduler_utils.populate_filter_properties(legacy_props,
@@ -91,6 +150,13 @@ class MigrationTask(base.TaskBase):
             self.flavor, host, self.reservations,
             request_spec=legacy_spec, filter_properties=legacy_props,
             node=node, clean_shutdown=self.clean_shutdown)
+
+        # WRS: return request_spec for save to db but need to clear retry and
+        # instance_group hosts so that next request starts cleanly
+        self.request_spec.retry = None
+        if self.request_spec.instance_group:
+            self.request_spec.instance_group.hosts = []
+        return self.request_spec
 
     def rollback(self):
         pass

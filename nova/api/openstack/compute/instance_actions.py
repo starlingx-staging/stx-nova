@@ -26,7 +26,8 @@ from nova import utils
 
 ACTION_KEYS = ['action', 'instance_uuid', 'request_id', 'user_id',
                'project_id', 'start_time', 'message']
-EVENT_KEYS = ['event', 'start_time', 'finish_time', 'result', 'traceback']
+EVENT_KEYS = ['event', 'start_time', 'finish_time', 'result', 'traceback',
+              'details']
 
 
 class InstanceActionsController(wsgi.Controller):

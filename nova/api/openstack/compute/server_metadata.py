@@ -103,6 +103,7 @@ class ServerMetadataController(wsgi.Controller):
 
     def _update_instance_metadata(self, context, server_id, metadata,
                                   delete=False):
+        common.validate_metadata(metadata)
         server = common.get_instance(self.compute_api, context, server_id)
         try:
             return self.compute_api.update_instance_metadata(context,

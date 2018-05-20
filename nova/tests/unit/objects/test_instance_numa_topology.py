@@ -9,6 +9,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2013-2017 Wind River Systems, Inc.
+#
 
 import copy
 
@@ -209,6 +212,21 @@ class _TestInstanceNUMATopology(object):
         primitive = topo_obj.obj_to_primitive(target_version='1.3',
                                               version_manifest=versions)
         self.assertNotIn('cpuset_reserved', primitive)
+
+    # WRS add tests for numa pinning
+    def test_numa_pinning_requested_cell(self):
+        inst_cell = objects.InstanceNUMACell(cpuset=set([0, 1, 2, 3]),
+                                             physnode=None)
+        self.assertFalse(inst_cell.numa_pinning_requested)
+        inst_cell.physnode = 0
+        self.assertTrue(inst_cell.numa_pinning_requested)
+
+    def test_numa_pinning_requested(self):
+        fake_topo_obj = copy.deepcopy(fake_obj_numa_topology)
+        self.assertFalse(fake_topo_obj.numa_pinning_requested)
+        for cell in fake_topo_obj.cells:
+            cell.physnode = cell.id
+        self.assertTrue(fake_topo_obj.numa_pinning_requested)
 
 
 class TestInstanceNUMATopology(test_objects._LocalTest,

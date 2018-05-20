@@ -672,10 +672,12 @@ class CellsConductorAPIRPCRedirect(test.NoDBTestCase):
         self.compute_api.resize(self.context, instance)
         self.assertTrue(self.cells_rpcapi.resize_instance.called)
 
+    @mock.patch.object(objects.ComputeNodeList, 'get_all_by_host')
     @mock.patch.object(objects.RequestSpec, 'get_by_instance_uuid')
     @mock.patch.object(compute_api.API, '_record_action_start')
     @mock.patch.object(objects.Instance, 'save')
-    def test_live_migrate_instance(self, instance_save, _record, _get_spec):
+    def test_live_migrate_instance(self, instance_save, _record, _get_spec,
+                                   get_all_by_host):
         orig_system_metadata = {}
         instance = fake_instance.fake_instance_obj(self.context,
                 vm_state=vm_states.ACTIVE, cell_name='fake-cell',
@@ -683,6 +685,10 @@ class CellsConductorAPIRPCRedirect(test.NoDBTestCase):
                 system_metadata=orig_system_metadata,
                 expected_attrs=['system_metadata'])
 
+        get_all_by_host.return_value = objects.ComputeNodeList(
+            objects=[objects.ComputeNode(
+                host='fake_dest_host',
+                hypervisor_hostname='fake_dest_node')])
         self.compute_api.live_migrate(self.context, instance,
                 True, True, 'fake_dest_host')
 

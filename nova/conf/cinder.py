@@ -12,6 +12,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2016-2017 Wind River Systems, Inc.
+#
 
 from keystoneauth1 import loading as ks_loading
 from oslo_config import cfg
@@ -93,6 +96,12 @@ If that AZ is not in Cinder (or allow_availability_zone_fallback=False in
 cinder.conf), the volume create request will fail and the instance will fail
 the build request.
 By default there is no availability zone restriction on volume attach.
+"""),
+    # WRS - add session_retries for cinder client
+    cfg.IntOpt('session_retries',
+               default=4,
+               help="""
+Allow cinder client to retry on InternalServer errors (500).
 """),
 ]
 

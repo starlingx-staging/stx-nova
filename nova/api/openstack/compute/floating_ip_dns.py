@@ -106,6 +106,7 @@ class FloatingIPDNSDomainController(wsgi.Controller):
         return _translate_domain_entries_view(domainlist)
 
     @wsgi.Controller.api_version("2.1", MAX_PROXY_API_SUPPORT_VERSION)
+    @extensions.block_during_upgrade()
     @extensions.expected_errors((400, 501))
     @validation.schema(floating_ip_dns.domain_entry_update)
     def update(self, req, id, body):
@@ -142,6 +143,7 @@ class FloatingIPDNSDomainController(wsgi.Controller):
                                              area_name: area})
 
     @wsgi.Controller.api_version("2.1", MAX_PROXY_API_SUPPORT_VERSION)
+    @extensions.block_during_upgrade()
     @extensions.expected_errors((404, 501))
     @wsgi.response(202)
     def delete(self, req, id):
@@ -205,6 +207,7 @@ class FloatingIPDNSEntryController(wsgi.Controller):
         return _translate_dns_entry_view(entry)
 
     @wsgi.Controller.api_version("2.1", MAX_PROXY_API_SUPPORT_VERSION)
+    @extensions.block_during_upgrade()
     @extensions.expected_errors(501)
     @validation.schema(floating_ip_dns.dns_entry_update)
     def update(self, req, domain_id, id, body):
@@ -237,6 +240,7 @@ class FloatingIPDNSEntryController(wsgi.Controller):
                                           'domain': domain})
 
     @wsgi.Controller.api_version("2.1", MAX_PROXY_API_SUPPORT_VERSION)
+    @extensions.block_during_upgrade()
     @extensions.expected_errors((404, 501))
     @wsgi.response(202)
     def delete(self, req, domain_id, id):

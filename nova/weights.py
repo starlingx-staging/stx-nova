@@ -12,6 +12,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2015-2016 Wind River Systems, Inc.
+#
 
 """
 Pluggable Weighing support
@@ -21,7 +24,10 @@ import abc
 
 import six
 
+import nova.conf
 from nova import loadables
+
+CONF = nova.conf.CONF
 
 
 def normalize(weight_list, minval=None, maxval=None):
@@ -125,16 +131,18 @@ class BaseWeightHandler(loadables.BaseLoader):
         """Return a sorted (descending), normalized list of WeighedObjects."""
         weighed_objs = [self.object_class(obj, 0.0) for obj in obj_list]
 
-        if len(weighed_objs) <= 1:
-            return weighed_objs
+        if CONF.scheduler.normalize_weigher:
+            if len(weighed_objs) <= 1:
+                return weighed_objs
 
         for weigher in weighers:
             weights = weigher.weigh_objects(weighed_objs, weighing_properties)
 
             # Normalize the weights
-            weights = normalize(weights,
-                                minval=weigher.minval,
-                                maxval=weigher.maxval)
+            if CONF.scheduler.normalize_weigher:
+                weights = normalize(weights,
+                                    minval=weigher.minval,
+                                    maxval=weigher.maxval)
 
             for i, weight in enumerate(weights):
                 obj = weighed_objs[i]

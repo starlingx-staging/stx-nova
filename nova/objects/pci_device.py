@@ -99,7 +99,7 @@ class PciDevice(base.NovaPersistentObject, base.NovaObject):
 
     fields = {
         'id': fields.IntegerField(),
-        'uuid': fields.UUIDField(),
+        'uuid': fields.UUIDField(nullable=True),
         # Note(yjiang5): the compute_node_id may be None because the pci
         # device objects are created before the compute node is created in DB
         'compute_node_id': fields.IntegerField(nullable=True),

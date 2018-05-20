@@ -474,6 +474,37 @@ class UserQuotasTestV21(BaseQuotaSetsTest):
         self.assertEqual(0,
                          len(mock_createlimit.mock_calls))
 
+    @mock.patch('nova.objects.Quotas.update_limit')
+    @mock.patch('nova.objects.Quotas.create_limit')
+    def test_user_quotas_update_quota_exist(self, mock_createlimit,
+                                              mock_updatelimit):
+        body = {'quota_set': {'instances': 1}}
+        mock_createlimit.side_effect = exception.QuotaExists(project_id='1',
+            resource='dummy')
+        url = '/v2/fake4/os-quota-sets/update_me?user_id=1'
+        req = fakes.HTTPRequest.blank(url, use_admin_context=True)
+        self.controller.update(req, 'update_me', body=body)
+        mock_updatelimit.assert_called_once_with(req.environ['nova.context'],
+            'update_me', 'instances', 1, user_id='1')
+
+    @mock.patch('nova.objects.Quotas.update_limit')
+    @mock.patch('nova.objects.Quotas.create_limit')
+    def test_user_quotas_update_project_not_exist(self, mock_createlimit,
+                                              mock_updatelimit):
+        body = {'quota_set': {'instances': 1}}
+        mock_createlimit.side_effect = exception.QuotaExists(project_id='1',
+            resource='dummy')
+        mock_updatelimit.side_effect = exception.ProjectQuotaNotFound(
+            project_id='1')
+        url = '/v2/fake4/os-quota-sets/update_me?user_id=1'
+        req = fakes.HTTPRequest.blank(url, use_admin_context=True)
+        ret = self.controller.update(req, 'update_me', body=body)
+        mock_updatelimit.assert_called_once_with(req.environ['nova.context'],
+            'update_me', 'instances', 1, user_id='1')
+        expected_quota_set = quota_set('123', self.include_server_group_quotas)
+        expected_quota_set['quota_set'].pop('id')
+        self.assertEqual(expected_quota_set, ret)
+
 
 class QuotaSetsPolicyEnforcementV21(test.NoDBTestCase):
 

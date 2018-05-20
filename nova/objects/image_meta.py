@@ -11,6 +11,9 @@
 # WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 # License for the specific language governing permissions and limitations
 # under the License.
+#
+# Copyright (c) 2013-2017 Wind River Systems, Inc.
+#
 
 import copy
 
@@ -251,6 +254,9 @@ class ImageMetaProps(base.NovaObject):
         # maximum number of CPU threads per core
         'hw_cpu_max_threads': fields.IntegerField(),
 
+        # desired CPU model
+        'hw_cpu_model': fields.CPUModelField(),
+
         # CPU allocation policy
         'hw_cpu_policy': fields.CPUAllocationPolicyField(),
 
@@ -306,6 +312,26 @@ class ImageMetaProps(base.NovaObject):
         # list value indicates the memory size of that node.
         'hw_numa_mem': fields.ListOfIntegersField(),
 
+        # WRS: Each list entry corresponds to a guest NUMA node and the
+        # list value indicates the host node for that node.
+        'hw_numa_node': fields.ListOfIntegersField(),
+
+        # Each list entry corresponds to a guest NUMA node and the
+        # set members indicate the L3 cache vcpus for that node
+        'hw_cache_vcpus': fields.ListOfSetsOfIntegersField(),
+
+        # Each list entry corresponds to a guest NUMA node and the
+        # list value indicates the L3 cache size KiB for that node
+        'hw_cache_l3': fields.ListOfIntegersField(),
+
+        # Each list entry corresponds to a guest NUMA node and the
+        # list value indicates the L3 cache code size KiB for that node
+        'hw_cache_l3_code': fields.ListOfIntegersField(),
+
+        # Each list entry corresponds to a guest NUMA node and the
+        # list value indicates the L3 cache data size KiB for that node
+        'hw_cache_l3_data': fields.ListOfIntegersField(),
+
         # Generic property to specify the pointer model type.
         'hw_pointer_model': fields.PointerModelField(),
 
@@ -342,6 +368,12 @@ class ImageMetaProps(base.NovaObject):
         # action to take when watchdog device fires eg reset, poweroff, pause,
         # none
         'hw_watchdog_action': fields.WatchdogActionField(),
+
+        # Max downtime for live migration, in msec
+        'hw_wrs_live_migration_max_downtime': fields.IntegerField(),
+
+        # Live migration completion timeout, in seconds
+        'hw_wrs_live_migration_timeout': fields.IntegerField(),
 
         # boolean - If true, this will enable the virtio-multiqueue feature
         'hw_vif_multiqueue_enabled': fields.FlexibleBooleanField(),
@@ -534,14 +566,97 @@ class ImageMetaProps(base.NovaObject):
         if hw_numa_cpus_set:
             self.hw_numa_cpus = hw_numa_cpus
 
+    # WRS extension to set numa node in image
+    def _set_numa_node(self, image_props):
+        hw_numa_node = []
+        hw_numa_node_set = False
+        for cellid in range(ImageMetaProps.NUMA_NODES_MAX):
+            memprop = "hw_numa_node.%d" % cellid
+            if memprop not in image_props:
+                break
+            hw_numa_node.append(int(image_props[memprop]))
+            hw_numa_node_set = True
+            del image_props[memprop]
+
+        if hw_numa_node_set:
+            self.hw_numa_node = hw_numa_node
+
+    def _set_cache_vcpus(self, image_props):
+        hw_cache_vcpus = []
+        hw_cache_vcpus_set = False
+        for cellid in range(ImageMetaProps.NUMA_NODES_MAX):
+            prop = "hw_cache_vcpus.%d" % cellid
+            if prop not in image_props:
+                break
+            hw_cache_vcpus.append(
+                hardware.parse_cpu_spec(image_props[prop]))
+            hw_cache_vcpus_set = True
+            del image_props[prop]
+
+        if hw_cache_vcpus_set:
+            self.hw_cache_vcpus = hw_cache_vcpus
+
+    def _set_cache_l3(self, image_props):
+        hw_cache_l3 = []
+        hw_cache_l3_set = False
+        for cellid in range(ImageMetaProps.NUMA_NODES_MAX):
+            prop = "hw_cache_l3.%d" % cellid
+            if prop not in image_props:
+                break
+            hw_cache_l3.append(int(image_props[prop]))
+            hw_cache_l3_set = True
+            del image_props[prop]
+
+        if hw_cache_l3_set:
+            self.hw_cache_l3 = hw_cache_l3
+
+    def _set_cache_l3_code(self, image_props):
+        hw_cache_l3_code = []
+        hw_cache_l3_code_set = False
+        for cellid in range(ImageMetaProps.NUMA_NODES_MAX):
+            prop = "hw_cache_l3_code.%d" % cellid
+            if prop not in image_props:
+                break
+            hw_cache_l3_code.append(int(image_props[prop]))
+            hw_cache_l3_code_set = True
+            del image_props[prop]
+
+        if hw_cache_l3_code_set:
+            self.hw_cache_l3_code = hw_cache_l3_code
+
+    def _set_cache_l3_data(self, image_props):
+        hw_cache_l3_data = []
+        hw_cache_l3_data_set = False
+        for cellid in range(ImageMetaProps.NUMA_NODES_MAX):
+            prop = "hw_cache_l3_data.%d" % cellid
+            if prop not in image_props:
+                break
+            hw_cache_l3_data.append(int(image_props[prop]))
+            hw_cache_l3_data_set = True
+            del image_props[prop]
+
+        if hw_cache_l3_data_set:
+            self.hw_cache_l3_data = hw_cache_l3_data
+
     def _set_attr_from_current_names(self, image_props):
         for key in self.fields:
-            # The two NUMA fields need special handling to
+            # The three NUMA fields need special handling to
             # un-stringify them correctly
             if key == "hw_numa_mem":
                 self._set_numa_mem(image_props)
             elif key == "hw_numa_cpus":
                 self._set_numa_cpus(image_props)
+            # WRS add hw_numa_node
+            elif key == "hw_numa_node":
+                self._set_numa_node(image_props)
+            elif key == "hw_cache_vcpus":
+                self._set_cache_vcpus(image_props)
+            elif key == "hw_cache_l3":
+                self._set_cache_l3(image_props)
+            elif key == "hw_cache_l3_code":
+                self._set_cache_l3_code(image_props)
+            elif key == "hw_cache_l3_data":
+                self._set_cache_l3_data(image_props)
             else:
                 if key not in image_props:
                     continue
@@ -568,6 +683,13 @@ class ImageMetaProps(base.NovaObject):
         obj._set_attr_from_legacy_names(image_props)
         obj._set_attr_from_current_names(image_props)
         return obj
+
+    def to_dict(self):
+        image_props = {}
+        for field in self.fields:
+            if self.obj_attr_is_set(field):
+                image_props[field] = getattr(self, field)
+        return image_props
 
     def get(self, name, defvalue=None):
         """Get the value of an attribute

@@ -13,6 +13,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2016-2017 Wind River Systems, Inc.
+#
 
 """
 Tests for database migrations.
@@ -171,7 +174,7 @@ class NovaMigrationsCheckers(test_migrations.ModelsMigrationsSync,
         havana_placeholders = list(range(217, 227))
         icehouse_placeholders = list(range(235, 244))
         juno_placeholders = list(range(255, 265))
-        kilo_placeholders = list(range(281, 291))
+        kilo_placeholders = list(range(281, 286))
         liberty_placeholders = list(range(303, 313))
         mitaka_placeholders = list(range(320, 330))
         newton_placeholders = list(range(335, 345))
@@ -362,8 +365,10 @@ class NovaMigrationsCheckers(test_migrations.ModelsMigrationsSync,
                                     ['instance_uuid', 'device_name']]))
 
     def _check_250(self, engine, data):
-        self.assertTableNotExists(engine, 'instance_group_metadata')
-        self.assertTableNotExists(engine, 'shadow_instance_group_metadata')
+        # WRS:extension -- migration 250 does nothing now since we still
+        # want to use instance_group_metadata
+        oslodbutils.get_table(engine, 'instance_group_metadata')
+        oslodbutils.get_table(engine, 'shadow_instance_group_metadata')
 
     def _check_251(self, engine, data):
         self.assertColumnExists(engine, 'compute_nodes', 'numa_topology')
@@ -714,6 +719,27 @@ class NovaMigrationsCheckers(test_migrations.ModelsMigrationsSync,
         key_pairs = oslodbutils.get_table(engine, 'key_pairs')
         self.assertFalse(key_pairs.c.name.nullable)
 
+    def _check_286(self, engine, data):
+        # Make sure we have the column
+        self.assertColumnExists(engine, 'instances', 'min_vcpus')
+        self.assertColumnExists(engine, 'instances', 'max_vcpus')
+
+    def _check_287(self, engine, data):
+        # Placeholder
+        pass
+
+    def _check_288(self, engine, data):
+        # Placeholder
+        pass
+
+    def _check_289(self, engine, data):
+        # Placeholder
+        pass
+
+    def _check_290(self, engine, data):
+        # Placeholder
+        pass
+
     def _check_291(self, engine, data):
         # NOTE(danms): This is a dummy migration that just does a consistency
         # check
@@ -926,6 +952,11 @@ class NovaMigrationsCheckers(test_migrations.ModelsMigrationsSync,
         self.assertColumnExists(engine, 'instance_extra', 'device_metadata')
         self.assertColumnExists(engine, 'shadow_instance_extra',
                                         'device_metadata')
+
+    def _check_335(self, engine, data):
+        # Make sure we have the column
+        self.assertColumnExists(engine, 'compute_nodes', 'l3_closids')
+        self.assertColumnExists(engine, 'compute_nodes', 'l3_closids_used')
 
     def _check_345(self, engine, data):
         # NOTE(danms): Just a sanity-check migration

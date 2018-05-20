@@ -37,6 +37,7 @@ class ServerPasswordController(wsgi.Controller):
         passw = password.extract_password(instance)
         return {'password': passw or ''}
 
+    @extensions.block_during_upgrade()
     @extensions.expected_errors(404)
     @wsgi.response(204)
     def clear(self, req, server_id):

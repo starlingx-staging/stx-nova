@@ -15,6 +15,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2013-2017 Wind River Systems, Inc.
+#
 
 """Built-in instance properties."""
 
@@ -64,7 +67,9 @@ system_metadata_flavor_props = {
 
 
 system_metadata_flavor_extra_props = [
-    'hw:numa_cpus.', 'hw:numa_mem.',
+    'hw:numa_cpus.', 'hw:numa_mem.', 'hw:numa_node.', 'hw:wrs:min_vcpus',
+    'hw:cache_vcpus.', 'hw:cache_l3.', 'hw_cache_l3_code.',
+    'hw_cache_l3_data.'
 ]
 
 

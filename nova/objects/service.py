@@ -11,7 +11,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
-
+#
+# Copyright (c) 2016-2017 Wind River Systems, Inc.
+#
 from oslo_log import log as logging
 from oslo_utils import uuidutils
 from oslo_utils import versionutils
@@ -113,6 +115,8 @@ SERVICE_VERSION_HISTORY = (
     # Version 22: A marker for the behaviour change of auto-healing code on the
     # compute host regarding allocations against an instance
     {'compute_rpc': '4.17'},
+    # WRS: Also changes to check_can_live_migrate_destination signature since
+    # we didn't want to bump the version.
 )
 
 
@@ -337,8 +341,19 @@ class Service(base.NovaPersistentObject, base.NovaObject,
             return
         minver = self.get_minimum_version(self._context, self.binary)
         if minver > self.version:
-            raise exception.ServiceTooOld(thisver=self.version,
-                                          minver=minver)
+            # WRS: CGTS-6904: ignoring ServiceTooOld excep for nova-compute.
+            # This is needed to allow downgrade of compute in a fully-upgraded
+            # system, as well as to work around scenarios where the only
+            # non-upgraded compute is set to 'forced-down' by the VIM
+            if self.binary == 'nova-compute':
+                LOG.warning('ServiceTooOld: %(service)s on %(computename)s'
+                    ' is older (v%(thisver)i) than the minimum '
+                    '(v%(minver)i) version of the rest of the deployment. ',
+                    {'service': self.binary, 'computename': self.host,
+                     'thisver': self.version, 'minver': minver})
+            else:
+                raise exception.ServiceTooOld(thisver=self.version,
+                                             minver=minver)
 
     @base.remotable
     def create(self):
@@ -356,7 +371,10 @@ class Service(base.NovaPersistentObject, base.NovaObject,
         self._from_db_object(self._context, self, db_service)
 
     @base.remotable
-    def save(self):
+    # WRS - Add conductor/rpcapi object_action specific RPC timeout. The
+    # parameter wrs_rpc_timeout is not actually used in this function,
+    # but is used in the "remotable" wrapper.
+    def save(self, wrs_rpc_timeout=None):
         updates = self.obj_get_changes()
         updates.pop('id', None)
         self._check_minimum_version()

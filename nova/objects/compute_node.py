@@ -11,6 +11,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2016-2017 Wind River Systems, Inc.
+#
 
 
 from oslo_serialization import jsonutils
@@ -60,7 +63,7 @@ class ComputeNode(base.NovaPersistentObject, base.NovaObject):
         'vcpus': fields.IntegerField(),
         'memory_mb': fields.IntegerField(),
         'local_gb': fields.IntegerField(),
-        'vcpus_used': fields.IntegerField(),
+        'vcpus_used': fields.FloatField(),
         'memory_mb_used': fields.IntegerField(),
         'local_gb_used': fields.IntegerField(),
         'hypervisor_type': fields.StringField(),
@@ -92,11 +95,22 @@ class ComputeNode(base.NovaPersistentObject, base.NovaObject):
         'ram_allocation_ratio': fields.FloatField(),
         'disk_allocation_ratio': fields.FloatField(),
         'mapped': fields.IntegerField(),
-        }
+
+        # L3 CAT Support
+        'l3_closids': fields.IntegerField(nullable=True),
+        'l3_closids_used': fields.IntegerField(nullable=True),
+    }
 
     def obj_make_compatible(self, primitive, target_version):
         super(ComputeNode, self).obj_make_compatible(primitive, target_version)
         target_version = versionutils.convert_version_to_tuple(target_version)
+        # NOTE(jgauld): R4 to R5 upgrades, Pike upversion to 1.18. Drop L3
+        #               related fields.
+        if target_version < (1, 18) or CONF.upgrade_levels.compute == 'newton':
+            if 'l3_closids' in primitive:
+                del primitive['l3_closids']
+            if 'l3_closids_used' in primitive:
+                del primitive['l3_closids_used']
         if target_version < (1, 17):
             if 'mapped' in primitive:
                 del primitive['mapped']
@@ -347,7 +361,9 @@ class ComputeNode(base.NovaPersistentObject, base.NovaObject):
                 "vcpus_used", "memory_mb_used", "local_gb_used",
                 "numa_topology", "hypervisor_type",
                 "hypervisor_version", "hypervisor_hostname",
-                "disk_available_least", "host_ip"]
+                "disk_available_least", "host_ip",
+                "l3_closids", "l3_closids_used",
+                ]
         for key in keys:
             if key in resources:
                 setattr(self, key, resources[key])

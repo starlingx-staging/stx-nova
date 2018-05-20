@@ -178,6 +178,13 @@ def is_supported(req, min_version=_MIN_API_VERSION,
             APIVersionRequest(min_version))
 
 
+def wrs_is_supported(req):
+    """Check if API request needs wrs attributes.
+
+    """
+    return (req.headers.get('wrs-header') is not None)
+
+
 class APIVersionRequest(object):
     """This class represents an API Version Request with convenience
     methods for manipulation and comparison of version

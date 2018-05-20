@@ -12,6 +12,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2016-2017 Wind River Systems, Inc.
+#
 
 """Tests for resource tracker claims."""
 
@@ -57,6 +60,10 @@ class DummyTracker(object):
     def new_pci_tracker(self):
         ctxt = context.RequestContext('testuser', 'testproject')
         self.pci_tracker = pci_manager.PciDevTracker(ctxt)
+
+    def normalized_vcpus(self, usage, nodename):
+        retval = usage.get('vcpus', 0)
+        return retval
 
 
 class ClaimTestCase(test.NoDBTestCase):
@@ -118,13 +125,15 @@ class ClaimTestCase(test.NoDBTestCase):
             'memory_mb': 1024,
             'vcpus': 1,
             'root_gb': 10,
-            'ephemeral_gb': 5
+            'ephemeral_gb': 5,
+            'extra_specs': {}
         }
         instance_type.update(**kwargs)
         return objects.Flavor(**instance_type)
 
     def _fake_resources(self, values=None):
         resources = {
+            'hypervisor_type': 'fake',
             'memory_mb': 2048,
             'memory_mb_used': 0,
             'free_ram_mb': 2048,
@@ -133,6 +142,8 @@ class ClaimTestCase(test.NoDBTestCase):
             'free_disk_gb': 20,
             'vcpus': 2,
             'vcpus_used': 0,
+            'l3_closids': 16,
+            'l3_closids_used': 1,
             'numa_topology': objects.NUMATopology(
                 cells=[objects.NUMACell(id=1, cpuset=set([1, 2]), memory=512,
                                         memory_usage=0, cpu_usage=0,

@@ -56,6 +56,7 @@ class KeypairController(wsgi.Controller):
 
     @wsgi.Controller.api_version("2.10")
     @wsgi.response(201)
+    @extensions.block_during_upgrade()
     @extensions.expected_errors((400, 403, 409))
     @validation.schema(keypairs.create_v210)
     def create(self, req, body):
@@ -75,6 +76,7 @@ class KeypairController(wsgi.Controller):
 
     @wsgi.Controller.api_version("2.2", "2.9")  # noqa
     @wsgi.response(201)
+    @extensions.block_during_upgrade()
     @extensions.expected_errors((400, 403, 409))
     @validation.schema(keypairs.create_v22)
     def create(self, req, body):
@@ -95,6 +97,7 @@ class KeypairController(wsgi.Controller):
         return self._create(req, body, type=True)
 
     @wsgi.Controller.api_version("2.1", "2.1")  # noqa
+    @extensions.block_during_upgrade()
     @extensions.expected_errors((400, 403, 409))
     @validation.schema(keypairs.create_v20, "2.0", "2.0")
     @validation.schema(keypairs.create, "2.1", "2.1")
@@ -149,6 +152,7 @@ class KeypairController(wsgi.Controller):
     @wsgi.Controller.api_version("2.1", "2.1")
     @validation.query_schema(keypairs.delete_query_schema_v20)
     @wsgi.response(202)
+    @extensions.block_during_upgrade()
     @extensions.expected_errors(404)
     def delete(self, req, id):
         self._delete(req, id)
@@ -156,6 +160,7 @@ class KeypairController(wsgi.Controller):
     @wsgi.Controller.api_version("2.2", "2.9")    # noqa
     @validation.query_schema(keypairs.delete_query_schema_v20)
     @wsgi.response(204)
+    @extensions.block_during_upgrade()
     @extensions.expected_errors(404)
     def delete(self, req, id):
         self._delete(req, id)
@@ -163,6 +168,7 @@ class KeypairController(wsgi.Controller):
     @wsgi.Controller.api_version("2.10")    # noqa
     @validation.query_schema(keypairs.delete_query_schema_v210)
     @wsgi.response(204)
+    @extensions.block_during_upgrade()
     @extensions.expected_errors(404)
     def delete(self, req, id):
         # handle optional user-id for admin only

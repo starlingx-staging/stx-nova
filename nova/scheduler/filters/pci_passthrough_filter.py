@@ -12,6 +12,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2013-2017 Wind River Systems, Inc.
+#
 
 from oslo_log import log as logging
 
@@ -52,5 +55,8 @@ class PciPassthroughFilter(filters.BaseHostFilter):
             LOG.debug("%(host_state)s doesn't have the required PCI devices"
                       " (%(requests)s)",
                       {'host_state': host_state, 'requests': pci_requests})
+            msg = ("Required PCI device: '%(req)s' not available"
+                   % {'req': pci_requests})
+            self.filter_reject(host_state, spec_obj, msg)
             return False
         return True

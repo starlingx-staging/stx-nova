@@ -12,6 +12,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2013-2017 Wind River Systems, Inc.
+#
 
 import collections
 import functools
@@ -39,6 +42,8 @@ CONF = nova.conf.CONF
 LOG = logging.getLogger(__name__)
 QUOTAS = quota.QUOTAS
 
+# minimum value in msec for live migration max downtime
+LIVE_MIGRATION_MAX_DOWNTIME_MIN = 100
 
 _STATE_MAP = {
     vm_states.ACTIVE: {
@@ -286,6 +291,106 @@ def check_img_metadata_properties_quota(context, metadata):
     except exception.OverQuota:
         expl = _("Image metadata limit exceeded")
         raise webob.exc.HTTPForbidden(explanation=expl)
+
+
+# WRS: validation shared between instance metadata and flavor extra-specs
+def validate_live_migration_max_downtime(metadata):
+    key = 'hw:wrs:live_migration_max_downtime'
+    if key in metadata:
+        try:
+            live_migration_max_downtime = int(metadata[key])
+        except ValueError:
+            msg = "%s must be an integer." % key
+            raise webob.exc.HTTPBadRequest(explanation=msg)
+        if live_migration_max_downtime < LIVE_MIGRATION_MAX_DOWNTIME_MIN:
+            msg = "%s must be greater than or equal to %s" % \
+                  (key, LIVE_MIGRATION_MAX_DOWNTIME_MIN)
+            raise webob.exc.HTTPBadRequest(explanation=msg)
+
+
+# WRS validation shared between instance metadata and flavor extra-specs
+def validate_live_migration_timeout(metadata):
+    # Timeout min/max in seconds.
+    LIVE_MIGRATION_TIMEOUT_MIN = 120
+    LIVE_MIGRATION_TIMEOUT_MAX = 800
+    key = 'hw:wrs:live_migration_timeout'
+    if key in metadata:
+        try:
+            live_migration_timeout = int(metadata[key])
+        except ValueError:
+            msg = "%s must be an integer." % key
+            raise webob.exc.HTTPBadRequest(explanation=msg)
+        if (live_migration_timeout != 0) and \
+           ((live_migration_timeout < LIVE_MIGRATION_TIMEOUT_MIN) or
+            (live_migration_timeout > LIVE_MIGRATION_TIMEOUT_MAX)):
+            msg = "%s must be 0 or in the range %s to %s" % \
+                  (key,
+                   LIVE_MIGRATION_TIMEOUT_MIN,
+                   LIVE_MIGRATION_TIMEOUT_MAX)
+            raise webob.exc.HTTPBadRequest(explanation=msg)
+
+
+def validate_metadata(metadata):
+    validate_live_migration_timeout(metadata)
+    validate_live_migration_max_downtime(metadata)
+    validate_boolean_options(metadata)
+    validate_recovery_priority(metadata)
+
+
+# WRS: validation for instance metadata
+def validate_recovery_priority(metadata):
+    key = 'sw:wrs:recovery_priority'
+    if key in metadata:
+        try:
+            recovery_priority = int(metadata[key])
+        except ValueError:
+            msg = "%s must be an integer." % key
+            raise webob.exc.HTTPBadRequest(explanation=msg)
+        if recovery_priority not in range(1, 11):
+            msg = "%s must be between 1 and 10" % key
+            raise webob.exc.HTTPBadRequest(explanation=msg)
+
+
+def validate_boolean_options(metadata):
+    keys = ['hw:wrs:live_migration_auto_converge',
+            'hw:wrs:live_migration_tunnel']
+    for key in keys:
+        if key in metadata:
+            try:
+                strutils.bool_from_string(metadata[key], strict=True)
+            except ValueError as error:
+                msg = _('Error setting key %(k)s: %(m)s') % \
+                        {'k': key, 'm': error.message}
+                raise webob.exc.HTTPBadRequest(explanation=msg)
+
+
+# WRS extension
+def get_nics_for_instance_from_nw_info(nw_info):
+    nics = []
+    for index, vif in enumerate(nw_info):
+        name = "nic" + str(index + 1)
+        nics.append({name: {'port_id': vif['id'],
+                            'mac_address': vif['address'],
+                            'vif_model': vif['vif_model'],
+                            'mtu': vif['mtu'],
+                            'network': vif['network']['label']}})
+    return nics
+
+
+# WRS extension
+def get_nics_for_instance(context, instance):
+    """Returns a prepared nic/vif list for passing into the view builders
+
+    We end up with a data structure like::
+
+        {'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa':
+            {'vif_model': 'virtio',
+             'mtu': 1500,
+             'index'}}
+         ...}
+    """
+    nw_info = instance.get_network_info()
+    return get_nics_for_instance_from_nw_info(nw_info)
 
 
 def get_networks_for_instance_from_nw_info(nw_info):

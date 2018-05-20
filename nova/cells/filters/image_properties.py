@@ -12,6 +12,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2013-2017 Wind River Systems, Inc.
+#
 
 """
 Image properties filter.
@@ -58,6 +61,13 @@ class ImagePropertiesFilter(filters.BaseCellFilter):
             if not version or self._matches_version(version,
                                             hypervisor_version_requires):
                 filtered_cells.append(cell)
+            else:
+                # WRS:extension - extend failure message
+                self.filter_reject(cell,
+                                   {'filter_properties': filter_properties},
+                                   "Hypervisor=%s. Required=%s" % (
+                                   str(version),
+                                   str(hypervisor_version_requires)))
 
         return filtered_cells
 

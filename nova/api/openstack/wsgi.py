@@ -662,6 +662,10 @@ class Resource(wsgi.Application):
                 response = resp_obj.serialize(request, accept)
 
         if hasattr(response, 'headers'):
+            # return with WRS header if request came with one
+            if api_version.wrs_is_supported(request):
+                response.headers['wrs-header'] = 'true'
+
             for hdr, val in list(response.headers.items()):
                 if six.PY2:
                     # In Py2.X Headers must be byte strings

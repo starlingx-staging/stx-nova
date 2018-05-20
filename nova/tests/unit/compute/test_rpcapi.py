@@ -11,7 +11,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
-
+#
+# Copyright (c) 2016-2017 Wind River Systems, Inc.
+#
 """
 Unit Tests for nova.compute.rpcapi
 """
@@ -23,6 +25,7 @@ from nova.compute import rpcapi as compute_rpcapi
 import nova.conf
 from nova import context
 from nova import exception
+from nova import objects
 from nova.objects import block_device as objects_block_dev
 from nova.objects import migrate_data as migrate_data_obj
 from nova.objects import migration as migration_obj
@@ -107,7 +110,8 @@ class ComputeRpcAPITestCase(test.NoDBTestCase):
         self.assertEqual('4.4', compute_rpcapi.LAST_VERSION)
 
     def _test_compute_api(self, method, rpc_method,
-                          expected_args=None, **kwargs):
+                          expected_args=None, drop_kwargs=None, timeout=None,
+                          **kwargs):
         ctxt = context.RequestContext('fake_user', 'fake_project')
 
         rpcapi = kwargs.pop('rpcapi_class', compute_rpcapi.ComputeAPI)()
@@ -124,12 +128,17 @@ class ComputeRpcAPITestCase(test.NoDBTestCase):
         expected_version = kwargs.pop('version', base_version)
 
         expected_kwargs = kwargs.copy()
+        drop_kwargs = drop_kwargs or []
+        for kwarg in drop_kwargs:
+            expected_kwargs.pop(kwarg, None)
+
         if expected_args:
             expected_kwargs.update(expected_args)
         if 'host_param' in expected_kwargs:
             expected_kwargs['host'] = expected_kwargs.pop('host_param')
         else:
             expected_kwargs.pop('host', None)
+            expected_kwargs.pop('destination', None)
 
         cast_and_call = ['confirm_resize', 'stop_instance']
         if rpc_method == 'call' and method in cast_and_call:
@@ -139,6 +148,8 @@ class ComputeRpcAPITestCase(test.NoDBTestCase):
                 kwargs['do_cast'] = False
         if 'host' in kwargs:
             host = kwargs['host']
+        elif 'destination' in kwargs:
+            host = kwargs['destination']
         elif 'instances' in kwargs:
             host = kwargs['instances'][0]['host']
         else:
@@ -168,8 +179,13 @@ class ComputeRpcAPITestCase(test.NoDBTestCase):
             retval = getattr(rpcapi, method)(ctxt, **kwargs)
             self.assertEqual(retval, rpc_mock.return_value)
 
-            prepare_mock.assert_called_once_with(version=expected_version,
-                                                 server=host)
+            if timeout is None:
+                prepare_mock.assert_called_once_with(version=expected_version,
+                                                     server=host)
+            else:
+                prepare_mock.assert_called_once_with(version=expected_version,
+                                                     server=host,
+                                                     timeout=timeout)
             rpc_mock.assert_called_once_with(ctxt, method, **expected_kwargs)
 
     def test_add_aggregate_host(self):
@@ -186,7 +202,7 @@ class ComputeRpcAPITestCase(test.NoDBTestCase):
         self._test_compute_api('attach_interface', 'call',
                 instance=self.fake_instance_obj, network_id='id',
                 port_id='id2', version='4.16', requested_ip='192.168.1.50',
-                tag='foo')
+                vif_model=None, tag='foo')
 
     def test_attach_interface_raises(self):
         ctxt = context.RequestContext('fake_user', 'fake_project')
@@ -237,7 +253,8 @@ class ComputeRpcAPITestCase(test.NoDBTestCase):
                                           instance=instance,
                                           network_id='fake_network',
                                           port_id='fake_port',
-                                          requested_ip='fake_requested_ip')
+                                          requested_ip='fake_requested_ip',
+                                          vif_model=None)
 
     def test_attach_volume(self):
         self._test_compute_api('attach_volume', 'cast',
@@ -247,6 +264,27 @@ class ComputeRpcAPITestCase(test.NoDBTestCase):
     def test_change_instance_metadata(self):
         self._test_compute_api('change_instance_metadata', 'cast',
                 instance=self.fake_instance_obj, diff={}, version='4.0')
+
+    def test_check_can_live_migrate_destination(self):
+        self._test_compute_api('check_can_live_migrate_destination', 'call',
+                instance=self.fake_instance_obj, destination="fake",
+                block_migration=False, disk_over_commit=False, migration=None,
+                limits=None, version='4.11',
+                _return_value=migrate_data_obj.LiveMigrateData())
+
+    def test_check_can_live_migrate_destination_downgrades(self):
+        self.flags(group='upgrade_levels', compute='4.0')
+        migration = objects.Migration(dest_compute=None)
+        with mock.patch('nova.objects.Migration.save') as mock_save:
+            self._test_compute_api(
+                    'check_can_live_migrate_destination', 'call',
+                    instance=self.fake_instance_obj, destination="fake",
+                    block_migration=False, disk_over_commit=False,
+                    migration=migration, version='4.0',
+                    drop_kwargs=['migration'],
+                    _return_value=migrate_data_obj.LiveMigrateData())
+            mock_save.assert_called_once_with()
+            self.assertEqual("fake", migration.dest_compute)
 
     def test_check_instance_shared_storage(self):
         self._test_compute_api('check_instance_shared_storage', 'call',
@@ -433,7 +471,8 @@ class ComputeRpcAPITestCase(test.NoDBTestCase):
     def test_post_live_migration_at_destination(self):
         self._test_compute_api('post_live_migration_at_destination', 'call',
                 instance=self.fake_instance_obj,
-                block_migration='block_migration', host='host', version='4.0')
+                block_migration='block_migration', host='host', version='4.0',
+                timeout=120)
 
     def test_pause_instance(self):
         self._test_compute_api('pause_instance', 'cast',
@@ -475,11 +514,12 @@ class ComputeRpcAPITestCase(test.NoDBTestCase):
         self._test_compute_api('restore_instance', 'cast',
                 instance=self.fake_instance_obj, version='4.0')
 
-    def test_pre_live_migration(self):
+    @mock.patch('nova.objects.instance.Instance.get_network_info')
+    def test_pre_live_migration(self, mock_getnet):
         self._test_compute_api('pre_live_migration', 'call',
                 instance=self.fake_instance_obj,
                 block_migration='block_migration', disk='disk', host='host',
-                migrate_data=None, version='4.8')
+                migrate_data=None, version='4.8', timeout=60)
 
     def test_prep_resize(self):
         self._test_compute_api('prep_resize', 'cast',
@@ -819,8 +859,9 @@ class ComputeRpcAPITestCase(test.NoDBTestCase):
                                callret=None,
                                calltype='cast')
 
+    @mock.patch('nova.objects.instance.Instance.get_network_info')
     @mock.patch('nova.objects.migrate_data.LiveMigrateData.from_legacy_dict')
-    def test_pre_live_migration_converts_objects(self, mock_fld):
+    def test_pre_live_migration_converts_objects(self, mock_fld, mock_getnet):
         obj = migrate_data_obj.LiveMigrateData()
         inst = self.fake_instance_obj
         result = self._test_simple_call('pre_live_migration',

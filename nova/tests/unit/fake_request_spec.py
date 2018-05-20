@@ -9,6 +9,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2016-2017 Wind River Systems, Inc.
+#
 
 from oslo_serialization import jsonutils
 from oslo_utils import uuidutils
@@ -86,6 +89,11 @@ def fake_spec_obj(remove_id=False):
     req_obj.force_nodes = ['node1', 'node2']
     req_obj.scheduler_hints = {'hint': ['over-there']}
     req_obj.requested_destination = None
+    # WRS: add min_num_instances
+    req_obj.min_num_instances = req_obj.num_instances
+    req_obj.display_name = 'fake'
+    req_obj.name = 'instance-00000001'
+    req_obj.reject_map = {}
     # This should never be a changed field
     req_obj.obj_reset_changes(['id'])
     return req_obj

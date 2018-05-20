@@ -12,6 +12,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2013-2017 Wind River Systems, Inc.
+#
 
 from oslo_log import log as logging
 
@@ -69,5 +72,8 @@ class AggregateImagePropertiesIsolation(filters.BaseHostFilter):
                           {'host_state': host_state,
                            'prop': prop,
                            'options': options})
+                msg = ('image aggregate property: %(prop)s not in: '
+                       '%(options)s' % {'prop': prop, 'options': options})
+                self.filter_reject(host_state, spec_obj, msg)
                 return False
         return True

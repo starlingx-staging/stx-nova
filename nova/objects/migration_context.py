@@ -35,6 +35,7 @@ class MigrationContext(base.NovaPersistentObject, base.NovaObject):
 
     # Version 1.0: Initial version
     # Version 1.1: Add old/new pci_devices and pci_requests
+    #              WRS: add new_allowed_cpus
     VERSION = '1.1'
 
     fields = {
@@ -52,10 +53,15 @@ class MigrationContext(base.NovaPersistentObject, base.NovaObject):
                                                nullable=True),
         'old_pci_requests': fields.ObjectField('InstancePCIRequests',
                                                 nullable=True),
+        # WRS: handle migration to hosts of different cpu topology.
+        # This is also added in R3/Mitaka (v1.0) so don't need to make
+        # compatible.
+        'new_allowed_cpus': fields.SetOfIntegersField(),
     }
 
-    @classmethod
     def obj_make_compatible(cls, primitive, target_version):
+        super(MigrationContext, cls).obj_make_compatible(primitive,
+                                                         target_version)
         target_version = versionutils.convert_version_to_tuple(target_version)
         if target_version < (1, 1):
             primitive.pop('old_pci_devices', None)

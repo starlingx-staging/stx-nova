@@ -839,6 +839,46 @@ EXTENSION_LIST = [
         "name": "Volumes",
         "namespace": "http://docs.openstack.org/compute/ext/fake_xml",
         "updated": "2014-12-03T00:00:00Z"
+    },
+    {
+        "alias": "wrs-if",
+        "description": "Adds wrs-if:nics on Servers.",
+        "links": [],
+        "name": "WrsServerIf",
+        "namespace": "http://docs.openstack.org/compute/ext/fake_xml",
+        "updated": "2014-12-03T00:00:00Z"
+    },
+    {
+        "alias": "wrs-pci",
+        "description": "WRS PCI support.",
+        "links": [],
+        "name": "WrsPci",
+        "namespace": "http://docs.openstack.org/compute/ext/fake_xml",
+        "updated": "2014-12-03T00:00:00Z"
+    },
+    {
+        "alias": "wrs-providernet",
+        "description": "WRS Provider Network support.",
+        "links": [],
+        "name": "Wrs_providernets",
+        "namespace": "http://docs.openstack.org/compute/ext/fake_xml",
+        "updated": "2014-12-03T00:00:00Z"
+    },
+    {
+        "alias": "wrs-sg",
+        "description": "Adds wrs-sg:server_group on Servers.",
+        "links": [],
+        "name": "WrsServerGroup",
+        "namespace": "http://docs.openstack.org/compute/ext/fake_xml",
+        "updated": "2014-12-03T00:00:00Z"
+    },
+    {
+        "alias": "wrs-res",
+        "description": "Adds wrs-res:vcpus and wrs-res:topology on Servers.",
+        "links": [],
+        "name": "WrsServerResources",
+        "namespace": "http://docs.openstack.org/compute/ext/fake_xml",
+        "updated": "2014-12-03T00:00:00Z"
     }
 ]
 

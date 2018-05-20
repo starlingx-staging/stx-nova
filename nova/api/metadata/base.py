@@ -13,6 +13,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2014-2017 Wind River Systems, Inc.
+#
 
 """Instance Metadata information."""
 
@@ -42,6 +45,7 @@ from nova.network.security_group import openstack_driver
 from nova import objects
 from nova.objects import virt_device_metadata as metadata_obj
 from nova import utils
+from nova.virt import hardware
 from nova.virt import netutils
 
 
@@ -131,6 +135,7 @@ class InstanceMetadata(object):
         instance.ec2_ids
         instance.keypairs
         instance.device_metadata
+        instance.numa_topology
         instance = objects.Instance.obj_from_primitive(
             instance.obj_to_primitive())
 
@@ -218,6 +223,13 @@ class InstanceMetadata(object):
                 instance=instance, address=address,
                 network_info=network_info, context=request_context)
         }
+
+        instance_numa_topology = \
+            hardware.instance_topology_from_instance(instance)
+        if instance_numa_topology is not None:
+            self.offline_cpuset = instance_numa_topology.offline_cpus
+        else:
+            self.offline_cpuset = set([])
 
     def _route_configuration(self):
         if self.route_configuration:
@@ -312,6 +324,7 @@ class InstanceMetadata(object):
 
         if self._check_version('2008-09-01', version):
             meta_data['instance-action'] = 'none'
+            meta_data['offline_cpuset'] = self.offline_cpuset
 
         data = {'meta-data': meta_data}
         if self.userdata_raw is not None:

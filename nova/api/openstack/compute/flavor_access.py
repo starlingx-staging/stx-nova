@@ -87,6 +87,7 @@ class FlavorActionController(wsgi.Controller):
 
             self._extend_flavor(resp_obj.obj['flavor'], db_flavor)
 
+    @extensions.block_during_upgrade()
     @extensions.expected_errors((400, 403, 404, 409))
     @wsgi.action("addTenantAccess")
     @validation.schema(flavor_access.add_tenant_access)
@@ -112,6 +113,7 @@ class FlavorActionController(wsgi.Controller):
             raise webob.exc.HTTPConflict(explanation=err.format_message())
         return _marshall_flavor_access(flavor)
 
+    @extensions.block_during_upgrade()
     @extensions.expected_errors((400, 403, 404))
     @wsgi.action("removeTenantAccess")
     @validation.schema(flavor_access.remove_tenant_access)

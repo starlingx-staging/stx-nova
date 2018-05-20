@@ -64,7 +64,9 @@ def is_vif_model_valid_for_virt(virt_type, vif_model):
                 network_model.VIF_MODEL_PCNET,
                 network_model.VIF_MODEL_RTL8139,
                 network_model.VIF_MODEL_E1000,
-                network_model.VIF_MODEL_SPAPR_VLAN],
+                network_model.VIF_MODEL_SPAPR_VLAN,
+                network_model.VIF_MODEL_PCI_SRIOV,
+                network_model.VIF_MODEL_PCI_PASSTHROUGH],
         'xen': [network_model.VIF_MODEL_NETFRONT,
                 network_model.VIF_MODEL_NE2K_PCI,
                 network_model.VIF_MODEL_PCNET,
@@ -102,17 +104,17 @@ class LibvirtGenericVIFDriver(object):
         devname = self.get_vif_devname(vif)
         return prefix + devname[3:]
 
+    # WRS: add parameter model to support user specifying a model in the vif
     def get_base_config(self, instance, mac, image_meta,
-                        inst_type, virt_type, vnic_type):
+                        inst_type, virt_type, vnic_type, model=None):
         conf = vconfig.LibvirtConfigGuestInterface()
         # Default to letting libvirt / the hypervisor choose the model
-        model = None
         driver = None
         vhost_queues = None
 
         # If the user has specified a 'vif_model' against the
         # image then honour that model
-        if image_meta:
+        if model is None and image_meta:
             model = osinfo.HardwareProperties(image_meta).network_model
 
         # Else if the virt type is KVM/QEMU/VZ(Parallels), then use virtio
@@ -418,8 +420,10 @@ class LibvirtGenericVIFDriver(object):
 
     def get_config_vhostuser(self, instance, vif, image_meta,
                             inst_type, virt_type, host):
+        # WRS: we support vhostuser so pass through vif_model
         conf = self.get_base_config(instance, vif['address'], image_meta,
-                                    inst_type, virt_type, vif['vnic_type'])
+                                    inst_type, virt_type, vif['vnic_type'],
+                                    vif.get('vif_model'))
         mode, sock_path = self._get_vhostuser_settings(vif)
         designer.set_vif_host_backend_vhostuser_config(conf, mode, sock_path)
         # (vladikr) Not setting up driver and queues for vhostuser
@@ -789,6 +793,9 @@ class LibvirtGenericVIFDriver(object):
                   'vif=%(vif)s',
                   {'vif_type': vif_type, 'instance': instance_repr,
                    'vif': vif})
+
+        LOG.info('vif_type=%(vif_type)s vif=%(vif)s',
+                  {'vif_type': vif_type, 'vif': vif})
 
         if vif_type is None:
             raise exception.VirtualInterfacePlugException(

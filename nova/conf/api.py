@@ -13,7 +13,10 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from keystonemiddleware.auth_token import _opts as keystone_auth_token_opts
 from oslo_config import cfg
+
+AUTHTOKEN_GROUP = 'keystone_authtoken'
 
 api_group = cfg.OptGroup('api',
     title='API options',
@@ -412,6 +415,8 @@ def register_opts(conf):
     conf.register_group(api_group)
     conf.register_opts(API_OPTS, group=api_group)
     conf.register_opts(deprecated_opts)
+    # WRS: Enable usage of keystone_authtoken.
+    conf.register_opts(keystone_auth_token_opts._OPTS, group=AUTHTOKEN_GROUP)
 
 
 def list_opts():

@@ -108,7 +108,11 @@ class SchedulerManagerTestCase(test.NoDBTestCase):
     @mock.patch('nova.scheduler.client.report.SchedulerReportClient.'
                 'get_allocation_candidates')
     def test_select_destination(self, mock_get_ac, mock_rfrs):
-        fake_spec = objects.RequestSpec()
+        fake_spec = objects.RequestSpec(
+                  flavor=objects.Flavor(vcpus=1, extra_specs={}),
+                  image=objects.ImageMeta(properties=objects.ImageMetaProps()),
+                  numa_topology=None)
+
         fake_spec.instance_uuid = uuids.instance
         place_res = (fakes.ALLOC_REQS, mock.sentinel.p_sums)
         mock_get_ac.return_value = place_res
@@ -125,12 +129,19 @@ class SchedulerManagerTestCase(test.NoDBTestCase):
                 mock.sentinel.p_sums)
             mock_get_ac.assert_called_once_with(mock_rfrs.return_value)
 
+    @mock.patch('nova.scheduler.host_manager.HostManager.get_all_host_states')
+    @mock.patch('nova.scheduler.client.report.SchedulerReportClient.'
+                'get_rejection_reasons')
     @mock.patch('nova.scheduler.utils.resources_from_request_spec')
     @mock.patch('nova.scheduler.client.report.SchedulerReportClient.'
                 'get_allocation_candidates')
     def _test_select_destination(self, get_allocation_candidates_response,
-                                 mock_get_ac, mock_rfrs):
-        fake_spec = objects.RequestSpec()
+                                 mock_get_ac, mock_rfrs,
+                                 mock_get_res, mock_get_all):
+        fake_spec = objects.RequestSpec(
+                  flavor=objects.Flavor(vcpus=1, extra_specs={}),
+                  image=objects.ImageMeta(properties=objects.ImageMetaProps()),
+                  numa_topology=None)
         fake_spec.instance_uuid = uuids.instance
         place_res = get_allocation_candidates_response
         mock_get_ac.return_value = place_res
@@ -172,7 +183,10 @@ class SchedulerManagerTestCase(test.NoDBTestCase):
     @mock.patch('nova.scheduler.client.report.SchedulerReportClient.'
                 'get_allocation_candidates')
     def test_select_destination_with_4_3_client(self, mock_get_ac, mock_rfrs):
-        fake_spec = objects.RequestSpec()
+        fake_spec = objects.RequestSpec(
+                  flavor=objects.Flavor(vcpus=1, extra_specs={}),
+                  image=objects.ImageMeta(properties=objects.ImageMetaProps()),
+                  numa_topology=None)
         place_res = (fakes.ALLOC_REQS, mock.sentinel.p_sums)
         mock_get_ac.return_value = place_res
         expected_alloc_reqs_by_rp_uuid = {
@@ -193,7 +207,10 @@ class SchedulerManagerTestCase(test.NoDBTestCase):
     @mock.patch.object(objects.RequestSpec, 'from_primitives')
     def test_select_destination_with_old_client(self, from_primitives,
             mock_get_ac, mock_rfrs):
-        fake_spec = objects.RequestSpec()
+        fake_spec = objects.RequestSpec(
+                  flavor=objects.Flavor(vcpus=1, extra_specs={}),
+                  image=objects.ImageMeta(properties=objects.ImageMetaProps()),
+                  numa_topology=None)
         fake_spec.instance_uuid = uuids.instance
         from_primitives.return_value = fake_spec
         place_res = (fakes.ALLOC_REQS, mock.sentinel.p_sums)

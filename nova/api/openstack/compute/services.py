@@ -11,9 +11,13 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2013-2017 Wind River Systems, Inc.
+#
 
 from oslo_utils import strutils
 from oslo_utils import uuidutils
+import six
 import webob.exc
 
 from nova.api.openstack import api_version_request
@@ -239,6 +243,41 @@ class ServiceController(wsgi.Controller):
 
         return {'services': _services}
 
+    # WRS: extension - service create
+    def _create(self, body, context):
+        """Create a service on a host. Simply causes an entry for the new host
+        to be added to the services table in the database.
+        """
+        if 'host' not in body:
+            msg = "Missing host field"
+            raise webob.exc.HTTPUnprocessableEntity(explanation=msg)
+
+        if 'binary' not in body:
+            msg = "Missing binary field"
+            raise webob.exc.HTTPUnprocessableEntity(explanation=msg)
+
+        if body['binary'] != "nova-compute":
+            msg = _('Service creation only supported for nova-compute')
+            raise webob.exc.HTTPUnprocessableEntity(explanation=msg)
+
+        host = body['host']
+        binary = body['binary']
+        try:
+            self.host_api.service_create(context, host, binary)
+            pass
+        except Exception as e:
+            raise webob.exc.HTTPInternalServerError(
+                explanation=six.text_type(e))
+
+        ret_value = {
+            'service': {
+                'binary': 'nova-compute',
+                'host': host,
+                'status': "created",
+            },
+        }
+        return ret_value
+
     @wsgi.Controller.api_version('2.1', '2.52')
     @extensions.expected_errors((400, 404))
     @validation.schema(services.service_update, '2.0', '2.10')
@@ -256,6 +295,9 @@ class ServiceController(wsgi.Controller):
             actions["force-down"] = self._forced_down
         else:
             actions = self.actions
+
+        # WRS: extension - add service create to update actions
+        actions["create"] = self._create
 
         return self._perform_action(req, id, body, actions)
 

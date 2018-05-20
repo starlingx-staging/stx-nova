@@ -11,6 +11,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2013-2017 Wind River Systems, Inc.
+#
 
 """Handles database requests from other nova services."""
 
@@ -22,6 +25,7 @@ from oslo_config import cfg
 from oslo_log import log as logging
 import oslo_messaging as messaging
 from oslo_utils import excutils
+from oslo_utils import strutils
 from oslo_utils import versionutils
 import six
 
@@ -50,6 +54,7 @@ from nova.scheduler import client as scheduler_client
 from nova.scheduler import utils as scheduler_utils
 from nova import servicegroup
 from nova import utils
+from nova.volume import cinder
 
 LOG = logging.getLogger(__name__)
 CONF = cfg.CONF
@@ -226,6 +231,7 @@ class ComputeTaskManager(base.Base):
         self.image_api = image.API()
         self.network_api = network.API()
         self.servicegroup_api = servicegroup.API()
+        self.volume_api = cinder.API()
         self.scheduler_client = scheduler_client.SchedulerClient()
         self.notifier = rpc.get_notifier('compute', CONF.host)
 
@@ -250,6 +256,7 @@ class ComputeTaskManager(base.Base):
         exception.InstanceInvalidState,
         exception.MigrationPreCheckError,
         exception.MigrationPreCheckClientException,
+        exception.MigrationPreCheckErrorNoRetry,
         exception.LiveMigrationWithOldNovaNotSupported,
         exception.UnsupportedPolicyException)
     @targets_cell
@@ -294,6 +301,14 @@ class ComputeTaskManager(base.Base):
         if not request_spec:
             # Make sure we hydrate a new RequestSpec object with the new flavor
             # and not the nested one from the instance
+
+            # WRS: these hints are needed by the vcpu filter
+            hints = filter_properties.get('scheduler_hints', {})
+            hints['task_state'] = instance.task_state or ""
+            hints['host'] = instance.host or ""
+            hints['node'] = instance.node or ""
+            filter_properties['scheduler_hints'] = hints
+
             request_spec = objects.RequestSpec.from_components(
                 context, instance.uuid, image,
                 flavor, instance.numa_topology, instance.pci_requests,
@@ -304,6 +319,17 @@ class ComputeTaskManager(base.Base):
             # the right one and not the original flavor
             request_spec.flavor = flavor
 
+            # WRS: these hints are needed by the vcpu filter
+            hints = {}
+            hints['task_state'] = [instance.task_state or ""]
+            hints['host'] = [instance.host or ""]
+            hints['node'] = [instance.node or ""]
+            if request_spec.obj_attr_is_set('scheduler_hints') and \
+                    request_spec.scheduler_hints:
+                request_spec.scheduler_hints.update(hints)
+            else:
+                request_spec.scheduler_hints = hints
+
         task = self._build_cold_migrate_task(context, instance, flavor,
                                              request_spec,
                                              reservations, clean_shutdown)
@@ -311,7 +337,7 @@ class ComputeTaskManager(base.Base):
         # _set_vm_state_and_notify() accepts it
         legacy_spec = request_spec.to_legacy_request_spec_dict()
         try:
-            task.execute()
+            request_spec = task.execute()
         except exception.NoValidHost as ex:
             vm_state = instance.vm_state
             if not vm_state:
@@ -326,7 +352,8 @@ class ComputeTaskManager(base.Base):
                 msg = _("No valid host found for cold migrate")
             else:
                 msg = _("No valid host found for resize")
-            raise exception.NoValidHost(reason=msg)
+            LOG.error("%s", msg)
+            raise
         except exception.UnsupportedPolicyException as ex:
             with excutils.save_and_reraise_exception():
                 vm_state = instance.vm_state
@@ -404,6 +431,7 @@ class ComputeTaskManager(base.Base):
         migration.status = 'accepted'
         migration.instance_uuid = instance.uuid
         migration.source_compute = instance.host
+        migration.source_node = instance.node
         migration.migration_type = 'live-migration'
         if instance.obj_attr_is_set('flavor'):
             migration.old_instance_type_id = instance.flavor.id
@@ -431,6 +459,7 @@ class ComputeTaskManager(base.Base):
                 exception.InstanceInvalidState,
                 exception.MigrationPreCheckError,
                 exception.MigrationPreCheckClientException,
+                exception.MigrationPreCheckErrorNoRetry,
                 exception.LiveMigrationWithOldNovaNotSupported,
                 exception.MigrationSchedulerRPCError) as ex:
             with excutils.save_and_reraise_exception():
@@ -535,6 +564,8 @@ class ComputeTaskManager(base.Base):
             filter_properties = dict(filter_properties, instance_type=flavor)
 
         request_spec = {}
+        is_bfv = (block_device_mapping.root_bdm_is_volume()
+                  if block_device_mapping else False)
         try:
             # check retry policy. Rather ugly use of instances[0]...
             # but if we've exceeded max retries... then we really only
@@ -550,7 +581,7 @@ class ComputeTaskManager(base.Base):
             spec_obj = objects.RequestSpec.from_primitives(
                     context, request_spec, filter_properties)
             hosts = self._schedule_instances(
-                    context, spec_obj, instance_uuids)
+                    context, spec_obj, is_bfv, instance_uuids)
         except Exception as exc:
             num_attempts = filter_properties.get(
                 'retry', {}).get('num_attempts', 1)
@@ -627,11 +658,23 @@ class ComputeTaskManager(base.Base):
                     block_device_mapping=bdms, node=host['nodename'],
                     limits=host['limits'])
 
-    def _schedule_instances(self, context, request_spec,
+    def _schedule_instances(self, context, request_spec, is_bfv,
                             instance_uuids=None):
         scheduler_utils.setup_instance_group(context, request_spec)
+        # NOTE(danms): We don't pass enough information to the scheduler to
+        # know that we have a boot-from-volume request.
+        # TODO(danms): We need to pass more context to the scheduler here
+        # in order to (a) handle boot-from-volume instances, as well as
+        # (b) know which volume provider to request resource from.
+        request_spec_copy = request_spec
+        if is_bfv:
+            LOG.debug('Requesting zero root disk for '
+                      'boot-from-volume instance')
+            # Clone this so we don't mutate the RequestSpec that was passed in
+            request_spec_copy = request_spec.obj_clone()
+            request_spec_copy.flavor.root_gb = 0
         hosts = self.scheduler_client.select_destinations(context,
-            request_spec, instance_uuids)
+            request_spec_copy, instance_uuids)
         return hosts
 
     @targets_cell
@@ -714,8 +757,9 @@ class ComputeTaskManager(base.Base):
                                 cell=instance_mapping.cell_mapping))
 
                     request_spec.ensure_project_id(instance)
-                    hosts = self._schedule_instances(context, request_spec,
-                                                     [instance.uuid])
+                    hosts = self._schedule_instances(
+                        context, request_spec, instance.is_volume_backed(),
+                        [instance.uuid])
                     host_state = hosts[0]
                     scheduler_utils.populate_filter_properties(
                             filter_properties, host_state)
@@ -869,16 +913,43 @@ class ComputeTaskManager(base.Base):
                 elif recreate:
                     # NOTE(sbauza): Augment the RequestSpec object by excluding
                     # the source host for avoiding the scheduler to pick it
-                    request_spec.ignore_hosts = request_spec.ignore_hosts or []
-                    request_spec.ignore_hosts.append(instance.host)
+                    # WRS: overwrite ignore_hosts list in RequestSpec with
+                    # source host.  This drops any ignore_hosts from previous
+                    # requests which could prevent evacuate from scheduling
+                    # properly.
+                    request_spec.ignore_hosts = [instance.host]
+                    # WRS: The request_spec has stale flavor and numa_topology,
+                    # so these fields must be updated. This occurs when we do
+                    # an evacuation after a reverted resize.
+                    request_spec.flavor = instance.flavor
+                    request_spec.numa_topology = instance.numa_topology
                     # NOTE(sbauza): Force_hosts/nodes needs to be reset
                     # if we want to make sure that the next destination
                     # is not forced to be the original host
                     request_spec.reset_forced_destinations()
+                    # WRS: determine offline cpus due to scaling to be used
+                    # to calculate placement service resource claim in
+                    # scheduler.
+                    request_spec.offline_cpus = \
+                        scheduler_utils.determine_offline_cpus(
+                                  instance.flavor, instance.numa_topology)
+
+                    # WRS: these hints are needed by the vcpu filter
+                    hints = dict()
+                    hints['task_state'] = [instance.task_state or ""]
+                    hints['host'] = [instance.host or ""]
+                    hints['node'] = [instance.node or ""]
+                    if request_spec.obj_attr_is_set('scheduler_hints') and \
+                            request_spec.scheduler_hints:
+                        request_spec.scheduler_hints.update(hints)
+                    else:
+                        request_spec.scheduler_hints = hints
+
                 try:
                     request_spec.ensure_project_id(instance)
-                    hosts = self._schedule_instances(context, request_spec,
-                                                     [instance.uuid])
+                    hosts = self._schedule_instances(
+                        context, request_spec, instance.is_volume_backed(),
+                        [instance.uuid])
                     host_dict = hosts.pop(0)
                     host, node, limits = (host_dict['host'],
                                           host_dict['nodename'],
@@ -997,6 +1068,11 @@ class ComputeTaskManager(base.Base):
         instances = instances or []
         instances_by_uuid = {inst.uuid: inst for inst in instances}
         for build_request in build_requests:
+            # WRS: unreserve volumes now since volume info will be lost
+            # once build_request is destroyed
+            for bdm in build_request.block_device_mappings:
+                if bdm.volume_id:
+                    self.volume_api.unreserve_volume(context, bdm.volume_id)
             if build_request.instance_uuid not in instances_by_uuid:
                 # This is an instance object with no matching db entry.
                 instance = build_request.get_new_instance(context)
@@ -1037,10 +1113,12 @@ class ComputeTaskManager(base.Base):
                                      admin_password, injected_files,
                                      requested_networks, block_device_mapping,
                                      tags=None):
+        is_bfv = (block_device_mapping.root_bdm_is_volume()
+                  if block_device_mapping else False)
         # Add all the UUIDs for the instances
         instance_uuids = [spec.instance_uuid for spec in request_specs]
         try:
-            hosts = self._schedule_instances(context, request_specs[0],
+            hosts = self._schedule_instances(context, request_specs[0], is_bfv,
                                              instance_uuids)
         except Exception as exc:
             LOG.exception('Failed to schedule instances')
@@ -1052,8 +1130,26 @@ class ComputeTaskManager(base.Base):
         cell_mapping_cache = {}
         instances = []
 
+        # WRS: get number of instances allowed to build, may need to adjust
+        #      for maximum server group size
+        instance_group = request_specs[0].instance_group
+        metadetails = {}
+        if instance_group:
+            metadetails = instance_group.get('metadetails', {})
+        group_exceed = int(metadetails.get('wrs-sg:group_exceed', 0))
+        num_allowed = len(build_requests)
+        num_allowed -= max(group_exceed, 0)
+        num_destroyed = 0
+
+        # WRS: need to keep track of remaining build requests to delete them.
+        # Not using deep copy since source object does not allow member delete
+        remaining_build_requests = []
+        for build_request in build_requests:
+            remaining_build_requests.append(build_request)
+
         for (build_request, request_spec, host) in six.moves.zip(
                 build_requests, request_specs, hosts):
+            del remaining_build_requests[0]
             instance = build_request.get_new_instance(context)
             # Convert host from the scheduler into a cell record
             if host['host'] not in host_mapping_cache:
@@ -1092,6 +1188,28 @@ class ComputeTaskManager(base.Base):
                 rc.delete_allocation_for_instance(instance.uuid)
                 continue
             else:
+                # WRS:extension - destroy instances execeeding number of
+                # allowed instances
+                if num_allowed == 0:
+                    try:
+                        build_request.destroy()
+                    except exception.BuildRequestNotFound:
+                        pass
+                    num_destroyed += 1
+
+                    try:
+                        instance_mapping = objects.InstanceMapping\
+                                  .get_by_instance_uuid(context, instance.uuid)
+                    except exception.InstanceMappingNotFound:
+                        pass
+                    else:
+                        instance_mapping.destroy()
+
+                    instances.append(None)
+                    rc = self.scheduler_client.reportclient
+                    rc.delete_allocation_for_instance(instance.uuid)
+                    continue
+                num_allowed -= 1
                 instance.availability_zone = (
                     availability_zones.get_host_availability_zone(
                         context, host['host']))
@@ -1099,6 +1217,9 @@ class ComputeTaskManager(base.Base):
                     instance.create()
                     instances.append(instance)
                     cell_mapping_cache[instance.uuid] = cell
+
+        for build_request in remaining_build_requests:
+            build_request.destroy()
 
         # NOTE(melwitt): We recheck the quota after creating the
         # objects to prevent users from allocating more resources
@@ -1183,6 +1304,23 @@ class ComputeTaskManager(base.Base):
                     block_device_mapping=instance_bdms,
                     host=host['host'], node=host['nodename'],
                     limits=host['limits'])
+
+        # WRS:extension - rollback quotas for destroyed instances
+        if num_destroyed > 0:
+            # get data to rollback
+            # this code is copied from _check_num_instances_quota()
+            #       in compute/api.py
+            flavor = request_specs[0].flavor
+            unused_cores = num_destroyed * flavor['vcpus']
+            unused_vram = int(flavor.get('extra_specs', {})
+                              .get('hw_video:ram_max_mb', 0))
+            unused_ram = num_destroyed * (flavor['memory_mb'] + unused_vram)
+            # rollback quotas
+            quotas = objects.Quotas(context)
+            quotas.reserve(instances=-num_destroyed,
+                           cores=-unused_cores,
+                           ram=-unused_ram)
+            quotas.commit()
 
     def _cleanup_build_artifacts(self, context, exc, instances, build_requests,
                                  request_specs, cell_mapping_cache):
@@ -1274,3 +1412,115 @@ class ComputeTaskManager(base.Base):
                         pass
             return False
         return True
+
+    # WRS: send server group message
+    def send_server_group_msg(self, context, exclude_instance, instance_id,
+                              instance_uuid, data):
+        """Send message to all instances in the same server group
+
+           The sender can specify an instance by either id or uuid.
+           If "exclude_instance" is True then we will not send the message
+           to that instance.
+        """
+        try:
+            # get the instance (could be deleted so use temporary context)
+            deleted_context = copy.deepcopy(context)
+            deleted_context.read_deleted = 'yes'
+            if instance_id is not None:
+                instance = objects.Instance.get_by_id(
+                    deleted_context, instance_id)
+            elif instance_uuid is not None:
+                try:
+                    instance = objects.Instance.get_by_uuid(
+                        deleted_context, instance_uuid)
+                except exception.InstanceNotFound:
+                    # Instance might not have been scheduled
+                    return
+            else:
+                raise exception.InvalidID(instance_id)
+
+            server_group = objects.InstanceGroup.get_by_instance_uuid(
+                context, instance.uuid)
+
+            if not server_group.metadetails.get('wrs-sg:active_listener'):
+                if strutils.bool_from_string(instance.flavor.extra_specs.get(
+                        'sw:wrs:srv_grp_messaging', 'false')):
+                    server_group.metadetails['wrs-sg:active_listener'] = 'true'
+                    server_group._changed_fields.add('metadetails')
+                    server_group.save()
+                else:
+                    return
+
+            # Build a dict where the keys are all compute nodes hosting group
+            # members, with a list of members for each compute node.
+            send_info = {}
+            found_listener = False
+            for uuid in server_group.members:
+                # Check whether we want to exclude this instance
+                if exclude_instance and instance.uuid == uuid:
+                    if strutils.bool_from_string(
+                            instance.flavor.extra_specs.get(
+                                'sw:wrs:srv_grp_messaging', 'false')):
+                        found_listener = True
+                    continue
+                try:
+                    d_instance = objects.Instance.get_by_uuid(context, uuid,
+                        expected_attrs=['flavor'])
+
+                    # skip instances not registered for server group messaging
+                    srv_grp_messaging = strutils.bool_from_string(
+                        d_instance.flavor.extra_specs.get(
+                            'sw:wrs:srv_grp_messaging', 'false'))
+                    if not srv_grp_messaging:
+                        continue
+                    found_listener = True
+                    # Initially send_info is going to be empty, be careful.
+                    send_info[d_instance.host] = [d_instance.name] + \
+                        send_info.get(d_instance.host, [])
+                except exception.InstanceNotFound:
+                    # Instance could have just been deleted, it's fine
+                    pass
+            if not found_listener:
+                server_group.metadetails.pop('wrs-sg:active_listener')
+                server_group._changed_fields.add('metadetails')
+                server_group.save()
+
+            # Call each compute node with message and list of instance names
+            for host in send_info.keys():
+                self.compute_rpcapi.send_server_group_msg(context, host,
+                       send_info[host], data)
+
+        except exception.InstanceGroupNotFound:
+            # server group has been deleted, this is okay
+            pass
+
+    # WRS: get server group status
+    def get_server_group_status(self, context, instance_id):
+        """Get status of all instances in the same server group """
+        statuslist = []
+        try:
+            # Get the instance
+            instance = objects.Instance.get_by_id(context, instance_id)
+        except exception.InstanceNotFound:
+            # Instance could have just been deleted, not an error
+            return statuslist
+
+        try:
+            server_group = objects.InstanceGroup.get_by_instance_uuid(
+                context, instance.uuid)
+
+            for uuid in server_group.members:
+                try:
+                    instance = objects.Instance.get_by_uuid(context, uuid)
+                except exception.InstanceNotFound:
+                    # Instance could have just been deleted, not an error
+                    pass
+
+                status = notifications.base.info_from_instance(
+                              context, instance, None, None)
+                statuslist.append(status)
+
+        except exception.InstanceGroupNotFound:
+            # server group has been deleted, this is okay
+            pass
+        return statuslist

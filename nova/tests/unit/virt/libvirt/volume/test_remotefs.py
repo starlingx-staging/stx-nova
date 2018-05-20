@@ -66,7 +66,7 @@ class RemoteFSTestCase(test.NoDBTestCase):
         rsync_call_args = mock.call('rsync', '--archive',
                                     '--delete', '--include',
                                     'dest', '--exclude', '*',
-                                    '/tmp/Mercury/', 'host:',
+                                    '/tmp/Mercury/', 'host-infra:',
                                     on_completion=None, on_execute=None)
         self.assertEqual(mock_execute.mock_calls[0], rsync_call_args)
         rm_call_args = mock.call('rm', '-rf', '/tmp/Mercury')
@@ -87,13 +87,13 @@ class RemoteFSTestCase(test.NoDBTestCase):
         remotefs.RsyncDriver().remove_dir('host', 'dest', None, None)
         rsync_call_args = mock.call('rsync', '--archive',
                                     '--delete-excluded', '/tmp/Venus/',
-                                    'host:dest',
+                                    'host-infra:dest',
                                     on_completion=None, on_execute=None)
         self.assertEqual(mock_execute.mock_calls[0], rsync_call_args)
         rsync_call_args = mock.call('rsync', '--archive',
                                     '--delete', '--include',
                                     'dest', '--exclude', '*',
-                                    '/tmp/Venus/', 'host:',
+                                    '/tmp/Venus/', 'host-infra:',
                                     on_completion=None, on_execute=None)
         self.assertEqual(mock_execute.mock_calls[1], rsync_call_args)
         rm_call_args = mock.call('rm', '-rf', '/tmp/Venus')
@@ -120,7 +120,7 @@ class RemoteFSTestCase(test.NoDBTestCase):
         self.assertEqual(mock_execute.mock_calls[1], touch_call_args)
         rsync_call_args = mock.call('rsync', '--archive', '--relative',
                                     '--no-implied-dirs',
-                                    '/tmp/Mars/./dest_dir', 'host:/',
+                                    '/tmp/Mars/./dest_dir', 'host-infra:/',
                                     on_completion=None, on_execute=None)
         self.assertEqual(mock_execute.mock_calls[2], rsync_call_args)
         rm_call_args = mock.call('rm', '-rf', '/tmp/Mars')
@@ -145,7 +145,7 @@ class RemoteFSTestCase(test.NoDBTestCase):
         self.assertEqual(mock_execute.mock_calls[0], mkdir_call_args)
         rsync_call_args = mock.call('rsync', '--archive', '--relative',
                                     '--no-implied-dirs',
-                                    '/tmp/Jupiter/./dest_dir', 'host:/',
+                                    '/tmp/Jupiter/./dest_dir', 'host-infra:/',
                                     on_completion=None, on_execute=None)
         self.assertEqual(mock_execute.mock_calls[1], rsync_call_args)
         rm_call_args = mock.call('rm', '-rf', '/tmp/Jupiter')

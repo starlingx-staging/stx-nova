@@ -12,6 +12,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2016-2017 Wind River Systems, Inc.
+#
 
 """The instance interfaces extension."""
 
@@ -20,6 +23,7 @@ from webob import exc
 
 from nova.api.openstack import common
 from nova.api.openstack.compute.schemas import attach_interfaces
+from nova.api.openstack.compute import wrs_server_if
 from nova.api.openstack import extensions
 from nova.api.openstack import wsgi
 from nova.api import validation
@@ -27,6 +31,9 @@ from nova import compute
 from nova import exception
 from nova.i18n import _
 from nova import network
+from nova.network import model as network_model
+from nova.network.neutronv2 import api as neutronapi
+from nova import objects
 from nova.policies import attach_interfaces as ai_policies
 
 
@@ -98,6 +105,7 @@ class InterfaceAttachmentController(wsgi.Controller):
         return {'interfaceAttachment': _translate_interface_attachment_view(
                 port_info['port'])}
 
+    @extensions.block_during_upgrade()
     @extensions.expected_errors((400, 404, 409, 500, 501))
     @validation.schema(attach_interfaces.create, '2.0', '2.48')
     @validation.schema(attach_interfaces.create_v249, '2.49')
@@ -111,11 +119,13 @@ class InterfaceAttachmentController(wsgi.Controller):
         port_id = None
         req_ip = None
         tag = None
+        vif_model = None
         if body:
             attachment = body['interfaceAttachment']
             network_id = attachment.get('net_id', None)
             port_id = attachment.get('port_id', None)
             tag = attachment.get('tag', None)
+            vif_model = attachment.get('wrs-if:vif_model')
             try:
                 req_ip = attachment['fixed_ips'][0]['ip_address']
             except Exception:
@@ -129,15 +139,62 @@ class InterfaceAttachmentController(wsgi.Controller):
             raise exc.HTTPBadRequest(explanation=msg)
 
         instance = common.get_instance(self.compute_api, context, server_id)
+
         try:
+            if hasattr(instance, 'info_cache'):
+                instance_nic_count = len(instance.info_cache.network_info)
+                if instance_nic_count >= wrs_server_if.MAXIMUM_VNICS:
+                    msg = _("Already at %(max)d configured NICs, "
+                            "which is the maximum amount supported") % {
+                                "max": wrs_server_if.MAXIMUM_VNICS,
+                           }
+                    raise exc.HTTPBadRequest(explanation=msg)
+            if hasattr(instance, 'host'):
+                physkey = 'provider:physical_network'
+                aggr_list = objects.AggregateList.get_by_metadata_key(
+                    context, physkey, hosts=set([instance.host])
+                )
+                providernet_list = []
+                for aggr_entry in aggr_list:
+                    providernet_list.append(aggr_entry.metadata[physkey])
+
+                neutron = neutronapi.get_client(context, admin=True)
+                temp_network_id = None
+                if port_id:
+                    port = neutron.show_port(port_id)['port']
+                    temp_network_id = port.get('network_id')
+                    if not vif_model:
+                        vif_model = port.get('wrs-binding:vif_model')
+                else:
+                    temp_network_id = network_id
+                network = neutron.show_network(temp_network_id)['network']
+                providernet = network[physkey]
+                providernet_on_host = (providernet in providernet_list)
+                if not providernet_on_host:
+                    msg = _("Providernet %(pnet)s not on instance's "
+                            "host %(host)s") % {
+                                "pnet": providernet,
+                                "host": instance.host,
+                            }
+                    raise exc.HTTPBadRequest(explanation=msg)
+            if not vif_model:
+                vif_model = network_model.VIF_MODEL_VIRTIO
+            elif vif_model not in network_model.VIF_MODEL_HOTPLUGGABLE:
+                msg = _("Interface attach not supported for vif_model "
+                        "%(vif_model)s. Must be one of %(valid_vifs)s.") % {
+                            'vif_model': vif_model,
+                            'valid_vifs': network_model.VIF_MODEL_HOTPLUGGABLE,
+                        }
+                raise exception.InvalidInput(msg)
             vif = self.compute_api.attach_interface(context,
-                instance, network_id, port_id, req_ip, tag=tag)
+                instance, network_id, port_id, req_ip, vif_model, tag=tag)
         except (exception.InterfaceAttachFailedNoNetwork,
                 exception.NetworkAmbiguous,
                 exception.NoMoreFixedIps,
                 exception.PortNotUsable,
                 exception.AttachInterfaceNotSupported,
                 exception.SecurityGroupCannotBeApplied,
+                exception.InvalidInput,
                 exception.TaggedAttachmentNotSupported) as e:
             raise exc.HTTPBadRequest(explanation=e.format_message())
         except (exception.InstanceIsLocked,
@@ -156,6 +213,7 @@ class InterfaceAttachmentController(wsgi.Controller):
 
         return self.show(req, server_id, vif['id'])
 
+    @extensions.block_during_upgrade()
     @wsgi.response(202)
     @extensions.expected_errors((404, 409, 501))
     def delete(self, req, server_id, id):

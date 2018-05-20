@@ -11,6 +11,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2016-2017 Wind River Systems, Inc.
+#
 
 from migrate.changeset import UniqueConstraint
 from migrate import ForeignKeyConstraint
@@ -262,7 +265,8 @@ def upgrade(migrate_engine):
         Column('vcpus', Integer, nullable=False),
         Column('memory_mb', Integer, nullable=False),
         Column('local_gb', Integer, nullable=False),
-        Column('vcpus_used', Integer, nullable=False),
+        # WRS: changed vcpus_used to float
+        Column('vcpus_used', Float, nullable=False),
         Column('memory_mb_used', Integer, nullable=False),
         Column('local_gb_used', Integer, nullable=False),
         Column('hypervisor_type', MediumText(), nullable=False),

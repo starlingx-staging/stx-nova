@@ -110,6 +110,11 @@ class Guest(object):
     def _encoded_xml(self):
         return encodeutils.safe_decode(self._domain.XMLDesc(0))
 
+    # WRS: ugly hack, mea culpa
+    @property
+    def domain(self):
+        return self._domain
+
     @classmethod
     def create(cls, xml, host):
         """Create a new Guest
@@ -263,12 +268,21 @@ class Guest(object):
             yield VCPUInfo(
                 id=vcpu[0], cpu=vcpu[3], state=vcpu[1], time=vcpu[2])
 
-    def delete_configuration(self, support_uefi=False):
+    def get_vcpus_map(self):
+        """Returns virtual cpu map information of guest."""
+        vcpus = self._domain.vcpus()
+        if vcpus is not None and len(vcpus) > 1:
+            return vcpus[1]
+
+    def delete_configuration(self, support_uefi=False, keep_nvram=False):
         """Undefines a domain from hypervisor."""
         try:
             flags = libvirt.VIR_DOMAIN_UNDEFINE_MANAGED_SAVE
             if support_uefi:
-                flags |= libvirt.VIR_DOMAIN_UNDEFINE_NVRAM
+                if keep_nvram:
+                    flags |= libvirt.VIR_DOMAIN_UNDEFINE_KEEP_NVRAM
+                else:
+                    flags |= libvirt.VIR_DOMAIN_UNDEFINE_NVRAM
             self._domain.undefineFlags(flags)
         except libvirt.libvirtError:
             LOG.debug("Error from libvirt during undefineFlags. %d"
@@ -369,7 +383,7 @@ class Guest(object):
                 devs.append(dev)
         return devs
 
-    def detach_device_with_retry(self, get_device_conf_func, device, live,
+    def detach_device_with_retry(self, get_device_conf_func, device, host,
                                  max_retry_count=7, inc_sleep_time=2,
                                  max_sleep_time=30,
                                  alternative_device_name=None):
@@ -381,8 +395,7 @@ class Guest(object):
         :param get_device_conf_func: function which takes device as a parameter
                                      and returns the configuration for device
         :param device: device to detach
-        :param live: bool to indicate whether it affects the guest in running
-                     state
+        :param host: host.Host object for guest attached to device
         :param max_retry_count: number of times the returned function will
                                 retry a detach before failing
         :param inc_sleep_time: incremental time to sleep in seconds between
@@ -396,7 +409,11 @@ class Guest(object):
         """
         alternative_device_name = alternative_device_name or device
 
-        def _try_detach_device(conf, persistent=False, live=False):
+        def _try_detach_device(conf, persistent=False, host=None):
+            # WRS: live flag is recalculated because the domain may have
+            # changed state.
+            state = self.get_power_state(host)
+            live = state in (power_state.RUNNING, power_state.PAUSED)
             # Raise DeviceNotFound if the device isn't found during detach
             try:
                 self.detach_device(conf, persistent=persistent, live=live)
@@ -404,22 +421,18 @@ class Guest(object):
                           'Persistent? %s. Live? %s',
                           device, persistent, live)
             except libvirt.libvirtError as ex:
-                with excutils.save_and_reraise_exception():
-                    errcode = ex.get_error_code()
-                    if errcode == libvirt.VIR_ERR_OPERATION_FAILED:
-                        errmsg = ex.get_error_message()
-                        if 'not found' in errmsg:
-                            # This will be raised if the live domain
-                            # detach fails because the device is not found
-                            raise exception.DeviceNotFound(
-                                device=alternative_device_name)
-                    elif errcode == libvirt.VIR_ERR_INVALID_ARG:
-                        errmsg = ex.get_error_message()
-                        if 'no target device' in errmsg:
-                            # This will be raised if the persistent domain
-                            # detach fails because the device is not found
-                            raise exception.DeviceNotFound(
-                                device=alternative_device_name)
+                errcode = ex.get_error_code()
+                # if the state of the domain changed, we need to retry
+                if errcode not in (libvirt.VIR_ERR_OPERATION_INVALID,
+                                   libvirt.VIR_ERR_OPERATION_FAILED):
+                    with excutils.save_and_reraise_exception():
+                        if errcode == libvirt.VIR_ERR_INVALID_ARG:
+                            errmsg = ex.get_error_message()
+                            if 'no target device' in errmsg:
+                                # This will be raised if the persistent domain
+                                # detach fails because the device is not found
+                                raise exception.DeviceNotFound(
+                                    device=alternative_device_name)
 
         conf = get_device_conf_func(device)
         if conf is None:
@@ -430,7 +443,7 @@ class Guest(object):
         LOG.debug('Attempting initial detach for device %s',
                   alternative_device_name)
         try:
-            _try_detach_device(conf, persistent, live)
+            _try_detach_device(conf, persistent, host)
         except exception.DeviceNotFound:
             # NOTE(melwitt): There are effectively two configs for an instance.
             # The persistent config (affects instance upon next boot) and the
@@ -439,6 +452,8 @@ class Guest(object):
             # persistent config and a live config. If we tried to detach the
             # device with persistent=True and live=True and it was not found,
             # we should still try to detach from the live config, so continue.
+            state = self.get_power_state(host)
+            live = state in (power_state.RUNNING, power_state.PAUSED)
             if persistent and live:
                 pass
             else:
@@ -455,7 +470,7 @@ class Guest(object):
             if config is not None:
                 # Device is already detached from persistent domain
                 # and only transient domain needs update
-                _try_detach_device(config, persistent=False, live=live)
+                _try_detach_device(config, persistent=False, host=host)
 
                 reason = _("Unable to detach from guest transient domain.")
                 raise exception.DeviceDetachFailed(

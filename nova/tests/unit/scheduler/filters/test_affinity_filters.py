@@ -9,6 +9,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2016-2017 Wind River Systems, Inc.
+#
 
 import mock
 
@@ -204,7 +207,9 @@ class TestGroupAffinityFilter(test.NoDBTestCase):
         host = fakes.FakeHostState('host1', 'node1', {})
         spec_obj = objects.RequestSpec(instance_group=objects.InstanceGroup(
             policies=[policy],
-            hosts=['host2']))
+            hosts=['host2'],
+            members=['fake-uuid1'],
+            metadetails={}))
         self.assertFalse(filt_cls.host_passes(host, spec_obj))
 
     def test_group_affinity_filter_fails(self):

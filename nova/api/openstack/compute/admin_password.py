@@ -34,6 +34,7 @@ class AdminPasswordController(wsgi.Controller):
     # TODO(eliqiao): Here should be 204(No content) instead of 202 by v2.1+
     # microversions because the password has been changed when returning
     # a response.
+    @extensions.block_during_upgrade()
     @wsgi.action('changePassword')
     @wsgi.response(202)
     @extensions.expected_errors((400, 404, 409, 501))

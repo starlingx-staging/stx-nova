@@ -24,10 +24,12 @@ import webob.dec
 import webob.exc
 
 from nova.api.openstack import wsgi
+import nova.conf
 from nova import exception
 from nova.i18n import _
 
 LOG = logging.getLogger(__name__)
+CONF = nova.conf.CONF
 
 
 class ExtensionDescriptor(object):
@@ -369,4 +371,26 @@ def expected_errors(errors):
 
         return wrapped
 
+    return decorator
+
+
+# WRS extension
+def block_during_upgrade():
+    """Decorator for v2.1 API methods which blocks commands during upgrade
+    """
+    def decorator(f):
+        @functools.wraps(f)
+        def wrapped(*args, **kwargs):
+            # current check for upgrades is to check if upgrade_levels
+            # is not None. During an upgrade, we put nova in
+            # compatibility mode. This will put something like "kilo"
+            # in CONF.upgrade_levels.compute
+            if CONF.upgrade_levels.compute is not None:
+                msg = "This command is not available during upgrades"
+                LOG.warning(msg + ", name = " + str(f.__name__) +
+                            ", module =  " + str(f.__module__))
+                raise webob.exc.HTTPBadRequest(explanation=msg)
+            return f(*args, **kwargs)
+
+        return wrapped
     return decorator

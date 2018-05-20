@@ -15,8 +15,13 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2013-2017 Wind River Systems, Inc.
+#
+
 """Tests for compute service."""
 
+import contextlib
 import datetime
 from itertools import chain
 import operator
@@ -151,6 +156,9 @@ class BaseTestCase(test.TestCase):
         self.flags(network_manager='nova.network.manager.FlatManager')
         fake.set_nodes([NODENAME, NODENAME2])
 
+        # WRS: Required since adding new_allowed_cpus to migration_context.
+        self.flags(vcpu_pin_set="0-15")
+
         fake_notifier.stub_notifier(self)
         self.addCleanup(fake_notifier.reset)
 
@@ -194,6 +202,8 @@ class BaseTestCase(test.TestCase):
                                    'cpu_allocation_ratio': 16.0,
                                    'ram_allocation_ratio': 1.5,
                                    'disk_allocation_ratio': 1.0,
+                                   'l3_closids': 16,
+                                   'l3_closids_used': 1,
                                    'host_ip': '127.0.0.1'}]
             return [objects.ComputeNode._from_db_object(
                         context, objects.ComputeNode(), cn)
@@ -288,7 +298,7 @@ class BaseTestCase(test.TestCase):
         inst.ami_launch_index = 0
         inst.memory_mb = 0
         inst.vcpus = 0
-        inst.root_gb = 0
+        inst.root_gb = flavor.get('root_gb', 0)
         inst.ephemeral_gb = 0
         inst.architecture = obj_fields.Architecture.X86_64
         inst.os_type = 'Linux'
@@ -303,8 +313,10 @@ class BaseTestCase(test.TestCase):
         inst.flavor = flavor
         inst.old_flavor = None
         inst.new_flavor = None
+        inst.max_vcpus = flavor.vcpus
         if params:
             inst.flavor.update(params.pop('flavor', {}))
+            inst.root_gb = inst.flavor.get('root_gb', 0)
             inst.update(params)
         if services:
             _create_service_entries(self.context.elevated(),
@@ -548,6 +560,83 @@ class ComputeVolumeTestCase(BaseTestCase):
         attempts = c._await_block_device_map_created(self.context, '1')
         self.assertEqual(1, attempts)
 
+    def test_await_volume_detached_too_slow(self):
+        self.flags(block_device_allocate_retries=2)
+        self.flags(block_device_allocate_retries_interval=0.1)
+
+        def never_get(context, volume_id):
+            return {
+                'status': 'detaching',
+                'id': 'blah',
+            }
+
+        self.stubs.Set(self.compute.volume_api, 'get', never_get)
+        self.assertRaises(exception.VolumeNotDetached,
+                          self.compute._await_volume_detached,
+                          self.context, '1')
+
+    def test_await_volume_detached_failed(self):
+        c = self.compute
+
+        fake_result = {'status': 'error', 'id': 'blah'}
+        with mock.patch.object(c.volume_api, 'get',
+                               return_value=fake_result) as fake_get:
+            self.assertRaises(exception.VolumeNotDetached,
+                c._await_volume_detached,
+                self.context, '1')
+            fake_get.assert_called_once_with(self.context, '1')
+
+    def test_await_volume_detached_slow(self):
+        c = self.compute
+        self.flags(block_device_allocate_retries=4)
+        self.flags(block_device_allocate_retries_interval=0.1)
+
+        def slow_get(context, volume_id):
+            if self.fetched_attempts < 2:
+                self.fetched_attempts += 1
+                return {
+                    'status': 'detaching',
+                    'id': 'blah',
+                }
+            return {
+                'status': 'available',
+                'id': 'blah',
+            }
+
+        self.stubs.Set(c.volume_api, 'get', slow_get)
+        attempts = c._await_volume_detached(self.context, '1')
+        self.assertEqual(attempts, 3)
+
+    def test_await_volume_detached_retries_negative(self):
+        c = self.compute
+        self.flags(block_device_allocate_retries=-1)
+        self.flags(block_device_allocate_retries_interval=0.1)
+
+        def volume_get(context, volume_id):
+            return {
+                'status': 'available',
+                'id': 'blah',
+            }
+
+        self.stubs.Set(c.volume_api, 'get', volume_get)
+        attempts = c._await_volume_detached(self.context, '1')
+        self.assertEqual(1, attempts)
+
+    def test_await_volume_detached_retries_zero(self):
+        c = self.compute
+        self.flags(block_device_allocate_retries=0)
+        self.flags(block_device_allocate_retries_interval=0.1)
+
+        def volume_get(context, volume_id):
+            return {
+                'status': 'available',
+                'id': 'blah',
+            }
+
+        self.stubs.Set(c.volume_api, 'get', volume_get)
+        attempts = c._await_volume_detached(self.context, '1')
+        self.assertEqual(1, attempts)
+
     def test_boot_volume_serial(self):
         self.stub_out('nova.volume.cinder.API.check_attach',
                        lambda *a, **kw: None)
@@ -768,8 +857,7 @@ class ComputeVolumeTestCase(BaseTestCase):
     @mock.patch.object(fake.FakeDriver, 'block_stats')
     @mock.patch.object(compute_manager.ComputeManager, '_get_host_volume_bdms')
     @mock.patch.object(fake.FakeDriver, 'get_all_volume_usage')
-    @mock.patch.object(fake.FakeDriver, 'instance_exists')
-    def test_detach_volume_usage(self, mock_exists, mock_get_all,
+    def test_detach_volume_usage(self, mock_get_all,
                                  mock_get_bdms, mock_stats, mock_get,
                                  mock_notify, mock_elevate):
         mock_elevate.return_value = self.context
@@ -799,7 +887,6 @@ class ComputeVolumeTestCase(BaseTestCase):
                                       'wr_req': 1,
                                       'wr_bytes': 5,
                                       'instance': instance}]
-        mock_exists.return_value = True
 
         def fake_get_volume_encryption_metadata(self, context, volume_id):
             return {}
@@ -869,7 +956,6 @@ class ComputeVolumeTestCase(BaseTestCase):
         mock_stats.assert_called_once_with(instance, 'vdb')
         mock_get_bdms.assert_called_once_with(self.context, use_slave=True)
         mock_get_all(self.context, host_volume_bdms)
-        mock_exists.assert_called_once_with(mock.ANY)
 
     def test_prepare_image_mapping(self):
         swap_size = 1
@@ -1435,6 +1521,9 @@ class ComputeTestCase(BaseTestCase,
     def setUp(self):
         super(ComputeTestCase, self).setUp()
         self.useFixture(fixtures.SpawnIsSynchronousFixture())
+        # WRS: stub out server group messaging
+        self.stubs.Set(nova.compute.cgcs_messaging,
+                      'send_server_grp_notification', lambda *a, **kw: None)
 
     def test_wrap_instance_fault(self):
         inst = {"uuid": uuids.instance}
@@ -1696,7 +1785,7 @@ class ComputeTestCase(BaseTestCase,
 
         self.flags(reserved_host_disk_mb=0, reserved_host_memory_mb=0)
         self.rt.update_available_resource(self.context.elevated(), NODENAME)
-        limits = {'vcpu': 3}
+        limits = {'vcpu': 3 / self.rt.cpu_allocation_ratio}
         filter_properties = {'limits': limits}
 
         # get total memory as reported by virt driver:
@@ -1708,33 +1797,40 @@ class ComputeTestCase(BaseTestCase,
         params = {"flavor": {"memory_mb": 10, "root_gb": 1,
                              "ephemeral_gb": 1, "vcpus": 2}}
         instance = self._create_fake_instance_obj(params)
+
+        # WRS rt._get_usage_dict(): get vcpus from instance object directly
+        instance.vcpus = 2
+
         self.compute.build_and_run_instance(self.context, instance, {}, {},
                 filter_properties, block_device_mapping=[])
 
         cn = self.rt.compute_nodes[NODENAME]
-        self.assertEqual(2, cn.vcpus_used)
+        self.assertEqual(2 / self.rt.cpu_allocation_ratio, cn.vcpus_used)
 
         # create one more instance:
         params = {"flavor": {"memory_mb": 10, "root_gb": 1,
                              "ephemeral_gb": 1, "vcpus": 1}}
         instance = self._create_fake_instance_obj(params)
+        instance.vcpus = 1
+
         self.compute.build_and_run_instance(self.context, instance, {}, {},
                 filter_properties, block_device_mapping=[])
 
-        self.assertEqual(3, cn.vcpus_used)
+        self.assertEqual(3 / self.rt.cpu_allocation_ratio, cn.vcpus_used)
 
         # delete the instance:
         instance['vm_state'] = vm_states.DELETED
         self.rt.update_usage(self.context, instance, NODENAME)
 
-        self.assertEqual(2, cn.vcpus_used)
+        self.assertEqual(2 / self.rt.cpu_allocation_ratio, cn.vcpus_used)
 
         # now oversubscribe vcpus and fail:
         params = {"flavor": {"memory_mb": 10, "root_gb": 1,
                              "ephemeral_gb": 1, "vcpus": 2}}
         instance = self._create_fake_instance_obj(params)
+        instance.vcpus = 2
 
-        limits = {'vcpu': 3}
+        limits = {'vcpu': 3 / self.rt.cpu_allocation_ratio}
         self.compute.build_and_run_instance(self.context, instance, {}, {},
                 {}, block_device_mapping=[], limits=limits)
         self.assertEqual(vm_states.ERROR, instance.vm_state)
@@ -2052,8 +2148,8 @@ class ComputeTestCase(BaseTestCase,
                     'attachments': {instance.uuid: {
                                        'attachment_id': 'abc123'
                                         }
-                                    }
-                    }
+                                    },
+                    'status': 'available'}
 
         def fake_terminate_connection(self, context, volume_id, connector):
             pass
@@ -3318,8 +3414,9 @@ class ComputeTestCase(BaseTestCase,
         instance.save()
         return instance
 
+    @mock.patch.object(objects.InstanceGroup, 'get_by_instance_uuid')
     @mock.patch.object(nova.compute.utils, 'notify_about_instance_action')
-    def test_snapshot(self, mock_notify_action):
+    def test_snapshot(self, mock_notify_action, mock_get_sg):
         inst_obj = self._get_snapshotting_instance()
         mock_context = mock.Mock()
         with mock.patch.object(self.context, 'elevated',
@@ -4909,6 +5006,93 @@ class ComputeTestCase(BaseTestCase,
         self.assertEqual(new_flavor['ephemeral_gb'], instance.ephemeral_gb)
         self.assertEqual(new_flavor['id'], instance.instance_type_id)
 
+    # WRS: Resize a downscaled instance to a scalable flavor with maximum cpus
+    # less than currently running. Offline ones should stay offline.
+    @mock.patch.object(objects.instance_numa_topology.InstanceNUMATopology,
+                       'offline_cpus', new_callable=mock.PropertyMock)
+    def test_set_instance_info_resize_downscaled_inst_downwards(
+            self, mock_offline_cpus):
+        old_flavor_name = 'm1.xlarge'  # vcpus=8
+        new_flavor_name = 'm1.medium'  # vcpus=2
+        instance = self._create_fake_instance_obj(type_name=old_flavor_name)
+        # scale down the instance with 8 cpus to 3
+        instance.max_vcpus = 8
+        instance.vcpus = 3
+        instance.numa_topology = objects.InstanceNUMATopology()
+        mock_offline_cpus.return_value = [3, 4, 5, 6, 7]
+
+        new_flavor = flavors.get_flavor_by_name(new_flavor_name)
+
+        self.compute._set_instance_info(instance, new_flavor.obj_clone())
+        # active vcpus is adjusted downwards to the new flavor
+        self.assertEqual(2, instance.max_vcpus)
+        self.assertEqual(2, instance.vcpus)
+
+    # WRS: Resize a downscaled instance to a scalable flavor with maximum cpus
+    # more than currently running. Offline ones should stay offline.
+    @mock.patch.object(objects.instance_numa_topology.InstanceNUMATopology,
+                       'offline_cpus', new_callable=mock.PropertyMock)
+    def test_set_instance_info_resize_downscaled_inst_upwards(
+            self, mock_offline_cpus):
+        old_flavor_name = 'm1.xlarge'  # vcpus=8
+        new_flavor_name = 'm1.large'   # vcpus=4
+        instance = self._create_fake_instance_obj(type_name=old_flavor_name)
+        # scale down the instance with 8 cpus to 3
+        instance.max_vcpus = 8
+        instance.vcpus = 3
+        instance.numa_topology = objects.InstanceNUMATopology()
+        mock_offline_cpus.return_value = [3, 4, 5, 6, 7]
+
+        new_flavor = flavors.get_flavor_by_name(new_flavor_name)
+
+        self.compute._set_instance_info(instance, new_flavor.obj_clone())
+        self.assertEqual(4, instance.max_vcpus)
+        self.assertEqual(3, instance.vcpus)
+
+    # WRS: Resize a downscaled instance to a scalable flavor with maximum cpus
+    # more than that of the current flavor. Offline ones should stay offline.
+    @mock.patch.object(objects.instance_numa_topology.InstanceNUMATopology,
+                       'offline_cpus', new_callable=mock.PropertyMock)
+    def test_set_instance_info_resize_downscaled_inst_upwards2(
+            self, mock_offline_cpus):
+        old_flavor_name = 'm1.large'   # vcpus=4
+        new_flavor_name = 'm1.xlarge'  # vcpus=8
+        instance = self._create_fake_instance_obj(type_name=old_flavor_name)
+        # scale down the instance with 4 cpus to 3
+        instance.max_vcpus = 4
+        instance.vcpus = 3
+        instance.numa_topology = objects.InstanceNUMATopology()
+        mock_offline_cpus.return_value = [3]
+
+        new_flavor = flavors.get_flavor_by_name(new_flavor_name)
+
+        self.compute._set_instance_info(instance, new_flavor.obj_clone())
+        # active vcpus is adjusted downwards to the new flavor
+        self.assertEqual(8, instance.max_vcpus)
+        self.assertEqual(7, instance.vcpus)
+
+    # WRS: Resize a downscaled instance in which not all offline cpus are from
+    # highest vcpu#.The offline cpus should stay offline.
+    @mock.patch.object(objects.instance_numa_topology.InstanceNUMATopology,
+                       'offline_cpus', new_callable=mock.PropertyMock)
+    def test_set_instance_info_resize_downscaled_inst_irregular(
+            self, mock_offline_cpus):
+        old_flavor_name = 'm1.xlarge'  # vcpus=8
+        new_flavor_name = 'm1.large'   # vcpus=4
+        instance = self._create_fake_instance_obj(type_name=old_flavor_name)
+        # scale down the instance with 8 cpus to 3
+        instance.max_vcpus = 8
+        instance.vcpus = 3
+        instance.numa_topology = objects.InstanceNUMATopology()
+        mock_offline_cpus.return_value = [1, 2, 5, 6, 7]
+
+        new_flavor = flavors.get_flavor_by_name(new_flavor_name)
+
+        self.compute._set_instance_info(instance, new_flavor.obj_clone())
+        self.assertEqual(4, instance.max_vcpus)
+        # only vcpus [0, 3] are online
+        self.assertEqual(2, instance.vcpus)
+
     def test_rebuild_instance_notification(self):
         # Ensure notifications on instance migrate/resize.
         old_time = datetime.datetime(2012, 4, 1)
@@ -5102,7 +5286,8 @@ class ComputeTestCase(BaseTestCase,
 
         self.assertRaises(exception.MigrationError, self.compute.prep_resize,
                           self.context, instance=instance,
-                          instance_type=instance_type, image={},
+                          instance_type=instance_type,
+                          image={'properties': {}},
                           reservations=[], request_spec={},
                           filter_properties={}, node=None,
                           clean_shutdown=True)
@@ -5387,7 +5572,9 @@ class ComputeTestCase(BaseTestCase,
                 self.context))
         self._test_confirm_resize(power_on=True, numa_topology=numa_topology)
 
-    def test_confirm_resize_with_numa_topology_and_cpu_pinning(self):
+    @mock.patch.object(nova.virt.hardware, 'update_floating_affinity')
+    def test_confirm_resize_with_numa_topology_and_cpu_pinning(self,
+              mock_update_floating_affinity):
         instance = self._create_fake_instance_obj()
         instance.old_flavor = instance.flavor
         instance.new_flavor = instance.flavor
@@ -5831,6 +6018,13 @@ class ComputeTestCase(BaseTestCase,
 
         # creating instance testdata
         instance = self._create_fake_instance_obj({'host': 'dummy'})
+
+        @contextlib.contextmanager
+        def fake_cm():
+            yield
+
+        instance.mutated_migration_context = mock.MagicMock(
+            side_effect=fake_cm)
         c = context.get_admin_context()
         nw_info = fake_network.fake_get_instance_nw_info(self)
         fake_notifier.NOTIFICATIONS = []
@@ -5862,6 +6056,7 @@ class ComputeTestCase(BaseTestCase,
         mock_ensure.assert_called_once_with(test.MatchType(objects.Instance),
                                             nw_info)
         mock_setup.assert_called_once_with(c, instance, self.compute.host)
+        instance.mutated_migration_context.assert_called_once_with()
 
         # cleanup
         db.instance_destroy(c, instance['uuid'])
@@ -5915,7 +6110,7 @@ class ComputeTestCase(BaseTestCase,
         mock_get_uuid.return_value = fake_bdms
 
         # start test
-        migration = objects.Migration()
+        migration = objects.Migration(status='accepted')
         with mock.patch.object(self.compute.network_api,
                                'setup_networks_on_host') as mock_setup:
             self.assertRaises(test.TestingException,
@@ -5968,7 +6163,8 @@ class ComputeTestCase(BaseTestCase,
         mock_pre.return_value = migrate_data
 
         # start test
-        migration = objects.Migration()
+        migration = objects.Migration(status='accepted')
+        mock_post.return_value = instance
         with test.nested(
             mock.patch.object(
                 self.compute.network_api, 'migrate_instance_start'),
@@ -5985,7 +6181,7 @@ class ComputeTestCase(BaseTestCase,
 
         self.assertIsNone(ret)
         mock_event.assert_called_with(
-                c, 'compute_live_migration', instance.uuid)
+                c, 'compute_dispatch_live_migration', instance.uuid)
         # cleanup
         instance.destroy()
 
@@ -6079,6 +6275,7 @@ class ComputeTestCase(BaseTestCase,
             is_shared_block_storage=False,
             block_migration=False)
 
+        mock_post.return_value = instance
         with test.nested(
             mock.patch.object(
                 self.compute.network_api, 'migrate_instance_start'),
@@ -6132,14 +6329,17 @@ class ComputeTestCase(BaseTestCase,
                               'setup_networks_on_host'),
             mock.patch.object(self.compute.instance_events,
                               'clear_events_for_instance'),
-            mock.patch.object(self.compute, 'update_available_resource'),
+            # WRS: Instead of update_available_resource(), use RT and call
+            # drop_move_claim()
+            mock.patch.object(self.rt, 'drop_move_claim'),
             mock.patch.object(migration_obj, 'save'),
         ) as (
             post_live_migration, unfilter_instance,
             migrate_instance_start, post_live_migration_at_destination,
             post_live_migration_at_source, setup_networks_on_host,
-            clear_events, update_available_resource, mig_save
+            clear_events, drop_move_claim, mig_save
         ):
+            post_live_migration_at_destination.return_value = instance
             self.compute._post_live_migration(c, instance, dest,
                                               migrate_data=migrate_data)
 
@@ -6158,7 +6358,11 @@ class ComputeTestCase(BaseTestCase,
             post_live_migration_at_source.assert_has_calls(
                 [mock.call(c, instance, [])])
             clear_events.assert_called_once_with(instance)
-            update_available_resource.assert_has_calls([mock.call(c)])
+
+            # WRS: Instead of update_available_resource(), use RT and call
+            # drop_move_claim()
+            drop_move_claim.assert_has_calls([])
+
             self.assertEqual('completed', migration_obj.status)
             mig_save.assert_called_once_with()
             # assert we logged a success message
@@ -6189,6 +6393,16 @@ class ComputeTestCase(BaseTestCase,
         migrate_data = migrate_data_obj.LiveMigrateData(
             migration=migration_obj)
 
+        # WRS: upstream _post_live_migration() will not re-raise exception if
+        # post_live_migration_at_destination() fails at any point, but we will
+        # unless the instance host has been updated to destination.  So create
+        # fake to update instance host to destination so this test can pass.
+        def fake_post_live_migration_at_destination(context, instance,
+                                                    block_migration, dest):
+            instance.host = dest
+            instance.save()
+            raise Exception
+
         # creating mocks
         with test.nested(
             mock.patch.object(self.compute.driver, 'post_live_migration'),
@@ -6197,7 +6411,7 @@ class ComputeTestCase(BaseTestCase,
                               'migrate_instance_start'),
             mock.patch.object(self.compute.compute_rpcapi,
                               'post_live_migration_at_destination',
-                              side_effect=Exception),
+                              fake_post_live_migration_at_destination),
             mock.patch.object(self.compute.driver,
                               'post_live_migration_at_source'),
             mock.patch.object(self.compute.network_api,
@@ -6264,6 +6478,7 @@ class ComputeTestCase(BaseTestCase,
         ):
             get_by_instance_uuid.return_value = bdms
             get_volume_connector.return_value = 'fake-connector'
+            post_live_migration_at_destination.return_value = instance
 
             self.compute._post_live_migration(c, instance, 'dest_host')
 
@@ -6286,10 +6501,11 @@ class ComputeTestCase(BaseTestCase,
         mock_get_node.return_value = dest_node
         mock_bdms.return_value = objects.BlockDeviceMappingList()
 
+        @mock.patch.object(objects.InstanceGroup, 'get_by_instance_uuid')
         @mock.patch('nova.compute.utils.notify_about_instance_action')
         @mock.patch.object(self.compute, '_live_migration_cleanup_flags')
         @mock.patch.object(self.compute, 'network_api')
-        def _test(mock_nw_api, mock_lmcf, mock_notify):
+        def _test(mock_nw_api, mock_lmcf, mock_notify, mock_get_sg):
             mock_lmcf.return_value = False, False
             self.compute._rollback_live_migration(c, instance, 'foo',
                                                   migrate_data=migrate_data)
@@ -6326,10 +6542,11 @@ class ComputeTestCase(BaseTestCase,
         mock_get_node.return_value = dest_node
         mock_bdms.return_value = objects.BlockDeviceMappingList()
 
+        @mock.patch.object(objects.InstanceGroup, 'get_by_instance_uuid')
         @mock.patch('nova.compute.utils.notify_about_instance_action')
         @mock.patch.object(self.compute, '_live_migration_cleanup_flags')
         @mock.patch.object(self.compute, 'network_api')
-        def _test(mock_nw_api, mock_lmcf, mock_notify):
+        def _test(mock_nw_api, mock_lmcf, mock_notify, mock_get_sg):
             mock_lmcf.return_value = False, False
             self.compute._rollback_live_migration(c, instance, 'foo',
                                                   migrate_data=migrate_data,
@@ -6356,6 +6573,15 @@ class ComputeTestCase(BaseTestCase,
         # creating instance testdata
         c = context.get_admin_context()
         instance = self._create_fake_instance_obj({'host': 'dummy'})
+
+        @contextlib.contextmanager
+        def fake_cm():
+            yield
+
+        instance.mutated_migration_context = mock.MagicMock(
+            side_effect=fake_cm)
+        instance.drop_migration_context = mock.MagicMock()
+
         fake_notifier.NOTIFICATIONS = []
 
         # start test
@@ -6380,6 +6606,8 @@ class ComputeTestCase(BaseTestCase,
                          'root_device_name': None,
                          'block_device_mapping': []},
                         destroy_disks=True, migrate_data=None)
+        instance.mutated_migration_context.assert_called_once_with()
+        instance.drop_migration_context.assert_called_once_with()
 
     @mock.patch('nova.virt.driver.ComputeDriver.'
                 'rollback_live_migration_at_destination')
@@ -6388,14 +6616,20 @@ class ComputeTestCase(BaseTestCase,
     def test_rollback_live_migration_at_destination_network_fails(
             self, mock_detect, mock_rollback):
         c = context.get_admin_context()
+        mock_detect.return_value = 'fake-migrate-data'
         instance = self._create_fake_instance_obj()
+        patch_mutate = mock.patch.object(instance, 'mutated_migration_context')
+        patch_drop = mock.patch.object(instance, 'drop_migration_context')
         with mock.patch.object(self.compute.network_api,
                                'setup_networks_on_host',
                                side_effect=test.TestingException):
-            self.assertRaises(
-                test.TestingException,
-                self.compute.rollback_live_migration_at_destination,
-                c, instance, destroy_disks=True, migrate_data={})
+            with patch_mutate as mutate_mock, patch_drop as drop_mock:
+                self.assertRaises(
+                    test.TestingException,
+                    self.compute.rollback_live_migration_at_destination,
+                    c, instance, destroy_disks=True, migrate_data={})
+                mutate_mock.assert_called_once_with()
+                drop_mock.assert_called_once_with()
         mock_rollback.assert_called_once_with(
             c, instance, mock.ANY, mock.ANY,
             destroy_disks=True,
@@ -6600,6 +6834,34 @@ class ComputeTestCase(BaseTestCase,
                                                   NotImplementedError('test'),
                                                   exc_info,
                                                   fault_message='hoge')
+
+    # WRS
+    def test_cleanup_orphan_domain(self):
+        instance = self._create_fake_instance_obj({'host': 'dummyhost'})
+        fake_name = 'dummyname'
+        fake_uuid = 'some-instance-uuid-aaa'
+        with test.nested(
+            mock.patch.object(objects.InstanceList, 'get_by_filters'),
+            mock.patch.object(self.compute.driver, 'list_instances'),
+            mock.patch.object(self.compute.driver, 'list_instance_uuids'),
+            mock.patch.object(self.compute.driver, 'destroy_name'),
+            mock.patch.object(self.compute.driver, 'destroy')
+        ) as (
+            instance_get_by_filters_mock,
+            list_instances_mock,
+            list_instance_uuids_mock,
+            destroy_name_mock,
+            destroy_mock
+        ):
+            instance_get_by_filters_mock.return_value = [instance]
+            list_instances_mock.return_value = [fake_name, instance.name]
+            list_instance_uuids_mock.return_value = [fake_uuid, instance.uuid]
+            self.compute._destroy_orphan_instances(self.context)
+            destroy_name_mock.assert_called_once_with(fake_name)
+            self.assertEqual(self.compute.suspected_uuids, ({instance.uuid}))
+            self.compute._destroy_orphan_instances(self.context)
+            destroy_mock.assert_called_once_with(self.context, instance,
+                                                 mock.ANY, mock.ANY, mock.ANY)
 
     def _test_cleanup_running(self, action):
         admin_context = context.get_admin_context()
@@ -7148,15 +7410,13 @@ class ComputeTestCase(BaseTestCase,
                        '_get_instance_block_device_info')
     @mock.patch.object(fake.FakeDriver,
                        'check_instance_shared_storage_local')
-    @mock.patch.object(compute_rpcapi.ComputeAPI,
-                       'check_instance_shared_storage')
     @mock.patch.object(fake.FakeDriver,
                        'check_instance_shared_storage_cleanup')
     @mock.patch.object(fake.FakeDriver, 'destroy')
     @mock.patch('nova.objects.MigrationList.get_by_filters')
     @mock.patch('nova.objects.Migration.save')
     def test_destroy_evacuated_instance_with_disks(self, mock_save,
-            mock_get_filter, mock_destroy, mock_check_clean, mock_check,
+            mock_get_filter, mock_destroy, mock_check_clean,
             mock_check_local, mock_get_blk, mock_get_drv):
         fake_context = context.get_admin_context()
 
@@ -7182,7 +7442,6 @@ class ComputeTestCase(BaseTestCase,
         mock_get_drv.return_value = instances
         mock_get_blk.return_value = 'fake-bdi'
         mock_check_local.return_value = {'filename': 'tmpfilename'}
-        mock_check.return_value = False
 
         with mock.patch.object(
                 self.compute.network_api, 'get_instance_nw_info',
@@ -7194,9 +7453,6 @@ class ComputeTestCase(BaseTestCase,
         mock_get_blk.assert_called_once_with(fake_context, evacuated_instance)
         mock_check_local.assert_called_once_with(fake_context,
                                                  evacuated_instance)
-        mock_check.assert_called_once_with(fake_context, evacuated_instance,
-                                           {'filename': 'tmpfilename'},
-                                           host=None)
         mock_check_clean.assert_called_once_with(fake_context,
                                                  {'filename': 'tmpfilename'})
         mock_destroy.assert_called_once_with(fake_context, evacuated_instance,
@@ -7299,7 +7555,7 @@ class ComputeTestCase(BaseTestCase,
         instance.vcpus = 1
 
         rt.instance_claim(admin_context, instance, NODENAME)
-        self.assertEqual(1, cn.vcpus_used)
+        self.assertEqual(1 / rt.cpu_allocation_ratio, cn.vcpus_used)
 
         self.compute.terminate_instance(admin_context, instance, [], [])
         self.assertEqual(0, cn.vcpus_used)
@@ -7324,7 +7580,7 @@ class ComputeTestCase(BaseTestCase,
 
         rt.instance_claim(admin_context, instance, NODENAME)
         self.compute._init_instance(admin_context, instance)
-        self.assertEqual(1, cn.vcpus_used)
+        self.assertEqual(1 / rt.cpu_allocation_ratio, cn.vcpus_used)
 
         instance.vm_state = vm_states.DELETED
         self.compute._init_instance(admin_context, instance)
@@ -9919,17 +10175,19 @@ class ComputeAPITestCase(BaseTestCase):
         mock_allocate = mock.Mock(return_value=nwinfo)
         self.compute.network_api.allocate_port_for_instance = mock_allocate
 
+        vif_model = None
         with mock.patch.dict(self.compute.driver.capabilities,
                              supports_attach_interface=True):
             vif = self.compute.attach_interface(self.context,
                                                 instance,
                                                 network_id,
                                                 port_id,
-                                                req_ip)
+                                                req_ip,
+                                                vif_model)
         self.assertEqual(vif['id'], network_id)
         mock_allocate.assert_called_once_with(
             self.context, instance, port_id, network_id, req_ip,
-            bind_host_id='fake-host', tag=None)
+            bind_host_id='fake-host', vif_model=vif_model, tag=None)
         return nwinfo, port_id
 
     def test_interface_tagged_attach(self):
@@ -9956,7 +10214,7 @@ class ComputeAPITestCase(BaseTestCase):
         self.assertEqual(vif['id'], network_id)
         mock_allocate.assert_called_once_with(
             self.context, instance, port_id, network_id, req_ip,
-            bind_host_id='fake-host', tag='foo')
+            bind_host_id='fake-host', vif_model=None, tag='foo')
         return nwinfo, port_id
 
     def test_tagged_attach_interface_raises(self):
@@ -9982,6 +10240,7 @@ class ComputeAPITestCase(BaseTestCase):
         network_id = nwinfo[0]['network']['id']
         port_id = nwinfo[0]['id']
         req_ip = '1.2.3.4'
+        vif_model = None
 
         with test.nested(
             mock.patch.object(self.compute.driver, 'attach_interface'),
@@ -9997,10 +10256,11 @@ class ComputeAPITestCase(BaseTestCase):
             mock_attach.side_effect = exception.NovaException("attach_failed")
             self.assertRaises(exception.InterfaceAttachFailed,
                               self.compute.attach_interface, self.context,
-                              instance, network_id, port_id, req_ip)
+                              instance, network_id, port_id, req_ip, vif_model)
             mock_allocate.assert_called_once_with(self.context, instance,
                                                   network_id, port_id, req_ip,
                                                   bind_host_id='fake-host',
+                                                  vif_model=vif_model,
                                                   tag=None)
             mock_deallocate.assert_called_once_with(self.context, instance,
                                                     port_id)
@@ -10446,7 +10706,8 @@ class ComputeAPITestCase(BaseTestCase):
         self.stub_out('nova.volume.cinder.API.detach', mock.MagicMock())
 
         def fake_volume_get(self, context, volume_id):
-            return {'id': volume_id}
+            return {'id': volume_id,
+                    'status': 'available'}
         self.stub_out('nova.volume.cinder.API.get', fake_volume_get)
 
         self.stub_out('nova.compute.manager.ComputeManager_prep_block_device',
@@ -10583,6 +10844,9 @@ class ComputeAPITestCase(BaseTestCase):
                     host='fake_dest_host',
                     hypervisor_hostname='fake_dest_node')])
 
+            # WRS drop support for forced destinations to make sure we always
+            # go through scheduler
+            force = False
             self.compute_api.live_migrate(self.context, instance,
                                           block_migration=True,
                                           disk_over_commit=True,
@@ -10684,7 +10948,7 @@ class ComputeAPITestCase(BaseTestCase):
                 new_pass=None,
                 injected_files=None,
                 image_ref=None,
-                orig_image_ref=None,
+                orig_image_ref=instance.image_ref,
                 orig_sys_metadata=None,
                 bdms=None,
                 recreate=True,
@@ -11840,8 +12104,9 @@ class ComputeRescheduleResizeOrReraiseTestCase(BaseTestCase):
         """
         inst_obj = self._create_fake_instance_obj()
         mock_mig.side_effect = test.TestingException("Original")
+        image = {'properties': {}}
 
-        self.compute.prep_resize(self.context, image=None,
+        self.compute.prep_resize(self.context, image=image,
                                  instance=inst_obj,
                                  instance_type=self.instance_type,
                                  reservations=[], request_spec={},
@@ -11849,7 +12114,7 @@ class ComputeRescheduleResizeOrReraiseTestCase(BaseTestCase):
                                  clean_shutdown=True)
 
         mock_mig.assert_called_once_with(mock.ANY, mock.ANY)
-        mock_res.assert_called_once_with(mock.ANY, None, inst_obj, mock.ANY,
+        mock_res.assert_called_once_with(mock.ANY, image, inst_obj, mock.ANY,
                                          self.instance_type, {}, {})
 
     @mock.patch.object(compute_manager.ComputeManager, "_reschedule")

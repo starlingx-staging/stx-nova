@@ -9,6 +9,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2017 Wind River Systems, Inc.
+#
 
 
 import itertools
@@ -87,6 +90,11 @@ from nova.policies import used_limits
 from nova.policies import virtual_interfaces
 from nova.policies import volumes
 from nova.policies import volumes_attachments
+from nova.policies import wrs_pci
+from nova.policies import wrs_providernets
+from nova.policies import wrs_server_groups
+from nova.policies import wrs_server_if
+from nova.policies import wrs_server_resources
 
 
 def list_rules():
@@ -164,5 +172,10 @@ def list_rules():
         used_limits.list_rules(),
         virtual_interfaces.list_rules(),
         volumes.list_rules(),
-        volumes_attachments.list_rules()
+        volumes_attachments.list_rules(),
+        wrs_pci.list_rules(),
+        wrs_providernets.list_rules(),
+        wrs_server_if.list_rules(),
+        wrs_server_groups.list_rules(),
+        wrs_server_resources.list_rules()
     )

@@ -20,8 +20,9 @@ from oslo_config import cfg
 from oslo_log import log as logging
 from oslo_serialization import jsonutils
 
+from nova.compute import task_states
+from nova import context
 from nova import exception
-from nova.i18n import _LW
 from nova import objects
 from nova.objects import fields
 from nova.pci import stats
@@ -84,8 +85,13 @@ class PciDevTracker(object):
                 self.claims[uuid].append(dev)
             elif dev.status == fields.PciDeviceStatus.ALLOCATED:
                 self.allocations[uuid].append(dev)
+
+                # WRS: The instances that are already running in the
+                # hypervisor need to be accounted for in the number of
+                # configured device of a compute.
+                self.stats.add_device(dev, sync=True, do_append=False)
             elif dev.status == fields.PciDeviceStatus.AVAILABLE:
-                self.stats.add_device(dev)
+                self.stats.add_device(dev, sync=True)
 
     def save(self, context):
         for dev in self.pci_devs:
@@ -168,9 +174,9 @@ class PciDevTracker(object):
                 try:
                     existed.remove()
                 except exception.PciDeviceInvalidStatus as e:
-                    LOG.warning(_LW("Trying to remove device with %(status)s "
-                                    "ownership %(instance_uuid)s because of "
-                                    "%(pci_exception)s"),
+                    LOG.warning("Trying to remove device with %(status)s "
+                                "ownership %(instance_uuid)s because of "
+                                "%(pci_exception)s",
                                 {'status': existed.status,
                                  'instance_uuid': existed.instance_uuid,
                                  'pci_exception': e.format_message()})
@@ -209,17 +215,42 @@ class PciDevTracker(object):
             dev['compute_node_id'] = self.node_id
             dev_obj = objects.PciDevice.create(self._context, dev)
             self.pci_devs.objects.append(dev_obj)
-            self.stats.add_device(dev_obj)
+            LOG.info("Synchronizing with hypervisor: Adding device %s",
+                dev_obj.address)
+            # WRS: This case is executed only when a compute node is configured
+            # with a new pci-sriov or pci-passthrough configuration.  Need to
+            # synchronize the number of configured PCI devices in this case.
+            self.stats.add_device(dev_obj, sync=True)
 
         self._build_device_tree(self.pci_devs)
 
-    def _claim_instance(self, context, pci_requests, instance_numa_topology):
+    # WRS:extension
+    def _instance_get_flavor_extra_specs(self, context, instance):
+        flavor = instance.flavor
+        if (instance.task_state == task_states.RESIZE_PREP and
+                instance.new_flavor):
+            flavor = instance.new_flavor
+
+        return flavor.get('extra_specs', {})
+
+    def _claim_instance(self, context, instance, pci_requests,
+                        instance_numa_topology):
         instance_cells = None
         if instance_numa_topology:
             instance_cells = instance_numa_topology.cells
 
+        # WRS: Support strict vs prefer allocation of PCI devices.
+        extra_specs = self._instance_get_flavor_extra_specs(
+            context, instance)
+        pci_numa_affinity = extra_specs.get('hw:wrs:pci_numa_affinity',
+            'strict')
+        pci_strict = False if pci_numa_affinity == 'prefer' else True
+
+        # WRS: For next rebase, track prefer/strict in the pci requests so
+        # that we avoid changing the method signatures.
         devs = self.stats.consume_requests(pci_requests.requests,
-                                           instance_cells)
+                                           instance_cells,
+                                           pci_strict=pci_strict)
         if not devs:
             return None
 
@@ -228,8 +259,8 @@ class PciDevTracker(object):
             dev.claim(instance_uuid)
         if instance_numa_topology and any(
                                         dev.numa_node is None for dev in devs):
-            LOG.warning(_LW("Assigning a pci device without numa affinity to"
-            "instance %(instance)s which has numa topology"),
+            LOG.warning("Assigning a pci device without numa affinity to"
+            "instance %(instance)s which has numa topology",
                         {'instance': instance_uuid})
         return devs
 
@@ -243,11 +274,12 @@ class PciDevTracker(object):
         if devs:
             self.allocations[instance['uuid']] += devs
 
-    def claim_instance(self, context, pci_requests, instance_numa_topology):
+    def claim_instance(self, context, instance, pci_requests,
+                       instance_numa_topology):
         devs = []
         if self.pci_devs and pci_requests.requests:
             instance_uuid = pci_requests.instance_uuid
-            devs = self._claim_instance(context, pci_requests,
+            devs = self._claim_instance(context, instance, pci_requests,
                                         instance_numa_topology)
             if devs:
                 self.claims[instance_uuid] = devs
@@ -297,6 +329,9 @@ class PciDevTracker(object):
         # However, the instance contains only allocated devices
         # information, not the claimed one. So we can't use
         # instance['pci_devices'] to check the devices to be freed.
+        LOG.info("Freeing instance %(uuid)s with PCI devices",
+                 {'uuid': instance['uuid']})
+
         for dev in self.pci_devs:
             if dev.status in (fields.PciDeviceStatus.CLAIMED,
                               fields.PciDeviceStatus.ALLOCATED):
@@ -329,18 +364,46 @@ class PciDevTracker(object):
         existed |= set(mig['instance_uuid'] for mig in migrations)
         existed |= set(inst['uuid'] for inst in orphans)
 
+        # WRS: Discard migration that refers to deleted instance so
+        # that we can properly put back the PCI devices that are pointing
+        # to this instance back in the pool.
+        # The Migration object will call objects.Instance.get_by_uuid() which
+        # will raise the below exception if the instance is deleted.
+        for mig in migrations:
+            try:
+                mig.instance
+            except exception.InstanceNotFound:
+                LOG.info("migration instance not found: %s", mig)
+                existed.discard(mig.instance_uuid)
+
         # need to copy keys, because the dict is modified in the loop body
         for uuid in list(self.claims):
             if uuid not in existed:
                 devs = self.claims.pop(uuid, [])
+                LOG.info("Cleaning instance %(uuid)s with PCI devices "
+                         "%(addrs)s",
+                         {'uuid': uuid,
+                          'addrs': [dev.address for dev in devs]})
                 for dev in devs:
-                    self._free_device(dev)
+                    # WRS: The PCI devices might have been cleaned up
+                    # on revert, which would cause an exception to be
+                    # raised.
+                    if dev.status != fields.PciDeviceStatus.AVAILABLE:
+                        self._free_device(dev)
         # need to copy keys, because the dict is modified in the loop body
         for uuid in list(self.allocations):
             if uuid not in existed:
                 devs = self.allocations.pop(uuid, [])
+                LOG.info("Cleaning instance %(uuid)s with PCI devices "
+                         "%(addrs)s",
+                         {'uuid': uuid,
+                          'addrs': [dev.address for dev in devs]})
                 for dev in devs:
-                    self._free_device(dev)
+                    # WRS: The PCI devices might have been cleaned up
+                    # on revert, which would cause an exception to be
+                    # raised.
+                    if dev.status != fields.PciDeviceStatus.AVAILABLE:
+                        self._free_device(dev)
 
 
 def get_instance_pci_devs(inst, request_id=None):
@@ -357,3 +420,29 @@ def get_instance_pci_devs(inst, request_id=None):
         return []
     return [device for device in pci_devices if
                    device.request_id == request_id or request_id == 'all']
+
+
+# WRS: extension
+def get_instance_pci_devs_by_host_and_node(inst, request_id=None,
+                                           host=None, nodename=None):
+    """Get the PCI devices allocated to one or all requests for an instance,
+       optionally filtering out devices for a specific host and node.
+    """
+    if not hasattr(inst, 'pci_devices'):
+        return []
+    pci_devices = inst.pci_devices
+    if ((not pci_devices) or
+            all(x is None for x in [inst.host, inst.node, host, nodename])):
+        return []
+    ctxt = context.get_admin_context()
+    if host is not None or nodename is not None:
+        _host = host
+        _node = nodename
+    else:
+        _host = inst.host
+        _node = inst.node
+    node = objects.ComputeNode.get_by_host_and_nodename(ctxt, _host, _node)
+    return [device for device in pci_devices if
+            (device.request_id == request_id or request_id == 'all')
+            and device.status == 'allocated'
+            and device.compute_node_id == node.id]

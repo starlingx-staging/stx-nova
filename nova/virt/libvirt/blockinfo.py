@@ -585,18 +585,20 @@ def get_disk_mapping(virt_type, instance,
         update_bdm(eph, eph_info)
 
     swap = driver.block_device_info_get_swap(block_device_info)
-    if swap and swap.get('swap_size', 0) > 0:
-        swap_info = get_info_from_bdm(
-            instance, virt_type, image_meta,
-            swap, mapping, disk_bus)
-        mapping['disk.swap'] = swap_info
-        update_bdm(swap, swap_info)
-    elif instance.get_flavor()['swap'] > 0:
-        swap_info = get_next_disk_info(mapping, disk_bus,
-            assigned_devices=pre_assigned_device_names)
-        if not block_device.volume_in_mapping(swap_info['dev'],
-                                              block_device_info):
+    # NOTE (knasim): only map swap disk if supported in flavor
+    if instance.get_flavor()['swap'] > 0:
+        if swap and swap.get('swap_size', 0) > 0:
+            swap_info = get_info_from_bdm(
+                instance, virt_type, image_meta,
+                swap, mapping, disk_bus)
             mapping['disk.swap'] = swap_info
+            update_bdm(swap, swap_info)
+        else:
+            swap_info = get_next_disk_info(mapping, disk_bus,
+                assigned_devices=pre_assigned_device_names)
+            if not block_device.volume_in_mapping(swap_info['dev'],
+                                                  block_device_info):
+                mapping['disk.swap'] = swap_info
 
     block_device_mapping = driver.block_device_info_get_mapping(
         block_device_info)

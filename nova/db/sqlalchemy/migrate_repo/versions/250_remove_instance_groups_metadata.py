@@ -12,12 +12,18 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2016-2017 Wind River Systems, Inc.
+#
 
 
 from sqlalchemy import MetaData, Table
 
 
 def upgrade(migrate_engine):
+    # WRS:extension - prevent instance_groups_metadata from being removed
+    return
+
     """Remove the instance_group_metadata table."""
     meta = MetaData(bind=migrate_engine)
 

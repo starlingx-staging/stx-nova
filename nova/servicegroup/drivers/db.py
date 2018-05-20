@@ -33,6 +33,7 @@ class DbDriver(base.Driver):
 
     def __init__(self, *args, **kwargs):
         self.service_down_time = CONF.service_down_time
+        self.service_rpc_timeout = 30
 
     def join(self, member, group, service=None):
         """Add a new member to a service group.
@@ -50,6 +51,10 @@ class DbDriver(base.Driver):
                                  ' ServiceGroup driver'))
         report_interval = service.report_interval
         if report_interval:
+            # WRS: Set service RPC timeout less than report interval so we
+            # react faster to messaging outages due to swact. Setting timeout
+            # too large defeats using the report interval as a heartbeat.
+            self.service_rpc_timeout = max(1, int(CONF.report_interval / 2))
             service.tg.add_timer(report_interval, self._report_state,
                                  api.INITIAL_REPORTING_DELAY, service)
 
@@ -88,7 +93,8 @@ class DbDriver(base.Driver):
 
         try:
             service.service_ref.report_count += 1
-            service.service_ref.save()
+            # WRS - Add conductor/rpcapi object_action specific RPC timeout
+            service.service_ref.save(wrs_rpc_timeout=self.service_rpc_timeout)
 
             # TODO(termie): make this pattern be more elegant.
             if getattr(service, 'model_disconnected', False):

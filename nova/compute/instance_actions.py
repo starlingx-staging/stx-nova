@@ -12,6 +12,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2014-2017 Wind River Systems, Inc.
+#
 
 """Possible actions on an instance.
 
@@ -60,3 +63,4 @@ TRIGGER_CRASH_DUMP = 'trigger_crash_dump'
 # is used for tracking this asynchronous operation so the user/admin can know
 # when it is done in case they need/want to reboot the guest operating system.
 EXTEND_VOLUME = 'extend_volume'
+SCALE = 'scale'

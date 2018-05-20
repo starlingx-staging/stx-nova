@@ -14,6 +14,8 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 #
+# Copyright (c) 2013-2017 Wind River Systems, Inc.
+#
 
 import time
 
@@ -71,6 +73,7 @@ def _load_auth_plugin(conf):
         return auth_plugin
 
     err_msg = _('Unknown auth type: %s') % conf.neutron.auth_type
+
     raise neutron_client_exc.Unauthorized(message=err_msg)
 
 
@@ -304,7 +307,8 @@ class API(base_api.NetworkAPI):
     def setup_networks_on_host(self, context, instance, host=None,
                                teardown=False):
         """Setup or teardown the network structures."""
-        if not self._has_port_binding_extension(context, refresh_cache=True):
+        if not self._has_port_binding_extension(context, refresh_cache=True,
+                                                admin=True):
             return
         # Check if the instance is migrating to a new host.
         port_migrating = host and (instance.host != host)
@@ -316,9 +320,9 @@ class API(base_api.NetworkAPI):
                            BINDING_HOST_ID: instance.host}
             # Now get the port details to process the ports
             # binding profile info.
-            data = self.list_ports(context, **search_opts)
-            ports = data['ports']
             admin_client = get_client(context, admin=True)
+            data = admin_client.list_ports(**search_opts)
+            ports = data['ports']
             if teardown:
                 # Reset the port profile
                 self._clear_migration_port_profile(
@@ -771,7 +775,7 @@ class API(base_api.NetworkAPI):
 
             try:
                 port_security_enabled = network.get(
-                    'port_security_enabled', True)
+                    'port_security_enabled', False)
                 if port_security_enabled:
                     if not network.get('subnets'):
                         # Neutron can't apply security groups to a port
@@ -944,6 +948,7 @@ class API(base_api.NetworkAPI):
         ports_in_requested_order = []
         nets_in_requested_order = []
         created_vifs = []   # this list is for cleanups if we fail
+        has_wrs_port_binding = self._has_wrs_port_binding_extension(context)
         for request, created_port_id in requests_and_created_ports:
             vifobj = objects.VirtualInterface(context)
             vifobj.instance_uuid = instance.uuid
@@ -960,6 +965,17 @@ class API(base_api.NetworkAPI):
             zone = 'compute:%s' % instance.availability_zone
             port_req_body = {'port': {'device_id': instance.uuid,
                                       'device_owner': zone}}
+
+            # WRS extension: add vif_model
+            if has_wrs_port_binding:
+                port_req_body['port'].update({constants.PORT_VIF_MODEL:
+                                              request.vif_model})
+
+            if request.vif_model == network_model.VIF_MODEL_PCI_SRIOV:
+                port_req_body['port'].update({'binding:vnic_type': 'direct'})
+            if request.vif_model == network_model.VIF_MODEL_PCI_PASSTHROUGH:
+                port_req_body['port'].update({'binding:vnic_type':
+                                              'direct-physical'})
             try:
                 self._populate_neutron_extension_values(
                     context, instance, request.pci_request_id, port_req_body,
@@ -1016,22 +1032,25 @@ class API(base_api.NetworkAPI):
         return (nets_in_requested_order, ports_in_requested_order,
             preexisting_port_ids, created_port_ids)
 
-    def _refresh_neutron_extensions_cache(self, context, neutron=None):
+    def _refresh_neutron_extensions_cache(self, context, neutron=None,
+                                          admin=False):
+
         """Refresh the neutron extensions cache when necessary."""
         if (not self.last_neutron_extension_sync or
             ((time.time() - self.last_neutron_extension_sync)
              >= CONF.neutron.extension_sync_interval)):
             if neutron is None:
-                neutron = get_client(context)
+                neutron = get_client(context, admin=admin)
             extensions_list = neutron.list_extensions()['extensions']
             self.last_neutron_extension_sync = time.time()
             self.extensions.clear()
             self.extensions = {ext['name']: ext for ext in extensions_list}
 
     def _has_port_binding_extension(self, context, refresh_cache=False,
-                                    neutron=None):
+                                    neutron=None, admin=False):
         if refresh_cache:
-            self._refresh_neutron_extensions_cache(context, neutron=neutron)
+            self._refresh_neutron_extensions_cache(context, neutron=neutron,
+                                                   admin=admin)
         return constants.PORTBINDING_EXT in self.extensions
 
     def _has_auto_allocate_extension(self, context, refresh_cache=False,
@@ -1043,6 +1062,12 @@ class API(base_api.NetworkAPI):
     def _has_multi_provider_extension(self, context, neutron=None):
         self._refresh_neutron_extensions_cache(context, neutron=neutron)
         return constants.MULTI_NET_EXT in self.extensions
+
+    def _has_wrs_port_binding_extension(self, context, refresh_cache=False,
+                                        neutron=None):
+        if refresh_cache:
+            self._refresh_neutron_extensions_cache(context, neutron=neutron)
+        return constants.WRS_PORTBINDING_EXT in self.extensions
 
     def _get_pci_device_profile(self, pci_dev):
         dev_spec = self.pci_whitelist.get_devspec(pci_dev)
@@ -1189,7 +1214,9 @@ class API(base_api.NetworkAPI):
         # NOTE(danms): Temporary and transitional
         if isinstance(requested_networks, objects.NetworkRequestList):
             requested_networks = requested_networks.as_tuples()
-        ports_to_skip = set([port_id for nets, fips, port_id, pci_request_id
+        # WRS extension: add vif_model
+        ports_to_skip = set([port_id for nets, fips, port_id,
+                             pci_request_id, vif_model
                              in requested_networks])
         # NOTE(boden): requested_networks only passed in when deallocating
         # from a failed build / spawn call. Therefore we need to include
@@ -1214,16 +1241,19 @@ class API(base_api.NetworkAPI):
         base_api.update_instance_cache_with_nw_info(self, context, instance,
                                             network_model.NetworkInfo([]))
 
+    # WRS extension: add vif_model
     def allocate_port_for_instance(self, context, instance, port_id,
                                    network_id=None, requested_ip=None,
-                                   bind_host_id=None, tag=None):
+                                   bind_host_id=None, tag=None,
+                                   vif_model=None):
         """Allocate a port for the instance."""
         requested_networks = objects.NetworkRequestList(
             objects=[objects.NetworkRequest(network_id=network_id,
                                             address=requested_ip,
                                             port_id=port_id,
                                             pci_request_id=None,
-                                            tag=tag)])
+                                            tag=tag,
+                                            vif_model=vif_model)])
         return self.allocate_for_instance(context, instance, vpn=False,
                 requested_networks=requested_networks,
                 bind_host_id=bind_host_id)
@@ -1308,7 +1338,8 @@ class API(base_api.NetworkAPI):
 
     def _get_instance_nw_info(self, context, instance, networks=None,
                               port_ids=None, admin_client=None,
-                              preexisting_port_ids=None, **kwargs):
+                              preexisting_port_ids=None,
+                              refresh_vif_id=None, **kwargs):
         # NOTE(danms): This is an inner method intended to be called
         # by other code that updates instance nwinfo. It *must* be
         # called with the refresh_cache-%(instance_uuid) lock held!
@@ -1319,7 +1350,8 @@ class API(base_api.NetworkAPI):
         compute_utils.refresh_info_cache_for_instance(context, instance)
         nw_info = self._build_network_info_model(context, instance, networks,
                                                  port_ids, admin_client,
-                                                 preexisting_port_ids)
+                                                 preexisting_port_ids,
+                                                 refresh_vif_id)
         return network_model.NetworkInfo.hydrate(nw_info)
 
     def _gather_port_ids_and_networks(self, context, instance, networks=None,
@@ -1625,14 +1657,6 @@ class API(base_api.NetworkAPI):
                                            neutron_client=neutron)
                     if port.get('device_id', None):
                         raise exception.PortInUse(port_id=request.port_id)
-                    deferred_ip = port.get('ip_allocation') == 'deferred'
-                    # NOTE(carl_baldwin) A deferred IP port doesn't have an
-                    # address here. If it fails to get one later when nova
-                    # updates it with host info, Neutron will error which
-                    # raises an exception.
-                    if not deferred_ip and not port.get('fixed_ips'):
-                        raise exception.PortRequiresFixedIP(
-                            port_id=request.port_id)
                     request.network_id = port['network_id']
                 else:
                     ports_needed_per_instance += 1
@@ -1666,11 +1690,6 @@ class API(base_api.NetworkAPI):
                 nets = self._get_available_networks(
                     context, context.project_id, net_ids_requested,
                     neutron=neutron)
-
-                for net in nets:
-                    if not net.get('subnets'):
-                        raise exception.NetworkRequiresSubnet(
-                            network_uuid=net['id'])
 
                 if len(nets) != len(net_ids_requested):
                     requested_netid_set = set(net_ids_requested)
@@ -1815,6 +1834,15 @@ class API(base_api.NetworkAPI):
                                   label=network['name'],
                                   uuid=network['id'])
         return net_obj
+
+    def get_dict(self, context, network_uuid):
+        """Get specific network for client."""
+        client = get_client(context)
+        try:
+            network = client.show_network(network_uuid).get('network') or {}
+        except neutron_client_exc.NetworkNotFoundClient:
+            raise exception.NetworkNotFound(network_id=network_uuid)
+        return network
 
     def delete(self, context, network_uuid):
         """Delete a network for client."""
@@ -2239,9 +2267,51 @@ class API(base_api.NetworkAPI):
         return [vif['id'] for vif in net_info
                 if vif.get('preserve_on_delete')]
 
+    def _build_vif_model(self, context, client, current_neutron_port,
+                         networks, preexisting_port_ids):
+        vif_active = False
+        if (current_neutron_port['admin_state_up'] is False
+            or current_neutron_port['status'] == 'ACTIVE'):
+            vif_active = True
+
+        network_IPs = self._nw_info_get_ips(client,
+                                            current_neutron_port)
+        subnets = self._nw_info_get_subnets(context,
+                                            current_neutron_port,
+                                            network_IPs, client)
+
+        devname = "tap" + current_neutron_port['id']
+        devname = devname[:network_model.NIC_NAME_LEN]
+
+        network, ovs_interfaceid = (
+            self._nw_info_build_network(current_neutron_port,
+                                        networks, subnets))
+        preserve_on_delete = (current_neutron_port['id'] in
+                              preexisting_port_ids)
+
+        return network_model.VIF(
+            id=current_neutron_port['id'],
+            address=current_neutron_port['mac_address'],
+            network=network,
+            vnic_type=current_neutron_port.get('binding:vnic_type',
+                                               network_model.VNIC_TYPE_NORMAL),
+            type=current_neutron_port.get('binding:vif_type'),
+            profile=_get_binding_profile(current_neutron_port),
+            # WRS extension: add mtu, vif_model, mac_filter
+            mtu=current_neutron_port.get('wrs-binding:mtu'),
+            vif_model= current_neutron_port.get(constants.PORT_VIF_MODEL),
+            details=current_neutron_port.get('binding:vif_details'),
+            ovs_interfaceid=ovs_interfaceid,
+            devname=devname,
+            mac_filter=current_neutron_port.get(
+                constants.PORT_MAC_FILTERING, False),
+            active=vif_active,
+            preserve_on_delete=preserve_on_delete)
+
     def _build_network_info_model(self, context, instance, networks=None,
                                   port_ids=None, admin_client=None,
-                                  preexisting_port_ids=None):
+                                  preexisting_port_ids=None,
+                                  refresh_vif_id=None):
         """Return list of ordered VIFs attached to instance.
 
         :param context: Request context.
@@ -2259,6 +2329,10 @@ class API(base_api.NetworkAPI):
                         an instance is de-allocated. Supplied list will
                         be added to the cached list of preexisting port
                         IDs for this instance.
+        :param refresh_vif_id: Optional port ID to refresh within the existing
+                        cache rather than the entire cache. This can be
+                        triggered via a "network-changed" server external event
+                        from Neutron.
         """
 
         search_opts = {'tenant_id': instance.project_id,
@@ -2267,14 +2341,8 @@ class API(base_api.NetworkAPI):
             client = get_client(context, admin=True)
         else:
             client = admin_client
-
         data = client.list_ports(**search_opts)
-
         current_neutron_ports = data.get('ports', [])
-        nw_info_refresh = networks is None and port_ids is None
-        networks, port_ids = self._gather_port_ids_and_networks(
-                context, instance, networks, port_ids, client)
-        nw_info = network_model.NetworkInfo()
 
         if preexisting_port_ids is None:
             preexisting_port_ids = []
@@ -2286,43 +2354,58 @@ class API(base_api.NetworkAPI):
             current_neutron_port_map[current_neutron_port['id']] = (
                 current_neutron_port)
 
+        # Figure out what kind of operation we're processing. If we're given
+        # a single port to refresh then we try to optimize and update just the
+        # information for that VIF in the existing cache rather than try to
+        # rebuild the entire thing.
+        if refresh_vif_id is not None:
+            nw_info = instance.get_network_info()
+            if nw_info:
+                current_neutron_port = current_neutron_port_map.get(
+                    refresh_vif_id)
+                if current_neutron_port:
+                    # Get the network for the port.
+                    networks = self._get_available_networks(
+                        context, instance.project_id,
+                        [current_neutron_port['network_id']], client)
+                    # Build the VIF model given the latest port information.
+                    vif_updated = self._build_vif_model(
+                        context, client, current_neutron_port, networks,
+                        preexisting_port_ids)
+                    for index, vif in enumerate(nw_info):
+                        if vif['id'] == refresh_vif_id:
+                            # Update the existing entry.
+                            nw_info[index] = vif_updated
+                            break
+                    else:
+                        # If it wasn't in the existing cache, add it.
+                        nw_info.append(vif_updated)
+                else:
+                    # Find the VIF in the existing cache and remove it.
+                    for index, vif in enumerate(nw_info):
+                        if vif['id'] == refresh_vif_id:
+                            LOG.info('Port %s from network info_cache is no '
+                                     'longer associated with instance in '
+                                     'Neutron. Removing from network '
+                                     'info_cache.', refresh_vif_id,
+                                     instance=instance)
+                            del nw_info[index]
+                            break
+                return nw_info
+            # else there is no existing cache and we need to build it
+
+        nw_info_refresh = networks is None and port_ids is None
+        networks, port_ids = self._gather_port_ids_and_networks(
+                context, instance, networks, port_ids, client)
+        nw_info = network_model.NetworkInfo()
+
         for port_id in port_ids:
             current_neutron_port = current_neutron_port_map.get(port_id)
             if current_neutron_port:
-                vif_active = False
-                if (current_neutron_port['admin_state_up'] is False
-                    or current_neutron_port['status'] == 'ACTIVE'):
-                    vif_active = True
-
-                network_IPs = self._nw_info_get_ips(client,
-                                                    current_neutron_port)
-                subnets = self._nw_info_get_subnets(context,
-                                                    current_neutron_port,
-                                                    network_IPs, client)
-
-                devname = "tap" + current_neutron_port['id']
-                devname = devname[:network_model.NIC_NAME_LEN]
-
-                network, ovs_interfaceid = (
-                    self._nw_info_build_network(current_neutron_port,
-                                                networks, subnets))
-                preserve_on_delete = (current_neutron_port['id'] in
-                                      preexisting_port_ids)
-
-                nw_info.append(network_model.VIF(
-                    id=current_neutron_port['id'],
-                    address=current_neutron_port['mac_address'],
-                    network=network,
-                    vnic_type=current_neutron_port.get('binding:vnic_type',
-                        network_model.VNIC_TYPE_NORMAL),
-                    type=current_neutron_port.get('binding:vif_type'),
-                    profile=_get_binding_profile(current_neutron_port),
-                    details=current_neutron_port.get('binding:vif_details'),
-                    ovs_interfaceid=ovs_interfaceid,
-                    devname=devname,
-                    active=vif_active,
-                    preserve_on_delete=preserve_on_delete))
-
+                vif = self._build_vif_model(
+                    context, client, current_neutron_port, networks,
+                    preexisting_port_ids)
+                nw_info.append(vif)
             elif nw_info_refresh:
                 LOG.info(_LI('Port %s from network info_cache is no '
                              'longer associated with instance in Neutron. '
@@ -2425,7 +2508,13 @@ class API(base_api.NetworkAPI):
 
     def setup_instance_network_on_host(self, context, instance, host):
         """Setup network for specified instance on host."""
-        self._update_port_binding_for_instance(context, instance, host)
+        migration = None
+        if instance.migration_context:
+            migration = objects.Migration.get_by_id_and_instance(
+                context, instance.migration_context.migration_id, instance.uuid
+            )
+        self._update_port_binding_for_instance(context, instance, host,
+                                               migration)
 
     def cleanup_instance_network_on_host(self, context, instance, host):
         """Cleanup network for specified instance on host."""
@@ -2509,16 +2598,34 @@ class API(base_api.NetworkAPI):
                     pci_mapping = self._get_pci_mapping_for_migration(context,
                         instance, migration)
 
-                pci_slot = binding_profile.get('pci_slot')
-                new_dev = pci_mapping.get(pci_slot)
-                if new_dev:
+                if pci_mapping:
+                    pci_slot = binding_profile.get('pci_slot')
+                    new_dev = pci_mapping.get(pci_slot)
+                    if not new_dev:
+                        raise exception.PortUpdateFailed(port_id=p['id'],
+                            reason=_("Unable to correlate PCI slot %s") %
+                                     pci_slot)
+
                     binding_profile.update(
                         self._get_pci_device_profile(new_dev))
+                    # WRS: Keep original vif pci address.  Else it's going to
+                    # be removed in the neutron port.
+                    vif_pci_address = binding_profile.get("vif_pci_address")
+                    if vif_pci_address is not None:
+                        binding_profile.update(
+                            {'vif_pci_address': vif_pci_address})
                     updates[BINDING_PROFILE] = binding_profile
-                else:
-                    raise exception.PortUpdateFailed(port_id=p['id'],
-                        reason=_("Unable to correlate PCI slot %s") %
-                                 pci_slot)
+                    if vnic_type == network_model.VNIC_TYPE_DIRECT_PHYSICAL:
+                        try:
+                            mac = pci_utils.get_mac_by_pci_address(
+                                new_dev.address)
+                        except exception.PciDeviceNotFoundById as e:
+                            raise exception.PortUpdateFailed(port_id=p['id'],
+                                reason=_("Could not determine MAC address for "
+                                         "%(addr)s, error: %(e)s") %
+                                         {"addr": new_dev.address, "e": e})
+                        else:
+                            updates['mac_address'] = mac
 
             port_updates.append((p['id'], updates))
 

@@ -15,13 +15,73 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2017 Wind River Systems, Inc.
+#
 
 import socket
+import sys
 
 from oslo_config import cfg
 from oslo_config import types
+import re
 
 from nova.conf import paths
+
+
+# WRS - get host extended configuration options
+def host_extend_options(config_opts_file='/etc/nova/compute_extend.conf'):
+    """Provide nova configuration options from auxiliary file.
+
+    Extend nova.conf options to have defaults initialized from a separate file.
+    This was done since there is no obvious way to have an 'include' file
+    with configuration parameters.
+
+    If no configuration file is provided, default values are provided.
+
+    param:   config_opts_file - supplemental configuration file
+    returns: parsed config data as key,value dictionary
+    """
+    # extended options defaults
+    dict_ext = {
+        'compute_vswitch_2M_pages': '',
+        'compute_vswitch_1G_pages': '',
+        'compute_vm_4K_pages': '',
+    }
+    re_blank = re.compile(r'^\s*$')
+    re_comment = re.compile(r'^\s*[#!]')
+    re_nonword = re.compile(r'^\s*\W')
+    re_dict = re.compile(r'^\s*(\w+)\s*[=:]\s*(.*)')
+
+    try:
+        with open(config_opts_file, 'r') as infile:
+            for line in infile:
+                # skip lines we don't care about
+                match = re_blank.search(line)
+                if match:
+                    continue
+                match = re_comment.search(line)
+                if match:
+                    continue
+                match = re_nonword.search(line)
+                if match:
+                    continue
+
+                # match key value pairs
+                match = re_dict.search(line)
+                if match:
+                    k = match.group(1)
+                    v = match.group(2)
+                    dict_ext[k] = v
+    except IOError:
+        pass
+
+    return dict_ext
+
+
+# WRS: Define extended configuration options
+_extend_opts = host_extend_options()
+
 
 compute_group = cfg.OptGroup(
     'compute',
@@ -401,11 +461,17 @@ Possible values:
 * Any positive integer representing number of physical CPUs to reserve
   for the host.
 """),
+    # WRS: tracker debug logging
+    cfg.BoolOpt('compute_resource_debug', default=False,
+                help='Enable compute resource tracker update logs'),
 ]
 
 allocation_ratio_opts = [
+    # WRS: Setting cpu_allocation_ratio default to 16 is a hack to make unit
+    # tests pass.  In the field all our compute nodes are explicitly set to
+    # 16 anyway.
     cfg.FloatOpt('cpu_allocation_ratio',
-        default=0.0,
+        default=16.0,
         min=0.0,
         help="""
 This option helps you specify virtual CPU to physical CPU allocation ratio.
@@ -599,6 +665,11 @@ Possible values:
 * Negative value defaults to 0.
 * Any positive integer representing maximum number of live migrations
   to run concurrently.
+"""),
+    cfg.IntOpt('max_concurrent_migrations',
+               default=1,
+               help="""
+Maximum number of migrations to run concurrently.
 """),
     cfg.IntOpt('block_device_allocate_retries',
         default=60,
@@ -882,6 +953,23 @@ Possible values:
 * 0: Will run at the default periodic interval.
 * Any value < 0: Disables the option.
 * Any positive integer in seconds.
+"""),
+    cfg.IntOpt('pci_affine_interval',
+               default=60,
+help="""
+Number of seconds between pci affinity updates
+
+This option specifies how often the pci_affine_interval
+periodic task should run. A number less than 0 means to disable the
+task completely. Leaving this at the default of 0 will cause this to
+run at the default periodic interval. Setting it to any positive
+value will cause it to run at approximately that number of seconds.
+
+Possible values:
+
+* 0: Will run at the default periodic interval.
+* Any value < 0: Disables the option.
+* Any positive integer in seconds.
 """)
 ]
 
@@ -1031,7 +1119,8 @@ Related options:
 instance_cleaning_opts = [
     # TODO(macsz): add min=1 flag in P development cycle
     cfg.IntOpt('maximum_instance_delete_attempts',
-        default=5,
+        # WRS: give an effectively unlimited number of retries
+        default=sys.maxsize,
         help="""
 The number of times to attempt to reap an instance's files.
 
@@ -1118,6 +1207,44 @@ Related options:
 """),
 ]
 
+# WRS: add option for default vif model, concurrent disk-IO limit
+wrs_compute_opts = [
+    cfg.StrOpt('default_vif_model',
+               default='virtio',
+               help='Name of default emulated VIF hardware type (e.g., '
+                    'virtio, e1000, etc...)'),
+    cfg.IntOpt('concurrent_disk_operations',
+               default=2,
+               help='Number of disk-IO-intensive operations (glance image'
+                    'downloads, image format conversions, etc.) that we will'
+                    'do in parallel.  If this is set too high then response'
+                    'time suffers.'),
+
+    # WRS: add shared_pcpu_map
+    cfg.DictOpt('shared_pcpu_map',
+                default={},
+                help='Shared pcpu index per numa node'),
+    cfg.StrOpt('default_mempages_size',
+               default='',
+               help="Default mempages size. "
+                    "Valid options: '', 'any', 'small', '2048', 'large'."),
+
+    # WRS: Define extended configuration options
+    cfg.StrOpt('compute_vswitch_2M_pages',
+               default=_extend_opts['compute_vswitch_2M_pages'],
+               help='List of per-numa node vswitch 2M reserved memory.'),
+    cfg.StrOpt('compute_vswitch_1G_pages',
+               default=_extend_opts['compute_vswitch_1G_pages'],
+               help='List of per-numa node vswitch 1G reserved memory.'),
+    cfg.StrOpt('compute_vm_4K_pages',
+               default=_extend_opts['compute_vm_4K_pages'],
+               help='List of per-numa node VM 4K memory.'),
+
+    cfg.BoolOpt('adjust_actual_mem_usage',
+                default=True,
+                help='Adjust memory usage based on host actual free pages'),
+]
+
 
 ALL_OPTS = (compute_opts +
             resource_tracker_opts +
@@ -1127,7 +1254,8 @@ ALL_OPTS = (compute_opts +
             timeout_opts +
             running_deleted_opts +
             instance_cleaning_opts +
-            db_opts)
+            db_opts +
+            wrs_compute_opts)
 
 
 def register_opts(conf):

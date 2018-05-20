@@ -11,6 +11,9 @@
 # WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 # License for the specific language governing permissions and limitations
 # under the License.
+#
+# Copyright (c) 2016-2017 Wind River Systems, Inc.
+#
 
 
 policy_data = """
@@ -126,6 +129,9 @@ policy_data = """
     "os_compute_api:server-metadata:update_all": "",
     "os_compute_api:server-metadata:delete": "",
     "os_compute_api:server-metadata:show": "",
-    "os_compute_api:server-metadata:index": ""
+    "os_compute_api:server-metadata:index": "",
+    "os_compute_api:wrs-if": "",
+    "os_compute_api:wrs-sg": "",
+    "os_compute_api:wrs-res": ""
 }
 """

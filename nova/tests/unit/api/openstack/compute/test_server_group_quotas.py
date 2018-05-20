@@ -125,7 +125,7 @@ class ServerGroupQuotasTestV21(test.TestCase):
         self.controller.create(self.req, body={'server_group': sgroup})
         ctxt = self.req.environ['nova.context']
         mock_check.assert_called_once_with(ctxt, {'server_groups': 1},
-                                           ctxt.project_id, ctxt.user_id)
+                                           None, ctxt.user_id)
 
     def test_delete_server_group_by_admin(self):
         self._setup_quotas()
@@ -136,7 +136,7 @@ class ServerGroupQuotasTestV21(test.TestCase):
         sg_id = res['server_group']['id']
         context = self.req.environ['nova.context']
 
-        self._assert_server_groups_in_use(context.project_id,
+        self._assert_server_groups_in_use(None,
                                           context.user_id, 1)
 
         # Delete the server group we've just created.
@@ -144,7 +144,7 @@ class ServerGroupQuotasTestV21(test.TestCase):
         self.controller.delete(req, sg_id)
 
         # Make sure the quota in use has been released.
-        self._assert_server_groups_in_use(context.project_id,
+        self._assert_server_groups_in_use(None,
                                           context.user_id, 0)
 
     def test_delete_server_group_by_id(self):

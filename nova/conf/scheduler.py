@@ -123,6 +123,13 @@ is added to avoid any overhead from constantly checking. If enabled,
 every time this runs, we will select any unmapped hosts out of each
 cell database on every run.
 """),
+# WRS extension - prevent normalization of weights; post-analysis of scheduler
+# logs requires unaltered values
+    cfg.BoolOpt("normalize_weigher",
+        default=False,
+        help="""
+Normalize weigher list values between 0 and 1.0.
+"""),
 ]
 
 filter_scheduler_group = cfg.OptGroup(name="filter_scheduler",
@@ -595,6 +602,33 @@ Related options:
 * aggregate_image_properties_isolation_namespace
 """)]
 
+wrs_weight_opts = [
+    # WRS: Group hosts by similar weight instead using
+    # scheduler_group_subset_size.
+    cfg.IntOpt("rounded_weight",
+        default=5,
+        help="""
+New hosts will he scheduled on a host chosen randomly from a subset of the
+best hosts that have similar weight. Specifying <=0 will revert algorithm to
+scheduler_host_subset_size.
+
+WRS engineering has weights typically between 0 to 200 range, corresponding
+to 2 vswitch engines of available power, and increments of 5*num_io_ops.
+It makes sense to round to the nearest multiple of 5.
+"""),
+    # WRS extension - Software managegment weigher
+    cfg.FloatOpt("swmgmt_patch_weight_multiplier",
+        default=1000.0,
+        help="""
+Multiplier used for weighing patch current hosts.
+"""),
+    cfg.FloatOpt("swmgmt_upgrade_weight_multiplier",
+        default=1000.0,
+        help="""
+Multiplier used for weighing upgrade current hosts.
+"""),
+]
+
 trust_group = cfg.OptGroup(name="trusted_computing",
                            title="Trust parameters",
                            help="""
@@ -922,6 +956,7 @@ def register_opts(conf):
 
     conf.register_group(filter_scheduler_group)
     conf.register_opts(filter_scheduler_opts, group=filter_scheduler_group)
+    conf.register_opts(wrs_weight_opts, group=filter_scheduler_group)
 
     conf.register_group(trust_group)
     conf.register_opts(trusted_opts, group=trust_group)

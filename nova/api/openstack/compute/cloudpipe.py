@@ -23,6 +23,7 @@ from nova.api.openstack import wsgi
 class CloudpipeController(wsgi.Controller):
     """Handle creating and listing cloudpipe instances."""
 
+    @extensions.block_during_upgrade()
     @extensions.expected_errors((410))
     def create(self, req, body):
         """Create a new cloudpipe instance, if none exists.
@@ -36,6 +37,7 @@ class CloudpipeController(wsgi.Controller):
         """List running cloudpipe instances."""
         raise exc.HTTPGone()
 
+    @extensions.block_during_upgrade()
     @extensions.expected_errors(410)
     def update(self, req, id, body):
         """Configure cloudpipe parameters for the project."""

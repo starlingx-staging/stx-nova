@@ -12,6 +12,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2016-2017 Wind River Systems, Inc.
+#
 
 """The Server Group API Extension."""
 
@@ -39,9 +42,13 @@ LOG = logging.getLogger(__name__)
 CONF = nova.conf.CONF
 
 
-def _authorize_context(req, action):
+def _authorize_context(req, action, project_id=None):
     context = req.environ['nova.context']
-    context.can(sg_policies.POLICY_ROOT % action)
+    if project_id:
+        context.can(sg_policies.POLICY_ROOT % action,
+            {'project_id': project_id})
+    else:
+        context.can(sg_policies.POLICY_ROOT % action)
     return context
 
 
@@ -56,10 +63,18 @@ def _get_not_deleted(context, uuids):
     # uuids organized by cell
     for im in mappings:
         if not im.cell_mapping:
-            # Not scheduled yet, so just throw it in the final list
-            # and move on
-            found_inst_uuids.append(im.instance_uuid)
-            continue
+            # WRS: let's see first if build request is still around:
+            try:
+                objects.BuildRequest.get_by_instance_uuid(
+                    context, im.instance_uuid)
+            except nova.exception.BuildRequestNotFound:
+                # the build request is gone so let's not add this instance
+                continue
+            else:
+                # Not scheduled yet, so just throw it in the final list
+                # and move on
+                found_inst_uuids.append(im.instance_uuid)
+                continue
         if im.cell_mapping.uuid not in cell_mappings:
             cell_mappings[im.cell_mapping.uuid] = im.cell_mapping
         inst_by_cell[im.cell_mapping.uuid].append(im.instance_uuid)
@@ -94,6 +109,15 @@ class ServerGroupController(wsgi.Controller):
         # NOTE(danms): This has been exposed to the user, but never used.
         # Since we can't remove it, just make sure it's always empty.
         server_group['metadata'] = {}
+
+        # WRS:extension -- metadata
+        if group.metadetails is not None:
+            metadata = {}
+            for k, v in group.metadetails.items():
+                if k in ['wrs-sg:group_size', 'wrs-sg:best_effort']:
+                    metadata[k] = v
+            server_group['metadata'] = metadata
+
         members = []
         if group.members:
             # Display the instances that are not deleted.
@@ -116,8 +140,9 @@ class ServerGroupController(wsgi.Controller):
             raise webob.exc.HTTPNotFound(explanation=e.format_message())
         return {'server_group': self._format_server_group(context, sg, req)}
 
+    @extensions.block_during_upgrade()
     @wsgi.response(204)
-    @extensions.expected_errors(404)
+    @extensions.expected_errors((400, 404))
     def delete(self, req, id):
         """Delete a server group."""
         context = _authorize_context(req, 'delete')
@@ -125,6 +150,12 @@ class ServerGroupController(wsgi.Controller):
             sg = objects.InstanceGroup.get_by_uuid(context, id)
         except nova.exception.InstanceGroupNotFound as e:
             raise webob.exc.HTTPNotFound(explanation=e.format_message())
+
+        # WRS:extension, don't allow deleting group with instances
+        if sg.count_members():
+            e = nova.exception.InstanceGroupNotEmpty(group_uuid=sg.uuid)
+            raise webob.exc.HTTPBadRequest(explanation=e.format_message())
+
         try:
             sg.destroy()
         except nova.exception.InstanceGroupNotFound as e:
@@ -146,27 +177,36 @@ class ServerGroupController(wsgi.Controller):
         return {'server_groups': result}
 
     @wsgi.Controller.api_version("2.1")
+    @extensions.block_during_upgrade()
     @extensions.expected_errors((400, 403))
     @validation.schema(schema.create, "2.0", "2.14")
     @validation.schema(schema.create_v215, "2.15")
     def create(self, req, body):
         """Creates a new server group."""
-        context = _authorize_context(req, 'create')
+        # WRS:extension -- admin can create server-groups for other tenants,
+        # so make sure we charge quota using project_id as specified in body
+        vals = body['server_group']
+        project_id = vals.get('project_id')
+
+        context = _authorize_context(req, 'create', project_id)
 
         try:
             objects.Quotas.check_deltas(context, {'server_groups': 1},
-                                        context.project_id, context.user_id)
+                                        project_id, context.user_id)
         except nova.exception.OverQuota:
             msg = _("Quota exceeded, too many server groups.")
             raise exc.HTTPForbidden(explanation=msg)
 
-        vals = body['server_group']
+        # WRS:extension -- possibly set project_id from body
         sg = objects.InstanceGroup(context)
-        sg.project_id = context.project_id
+        sg.project_id = project_id
         sg.user_id = context.user_id
         try:
             sg.name = vals.get('name')
             sg.policies = vals.get('policies')
+
+            # WRS:extension -- metadetails
+            sg.metadetails = vals.get('metadata', {})
             sg.create()
         except ValueError as e:
             raise exc.HTTPBadRequest(explanation=e)
@@ -178,11 +218,65 @@ class ServerGroupController(wsgi.Controller):
         if CONF.quota.recheck_quota:
             try:
                 objects.Quotas.check_deltas(context, {'server_groups': 0},
-                                            context.project_id,
+                                            project_id,
                                             context.user_id)
             except nova.exception.OverQuota:
                 sg.destroy()
                 msg = _("Quota exceeded, too many server groups.")
                 raise exc.HTTPForbidden(explanation=msg)
 
+        return {'server_group': self._format_server_group(context, sg, req)}
+
+    # WRS: extension
+    @wsgi.Controller.api_version("2.25")
+    @extensions.block_during_upgrade()
+    @extensions.expected_errors((400, 404))
+    @wsgi.action("set_metadata")
+    @validation.schema(schema.set_meta, "2.25")
+    def _set_metadata(self, req, id, body):
+        """Update metadata for the specified server group."""
+        context = _authorize_context(req, 'set_metadata')
+        try:
+            sg = objects.InstanceGroup.get_by_uuid(context, id)
+        except nova.exception.InstanceGroupNotFound as e:
+            raise webob.exc.HTTPNotFound(explanation=e.format_message())
+
+        metadata = body['set_metadata']['metadata']
+
+        # Check group_size limits
+        key = 'wrs-sg:group_size'
+        if key in metadata.keys():
+            if metadata[key] not in ['', None]:
+                group_size = int(metadata[key])
+                num_members = sg.count_members()
+                if group_size < num_members:
+                    msg = _(
+                        'Action would result in server group %(uuid)s '
+                        'number of members %(num)d exceeding '
+                        ' group size %(size)d.'
+                    ), {'uuid': sg.uuid, 'num': num_members,
+                        'size': group_size}
+                    raise exc.HTTPBadRequest(explanation=msg)
+                sg.metadetails[key] = metadata[key]
+            else:
+                sg.metadetails.pop(key, None)
+
+        key = 'wrs-sg:best_effort'
+        if key in metadata.keys():
+            if metadata[key] not in ['', None]:
+                sg.metadetails[key] = metadata[key]
+            else:
+                sg.metadetails.pop(key, None)
+
+        # Assume we changed something and want to write to the DB.
+        # Updating the metadetails in-place doesn't trigger the what-changed
+        # detection in the object.
+        sg._changed_fields.add('metadetails')
+        sg.save()
+
+        # Get updated server group
+        try:
+            sg = objects.InstanceGroup.get_by_uuid(context, id)
+        except nova.exception.InstanceGroupNotFound as e:
+            raise webob.exc.HTTPNotFound(explanation=e.format_message())
         return {'server_group': self._format_server_group(context, sg, req)}

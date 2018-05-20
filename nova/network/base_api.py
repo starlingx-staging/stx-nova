@@ -12,6 +12,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2016-2017 Wind River Systems, Inc.
+#
 
 import functools
 import inspect
@@ -77,7 +80,8 @@ def refresh_cache(f):
             msg = _('instance is a required argument to use @refresh_cache')
             raise Exception(msg)
 
-        with lockutils.lock('refresh_cache-%s' % instance.uuid):
+        # WRS: enable fair option
+        with lockutils.lock('refresh_cache-%s' % instance.uuid, fair=True):
             # We need to call the wrapped function with the lock held to ensure
             # that it can call _get_instance_nw_info safely.
             res = f(self, context, *args, **kwargs)
@@ -216,7 +220,8 @@ class NetworkAPI(base.Base):
 
     def allocate_port_for_instance(self, context, instance, port_id,
                                    network_id=None, requested_ip=None,
-                                   bind_host_id=None, tag=None):
+                                   bind_host_id=None, vif_model=None,
+                                   tag=None):
         """Allocate port for instance."""
         raise NotImplementedError()
 
@@ -251,7 +256,15 @@ class NetworkAPI(base.Base):
 
     def get_instance_nw_info(self, context, instance, **kwargs):
         """Returns all network info related to an instance."""
-        with lockutils.lock('refresh_cache-%s' % instance.uuid):
+
+        # WRS: this is a terrible hack to work around the fact that tox
+        # installs oslo_concurrency via pip from vanilla servers.
+        try:
+            cachelock = lockutils.lock('refresh_cache-%s' % instance.uuid,
+                                       fair=True)
+        except TypeError:
+            cachelock = lockutils.lock('refresh_cache-%s' % instance.uuid)
+        with cachelock:
             result = self._get_instance_nw_info(context, instance, **kwargs)
             # NOTE(comstud): Don't update API cell with new info_cache every
             # time we pull network info for an instance.  The periodic healing

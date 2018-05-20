@@ -13,6 +13,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2013-2017 Wind River Systems, Inc.
+#
 
 """
 Filter to add support for Trusted Computing Pools (EXPERIMENTAL).
@@ -249,5 +252,9 @@ class TrustedFilter(filters.BaseHostFilter):
         trust = extra.get('trust:trusted_host')
         host = host_state.nodename
         if trust:
-            return self.compute_attestation.is_trusted(host, trust)
+            retval = self.compute_attestation.is_trusted(host, trust)
+            if not retval:
+                msg = 'not trusted'
+                self.filter_reject(host_state, spec_obj, msg)
+            return retval
         return True

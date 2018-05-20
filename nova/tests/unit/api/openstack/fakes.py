@@ -12,6 +12,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2014-2017 Wind River Systems, Inc.
+#
 
 import datetime
 
@@ -257,6 +260,9 @@ class HTTPRequest(os_wsgi.Request):
             project_id=project_id,
             is_admin=use_admin_context)
         out.api_version_request = api_version.APIVersionRequest(version)
+
+        # adding the WRS header to requests adds WRS fields to responses
+        out.headers['wrs-header'] = 'true'
         return out
 
 
@@ -359,6 +365,16 @@ def fake_compute_get(**kwargs):
 
 def fake_actions_to_locked_server(self, context, instance, *args, **kwargs):
     raise exc.InstanceIsLocked(instance_uuid=instance['uuid'])
+
+
+def fake_actions_to_server_instance_while_resize(self, context, instance,
+                                                 *args, **kwargs):
+
+    raise exc.InstanceInvalidState(
+                    instance_uuid = instance['uuid'],
+                    attr = 'task_state',
+                    state = instance.task_state,
+                    method = 'delete')
 
 
 def fake_instance_get_all_by_filters(num_servers=5, **kwargs):
@@ -498,6 +514,8 @@ def stub_instance(id=1, user_id=None, project_id=None, host=None,
         "power_state": power_state,
         "memory_mb": memory_mb,
         "vcpus": vcpus,
+        "min_vcpus": vcpus,
+        "max_vcpus": vcpus,
         "root_gb": root_gb,
         "ephemeral_gb": ephemeral_gb,
         "ephemeral_key_uuid": None,
@@ -553,6 +571,8 @@ def stub_instance_obj(ctxt, *args, **kwargs):
     db_inst = stub_instance(*args, **kwargs)
     expected = ['metadata', 'system_metadata', 'flavor',
                 'info_cache', 'security_groups']
+    # WRS: extension
+    expected.append('pci_devices')
     inst = objects.Instance._from_db_object(ctxt, objects.Instance(),
                                             db_inst,
                                             expected_attrs=expected)

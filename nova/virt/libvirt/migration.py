@@ -18,9 +18,14 @@
 """
 
 from collections import deque
-
+from collections import namedtuple
 from lxml import etree
 from oslo_log import log as logging
+import six
+
+from nova import objects
+from nova.virt import hardware
+from nova.virt.libvirt import config as vconfig
 
 from nova.compute import power_state
 import nova.conf
@@ -33,6 +38,12 @@ CONF = nova.conf.CONF
 # Remove this and similar hacks in guest.py, driver.py, host.py
 # etc in Ocata.
 libvirt = None
+
+DriverInterface = namedtuple(
+    'DriverInterface', ['get_volume_config',
+                        'get_guest_numa_config',
+                        'get_guest_memory_backing_config',
+                        'get_guest_cpu_config', ])
 
 
 def graphics_listen_addrs(migrate_data):
@@ -76,12 +87,13 @@ def serial_listen_ports(migrate_data):
     return ports
 
 
-def get_updated_guest_xml(guest, migrate_data, get_volume_config):
+def get_updated_guest_xml(guest, migrate_data, driver_interface, instance):
     xml_doc = etree.fromstring(guest.get_xml_desc(dump_migratable=True))
     xml_doc = _update_graphics_xml(xml_doc, migrate_data)
     xml_doc = _update_serial_xml(xml_doc, migrate_data)
-    xml_doc = _update_volume_xml(xml_doc, migrate_data, get_volume_config)
+    xml_doc = _update_volume_xml(xml_doc, migrate_data, driver_interface)
     xml_doc = _update_perf_events_xml(xml_doc, migrate_data)
+    xml_doc = _update_numa_xml(xml_doc, driver_interface, instance)
     return etree.tostring(xml_doc)
 
 
@@ -130,7 +142,7 @@ def _update_serial_xml(xml_doc, migrate_data):
     return xml_doc
 
 
-def _update_volume_xml(xml_doc, migrate_data, get_volume_config):
+def _update_volume_xml(xml_doc, migrate_data, driver_interface):
     """Update XML using device information of destination host."""
     migrate_bdm_info = migrate_data.bdms
 
@@ -146,7 +158,7 @@ def _update_volume_xml(xml_doc, migrate_data, get_volume_config):
             not bdm_info or not bdm_info.connection_info or
             serial_source not in bdm_info_by_serial):
             continue
-        conf = get_volume_config(
+        conf = driver_interface.get_volume_config(
             bdm_info.connection_info, bdm_info.as_disk_info())
         xml_doc2 = etree.XML(conf.to_xml(), parser)
         serial_dest = xml_doc2.findtext('serial')
@@ -262,24 +274,29 @@ def should_abort(instance, now,
 
     Avoid migration to be aborted if it is running in post-copy mode
 
-    :returns: True if migration should be aborted, False otherwise
+    :returns: (result, fault): result is True if migration should be aborted,
+    False otherwise; fault is the description of failure when abort
     """
     if migration_status == 'running (post-copy)':
-        return False
+        return False, None
 
     if (progress_timeout != 0 and
             (now - progress_time) > progress_timeout):
         LOG.warning("Live migration stuck for %d sec",
                     (now - progress_time), instance=instance)
-        return True
+        fault = "Live migration stuck for %d sec." \
+                % (now - progress_time)
+        return True, fault
 
     if (completion_timeout != 0 and
             elapsed > completion_timeout):
         LOG.warning("Live migration not completed after %d sec",
                     completion_timeout, instance=instance)
-        return True
+        fault = "Live migration timeout after %d sec." \
+                % completion_timeout
+        return True, fault
 
-    return False
+    return False, None
 
 
 def should_switch_to_postcopy(memory_iteration, current_data_remaining,
@@ -391,8 +408,8 @@ def save_stats(instance, migration, info, remaining):
     migration.disk_remaining = info.disk_remaining
     migration.save()
 
-    # The coarse % completion stats
-    instance.progress = 100 - remaining
+    # WRS: we pass in a stat based on data_remaining so just store in progress
+    instance.progress = remaining
     instance.save()
 
 
@@ -491,16 +508,16 @@ def run_recover_tasks(host, guest, instance, on_migration_failure):
                         {"task": task}, instance=instance)
 
 
-def downtime_steps(data_gb):
+def downtime_steps(completion_timeout, downtime):
     '''Calculate downtime value steps and time between increases.
 
-    :param data_gb: total GB of RAM and disk to transfer
-
+    :param completion_timeout: allowed time to complete migration in secs
+    :param downtime: max allowed downtime in msecs
     This looks at the total downtime steps and upper bound
     downtime value and uses a linear function.
 
-    For example, with 10 steps, 30 second step delay, 3 GB
-    of RAM and 400ms target maximum downtime, the downtime will
+    For example, with 10 steps, 1350sec overall timeout,
+    and 400ms target maximum downtime, the downtime will
     be increased every 90 seconds in the following progression:
 
     -   0 seconds -> set downtime to  40ms
@@ -518,14 +535,83 @@ def downtime_steps(data_gb):
     This allows the guest a good chance to complete migration
     with a small downtime value.
     '''
-    downtime = CONF.libvirt.live_migration_downtime
     steps = CONF.libvirt.live_migration_downtime_steps
-    delay = CONF.libvirt.live_migration_downtime_delay
 
-    delay = int(delay * data_gb)
+    # WRS: rather than get the delay from the config option, we'll
+    # calculate it such that we ramp up to the max downtime at
+    # 2/3 of the overall live migration completion timeout
+    delay = int(completion_timeout * 2.0 / 3 / steps)
+
+    # WRS: we want the delay to be fixed, not relative to data size
+    # delay = int(delay * data_gb)
 
     base = downtime / steps
     offset = (downtime - base) / steps
 
     for i in range(steps + 1):
         yield (int(delay * i), int(base + offset * i))
+
+
+def _update_numa_xml(xml_doc, driver_interface, instance):
+    image_meta = objects.ImageMeta.from_instance(instance)
+    # WRS: Use numa topology and allowed cpus from destination host.
+    allowed_cpus = instance.migration_context.new_allowed_cpus
+    # TODO(sahid/cfriesen): If the destination has more numa nodes than the
+    # source then this could cause problems due to the loop over topology.cells
+    # where "topology" is for the source host.
+    numa_config = driver_interface.get_guest_numa_config(
+        instance.migration_context.new_numa_topology,
+        instance.flavor, allowed_cpus, image_meta)
+    if numa_config[1] is None:
+        # Quit early if the instance does not provide numa topology.
+        return xml_doc
+    membacking = driver_interface.get_guest_memory_backing_config(
+        instance.numa_topology, numa_config.numatune, instance.flavor)
+    cpu = driver_interface.get_guest_cpu_config(
+        instance.flavor, image_meta, numa_config.numaconfig,
+        instance.numa_topology)
+
+    # We need to treat cpuset slightly differently - it's just an
+    # attribute on the vcpu element, which we expect is always there
+    vcpu = xml_doc.find('./vcpu')
+    new_vcpu = etree.Element("vcpu")
+    new_vcpu.text = six.text_type(instance.flavor.vcpus)
+    if numa_config.cpuset:
+        new_vcpu.set("cpuset",
+                     hardware.format_cpu_spec(numa_config.cpuset))
+    if vcpu is not None:
+        xml_doc.remove(vcpu)
+    xml_doc.append(new_vcpu)
+
+    # WRS: It's possible that a guest cpu changes while migrating to a host
+    # that has a different physical host cpu topology (for e.g. HT to non-HT).
+    # Guest cpu topology can't change during live migration.  For this reason,
+    # we always keep the guest cpu topology that is currently used in the
+    # running instance.  The topology stays the same but the cpu_tune still
+    # gets recalculated based on the InstanceNUMATopology that was
+    # claimed on the destination.
+    old_cpu_xml = xml_doc.find('./cpu')
+    old_cpu = vconfig.LibvirtConfigCPU()
+    old_cpu.parse_dom(old_cpu_xml)
+
+    cpu.sockets = old_cpu.sockets
+    cpu.cores = old_cpu.cores
+    cpu.threads = old_cpu.threads
+
+    def replace_from_config(tag, config):
+        """Replace a top level node with xml generated by config """
+        elem = xml_doc.find('./' + tag)
+        if elem is not None:
+            xml_doc.remove(elem)
+        if config:
+            new_elem = config.format_dom()
+            xml_doc.append(new_elem)
+
+    replace = [('cputune', numa_config.cputune),
+               ('numatune', numa_config.numatune),
+               ('memoryBacking', membacking),
+               ('cpu', cpu)]
+    for tag, config in replace:
+        replace_from_config(tag, config)
+
+    return xml_doc

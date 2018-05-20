@@ -11,6 +11,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+#  Copyright (c) 2017 Wind River Systems, Inc.
+#
 """
 Common parameter types for validating request Body.
 
@@ -299,6 +302,12 @@ description = {
 }
 
 
+userdata = {
+    'type': 'string',
+    'format': 'base64'
+}
+
+
 tcp_udp_port = {
     'type': ['integer', 'string'], 'pattern': '^[0-9]*$',
     'minimum': 0, 'maximum': 65535,
@@ -342,6 +351,11 @@ network_id = {
 
 network_port_id = {
     'type': 'string', 'format': 'uuid'
+}
+
+
+vif_model = {
+    'type': 'string',
 }
 
 

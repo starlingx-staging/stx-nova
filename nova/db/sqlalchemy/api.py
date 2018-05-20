@@ -14,6 +14,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2016-2017 Wind River Systems, Inc.
+#
 
 """Implementation of SQLAlchemy backend."""
 
@@ -77,6 +80,21 @@ LOG = logging.getLogger(__name__)
 
 main_context_manager = enginefacade.transaction_context()
 api_context_manager = enginefacade.transaction_context()
+
+INSTANCES_CHILD_TABLES = [
+    'block_device_mapping',
+    'consoles',
+    'instance_actions',
+    'instance_extra',
+    'instance_faults',
+    'instance_id_mappings',
+    'instance_info_caches',
+    'instance_metadata',
+    'instance_system_metadata',
+    'fixed_ips',
+    'migrations',
+    'security_group_instance_association',
+    'virtual_interfaces']
 
 
 def _get_db_conf(conf_group, connection=None):
@@ -850,10 +868,12 @@ def compute_node_statistics(context):
     fields = ('count', 'vcpus', 'memory_mb', 'local_gb', 'vcpus_used',
               'memory_mb_used', 'local_gb_used', 'free_ram_mb', 'free_disk_gb',
               'current_workload', 'running_vms', 'disk_available_least')
-    results = {field: int(results[idx] or 0)
+    stats = {field: int(results[idx] or 0)
                for idx, field in enumerate(fields)}
+    # WRS: vcpus_used is now floating-point.
+    stats['vcpus_used'] = results[fields.index('vcpus_used')] or 0
     conn.close()
-    return results
+    return stats
 
 
 ###################
@@ -1904,6 +1924,337 @@ def instance_destroy(context, instance_uuid, constraint=None):
     return instance_ref
 
 
+def _related_fks_get(table_name):
+    """For a given table name, return all the tables that have a foreign
+       key relationship to the given table
+
+    :param table_name: The table in which to find related tables
+    :return: A list of Column sqlalchemy objects that represent a foreign
+             key to the given provided table in table_name
+    """
+    engine = get_engine()
+    engine.connect()
+    metadata = MetaData()
+    metadata.bind = engine
+    metadata.reflect(engine)
+
+    ret = []
+    for table in metadata.sorted_tables:
+        for col in table.columns:
+            fkeys = col.foreign_keys or []
+            for fkey in fkeys:
+                if fkey.column.table.name == table_name:
+                    ret.append(col)
+                    break
+    return ret
+
+
+def _purge_records(query, model, context, dry_run):
+    """Performs a deep delete of table records.  This will find each related
+       table, related by foreign key relationships, to the given table provided
+
+    :param query: The query in which to execute
+    :param model: The model in which the query represents
+    :param context: DB context
+    :param dry_run: If true, don't perform an actual delete
+    :return:
+    """
+    if not hasattr(_purge_records, "rows_count"):
+        rows_count = 0
+
+    fks = _related_fks_get(model.__tablename__)
+    q_offset = 0
+    more_records = True
+    limit = 50
+    results = query.limit(limit).offset(q_offset).all()
+    more_records = len(results) > 0
+    while more_records:
+        more_records = False
+
+        for fk in fks:
+            model_class = None
+            found_model = false
+
+            for model_class in six.itervalues(models.__dict__):
+                if hasattr(model_class, "__tablename__"):
+                    if model_class.__tablename__ == fk.table.name:
+                        found_model = true
+                        break
+
+            if found_model:
+                for referenced_key in fk.foreign_keys:
+                    if (referenced_key.column.table.name ==
+                            model.__tablename__):
+                        fk_ids = [x[referenced_key.column.name] for x
+                                  in results]
+                        fk_ = getattr(model_class, fk.name)
+                        related_model_query = model_query(context,
+                                                       model_class).\
+                                                       filter(fk_.in_(fk_ids))
+
+                        rows_count += _purge_records(related_model_query,
+                                                     model_class,
+                                                     context, dry_run)
+        q_offset += limit
+        results = query.limit(limit).offset(q_offset).all()
+        more_records = len(results) > 0
+
+    if not dry_run:
+        rows_count += query.delete(synchronize_session='fetch')
+    else:
+        rows_count += query.count()
+    return rows_count
+
+
+def _get_force_delete_statements(metadata, deleted_age):
+    """Returns a list of delete statements that need to be performed
+    before the purging of soft deleted records can take place.
+
+    Some tables, which are directly and indirectly related table
+    instances, are not soft deleted. To avoid FK violation, any
+    records in these tables that reference soft deleted instances
+    must be hard deleted first.
+
+    :param metadata: nova database metadata
+    :param deleted_age: age in days of the records to be hard deleted
+    """
+
+    stmts = []
+    it = Table("instances", metadata, autoload=True)
+    iat = Table("instance_actions", metadata, autoload=True)
+    iaet = Table("instance_actions_events", metadata, autoload=True)
+    deleted_instances = sql.select([it.c.uuid]).\
+        where(it.c.deleted_at.isnot(None)).\
+        where(it.c.deleted_at < deleted_age)
+    deleted_actions = sql.select([iat.c.id]).\
+        where(iat.c.instance_uuid.in_(deleted_instances)).\
+        where(iat.c.deleted_at.is_(None))
+    deleted_actions_events = \
+        sql.select([iaet.c.id]).\
+        where(iaet.c.action_id.in_(deleted_actions))
+
+    delete_statement = DeleteFromSelect(
+        iaet, deleted_actions_events, iaet.c.id)
+    stmts.append(("instance_actions_events", delete_statement))
+
+    # Only a subset of instances child tables are not soft deleted
+    # but to be on the safe side, we scan them all for potential
+    # FK violations.
+    for tbl in INSTANCES_CHILD_TABLES:
+        t = Table(tbl, metadata, autoload=True)
+        if tbl == "instance_id_mappings":
+            column = t.c.uuid
+        else:
+            column = t.c.instance_uuid
+
+        query_delete = sql.select([column]).\
+            where(column.in_(deleted_instances))
+        delete_statement = DeleteFromSelect(
+            t, query_delete, column)
+        stmts.append((tbl, delete_statement))
+
+    # Table task_log is a special case. It is neither directly nor
+    # indirectly related to instances table. The audit entries in this
+    # table are intentionally not soft deleted. To prevent unbound growth
+    # of this table, purge any records that are older than 30 days.
+    age = timeutils.utcnow() - datetime.timedelta(30)
+    tlt = Table("task_log", metadata, autoload=True)
+    old_tasks = sql.select([tlt.c.id]).\
+        where(tlt.c.created_at < age)
+    delete_statement = DeleteFromSelect(
+        tlt, old_tasks, tlt.c.id)
+    stmts.append(("task_log", delete_statement))
+
+    return stmts
+
+
+def _purge_instance_refs_in_api_db(instance_uuids):
+    """Purges records that refence deleted instances in api database.
+
+    Only request_specs table, which can potentially grow large, and its
+    child table are considered. This is a workaround until upstream has
+    a proper design to keep the nova_api database in sync with the primary
+    database.
+
+    :param instance_uuids: list of instance uuids that were purged
+    """
+
+    api_engine = get_api_engine()
+    api_conn = api_engine.connect()
+    metadata = MetaData(api_engine)
+
+    rst = Table("request_specs", metadata, autoload=True)
+    brt = Table("build_requests", metadata, autoload=True)
+    selected_specs = sql.select([rst.c.id]).\
+        where(rst.c.instance_uuid.in_(instance_uuids))
+    selected_requests = sql.select([brt.c.id]).\
+        where(brt.c.request_spec_id.in_(selected_specs))
+
+    spec_delete_stmt = DeleteFromSelect(rst, selected_specs, rst.c.id)
+    build_delete_stmt = DeleteFromSelect(brt, selected_requests,
+                                                  brt.c.id)
+    try:
+        with api_conn.begin():
+            build_delete_result = api_conn.execute(build_delete_stmt)
+            spec_delete_result = api_conn.execute(spec_delete_stmt)
+    except Exception as ex:
+        LOG.exception('DB Error while purging records that reference '
+                      'deleted instances from nova_api database: '
+                      '%(error)s', {'error': six.text_type(ex)})
+        raise
+
+    LOG.info('Deleted %(row)d rows from table=%(table)s in nova_api db',
+             {'row': build_delete_result.rowcount,
+              'table': "build_requests"})
+    LOG.info('Deleted %(row)d rows from table=%(table)s in nova_api db',
+             {'row': spec_delete_result.rowcount,
+              'table': "request_specs"})
+
+
+def instances_purge_deleted(context, older_than=0):
+    """Purges soft deleted rows
+
+    US93169: Deletes rows of all non-shadow tables:
+        a. that reference either directly or indirectly soft deleted instances
+           regardless if the rows are marked for purge or not.
+           Background: some tables are not soft deleted when an instance is
+                       soft deleted. This was done intentionally so that the
+                       operators can find out what actions were performed
+                       on an instance which may now be deleted.
+                       This design intent adds little (if any) value yet poses
+                       serious operational risks due to unbound growth of
+                       Nova database.
+        b. with deleted_at values that match the given age for relevant models.
+           This also covers rows that reference live instances but are marked
+           for purge.
+
+    Rows marked for purge are rows with deleted_at field that are not null.
+
+    Shadow tables are not covered by the purge task as they are empty
+        - in 15.12 (archive cron job does not exist)
+        - in 16.10 (archive cron is broken) and
+        - in 17.xx and beyond (archive cron is disabled)
+
+    Returns the number of soft deleted instances and number of records in
+    other tables that were purged.
+    """
+
+    try:
+        age_in_days = int(older_than)
+    except ValueError:
+        msg = _('Invalid value for age, %(age)s') % {'age': age_in_days}
+        LOG.exception(msg)
+        raise exception.InvalidParameterValue(msg)
+    if age_in_days < 0:
+        msg = _('Must supply a positive value for age')
+        LOG.error(msg)
+        raise exception.InvalidParameterValue(msg)
+
+    LOG.info('Purging deleted rows older than age=%d days.', age_in_days)
+    engine = get_engine(context)
+    conn = engine.connect()
+    metadata = MetaData(engine)
+    tables = []
+    table_counts = {}
+
+    # Build the list of all tables to be purged
+    for model_class in models.__dict__.values():
+        if hasattr(model_class, "__tablename__") \
+                and hasattr(model_class, "deleted"):
+            # Ignore the aggregate related tables which used
+            # to be in nova main db but now in nova_api db
+            tbl = model_class.__tablename__
+            if tbl in ['aggregate_hosts', 'aggregate_metadata', 'aggregates']:
+                continue
+            tables.append(tbl)
+
+    deleted_age = timeutils.utcnow() - datetime.timedelta(days=age_in_days)
+
+    # First force purging of records that are not soft deleted but are
+    # referencing soft deleted instance records. Then purge all soft deleted
+    # records in nova tables in the right order to avoid FK constraint
+    # violation.
+    #
+    # Note: This solution is not as performant as using DB cascade delete
+    # triggers but is patchback friendly and it keeps the code DB agnostic.
+    stmt_list = _get_force_delete_statements(metadata, deleted_age)
+    for stmt in stmt_list:
+        try:
+            with conn.begin():
+                delete_result = conn.execute(stmt[1])
+            table_counts[stmt[0]] = delete_result.rowcount
+        except (db_exc.DBError, db_exc.DBReferenceError):
+            LOG.exception('DBError detected when force purging %s ',
+                         stmt)
+            raise
+
+    tables.sort()
+    # REBASE NOTE: For newly introduced tables, please make sure the child and
+    #              parent tables are placed in the right order in the tables
+    #              list.
+    for table in ('compute_nodes', 'console_pools',
+                  'instance_actions', 'instance_groups', 'instance_types',
+                  'instances', 'quota_usages', 'security_groups'):
+        try:
+            tables.remove(table)
+        except ValueError:
+            LOG.warning('Expected table %s was not found in DB.', table)
+        else:
+            tables.append(table)
+
+    soft_deleted_instance_count = 0
+    deleted_row_count = 0
+
+    for table in tables:
+        t = Table(table, metadata, autoload=True)
+        if table == "dns_domains":
+            column = t.c.project_id
+        else:
+            column = t.c.id
+
+        deleted_at_column = t.c.deleted_at
+        if table == "instances":
+            query_delete_by_uuid = sql.select([t.c.uuid],
+                deleted_at_column < deleted_age).order_by(
+                    deleted_at_column)
+
+        query_delete = sql.select(
+            [column], deleted_at_column < deleted_age).order_by(
+            deleted_at_column)
+
+        delete_statement = DeleteFromSelect(t, query_delete, column)
+        try:
+            with conn.begin():
+                if table == "instances":
+                    select_result = conn.execute(query_delete_by_uuid)
+                delete_result = conn.execute(delete_statement)
+            if table not in table_counts:
+                table_counts[table] = delete_result.rowcount
+            else:
+                table_counts[table] += delete_result.rowcount
+
+        except db_exc.DBReferenceError as ex:
+            # This is very unexpected. We did not catch this bizzare case
+            # during our tests but let's not stop purging unrelated tables
+            # in the queue.
+            LOG.exception('DBReferenceError detected when purging from '
+                          'table=%(table)s: %(error)s',
+                          {'table': table, 'error': six.text_type(ex)})
+
+        # Log the count of the table after purge
+        LOG.info('Deleted %(row)d rows from table=%(table)s',
+                 {'row': table_counts[table], 'table': table})
+        if (table == "instances"):
+            soft_deleted_instance_count = table_counts[table]
+        else:
+            deleted_row_count += table_counts[table]
+
+    deleted_instance_uuids = [r[0] for r in select_result.fetchall()]
+    _purge_instance_refs_in_api_db(deleted_instance_uuids)
+
+    return [soft_deleted_instance_count, deleted_row_count]
+
+
 @require_context
 @pick_context_manager_reader_allow_async
 def instance_get_by_uuid(context, uuid, columns_to_join=None):
@@ -2737,10 +3088,21 @@ def _instance_update(context, instance_uuid, values, expected, original=None):
         _validate_unique_server_name(context, values['hostname'])
 
     compare = models.Instance(uuid=instance_uuid, **expected)
+    query = model_query(context, models.Instance, project_only=True)
+
+    # Make sure we do not accidentally overwrite a deleting task state.
+    # Setting vm_state to DELETED or ERROR however is always allowed.
+    if values.get('vm_state') not in (vm_states.DELETED, vm_states.ERROR):
+        overwrite_condition = ('task_state' in values and
+                               'task_state' not in expected and
+                               values['task_state'] != task_states.DELETING)
+        if overwrite_condition:
+            query = query.filter(or_(
+                models.Instance.task_state != task_states.DELETING,
+                models.Instance.task_state == null()))
+
     try:
-        instance_ref = model_query(context, models.Instance,
-                                   project_only=True).\
-                       update_on_match(compare, 'uuid', values)
+        instance_ref = query.update_on_match(compare, 'uuid', values)
     except update_match.NoRowsMatched:
         # Update failed. Try to find why and raise a specific error.
 
@@ -2770,6 +3132,9 @@ def _instance_update(context, instance_uuid, values, expected, original=None):
             if actual not in expected_values:
                 conflicts_expected[field] = expected_values
                 conflicts_actual[field] = actual
+
+        if original.task_state == task_states.DELETING:
+            conflicts_actual['task_state'] = original.task_state
 
         # Exception properties
         exc_props = {
@@ -3374,6 +3739,19 @@ def quota_get_all_by_project(context, project_id):
         result[row.resource] = row.hard_limit
 
     return result
+
+
+@require_context
+@pick_context_manager_reader
+def quota_really_get_all(context):
+    return model_query(context, models.Quota, read_deleted="no").all()
+
+
+@require_context
+@pick_context_manager_reader
+def quota_user_really_get_all(context):
+    return model_query(context, models.ProjectUserQuota,
+                       read_deleted="no").all()
 
 
 @require_context
@@ -6219,6 +6597,54 @@ def action_event_get_by_id(context, action_id, event_id):
     return event
 
 
+@pick_context_manager_writer
+def action_events_purge(context, dry_run=False,
+                        keep_time_range=5, max_number=1000):
+    # get rid of records older than keep_time_range days:
+    purge_before = timeutils.utcnow() - datetime.\
+                    timedelta(days=int(keep_time_range))
+
+    out_of_date_query = model_query(context, models.InstanceActionEvent,
+                                    read_deleted="yes").\
+                                    filter(models.InstanceActionEvent.
+                                           updated_at < purge_before)
+
+    deleted_ood_row_count = _purge_records(out_of_date_query, models.
+                                           InstanceActionEvent,
+                                           context, dry_run)
+
+    LOG.info("%d out of date action events removed", deleted_ood_row_count)
+    # get rid of oldest records that result in count higher than max_number:
+    number_of_rows = context.session.query(func.count(models.
+                                           InstanceActionEvent.id)).\
+                                           scalar()
+    deleted_extra_row_count = 0
+    if(number_of_rows > max_number):
+        # keep the 1st max_number entries, purge the rest
+        number_of_extra_rows = number_of_rows - max_number
+
+        base_query = model_query(context, models.InstanceActionEvent,
+                                 read_deleted="yes").\
+                                 order_by(asc(models.InstanceActionEvent.
+                                 updated_at)).\
+                                 limit(number_of_extra_rows).all()
+
+        ids = [x[models.InstanceActionEvent.id.name] for x in base_query]
+
+        deleted_extra_row_count = model_query(context,
+                                              models.InstanceActionEvent,
+                                              read_deleted="yes").\
+                                              filter(models.
+                                                     InstanceActionEvent.
+                                                     id.in_(ids)).\
+                                              delete(synchronize_session
+                                                     ='fetch')
+        LOG.info("%d more action events removed", deleted_extra_row_count)
+
+    deleted_row_count = deleted_ood_row_count + deleted_extra_row_count
+
+    return deleted_row_count
+
 ##################
 
 
@@ -6503,7 +6929,13 @@ def archive_deleted_rows(max_rows=None):
         }
 
     """
+
+    # US93169: starting 17.x, disable both archive cron and manual archive
     table_to_rows_archived = {}
+    LOG.info('Archiving soft deleted records is disabled.')
+    return table_to_rows_archived
+
+    """
     total_rows_archived = 0
     meta = MetaData(get_engine(use_slave=True))
     meta.reflect()
@@ -6524,6 +6956,7 @@ def archive_deleted_rows(max_rows=None):
         if total_rows_archived >= max_rows:
             break
     return table_to_rows_archived
+    """
 
 
 @pick_context_manager_writer
@@ -6549,7 +6982,8 @@ def service_uuids_online_data_migration(context, max_count):
 
 def _instance_group_get_query(context, model_class, id_field=None, id=None,
                               read_deleted=None):
-    columns_to_join = {models.InstanceGroup: ['_policies', '_members']}
+    columns_to_join = {models.InstanceGroup: ['_policies', '_members',
+                                              '_metadata']}
     query = model_query(context, model_class, read_deleted=read_deleted,
                         project_only=True)
     for c in columns_to_join.get(model_class, []):
@@ -6561,8 +6995,10 @@ def _instance_group_get_query(context, model_class, id_field=None, id=None,
     return query
 
 
+# WRS:extended - metadata
 @pick_context_manager_writer
-def instance_group_create(context, values, policies=None, members=None):
+def instance_group_create(context, values, policies=None, members=None,
+                          metadata=None):
     """Create a new group."""
     uuid = values.get('uuid', None)
     if uuid is None:
@@ -6587,6 +7023,10 @@ def instance_group_create(context, values, policies=None, members=None):
         _instance_group_members_add(context, group.id, members)
     else:
         group._members = []
+    if metadata:
+        _instance_group_metadata_add(context, group.id, metadata)
+    else:
+        group._metadata = []
 
     return instance_group_get(context, uuid)
 
@@ -6620,6 +7060,7 @@ def instance_group_get_by_instance(context, instance_uuid):
     return group
 
 
+# WRS:extension - metadata
 @pick_context_manager_writer
 def instance_group_update(context, group_uuid, values):
     """Update the attributes of a group.
@@ -6645,6 +7086,12 @@ def instance_group_update(context, group_uuid, values):
                                     group.id,
                                     values.pop('members'),
                                     set_delete=True)
+    metadata = values.get('metadata')
+    if metadata is not None:
+        _instance_group_metadata_add(context,
+                                    group.id,
+                                    values.pop('metadata'),
+                                    set_delete=True)
 
     group.update(values)
 
@@ -6652,8 +7099,11 @@ def instance_group_update(context, group_uuid, values):
         values['policies'] = policies
     if members:
         values['members'] = members
+    if metadata:
+        values['metadata'] = metadata
 
 
+# WRS:extended - metadata
 @pick_context_manager_writer
 def instance_group_delete(context, group_uuid):
     """Delete a group."""
@@ -6668,6 +7118,7 @@ def instance_group_delete(context, group_uuid):
 
     # Delete policies, metadata and members
     instance_models = [models.InstanceGroupPolicy,
+                       models.InstanceGroupMetadata,
                        models.InstanceGroupMember]
     for model in instance_models:
         model_query(context, model).filter_by(group_id=group_id).soft_delete()
@@ -6713,6 +7164,59 @@ def _instance_group_id(context, group_uuid):
     if not result:
         raise exception.InstanceGroupNotFound(group_uuid=group_uuid)
     return result.id
+
+
+# WRS:extended - metadata
+def _instance_group_metadata_add(context, id, metadata, set_delete=False):
+        all_keys = metadata.keys()
+        query = _instance_group_model_get_query(context,
+                                                models.InstanceGroupMetadata,
+                                                id)
+        if set_delete:
+            query.filter(~models.InstanceGroupMetadata.key.in_(all_keys)).\
+                    soft_delete(synchronize_session=False)
+
+        query = query.filter(models.InstanceGroupMetadata.key.in_(all_keys))
+        already_existing_keys = set()
+        for meta_ref in query.all():
+            key = meta_ref.key
+            meta_ref['value'] = metadata[key]
+            already_existing_keys.add(key)
+
+        for key, value in metadata.items():
+            if key in already_existing_keys:
+                continue
+            meta_ref = models.InstanceGroupMetadata()
+            meta_ref.update({'key': key,
+                             'value': value,
+                             'group_id': id})
+            context.session.add(meta_ref)
+
+        return metadata
+
+
+# WRS:extended - metadata
+@pick_context_manager_writer
+def instance_group_metadata_add(context, group_uuid, metadata,
+                                set_delete=False):
+    id = _instance_group_id(context, group_uuid)
+    return _instance_group_metadata_add(context, id, metadata,
+                                        set_delete=set_delete)
+
+
+# WRS:extended - metadata
+@pick_context_manager_writer
+def instance_group_metadata_delete(context, group_uuid, key):
+    id = _instance_group_id(context, group_uuid)
+    count = _instance_group_model_get_query(context,
+                                      models.InstanceGroupMetadata,
+                                      models.InstanceGroupMetadata.group_id,
+                                      id).\
+                filter_by(key=key).\
+                soft_delete()
+    if count == 0:
+        raise exception.InstanceGroupMetadataNotFound(group_uuid=group_uuid,
+                                                      metadata_key=key)
 
 
 def _instance_group_members_add(context, id, members, set_delete=False):

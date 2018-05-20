@@ -13,11 +13,14 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 #
+# Copyright (c) 2016-2017 Wind River Systems, Inc.
+#
 
 """
 Test the base rpc API.
 """
 
+import mock
 from nova import baserpc
 from nova.compute import rpcapi as compute_rpcapi
 import nova.conf
@@ -29,7 +32,9 @@ CONF = nova.conf.CONF
 
 class BaseAPITestCase(test.TestCase):
 
-    def setUp(self):
+    # WRS: mock out server group messaging
+    @mock.patch('nova.compute.cgcs_messaging.CGCSMessaging._do_setup')
+    def setUp(self, mock_do_setup):
         super(BaseAPITestCase, self).setUp()
         self.user_id = 'fake'
         self.project_id = 'fake'

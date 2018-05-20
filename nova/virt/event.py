@@ -11,6 +11,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2013-2017 Wind River Systems, Inc.
+#
 
 """
 Asynchronous event notifications from virtualization drivers.
@@ -29,6 +32,8 @@ EVENT_LIFECYCLE_STOPPED = 1
 EVENT_LIFECYCLE_PAUSED = 2
 EVENT_LIFECYCLE_RESUMED = 3
 EVENT_LIFECYCLE_SUSPENDED = 4
+# WRS: add crashed event
+EVENT_LIFECYCLE_CRASHED = 5
 
 NAMES = {
     EVENT_LIFECYCLE_STARTED: _('Started'),
@@ -36,6 +41,7 @@ NAMES = {
     EVENT_LIFECYCLE_PAUSED: _('Paused'),
     EVENT_LIFECYCLE_RESUMED: _('Resumed'),
     EVENT_LIFECYCLE_SUSPENDED: _('Suspended'),
+    EVENT_LIFECYCLE_CRASHED: _('Crashed')
 }
 
 

@@ -12,6 +12,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2016-2017 Wind River Systems, Inc.
+#
 
 import base64
 import inspect
@@ -28,6 +31,7 @@ from oslo_utils import imageutils
 from oslo_utils import units
 from oslo_utils import uuidutils
 
+from nova.compute import utils as compute_utils
 import nova.conf
 from nova import context
 from nova import exception
@@ -35,6 +39,7 @@ from nova import objects
 from nova import test
 from nova.tests.unit import fake_processutils
 from nova.tests.unit.virt.libvirt import fake_libvirt_utils
+from nova import utils
 from nova.virt.image import model as imgmodel
 from nova.virt import images
 from nova.virt.libvirt import config as vconfig
@@ -656,13 +661,18 @@ class LvmTestCase(_ImageTestCase, test.NoDBTestCase):
         self.LV = '%s_%s' % (self.INSTANCE['uuid'], self.NAME)
         self.PATH = os.path.join('/dev', self.VG, self.LV)
 
+    # WRS: mock out disk concurrency sema
+    @mock.patch.object(utils, 'disk_op_sema')
     @mock.patch.object(imagebackend.lvm, 'create_volume')
     @mock.patch.object(imagebackend.disk, 'get_disk_size',
                        return_value=TEMPLATE_SIZE)
     @mock.patch.object(imagebackend.utils, 'execute')
-    def _create_image(self, sparse, mock_execute, mock_get, mock_create):
+    def _create_image(self, sparse, mock_execute, mock_get, mock_create,
+                      mock_disk_op_sema):
         fn = mock.MagicMock()
-        cmd = ('qemu-img', 'convert', '-t', 'none', '-O', 'raw',
+        # WRS: add ionice option to qemu-img
+        cmd = ('ionice', '-c2', '-n4',
+               'qemu-img', 'convert', '-t', 'none', '-O', 'raw',
                self.TEMPLATE_PATH, self.PATH)
 
         image = self.image_class(self.INSTANCE, self.NAME)
@@ -689,16 +699,20 @@ class LvmTestCase(_ImageTestCase, test.NoDBTestCase):
                                             self.SIZE, sparse=sparse)
         fn.assert_called_once_with(target=self.PATH, ephemeral_size=None)
 
+    # WRS: mock out disk concurrency sema
+    @mock.patch.object(utils, 'disk_op_sema')
     @mock.patch.object(imagebackend.disk, 'resize2fs')
     @mock.patch.object(imagebackend.lvm, 'create_volume')
     @mock.patch.object(imagebackend.disk, 'get_disk_size',
                        return_value=TEMPLATE_SIZE)
     @mock.patch.object(imagebackend.utils, 'execute')
     def _create_image_resize(self, sparse, mock_execute, mock_get,
-                             mock_create, mock_resize):
+                             mock_create, mock_resize, mock_disk_op_sema):
         fn = mock.MagicMock()
         fn(target=self.TEMPLATE_PATH)
-        cmd = ('qemu-img', 'convert', '-t', 'none', '-O', 'raw',
+        # WRS: add ionice option to qemu-img
+        cmd = ('ionice', '-c2', '-n4',
+               'qemu-img', 'convert', '-t', 'none', '-O', 'raw',
                self.TEMPLATE_PATH, self.PATH)
         image = self.image_class(self.INSTANCE, self.NAME)
         image.create_image(fn, self.TEMPLATE_PATH, self.SIZE)
@@ -927,8 +941,11 @@ class EncryptedLvmTestCase(_ImageTestCase, test.NoDBTestCase):
             fn = mock.Mock()
 
             image = self.image_class(self.INSTANCE, self.NAME)
-            image.create_image(fn, self.TEMPLATE_PATH, self.TEMPLATE_SIZE,
-                context=self.CONTEXT)
+            # WRS: mock out disk concurrency sema
+            with mock.patch.object(utils, 'disk_op_sema',
+                               new_callable=compute_utils.UnlimitedSemaphore):
+                image.create_image(fn, self.TEMPLATE_PATH, self.TEMPLATE_SIZE,
+                    context=self.CONTEXT)
 
             fn.assert_called_with(context=self.CONTEXT,
                 target=self.TEMPLATE_PATH)
@@ -942,7 +959,9 @@ class EncryptedLvmTestCase(_ImageTestCase, test.NoDBTestCase):
                 CONF.ephemeral_storage_encryption.cipher,
                 CONF.ephemeral_storage_encryption.key_size,
                 self.KEY)
-            cmd = ('qemu-img',
+            # WRS: add ionice option to qemu-img
+            cmd = ('ionice', '-c2', '-n4',
+                   'qemu-img',
                    'convert',
                    '-t', 'none',
                    '-O',
@@ -1006,8 +1025,11 @@ class EncryptedLvmTestCase(_ImageTestCase, test.NoDBTestCase):
             fn = mock.Mock()
 
             image = self.image_class(self.INSTANCE, self.NAME)
-            image.create_image(fn, self.TEMPLATE_PATH, self.SIZE,
-                context=self.CONTEXT)
+            # WRS: mock out disk concurrency sema
+            with mock.patch.object(utils, 'disk_op_sema',
+                               new_callable=compute_utils.UnlimitedSemaphore):
+                image.create_image(fn, self.TEMPLATE_PATH, self.SIZE,
+                    context=self.CONTEXT)
 
             fn.assert_called_with(context=self.CONTEXT,
                                   target=self.TEMPLATE_PATH)
@@ -1023,7 +1045,9 @@ class EncryptedLvmTestCase(_ImageTestCase, test.NoDBTestCase):
                  CONF.ephemeral_storage_encryption.cipher,
                  CONF.ephemeral_storage_encryption.key_size,
                  self.KEY)
-            cmd = ('qemu-img',
+            # WRS: add ionice & no cache options to qemu-img
+            cmd = ('ionice', '-c2', '-n4',
+                   'qemu-img',
                    'convert',
                    '-t', 'none',
                    '-O',
@@ -1355,9 +1379,9 @@ class RbdTestCase(_ImageTestCase, test.NoDBTestCase):
         image.create_image(fn, self.TEMPLATE_PATH, None)
 
         rbd_name = "%s_%s" % (self.INSTANCE['uuid'], self.NAME)
-        cmd = ('rbd', 'import', '--pool', self.POOL, self.TEMPLATE_PATH,
-               rbd_name, '--image-format=2', '--id', self.USER,
-               '--conf', self.CONF)
+        cmd = ('qemu-img', 'convert', '-O', 'raw', self.TEMPLATE_PATH,
+               'rbd:{}/{}:id={}:conf={}'.format(
+                   self.POOL, rbd_name, self.USER, self.CONF))
         self.assertEqual(fake_processutils.fake_execute_get_log(),
                          [' '.join(cmd)])
         mock_exists.assert_has_calls([mock.call(), mock.call()])
@@ -1381,9 +1405,9 @@ class RbdTestCase(_ImageTestCase, test.NoDBTestCase):
         mock_exists.return_value = False
         mock_get.return_value = self.SIZE
         rbd_name = "%s_%s" % (self.INSTANCE['uuid'], self.NAME)
-        cmd = ('rbd', 'import', '--pool', self.POOL, self.TEMPLATE_PATH,
-               rbd_name, '--image-format=2', '--id', self.USER,
-               '--conf', self.CONF)
+        cmd = ('qemu-img', 'convert', '-O', 'raw', self.TEMPLATE_PATH,
+               'rbd:{}/{}:id={}:conf={}'.format(
+                   self.POOL, rbd_name, self.USER, self.CONF))
 
         image.create_image(fn, self.TEMPLATE_PATH, full_size)
 

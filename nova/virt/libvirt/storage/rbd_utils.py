@@ -315,19 +315,20 @@ class RBDDriver(object):
     def import_image(self, base, name):
         """Import RBD volume from image file.
 
-        Uses the command line import instead of librbd since rbd import
-        command detects zeroes to preserve sparseness in the image.
+        Uses the qemu-img convert to import image into rbd and convert
+        it to raw if necessary. (see CGTS-8596)
 
         :base: Path to image file
         :name: Name of RBD volume
         """
-        args = ['--pool', self.pool, base, name]
-        # Image format 2 supports cloning,
-        # in stable ceph rbd release default is not 2,
-        # we need to use it explicitly.
-        args += ['--image-format=2']
-        args += self.ceph_args()
-        utils.execute('rbd', 'import', *args)
+        args = ['-O', 'raw', base]
+        target = 'rbd:{}/{}'.format(self.pool, name)
+        if self.rbd_user:
+            target = '{}:id={}'.format(target, self.rbd_user)
+        if self.ceph_conf:
+            target = '{}:conf={}'.format(target, self.ceph_conf)
+        args.append(target)
+        utils.execute('qemu-img', 'convert', *args)
 
     def _destroy_volume(self, client, volume, pool=None):
         """Destroy an RBD volume, retrying as needed.

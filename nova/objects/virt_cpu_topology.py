@@ -15,7 +15,8 @@ from nova.objects import fields
 
 
 @base.NovaObjectRegistry.register
-class VirtCPUTopology(base.NovaObject):
+class VirtCPUTopology(base.NovaObject,
+                      base.NovaObjectDictCompat):
     # Version 1.0: Initial version
     VERSION = '1.0'
 

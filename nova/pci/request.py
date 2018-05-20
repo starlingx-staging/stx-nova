@@ -88,6 +88,10 @@ _ALIAS_SCHEMA = {
             "type": "string",
             "pattern": utils.PCI_VENDOR_PATTERN,
         },
+        "class_id": {
+            "type": "string",
+            "pattern": utils.PCI_CLASS_PATTERN,
+        },
         "device_type": {
             "type": "string",
             "enum": _ALIAS_DEV_TYPE,
@@ -103,22 +107,37 @@ def _get_alias_from_config():
     aliases = {}  # map alias name to alias spec list
     try:
         for jsonspecs in jaliases:
-            spec = jsonutils.loads(jsonspecs)
-            jsonschema.validate(spec, _ALIAS_SCHEMA)
-            # It should keep consistent behaviour in configuration
-            # and extra specs to call strip() function.
-            name = spec.pop("name").strip()
-            dev_type = spec.pop('device_type', None)
-            if dev_type:
-                spec['dev_type'] = dev_type
-            if name not in aliases:
-                aliases[name] = [spec]
-            else:
-                if aliases[name][0]["dev_type"] == spec["dev_type"]:
-                    aliases[name].append(spec)
+            # WRS: Align with packstack and pci_passthrough_whitelist.  Support
+            # list of pci_alias.
+            try:
+                spec = jsonutils.loads(jsonspecs)
+            except ValueError:
+                raise exception.PciInvalidAlias(
+                          reason=_("Invalid entry: '%s'") % jsonspecs)
+            if isinstance(spec, dict):
+                spec = [spec]
+            elif not isinstance(spec, list):
+                raise exception.PciInvalidAlias(
+                          reason=_("Invalid entry: '%s'; "
+                                   "Expecting list or dict") % jsonspecs)
+
+            for s in spec:
+                jsonschema.validate(s, _ALIAS_SCHEMA)
+                # It should keep consistent behaviour in configuration
+                # and extra specs to call strip() function.
+                name = s.pop("name").strip()
+                dev_type = s.pop('device_type', None)
+                if dev_type:
+                    s['dev_type'] = dev_type
+                if name not in aliases:
+                    aliases[name] = [s]
                 else:
-                    reason = _("Device type mismatch for alias '%s'") % name
-                    raise exception.PciInvalidAlias(reason=reason)
+                    if aliases[name][0]["dev_type"] == s["dev_type"]:
+                        aliases[name].append(s)
+                    else:
+                        reason = (_("Device type mismatch for alias '%s'") %
+                                  name)
+                        raise exception.PciInvalidAlias(reason=reason)
 
     except exception.PciInvalidAlias:
         raise

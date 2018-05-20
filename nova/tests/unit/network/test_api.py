@@ -20,6 +20,8 @@ import itertools
 import uuid
 
 import mock
+from oslo_concurrency import lockutils
+import threading
 
 from nova.compute import flavors
 from nova import context
@@ -58,6 +60,11 @@ class ApiTestCase(test.TestCase):
         self.network_api = network.API()
         self.context = context.RequestContext('fake-user',
                                               fakes.FAKE_PROJECT_ID)
+
+        # WRS: stub out lockutils.lock since it does not have 'fair' option
+        def fake_lock(target, fair=None):
+            return threading.Semaphore()
+        self.stubs.Set(lockutils, 'lock', fake_lock)
 
     @mock.patch('nova.objects.NetworkList.get_all')
     def test_get_all(self, mock_get_all):
@@ -570,6 +577,11 @@ class TestUpdateInstanceCache(test.NoDBTestCase):
         self.nw_info = network_model.NetworkInfo(vifs)
         self.nw_json = fields.NetworkModel.to_primitive(self, 'network_info',
                                                         self.nw_info)
+
+        # WRS: stub out lockutils.lock since it does not have 'fair' option
+        def fake_lock(target, fair=None):
+            return threading.Semaphore()
+        self.stubs.Set(lockutils, 'lock', fake_lock)
 
     def test_update_nw_info_none(self, db_mock, api_mock):
         api_mock._get_instance_nw_info.return_value = self.nw_info

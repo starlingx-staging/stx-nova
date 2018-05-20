@@ -9,7 +9,11 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2016-2017 Wind River Systems, Inc.
+#
 
+import copy
 import mock
 import oslo_messaging as messaging
 import six
@@ -51,6 +55,7 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
         self.disk_over_commit = "doc"
         self.migration = objects.Migration()
         self.fake_spec = objects.RequestSpec()
+        self.instance.flavor = objects.Flavor()
         self._generate_task()
 
     def _generate_task(self):
@@ -95,12 +100,10 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
         with test.nested(
             mock.patch.object(self.task, '_check_host_is_up'),
             mock.patch.object(self.task, '_find_destination'),
-            mock.patch.object(self.task.compute_rpcapi, 'live_migration'),
-            mock.patch.object(self.migration, 'save')
-        ) as (mock_check, mock_find, mock_mig, mock_save):
-            mock_find.return_value = "found_host"
+            mock.patch.object(self.task.compute_rpcapi, 'live_migration')
+        ) as (mock_check, mock_find, mock_mig):
+            mock_find.return_value = ("found_host", None)
             mock_mig.return_value = "bob"
-
             self.assertEqual("bob", self.task.execute())
             mock_check.assert_called_once_with(self.instance_host)
             mock_find.assert_called_once_with()
@@ -111,8 +114,6 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
                 block_migration=self.block_migration,
                 migration=self.migration,
                 migrate_data=None)
-            self.assertTrue(mock_save.called)
-            self.assertEqual('found_host', self.migration.dest_compute)
 
     def test_check_instance_is_active_passes_when_paused(self):
         self.task.instance['power_state'] = power_state.PAUSED
@@ -179,7 +180,8 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
                           mock.call(self.destination)],
                          mock_get_info.call_args_list)
         mock_check.assert_called_once_with(self.context, self.instance,
-            self.destination, self.block_migration, self.disk_over_commit)
+            self.destination, self.block_migration, self.disk_over_commit,
+            migration=self.migration, limits=self.task.sched_limits)
 
     def test_check_requested_destination_fails_with_same_dest(self):
         self.task.destination = "same"
@@ -277,6 +279,7 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
         self.assertIn('across cells', six.text_type(ex))
 
     def test_find_destination_works(self):
+        self.instance.numa_topology = None
         self.mox.StubOutWithMock(utils, 'get_image_from_system_metadata')
         self.mox.StubOutWithMock(scheduler_utils, 'setup_instance_group')
         self.mox.StubOutWithMock(objects.RequestSpec,
@@ -286,26 +289,97 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
         self.mox.StubOutWithMock(self.task,
                 '_check_compatible_with_source_hypervisor')
         self.mox.StubOutWithMock(self.task, '_call_livem_checks_on_host')
+        self.mox.StubOutWithMock(self.instance, 'is_volume_backed')
 
         utils.get_image_from_system_metadata(
             self.instance.system_metadata).AndReturn("image")
         scheduler_utils.setup_instance_group(
             self.context, self.fake_spec)
         self.fake_spec.reset_forced_destinations()
+        self.instance.is_volume_backed().AndReturn(False)
         self.task.scheduler_client.select_destinations(
             self.context, self.fake_spec, [self.instance.uuid]).AndReturn(
-                        [{'host': 'host1'}])
+                [{'host': 'host1',
+                  'nodename': 'node1',
+                  'limits': 'fake-limits'}])
         self.task._check_compatible_with_source_hypervisor("host1")
-        self.task._call_livem_checks_on_host("host1")
+        self.task._call_livem_checks_on_host("host1", limits='fake-limits')
 
         self.mox.ReplayAll()
-        self.assertEqual("host1", self.task._find_destination())
+        self.assertEqual(("host1", 'fake-limits'),
+                         self.task._find_destination())
 
         # Make sure the request_spec was updated to include the cell
         # mapping.
         self.assertIsNotNone(self.fake_spec.requested_destination.cell)
         # Make sure the spec was updated to include the project_id.
         self.assertEqual(self.fake_spec.project_id, self.instance.project_id)
+
+    # WRS: add testcase for server groups to test that _find_destination()
+    # will update RequestSpec with latest instance_group details.
+    def test_find_destination_works_with_instance_group(self):
+        self.instance.numa_topology = None
+        self.fake_spec.instance_group = objects.InstanceGroup(members=["uuid"])
+        self.instance_uuid = self.instance.uuid = "uuid-2"
+        updated_instance_group = objects.InstanceGroup(members=["uuid",
+                                                                "uuid-2"],
+                                   hosts=['host1', 'host2'],
+                                   policies=['anti-affinity'],
+                                   metadetails={'wrs-sg:best_effort': 'false'})
+        expected_instance_group = copy.deepcopy(updated_instance_group)
+        expected_instance_group.hosts = ['host1', 'host2', 'host3']
+        migration = objects.Migration(source_compute='host1',
+                                      dest_compute='host3')
+        migrations = objects.MigrationList(objects=[migration])
+
+        self.mox.StubOutWithMock(utils, 'get_image_from_system_metadata')
+        self.mox.StubOutWithMock(scheduler_utils, 'setup_instance_group')
+        self.mox.StubOutWithMock(objects.RequestSpec,
+                                 'reset_forced_destinations')
+        self.mox.StubOutWithMock(objects.InstanceGroup,
+                                 'get_by_instance_uuid')
+        self.mox.StubOutWithMock(objects.MigrationList,
+                                 'get_by_filters')
+        filters = {
+            'migration_type': 'live-migration',
+            'instance_uuid': 'uuid',
+            'status': ['queued', 'accepted', 'pre-migrating',
+                       'preparing', 'running']
+        }
+
+        self.mox.StubOutWithMock(self.task,
+                                 '_check_compatible_with_source_hypervisor')
+        self.mox.StubOutWithMock(self.task, '_call_livem_checks_on_host')
+        self.mox.StubOutWithMock(self.instance, 'is_volume_backed')
+
+        def fake_select_destinations(context, request_spec, instance_uuids):
+            self.assertEqual(expected_instance_group.members,
+                             request_spec.instance_group.members)
+            self.assertEqual(expected_instance_group.hosts,
+                             request_spec.instance_group.hosts)
+            return [{'host': 'host1', 'nodename': 'node1',
+                     'limits': 'fake-limits'}]
+
+        self.instance.is_volume_backed().AndReturn(False)
+        self.task.scheduler_client.select_destinations = \
+                                                      fake_select_destinations
+        utils.get_image_from_system_metadata(
+            self.instance.system_metadata).AndReturn("image")
+        scheduler_utils.setup_instance_group(
+            self.context, self.fake_spec)
+        self.fake_spec.reset_forced_destinations()
+        objects.InstanceGroup.get_by_instance_uuid(
+            self.context, self.instance_uuid).AndReturn(updated_instance_group)
+        objects.MigrationList.get_by_filters(
+            self.context, filters).AndReturn(migrations)
+
+        self.task._check_compatible_with_source_hypervisor("host1")
+        self.task._call_livem_checks_on_host("host1", limits='fake-limits')
+
+        self.mox.ReplayAll()
+        self.assertEqual(("host1", 'fake-limits'),
+                         self.task._find_destination())
+        self.mox.VerifyAll()
 
     def test_find_destination_works_with_no_request_spec(self):
         task = live_migrate.LiveMigrationTask(
@@ -318,6 +392,7 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
         self.instance.numa_topology = None
         self.instance.pci_requests = None
 
+        @mock.patch('nova.objects.Instance.is_volume_backed')
         @mock.patch.object(task, '_call_livem_checks_on_host')
         @mock.patch.object(task, '_check_compatible_with_source_hypervisor')
         @mock.patch.object(task.scheduler_client, 'select_destinations')
@@ -325,12 +400,16 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
         @mock.patch.object(scheduler_utils, 'setup_instance_group')
         @mock.patch.object(utils, 'get_image_from_system_metadata')
         def do_test(get_image, setup_ig, from_components, select_dest,
-                    check_compat, call_livem_checks):
+                    check_compat, call_livem_checks, is_volume_backed):
             get_image.return_value = "image"
             from_components.return_value = another_spec
-            select_dest.return_value = [{'host': 'host1'}]
+            select_dest.return_value = [{'host': 'host1',
+                                         'nodename': 'node1',
+                                         'limits': 'fake-limits'}]
+            is_volume_backed.return_value = False
 
-            self.assertEqual("host1", task._find_destination())
+            self.assertEqual(("host1", 'fake-limits'),
+                             task._find_destination())
 
             get_image.assert_called_once_with(self.instance.system_metadata)
             setup_ig.assert_called_once_with(self.context, another_spec)
@@ -340,11 +419,13 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
             # mapping.
             self.assertIsNotNone(another_spec.requested_destination.cell)
             check_compat.assert_called_once_with("host1")
-            call_livem_checks.assert_called_once_with("host1")
+            call_livem_checks.assert_called_once_with("host1",
+                                                      limits='fake-limits')
         do_test()
 
     def test_find_destination_no_image_works(self):
         self.instance['image_ref'] = ''
+        self.instance.numa_topology = None
 
         self.mox.StubOutWithMock(scheduler_utils, 'setup_instance_group')
         self.mox.StubOutWithMock(self.task.scheduler_client,
@@ -352,18 +433,24 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
         self.mox.StubOutWithMock(self.task,
                 '_check_compatible_with_source_hypervisor')
         self.mox.StubOutWithMock(self.task, '_call_livem_checks_on_host')
+        self.mox.StubOutWithMock(self.instance, 'is_volume_backed')
 
         scheduler_utils.setup_instance_group(self.context, self.fake_spec)
+        self.instance.is_volume_backed().AndReturn(False)
         self.task.scheduler_client.select_destinations(self.context,
                 self.fake_spec, [self.instance.uuid]).AndReturn(
-                        [{'host': 'host1'}])
+                        [{'host': 'host1',
+                          'nodename': 'node1',
+                          'limits': 'fake-limits'}])
         self.task._check_compatible_with_source_hypervisor("host1")
-        self.task._call_livem_checks_on_host("host1")
+        self.task._call_livem_checks_on_host("host1", limits='fake-limits')
 
         self.mox.ReplayAll()
-        self.assertEqual("host1", self.task._find_destination())
+        self.assertEqual(("host1", 'fake-limits'),
+                         self.task._find_destination())
 
     def _test_find_destination_retry_hypervisor_raises(self, error):
+        self.instance.numa_topology = None
         self.mox.StubOutWithMock(utils, 'get_image_from_system_metadata')
         self.mox.StubOutWithMock(scheduler_utils, 'setup_instance_group')
         self.mox.StubOutWithMock(self.task.scheduler_client,
@@ -371,28 +458,35 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
         self.mox.StubOutWithMock(self.task,
                 '_check_compatible_with_source_hypervisor')
         self.mox.StubOutWithMock(self.task, '_call_livem_checks_on_host')
+        self.mox.StubOutWithMock(self.instance, 'is_volume_backed')
 
         utils.get_image_from_system_metadata(
             self.instance.system_metadata).AndReturn("image")
         scheduler_utils.setup_instance_group(self.context, self.fake_spec)
+        self.instance.is_volume_backed().AndReturn(False)
         self.task.scheduler_client.select_destinations(self.context,
                 self.fake_spec, [self.instance.uuid]).AndReturn(
-                        [{'host': 'host1', 'nodename': 'node1'}])
+                        [{'host': 'host1', 'nodename': 'node1',
+                          'limits': 'fake-limits'}])
         self.task._check_compatible_with_source_hypervisor("host1")\
                 .AndRaise(error)
 
+        self.instance.is_volume_backed().AndReturn(False)
         self.task.scheduler_client.select_destinations(self.context,
                 self.fake_spec, [self.instance.uuid]).AndReturn(
-                        [{'host': 'host2'}])
+                        [{'host': 'host2',
+                          'nodename': 'node2',
+                          'limits': 'fake-limits'}])
         self.task._check_compatible_with_source_hypervisor("host2")
-        self.task._call_livem_checks_on_host("host2")
+        self.task._call_livem_checks_on_host("host2", limits='fake-limits')
 
         self.mox.ReplayAll()
         with mock.patch.object(self.task,
                                '_remove_host_allocations') as remove_allocs:
-            self.assertEqual("host2", self.task._find_destination())
+            self.assertEqual(("host2", 'fake-limits'),
+                             self.task._find_destination())
         # Should have removed allocations for the first host.
-        remove_allocs.assert_called_once_with('host1', 'node1')
+        remove_allocs.assert_called_once_with('host1', 'node1', self.fake_spec)
 
     def test_find_destination_retry_with_old_hypervisor(self):
         self._test_find_destination_retry_hypervisor_raises(
@@ -402,8 +496,9 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
         self._test_find_destination_retry_hypervisor_raises(
                 exception.InvalidHypervisorType)
 
-    def test_find_destination_retry_with_invalid_livem_checks(self):
+    def _test_find_destination_retry_livem_checks_fail(self, error):
         self.flags(migrate_max_retries=1)
+        self.instance.numa_topology = None
         self.mox.StubOutWithMock(utils, 'get_image_from_system_metadata')
         self.mox.StubOutWithMock(scheduler_utils, 'setup_instance_group')
         self.mox.StubOutWithMock(self.task.scheduler_client,
@@ -411,32 +506,41 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
         self.mox.StubOutWithMock(self.task,
                 '_check_compatible_with_source_hypervisor')
         self.mox.StubOutWithMock(self.task, '_call_livem_checks_on_host')
+        self.mox.StubOutWithMock(self.instance, 'is_volume_backed')
 
         utils.get_image_from_system_metadata(
             self.instance.system_metadata).AndReturn("image")
         scheduler_utils.setup_instance_group(self.context, self.fake_spec)
+        self.instance.is_volume_backed().AndReturn(False)
         self.task.scheduler_client.select_destinations(self.context,
                 self.fake_spec, [self.instance.uuid]).AndReturn(
-                        [{'host': 'host1', 'nodename': 'node1'}])
+                        [{'host': 'host1', 'nodename': 'node1',
+                          'limits': 'fake-limits'}])
         self.task._check_compatible_with_source_hypervisor("host1")
-        self.task._call_livem_checks_on_host("host1")\
-                .AndRaise(exception.Invalid)
+        self.task._call_livem_checks_on_host(
+            "host1", limits='fake-limits').AndRaise(error)
 
+        self.instance.is_volume_backed().AndReturn(False)
         self.task.scheduler_client.select_destinations(self.context,
                 self.fake_spec, [self.instance.uuid]).AndReturn(
-                        [{'host': 'host2'}])
+                        [{'host': 'host2',
+                          'nodename': 'node2',
+                          'limits': 'fake-limits'}])
         self.task._check_compatible_with_source_hypervisor("host2")
-        self.task._call_livem_checks_on_host("host2")
+        self.task._call_livem_checks_on_host(
+            "host2", limits='fake-limits')
 
         self.mox.ReplayAll()
         with mock.patch.object(self.task,
                                '_remove_host_allocations') as remove_allocs:
-            self.assertEqual("host2", self.task._find_destination())
+            self.assertEqual(("host2", 'fake-limits'),
+                             self.task._find_destination())
         # Should have removed allocations for the first host.
-        remove_allocs.assert_called_once_with('host1', 'node1')
+        remove_allocs.assert_called_once_with('host1', 'node1', self.fake_spec)
 
     def test_find_destination_retry_with_failed_migration_pre_checks(self):
         self.flags(migrate_max_retries=1)
+        self.instance.numa_topology = None
         self.mox.StubOutWithMock(utils, 'get_image_from_system_metadata')
         self.mox.StubOutWithMock(scheduler_utils, 'setup_instance_group')
         self.mox.StubOutWithMock(self.task.scheduler_client,
@@ -444,45 +548,64 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
         self.mox.StubOutWithMock(self.task,
                 '_check_compatible_with_source_hypervisor')
         self.mox.StubOutWithMock(self.task, '_call_livem_checks_on_host')
+        self.mox.StubOutWithMock(self.instance, 'is_volume_backed')
 
         utils.get_image_from_system_metadata(
             self.instance.system_metadata).AndReturn("image")
         scheduler_utils.setup_instance_group(self.context, self.fake_spec)
+        self.instance.is_volume_backed().AndReturn(False)
         self.task.scheduler_client.select_destinations(self.context,
                 self.fake_spec, [self.instance.uuid]).AndReturn(
-                        [{'host': 'host1', 'nodename': 'node1'}])
+                        [{'host': 'host1', 'nodename': 'node1',
+                          'limits': 'fake-limits'}])
         self.task._check_compatible_with_source_hypervisor("host1")
-        self.task._call_livem_checks_on_host("host1")\
-                .AndRaise(exception.MigrationPreCheckError("reason"))
+        self.task._call_livem_checks_on_host(
+            "host1", limits='fake-limits').AndRaise(
+                exception.MigrationPreCheckError("reason"))
 
+        self.instance.is_volume_backed().AndReturn(False)
         self.task.scheduler_client.select_destinations(self.context,
                 self.fake_spec, [self.instance.uuid]).AndReturn(
-                        [{'host': 'host2'}])
+                        [{'host': 'host2',
+                          'nodename': 'node2',
+                          'limits': 'fake-limits'}])
         self.task._check_compatible_with_source_hypervisor("host2")
-        self.task._call_livem_checks_on_host("host2")
+        self.task._call_livem_checks_on_host("host2", limits='fake-limits')
 
         self.mox.ReplayAll()
         with mock.patch.object(self.task,
                                '_remove_host_allocations') as remove_allocs:
-            self.assertEqual("host2", self.task._find_destination())
+            self.assertEqual(("host2", 'fake-limits'),
+                             self.task._find_destination())
         # Should have removed allocations for the first host.
-        remove_allocs.assert_called_once_with('host1', 'node1')
+        remove_allocs.assert_called_once_with('host1', 'node1', self.fake_spec)
+
+    def test_find_destination_retry_with_invalid_livem_checks(self):
+        self._test_find_destination_retry_livem_checks_fail(exception.Invalid)
+
+    def test_find_destination_retry_with_failed_mig_pre_checks_fail(self):
+        self._test_find_destination_retry_livem_checks_fail(
+            exception.MigrationPreCheckError("reason"))
 
     def test_find_destination_retry_exceeds_max(self):
         self.flags(migrate_max_retries=0)
+        self.instance.numa_topology = None
         self.mox.StubOutWithMock(utils, 'get_image_from_system_metadata')
         self.mox.StubOutWithMock(scheduler_utils, 'setup_instance_group')
         self.mox.StubOutWithMock(self.task.scheduler_client,
                                  'select_destinations')
         self.mox.StubOutWithMock(self.task,
                 '_check_compatible_with_source_hypervisor')
+        self.mox.StubOutWithMock(self.instance, 'is_volume_backed')
 
         utils.get_image_from_system_metadata(
             self.instance.system_metadata).AndReturn("image")
         scheduler_utils.setup_instance_group(self.context, self.fake_spec)
+        self.instance.is_volume_backed().AndReturn(False)
         self.task.scheduler_client.select_destinations(self.context,
                 self.fake_spec, [self.instance.uuid]).AndReturn(
-                        [{'host': 'host1', 'nodename': 'node1'}])
+                        [{'host': 'host1', 'nodename': 'node1',
+                          'limits': 'fake-limits'}])
         self.task._check_compatible_with_source_hypervisor("host1")\
                 .AndRaise(exception.DestinationHypervisorTooOld)
 
@@ -498,16 +621,20 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
             self.assertEqual('failed', self.task.migration.status)
             save_mock.assert_called_once_with()
             # Should have removed allocations for the first host.
-            remove_allocs.assert_called_once_with('host1', 'node1')
+            remove_allocs.assert_called_once_with('host1', 'node1',
+                                                  self.fake_spec)
 
     def test_find_destination_when_runs_out_of_hosts(self):
+        self.instance.numa_topology = None
         self.mox.StubOutWithMock(utils, 'get_image_from_system_metadata')
         self.mox.StubOutWithMock(scheduler_utils, 'setup_instance_group')
         self.mox.StubOutWithMock(self.task.scheduler_client,
                                  'select_destinations')
+        self.mox.StubOutWithMock(self.instance, 'is_volume_backed')
         utils.get_image_from_system_metadata(
             self.instance.system_metadata).AndReturn("image")
         scheduler_utils.setup_instance_group(self.context, self.fake_spec)
+        self.instance.is_volume_backed().AndReturn(False)
         self.task.scheduler_client.select_destinations(self.context,
                 self.fake_spec, [self.instance.uuid]).AndRaise(
                         exception.NoValidHost(reason=""))
@@ -515,13 +642,16 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
         self.mox.ReplayAll()
         self.assertRaises(exception.NoValidHost, self.task._find_destination)
 
+    @mock.patch('nova.objects.Instance.is_volume_backed')
     @mock.patch("nova.utils.get_image_from_system_metadata")
     @mock.patch("nova.scheduler.utils.build_request_spec")
     @mock.patch("nova.scheduler.utils.setup_instance_group")
     @mock.patch("nova.objects.RequestSpec.from_primitives")
     def test_find_destination_with_remoteError(self,
         m_from_primitives, m_setup_instance_group,
-        m_build_request_spec, m_get_image_from_system_metadata):
+        m_build_request_spec, m_get_image_from_system_metadata,
+        m_is_volume_backed):
+        self.instance.numa_topology = None
         m_get_image_from_system_metadata.return_value = {'properties': {}}
         m_build_request_spec.return_value = {}
         fake_spec = objects.RequestSpec()
@@ -573,5 +703,5 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
         with mock.patch.object(
                 self.task.scheduler_client.reportclient,
                 'remove_provider_from_instance_allocation') as remove_provider:
-            self.task._remove_host_allocations('host', 'node')
+            self.task._remove_host_allocations('host', 'node', self.fake_spec)
         remove_provider.assert_not_called()

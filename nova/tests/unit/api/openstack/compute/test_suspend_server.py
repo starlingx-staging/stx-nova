@@ -41,17 +41,32 @@ class SuspendServerTestsV21(admin_only_action_common.CommonTests):
         self.mox.StubOutWithMock(self.compute_api, 'get')
 
     def test_suspend_resume(self):
-        self._test_actions(['_suspend', '_resume'])
+        # WRS: suspend operation stubbed for pause
+        method_translations = {'_suspend': 'pause',
+                               '_resume': 'unpause'}
+        self._test_actions(['_suspend', '_resume'],
+                           method_translations=method_translations)
 
     def test_suspend_resume_with_non_existed_instance(self):
         self._test_actions_with_non_existed_instance(['_suspend', '_resume'])
 
     def test_suspend_resume_raise_conflict_on_invalid_state(self):
+        # WRS: suspend operation stubbed for pause
+        method_translations = {'_suspend': 'pause',
+                               '_resume': 'unpause'}
+        exception_args = {'_suspend': 'suspend',
+                         '_resume': 'resume'}
         self._test_actions_raise_conflict_on_invalid_state(['_suspend',
-                                                            '_resume'])
+                                                            '_resume'],
+                                method_translations=method_translations,
+                                exception_args=exception_args)
 
     def test_actions_with_locked_instance(self):
-        self._test_actions_with_locked_instance(['_suspend', '_resume'])
+        # WRS: suspend operation stubbed for pause
+        method_translations = {'_suspend': 'pause',
+                               '_resume': 'unpause'}
+        self._test_actions_with_locked_instance(['_suspend', '_resume'],
+                           method_translations=method_translations)
 
 
 class SuspendServerPolicyEnforcementV21(test.NoDBTestCase):
@@ -94,7 +109,8 @@ class SuspendServerPolicyEnforcementV21(test.NoDBTestCase):
                       "Policy doesn't allow %s to be performed." % rule_name,
                       exc.format_message())
 
-    @mock.patch('nova.compute.api.API.suspend')
+    # WRS: suspend operation stubbed for pause
+    @mock.patch('nova.compute.api.API.pause')
     @mock.patch('nova.api.openstack.common.get_instance')
     def test_suspend_overridden_policy_pass_with_same_user(self,
                                                         get_instance_mock,

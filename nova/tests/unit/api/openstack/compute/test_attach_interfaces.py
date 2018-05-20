@@ -12,6 +12,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2016-2017 Wind River Systems, Inc.
+#
 
 import mock
 from webob import exc
@@ -83,7 +86,8 @@ def fake_show_port(context, port_id, **kwargs):
 
 
 def fake_attach_interface(self, context, instance, network_id, port_id,
-                          requested_ip='192.168.1.3', tag=None):
+                          requested_ip='192.168.1.3', vif_model=None,
+                          tag=None):
     if not network_id:
         # if no network_id is given when add a port to an instance, use the
         # first default network.
@@ -222,7 +226,7 @@ class InterfaceAttachTestsV21(test.NoDBTestCase):
 
     def test_attach_interface_instance_locked(self):
         def fake_attach_interface_to_locked_server(self, context,
-            instance, network_id, port_id, requested_ip, tag=None):
+            instance, network_id, port_id, requested_ip, vif_model, tag=None):
             raise exception.InstanceIsLocked(instance_uuid=FAKE_UUID1)
 
         self.stub_out('nova.compute.api.API.attach_interface',
@@ -355,7 +359,7 @@ class InterfaceAttachTestsV21(test.NoDBTestCase):
                           body=body)
         ctxt = self.req.environ['nova.context']
         attach_mock.assert_called_once_with(ctxt, fake_instance, None,
-                                            None, None, tag=None)
+                                            None, None, 'virtio', tag=None)
         get_mock.assert_called_once_with(ctxt, FAKE_UUID1,
                                          expected_attrs=None)
 
@@ -374,7 +378,7 @@ class InterfaceAttachTestsV21(test.NoDBTestCase):
                           body=body)
         ctxt = self.req.environ['nova.context']
         attach_mock.assert_called_once_with(ctxt, fake_instance, None,
-                                            None, None, tag=None)
+                                            None, None, 'virtio', tag=None)
         get_mock.assert_called_once_with(ctxt, FAKE_UUID1,
                                          expected_attrs=None)
 
@@ -394,7 +398,7 @@ class InterfaceAttachTestsV21(test.NoDBTestCase):
                           body=body)
         ctxt = self.req.environ['nova.context']
         attach_mock.assert_called_once_with(ctxt, fake_instance, None,
-                                            None, None, tag=None)
+                                            None, None, 'virtio', tag=None)
         get_mock.assert_called_once_with(ctxt, FAKE_UUID1,
                                          expected_attrs=None)
 
@@ -410,7 +414,7 @@ class InterfaceAttachTestsV21(test.NoDBTestCase):
                           self.req, FAKE_UUID1, body={})
         ctxt = self.req.environ['nova.context']
         attach_mock.assert_called_once_with(ctxt, fake_instance, None,
-                                            None, None, tag=None)
+                                            None, None, 'virtio', tag=None)
         get_mock.assert_called_once_with(ctxt, FAKE_UUID1,
                                          expected_attrs=None)
 
@@ -429,7 +433,7 @@ class InterfaceAttachTestsV21(test.NoDBTestCase):
                           body=body)
         ctxt = self.req.environ['nova.context']
         attach_mock.assert_called_once_with(ctxt, fake_instance, None,
-                                            None, None, tag=None)
+                                            None, None, 'virtio', tag=None)
         get_mock.assert_called_once_with(ctxt, FAKE_UUID1,
                                          expected_attrs=None)
 
@@ -446,7 +450,7 @@ class InterfaceAttachTestsV21(test.NoDBTestCase):
                           self.req, FAKE_UUID1, body={})
         ctxt = self.req.environ['nova.context']
         attach_mock.assert_called_once_with(ctxt, fake_instance, None,
-                                            None, None, tag=None)
+                                            None, None, 'virtio', tag=None)
         get_mock.assert_called_once_with(ctxt, FAKE_UUID1,
                                          expected_attrs=None)
 

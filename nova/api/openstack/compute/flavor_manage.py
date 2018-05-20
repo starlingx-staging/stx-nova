@@ -9,6 +9,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2015-2017 Wind River Systems, Inc.
+#
 
 import webob
 
@@ -42,8 +45,9 @@ class FlavorManageController(wsgi.Controller):
     # NOTE(oomichi): Return 202 for backwards compatibility but should be
     # 204 as this operation complete the deletion of aggregate resource and
     # return no response body.
+    @extensions.block_during_upgrade()
     @wsgi.response(202)
-    @extensions.expected_errors((404))
+    @extensions.expected_errors((400, 404))
     @wsgi.action("delete")
     def _delete(self, req, id):
         context = req.environ['nova.context']
@@ -65,6 +69,7 @@ class FlavorManageController(wsgi.Controller):
 
     # NOTE(oomichi): Return 200 for backwards compatibility but should be 201
     # as this operation complete the creation of flavor resource.
+    @extensions.block_during_upgrade()
     @wsgi.action("create")
     @extensions.expected_errors((400, 409))
     @validation.schema(flavor_manage.create_v20, '2.0', '2.0')
@@ -99,6 +104,12 @@ class FlavorManageController(wsgi.Controller):
                                     flavorid=flavorid, swap=swap,
                                     rxtx_factor=rxtx_factor,
                                     is_public=is_public)
+
+            # WRS: set local storage backend default to local_image
+            flavor.extra_specs = {
+                'aggregate_instance_extra_specs:storage': 'local_image'}
+            flavor.save()
+
             # NOTE(gmann): For backward compatibility, non public flavor
             # access is not being added for created tenant. Ref -bug/1209101
             req.cache_db_flavor(flavor)

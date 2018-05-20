@@ -381,6 +381,10 @@ class BlockDeviceMappingList(base.ObjectListBase, base.NovaObject):
         except StopIteration:
             return
 
+    def root_bdm_is_volume(self):
+        root_bdm = self.root_bdm()
+        return root_bdm.is_volume if root_bdm else False
+
 
 def block_device_make_list(context, db_list, **extra_args):
     return base.obj_make_list(context,

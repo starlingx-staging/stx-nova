@@ -13,6 +13,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2013-2017 Wind River Systems, Inc.
+#
 
 """Nova base exception handling.
 
@@ -165,6 +168,10 @@ class PolicyNotAuthorized(Forbidden):
     msg_fmt = _("Policy doesn't allow %(action)s to be performed.")
 
 
+class VolumeLimitExceeded(Forbidden):
+    msg_fmt = _("Maximum number of volumes exceeded: %(reason)s")
+
+
 class ImageNotActive(NovaException):
     # NOTE(jruzicka): IncorrectState is used for volumes only in EC2,
     # but it still seems like the most appropriate option.
@@ -173,6 +180,10 @@ class ImageNotActive(NovaException):
 
 class ImageNotAuthorized(NovaException):
     msg_fmt = _("Not authorized for image %(image_id)s.")
+
+
+class ImageStorageMediaFull(NovaException):
+    msg_fmt = _("Not enough space on the storage media for image %(image_id)s")
 
 
 class Invalid(NovaException):
@@ -251,13 +262,30 @@ class VolumeAttachFailed(Invalid):
 
 
 class VolumeNotCreated(NovaException):
-    msg_fmt = _("Volume %(volume_id)s did not finish being created"
-                " even after we waited %(seconds)s seconds or %(attempts)s"
-                " attempts. And its status is %(volume_status)s.")
+    msg_fmt = None
+
+    def __init__(self, message=None, **kwargs):
+        if 'volume_error' in kwargs:
+            self.msg_fmt = _(
+                "Volume %(volume_id)s creation did not finish after "
+                "%(seconds)s seconds or %(attempts)s attempts. "
+                "Status is %(volume_status)s. %(volume_error)s")
+        else:
+            self.msg_fmt = _(
+                "Volume %(volume_id)s creation did not finish after "
+                "%(seconds)s seconds or %(attempts)s attempts. "
+                "Status is %(volume_status)s.")
+        super(VolumeNotCreated, self).__init__(message=message, **kwargs)
 
 
 class ExtendVolumeNotSupported(Invalid):
     msg_fmt = _("Volume size extension is not supported by the hypervisor.")
+
+
+class VolumeNotDetached(NovaException):
+    msg_fmt = _("Volume %(volume_id)s did not finish being detached"
+                " even after we waited %(seconds)s seconds or %(attempts)s"
+                " attempts. And its status is %(volume_status)s.")
 
 
 class VolumeEncryptionNotSupported(Invalid):
@@ -1296,6 +1324,10 @@ class MigrationPreCheckClientException(MigrationError):
     msg_fmt = _("Client exception during Migration Pre check: %(reason)s")
 
 
+class MigrationPreCheckErrorNoRetry(MigrationError):
+    msg_fmt = _("Migration pre-check error no retry: %(reason)s")
+
+
 class MigrationSchedulerRPCError(MigrationError):
     msg_fmt = _("Migration select destinations error: %(reason)s")
 
@@ -1316,6 +1348,10 @@ class ConfigNotFound(NovaException):
 
 class PasteAppNotFound(NovaException):
     msg_fmt = _("Could not load paste app '%(name)s' from %(path)s")
+
+
+class CannotScaleBeyondLimits(NovaException):
+    msg_fmt = _("When scaling, cannot scale beyond limits!")
 
 
 class CannotResizeToSameFlavor(NovaException):
@@ -1629,12 +1665,29 @@ class AgentNotImplemented(AgentError):
     msg_fmt = _('Agent does not support the call: %(method)s')
 
 
+# WRS - extension
+class InstanceGroupNotEmpty(NovaException):
+    msg_fmt = _("Instance group %(group_uuid)s is not empty. "
+                "Must delete all group members before deleting group.")
+
+
+# WRS - extension
+class InstanceGroupSizeLimit(NovaException):
+    msg_fmt = _("Action would result in server group %(group_uuid)s "
+                "exceeding the group size of %(group_size)s.")
+
+
 class InstanceGroupNotFound(NotFound):
     msg_fmt = _("Instance group %(group_uuid)s could not be found.")
 
 
 class InstanceGroupIdExists(NovaException):
     msg_fmt = _("Instance group %(group_uuid)s already exists.")
+
+
+class InstanceGroupMetadataNotFound(NotFound):
+    msg_fmt = _("Instance group %(group_uuid)s has no metadata with "
+                "key %(metadata_key)s.")
 
 
 class InstanceGroupMemberNotFound(NotFound):
@@ -1797,12 +1850,26 @@ class ImageVCPULimitsRangeImpossible(Invalid):
                 "are impossible to satisfy for vcpus count %(vcpus)d")
 
 
+class ImageVCPUModelForbidden(Invalid):
+    msg_fmt = _("Image vCPU model is not permitted to override configuration "
+                "set against the flavor")
+
+
 class InvalidArchitectureName(Invalid):
     msg_fmt = _("Architecture name '%(arch)s' is not recognised")
 
 
 class ImageNUMATopologyIncomplete(Invalid):
     msg_fmt = _("CPU and memory allocation must be provided for all "
+                "NUMA nodes")
+
+
+class ImageL3CacheInvalid(Invalid):
+    msg_fmt = _("L3 Cache allocation '%(name)s' cannot be specified together")
+
+
+class ImageL3CacheIncomplete(Invalid):
+    msg_fmt = _("L3 Cache allocation '%(name)s' must be provided for all "
                 "NUMA nodes")
 
 
@@ -1954,6 +2021,29 @@ class ImageCPUPinningForbidden(Forbidden):
 class ImageCPUThreadPolicyForbidden(Forbidden):
     msg_fmt = _("Image property 'hw_cpu_thread_policy' is not permitted to "
                 "override CPU thread pinning policy set against the flavor")
+
+
+class ImageNUMATopologyNodesIncomplete(Invalid):
+    msg_fmt = _("Host NUMA node mapping must be provided for all "
+                "NUMA nodes or for none of them.")
+
+
+class ImageNUMATopologyNodesDuplicates(Invalid):
+    msg_fmt = _("One or more NUMA nodes are assigned to the same host node")
+
+
+class ImageNUMATopologyNodesForbidden(Forbidden):
+    msg_fmt = _("Image property 'hw_numa_node.X' is not permitted to "
+                "override CPU pinning policy of 'shared' set against the "
+                "flavor or image.")
+
+
+class InstanceScalingError(NovaException):
+    msg_fmt = _("Problem scaling instance as requested")
+
+
+class CannotOfflineCpu(NovaException):
+    msg_fmt = _("Cpu %(cpu)s is already offline or out of range.")
 
 
 class UnsupportedPolicyException(Invalid):

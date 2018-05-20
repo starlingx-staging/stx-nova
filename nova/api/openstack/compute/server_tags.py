@@ -100,6 +100,7 @@ class ServerTagsController(wsgi.Controller):
         return {'tags': _get_tags_names(tags)}
 
     @wsgi.Controller.api_version("2.26")
+    @extensions.block_during_upgrade()
     @extensions.expected_errors((400, 404, 409))
     @validation.schema(schema.update)
     def update(self, req, server_id, id, body):
@@ -152,6 +153,7 @@ class ServerTagsController(wsgi.Controller):
         return response
 
     @wsgi.Controller.api_version("2.26")
+    @extensions.block_during_upgrade()
     @extensions.expected_errors((400, 404, 409))
     @validation.schema(schema.update_all)
     def update_all(self, req, server_id, body):
@@ -176,6 +178,7 @@ class ServerTagsController(wsgi.Controller):
         return {'tags': _get_tags_names(tags)}
 
     @wsgi.Controller.api_version("2.26")
+    @extensions.block_during_upgrade()
     @wsgi.response(204)
     @extensions.expected_errors((404, 409))
     def delete(self, req, server_id, id):
@@ -200,6 +203,7 @@ class ServerTagsController(wsgi.Controller):
             context, instance, service="nova-api")
 
     @wsgi.Controller.api_version("2.26")
+    @extensions.block_during_upgrade()
     @wsgi.response(204)
     @extensions.expected_errors((404, 409))
     def delete_all(self, req, server_id):

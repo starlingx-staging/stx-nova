@@ -17,6 +17,9 @@ images used by the compute layer.
 
 from nova.image import glance
 from nova import profiler
+from oslo_log import log as logging
+
+LOG = logging.getLogger(__name__)
 
 
 @profiler.trace_cls("nova_image")
@@ -180,5 +183,7 @@ class API(object):
         #                 to a bytestream iterator and allows the caller to
         #                 handle streaming/copying/zero-copy as they see fit.
         session, image_id = self._get_session_and_image_id(context, id_or_uri)
+        LOG.info('download: Downloading %(src)s to %(dest)s',
+                 {'src': image_id, 'dest': dest_path})
         return session.download(context, image_id, data=data,
                                 dst_path=dest_path)

@@ -45,7 +45,14 @@ class MigrateServerController(wsgi.Controller):
         context = req.environ['nova.context']
         context.can(ms_policies.POLICY_ROOT % 'migrate')
 
-        instance = common.get_instance(self.compute_api, context, id)
+        # WRS: Load 'pci_requests' explicitly else the request_spec won't
+        # specify it and NUMATopologyFilter and PciPassthroughFilter will
+        # return True to host_passes because it thinks there are no PCI in
+        # request.
+        expected_attrs = ['pci_requests']
+
+        instance = common.get_instance(self.compute_api, context, id,
+                                       expected_attrs=expected_attrs)
         try:
             self.compute_api.resize(req.environ['nova.context'], instance)
         except (exception.TooManyInstances, exception.QuotaError) as e:
@@ -94,13 +101,19 @@ class MigrateServerController(wsgi.Controller):
 
         instance = common.get_instance(self.compute_api, context, id)
         try:
+            # WRS: Live migration with pci devices is only supported with
+            # macvtap (which is currently not supported in Titanium Cloud).
+            if instance.pci_devices:
+                msg = _("Live migration of instance %s is not supported "
+                        "with PCI devices attached.") % id
+                raise exc.HTTPBadRequest(explanation=msg)
+
             self.compute_api.live_migrate(context, instance, block_migration,
                                           disk_over_commit, host, force, async)
         except exception.InstanceUnknownCell as e:
             raise exc.HTTPNotFound(explanation=e.format_message())
         except (exception.NoValidHost,
                 exception.ComputeServiceUnavailable,
-                exception.ComputeHostNotFound,
                 exception.InvalidHypervisorType,
                 exception.InvalidCPUInfo,
                 exception.UnableToMigrateToSelf,
@@ -109,6 +122,7 @@ class MigrateServerController(wsgi.Controller):
                 exception.InvalidSharedStorage,
                 exception.HypervisorUnavailable,
                 exception.MigrationPreCheckError,
+                exception.MigrationPreCheckErrorNoRetry,
                 exception.LiveMigrationWithOldNovaNotSupported) as ex:
             if async:
                 with excutils.save_and_reraise_exception():
@@ -119,6 +133,8 @@ class MigrateServerController(wsgi.Controller):
                 raise exc.HTTPBadRequest(explanation=ex.format_message())
         except exception.InstanceIsLocked as e:
             raise exc.HTTPConflict(explanation=e.format_message())
+        except exception.ComputeHostNotFound as e:
+            raise exc.HTTPBadRequest(explanation=e.format_message())
         except exception.InstanceInvalidState as state_error:
             common.raise_http_conflict_for_instance_invalid_state(state_error,
                     'os-migrateLive', id)

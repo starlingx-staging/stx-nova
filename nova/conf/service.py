@@ -168,6 +168,9 @@ Possible Values:
                ],
                default='nova.network.manager.VlanManager',
                help='Full class name for the Manager for network'),
+    cfg.BoolOpt('service_enabled_flag',
+               default=True,
+               help='Write flag file /var/run/nova/.nova_<service>_enabled'),
     ]
 
 

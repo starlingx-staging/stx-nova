@@ -363,10 +363,14 @@ class ComputeHostAPITestCase(test.TestCase):
             [mock.call(ctxt, uuids.service_uuid)] * 2)
         self.assertEqual('db://fake2', ctxt.db_connection)
 
+    @mock.patch('nova.objects.HostMapping.destroy')
+    @mock.patch('nova.scheduler.client.report.SchedulerReportClient.'
+                'delete_resource_provider')
     @mock.patch('nova.context.set_target_cell')
     @mock.patch('nova.compute.api.load_cells')
     @mock.patch('nova.objects.Service.get_by_id')
-    def test_service_delete(self, get_by_id, load_cells, set_target):
+    def test_service_delete(self, get_by_id, load_cells, set_target,
+                            delete_rp, destroy_hm):
         compute_api.CELLS = [
             objects.CellMapping(),
             objects.CellMapping(),

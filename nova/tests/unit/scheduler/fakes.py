@@ -22,7 +22,9 @@ from nova import objects
 from nova.scheduler import driver
 from nova.scheduler import host_manager
 from nova.tests import uuidsentinel
+from nova.virt.libvirt import host as libvirt_host
 
+HYPERVISOR_TYPE = libvirt_host.HV_DRIVER_QEMU
 NUMA_TOPOLOGY = objects.NUMATopology(
                            cells=[
                              objects.NUMACell(
@@ -33,7 +35,13 @@ NUMA_TOPOLOGY = objects.NUMATopology(
                                                            used=0),
                                  objects.NUMAPagesTopology(size_kb=2048,
                                                            total=512, used=0)],
-                               siblings=[], pinned_cpus=set([])),
+                               siblings=[], pinned_cpus=set([]),
+                               l3_cdp=False,
+                               l3_size=0,
+                               l3_granularity=0,
+                               l3_both_used=0,
+                               l3_code_used=0,
+                               l3_data_used=0),
                              objects.NUMACell(
                                id=1, cpuset=set([3, 4]), memory=512,
                                cpu_usage=0, memory_usage=0, mempages=[
@@ -42,32 +50,68 @@ NUMA_TOPOLOGY = objects.NUMATopology(
                                                            used=0),
                                  objects.NUMAPagesTopology(size_kb=2048,
                                                            total=512, used=0)],
-                               siblings=[], pinned_cpus=set([]))])
+                               siblings=[], pinned_cpus=set([]),
+                                 l3_cdp=False,
+                                 l3_size=0,
+                                 l3_granularity=0,
+                                 l3_both_used=0,
+                                 l3_code_used=0,
+                                 l3_data_used=0)])
 
 NUMA_TOPOLOGIES_W_HT = [
     objects.NUMATopology(cells=[
         objects.NUMACell(
             id=0, cpuset=set([1, 2, 5, 6]), memory=512,
             cpu_usage=0, memory_usage=0, mempages=[],
-            siblings=[set([1, 5]), set([2, 6])], pinned_cpus=set([])),
+            siblings=[set([1, 5]), set([2, 6])], pinned_cpus=set([]),
+            l3_cdp=False,
+            l3_size=0,
+            l3_granularity=0,
+            l3_both_used=0,
+            l3_code_used=0,
+            l3_data_used=0),
         objects.NUMACell(
             id=1, cpuset=set([3, 4, 7, 8]), memory=512,
             cpu_usage=0, memory_usage=0, mempages=[],
-            siblings=[set([3, 4]), set([7, 8])], pinned_cpus=set([]))
+            siblings=[set([3, 4]), set([7, 8])], pinned_cpus=set([]),
+            l3_cdp=False,
+            l3_size=0,
+            l3_granularity=0,
+            l3_both_used=0,
+            l3_code_used=0,
+            l3_data_used=0)
     ]),
     objects.NUMATopology(cells=[
         objects.NUMACell(
             id=0, cpuset=set([]), memory=512,
             cpu_usage=0, memory_usage=0, mempages=[],
-            siblings=[], pinned_cpus=set([])),
+            siblings=[], pinned_cpus=set([]),
+            l3_cdp=False,
+            l3_size=0,
+            l3_granularity=0,
+            l3_both_used=0,
+            l3_code_used=0,
+            l3_data_used=0),
         objects.NUMACell(
             id=1, cpuset=set([1, 2, 5, 6]), memory=512,
             cpu_usage=0, memory_usage=0, mempages=[],
-            siblings=[set([1, 5]), set([2, 6])], pinned_cpus=set([])),
+            siblings=[set([1, 5]), set([2, 6])], pinned_cpus=set([]),
+            l3_cdp=False,
+            l3_size=0,
+            l3_granularity=0,
+            l3_both_used=0,
+            l3_code_used=0,
+            l3_data_used=0),
         objects.NUMACell(
             id=2, cpuset=set([3, 4, 7, 8]), memory=512,
             cpu_usage=0, memory_usage=0, mempages=[],
-            siblings=[set([3, 4]), set([7, 8])], pinned_cpus=set([])),
+            siblings=[set([3, 4]), set([7, 8])], pinned_cpus=set([]),
+            l3_cdp=False,
+            l3_size=0,
+            l3_granularity=0,
+            l3_both_used=0,
+            l3_code_used=0,
+            l3_data_used=0),
     ]),
 ]
 
@@ -83,7 +127,9 @@ COMPUTE_NODES = [
             hypervisor_type='foo', supported_hv_specs=[],
             pci_device_pools=None, cpu_info=None, stats=None, metrics=None,
             cpu_allocation_ratio=16.0, ram_allocation_ratio=1.5,
-            disk_allocation_ratio=1.0),
+            disk_allocation_ratio=1.0,
+            l3_closids=16,
+            l3_closids_used=1),
         objects.ComputeNode(
             uuid=uuidsentinel.cn2,
             id=2, local_gb=2048, memory_mb=2048, vcpus=2,
@@ -95,7 +141,9 @@ COMPUTE_NODES = [
             hypervisor_type='foo', supported_hv_specs=[],
             pci_device_pools=None, cpu_info=None, stats=None, metrics=None,
             cpu_allocation_ratio=16.0, ram_allocation_ratio=1.5,
-            disk_allocation_ratio=1.0),
+            disk_allocation_ratio=1.0,
+            l3_closids=16,
+            l3_closids_used=1),
         objects.ComputeNode(
             uuid=uuidsentinel.cn3,
             id=3, local_gb=4096, memory_mb=4096, vcpus=4,
@@ -107,7 +155,9 @@ COMPUTE_NODES = [
             hypervisor_type='foo', supported_hv_specs=[],
             pci_device_pools=None, cpu_info=None, stats=None, metrics=None,
             cpu_allocation_ratio=16.0, ram_allocation_ratio=1.5,
-            disk_allocation_ratio=1.0),
+            disk_allocation_ratio=1.0,
+            l3_closids=16,
+            l3_closids_used=1),
         objects.ComputeNode(
             uuid=uuidsentinel.cn4,
             id=4, local_gb=8192, memory_mb=8192, vcpus=8,
@@ -119,7 +169,9 @@ COMPUTE_NODES = [
             hypervisor_type='foo', supported_hv_specs=[],
             pci_device_pools=None, cpu_info=None, stats=None, metrics=None,
             cpu_allocation_ratio=16.0, ram_allocation_ratio=1.5,
-            disk_allocation_ratio=1.0),
+            disk_allocation_ratio=1.0,
+            l3_closids=16,
+            l3_closids_used=1),
         # Broken entry
         objects.ComputeNode(
             uuid=uuidsentinel.cn5,

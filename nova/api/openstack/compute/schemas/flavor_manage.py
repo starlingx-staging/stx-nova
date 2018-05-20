@@ -32,7 +32,11 @@ create = {
                     'pattern': '^(?! )[a-zA-Z0-9. _-]+(?<! )$'
                 },
                 'ram': parameter_types.flavor_param_positive,
-                'vcpus': parameter_types.flavor_param_positive,
+                'vcpus': {
+                    'type': ['integer'],
+                    'minimum': 0, 'exclusiveMinimum': True,
+                    'maximum': 128
+                },
                 'disk': parameter_types.flavor_param_non_negative,
                 'OS-FLV-EXT-DATA:ephemeral':
                     parameter_types.flavor_param_non_negative,

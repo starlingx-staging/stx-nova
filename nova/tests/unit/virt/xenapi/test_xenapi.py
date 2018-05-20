@@ -225,6 +225,43 @@ def create_instance_with_system_metadata(context, instance_values):
     return inst
 
 
+def create_compute_node(values=None):
+    compute = {
+        "id": 1,
+        "service_id": 1,
+        "host": "fakehost",
+        "vcpus": 1,
+        "memory_mb": 1,
+        "local_gb": 1,
+        "vcpus_used": 1,
+        "memory_mb_used": 1,
+        "local_gb_used": 1,
+        "free_ram_mb": 1,
+        "free_disk_gb": 1,
+        "current_workload": 1,
+        "running_vms": 0,
+        "cpu_info": None,
+        "numa_topology": None,
+        "stats": '{"num_instances": "1"}',
+        "hypervisor_hostname": "fakenode",
+        'hypervisor_version': 1,
+        'hypervisor_type': 'fake-hyp',
+        'disk_available_least': None,
+        'host_ip': None,
+        'metrics': None,
+        'created_at': None,
+        'updated_at': None,
+        'deleted_at': None,
+        'deleted': False,
+        'disk_allocation_ratio': 1.0,
+        'cpu_allocation_ratio': 16.0,
+        'ram_allocation_ratio': 1.5,
+    }
+    if values:
+        compute.update(values)
+    return compute
+
+
 class XenAPIVolumeTestCase(stubs.XenAPITestBaseNoDB):
     """Unit tests for Volume operations."""
     def setUp(self):
@@ -332,6 +369,13 @@ class XenAPIVMTestCase(stubs.XenAPITestBase,
             self._update_last_dom_id(vm_ref)
         self.stubs.Set(vmops.VMOps, '_unpause_and_wait',
                        fake_unpause_and_wait)
+        self.stubs.Set(objects.ComputeNode, 'get_by_host_and_nodename',
+                self._fake_compute_node_get_by_host_and_nodename)
+
+    def _fake_compute_node_get_by_host_and_nodename(self, ctx, host,
+                                                    nodename):
+        self.compute = create_compute_node()
+        return self.compute
 
     def tearDown(self):
         fake_image.FakeImageService_reset()
@@ -1685,6 +1729,13 @@ class XenAPIMigrateInstance(stubs.XenAPITestBase):
             pass
         self.stub_out('nova.virt.xenapi.vmops.VMOps._unpause_and_wait',
                        fake_unpause_and_wait)
+        self.stubs.Set(objects.ComputeNode, 'get_by_host_and_nodename',
+                self._fake_compute_node_get_by_host_and_nodename)
+
+    def _fake_compute_node_get_by_host_and_nodename(self, ctx, host,
+                                                    nodename):
+        self.compute = create_compute_node()
+        return self.compute
 
     def _create_instance(self, **kw):
         values = self.instance_values.copy()
@@ -1694,6 +1745,8 @@ class XenAPIMigrateInstance(stubs.XenAPITestBase):
                                          ephemeral_gb=0)
         instance.create()
         return instance
+        self.stubs.Set(objects.ComputeNode, 'get_by_host_and_nodename',
+                self._fake_compute_node_get_by_host_and_nodename)
 
     @mock.patch.object(vmops.VMOps, '_migrate_disk_resizing_up')
     @mock.patch.object(vm_utils, 'get_sr_path')

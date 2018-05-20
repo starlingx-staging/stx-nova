@@ -13,6 +13,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2013-2017 Wind River Systems, Inc.
+#
 
 from oslo_log import log as logging
 
@@ -20,11 +23,18 @@ from oslo_log import log as logging
 from nova.scheduler import filters
 from nova.scheduler.filters import extra_specs_ops
 from nova.scheduler.filters import utils
+from nova import utils as nova_utils
 
 
 LOG = logging.getLogger(__name__)
 
 _SCOPE = 'aggregate_instance_extra_specs'
+
+# WRS - Hybrid baremetal support
+BAREMETAL_IGNORE_KEYS = [
+    'baremetal',
+    'storage',
+]
 
 
 class AggregateInstanceExtraSpecsFilter(filters.BaseHostFilter):
@@ -49,6 +59,7 @@ class AggregateInstanceExtraSpecsFilter(filters.BaseHostFilter):
             return True
 
         metadata = utils.aggregate_metadata_get_by_host(host_state)
+        is_ironic = nova_utils.is_ironic_compute(host_state)
 
         for key, req in instance_type.extra_specs.items():
             # Either not scope format, or aggregate_instance_extra_specs scope
@@ -59,11 +70,20 @@ class AggregateInstanceExtraSpecsFilter(filters.BaseHostFilter):
                 else:
                     del scope[0]
             key = scope[0]
+
+            # WRS - Hybrid baremetal support
+            if is_ironic and key in BAREMETAL_IGNORE_KEYS:
+                continue
+
             aggregate_vals = metadata.get(key, None)
             if not aggregate_vals:
                 LOG.debug("%(host_state)s fails instance_type extra_specs "
                     "requirements. Extra_spec %(key)s is not in aggregate.",
                     {'host_state': host_state, 'key': key})
+                msg = ("extra_specs '%(key)s' not in aggregate, "
+                       "cannot match '%(req)s'." %
+                       {'key': key, 'req': req})
+                self.filter_reject(host_state, spec_obj, msg)
                 return False
             for aggregate_val in aggregate_vals:
                 if extra_specs_ops.match(aggregate_val, req):
@@ -74,5 +94,8 @@ class AggregateInstanceExtraSpecsFilter(filters.BaseHostFilter):
                             "match '%(req)s'",
                           {'host_state': host_state, 'req': req,
                            'aggregate_vals': aggregate_vals})
+                msg = ("extra_specs '%(agg)s' do not match '%(req)s'" %
+                       {'req': req, 'agg': aggregate_vals})
+                self.filter_reject(host_state, spec_obj, msg)
                 return False
         return True

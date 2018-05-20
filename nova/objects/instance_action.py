@@ -11,13 +11,19 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2015-2017 Wind River Systems, Inc.
+#
 
+from oslo_log import log as logging
 from oslo_utils import timeutils
 
 from nova import db
 from nova import objects
 from nova.objects import base
 from nova.objects import fields
+
+LOG = logging.getLogger(__name__)
 
 
 # TODO(berrange): Remove NovaObjectDictCompat
@@ -124,6 +130,7 @@ class InstanceActionEvent(base.NovaPersistentObject, base.NovaObject,
         'finish_time': fields.DateTimeField(nullable=True),
         'result': fields.StringField(nullable=True),
         'traceback': fields.StringField(nullable=True),
+        'details': fields.StringField(nullable=True),
         }
 
     @staticmethod
@@ -153,7 +160,7 @@ class InstanceActionEvent(base.NovaPersistentObject, base.NovaObject,
             values['result'] = 'Success'
         else:
             values['result'] = 'Error'
-            values['message'] = exc_val
+            values['details'] = exc_val
             values['traceback'] = exc_tb
         return values
 
@@ -166,6 +173,8 @@ class InstanceActionEvent(base.NovaPersistentObject, base.NovaObject,
     def event_start(cls, context, instance_uuid, event_name, want_result=True):
         values = cls.pack_action_event_start(context, instance_uuid,
                                              event_name)
+        LOG.info('%(event)s instance %(uuid)s',
+                 {'event': event_name, 'uuid': instance_uuid})
         db_event = db.action_event_start(context, values)
         if want_result:
             return cls._from_db_object(context, cls(), db_event)

@@ -12,6 +12,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2013-2017 Wind River Systems, Inc.
+#
 
 from oslo_log import log as logging
 from oslo_serialization import jsonutils
@@ -66,7 +69,7 @@ class ComputeCapabilitiesFilter(filters.BaseHostFilter):
                 return None
         return cap
 
-    def _satisfies_extra_specs(self, host_state, instance_type):
+    def _satisfies_extra_specs(self, host_state, instance_type, spec_obj):
         """Check that the host_state provided by the compute service
         satisfies the extra specs associated with the instance type.
         """
@@ -96,6 +99,8 @@ class ComputeCapabilitiesFilter(filters.BaseHostFilter):
 
             cap = self._get_capabilities(host_state, scope)
             if cap is None:
+                msg = ('capability is missing')
+                self.filter_reject(host_state, spec_obj, msg)
                 return False
 
             if not extra_specs_ops.match(str(cap), req):
@@ -103,13 +108,19 @@ class ComputeCapabilitiesFilter(filters.BaseHostFilter):
                           "'%(req)s' does not match '%(cap)s'",
                           {'host_state': host_state, 'req': req,
                            'cap': cap})
+                msg = ("%(host_state)s fails extra_spec requirements. "
+                       "'%(req)s' does not match '%(cap)s'",
+                       {'host_state': host_state, 'req': req,
+                        'cap': cap})
+                self.filter_reject(host_state, spec_obj, msg)
                 return False
         return True
 
     def host_passes(self, host_state, spec_obj):
         """Return a list of hosts that can create instance_type."""
         instance_type = spec_obj.flavor
-        if not self._satisfies_extra_specs(host_state, instance_type):
+        if not self._satisfies_extra_specs(host_state, instance_type,
+                                           spec_obj):
             LOG.debug("%(host_state)s fails instance_type extra_specs "
                       "requirements", {'host_state': host_state})
             return False

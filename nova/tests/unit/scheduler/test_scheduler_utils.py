@@ -12,6 +12,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2013-2017 Wind River Systems, Inc.
+#
 """
 Tests For Scheduler Utils
 """
@@ -36,6 +39,12 @@ class SchedulerUtilsTestCase(test.NoDBTestCase):
     def setUp(self):
         super(SchedulerUtilsTestCase, self).setUp()
         self.context = 'fake-context'
+
+        self.stubs.Set(objects.Instance, '_load_pci_requests',
+            self._fake_load_pci_requests)
+
+    def _fake_load_pci_requests(self):
+        return
 
     def test_build_request_spec_without_image(self):
         instance = {'uuid': uuids.instance}
@@ -274,23 +283,36 @@ class SchedulerUtilsTestCase(test.NoDBTestCase):
         group.uuid = uuids.fake
         group.members = [instance.uuid]
         group.policies = [policy]
+        # WRS:extension -- metadetails
+        group.metadetails = {"wrs-sg:best_effort": "true",
+                             "wrs-sg:group_size": "2",
+                             "wrs-sg:group_exceed": "0"}
         return group
 
+    # WRS:extension - pass through instance_props
     def _get_group_details(self, group, policy=None):
         group_hosts = ['hostB']
+        spec = objects.RequestSpec(instance_uuid=uuids.instance)
+        spec.num_instances = 1
+        spec.min_num_instances = 1
 
         with test.nested(
             mock.patch.object(objects.InstanceGroup, 'get_by_instance_uuid',
                               return_value=group),
             mock.patch.object(objects.InstanceGroup, 'get_hosts',
                               return_value=['hostA']),
-        ) as (get_group, get_hosts):
+            mock.patch.object(objects.InstanceGroup, 'get_members_launched',
+                              return_value=['FakE-uuid']),
+        ) as (get_group, get_hosts, get_members):
             scheduler_utils._SUPPORTS_ANTI_AFFINITY = None
             scheduler_utils._SUPPORTS_AFFINITY = None
             group_info = scheduler_utils._get_group_details(
-                self.context, 'fake_uuid', group_hosts)
+                self.context, 'fake_uuid', spec, user_group_hosts=group_hosts)
             self.assertEqual(
-                (set(['hostA', 'hostB']), [policy], group.members),
+                (set(['hostA', 'hostB']), [policy], group.members,
+                {"wrs-sg:best_effort": "true",
+                 "wrs-sg:group_size": "2",
+                 "wrs-sg:group_exceed": "0"}, 'pele'),
                 group_info)
 
     def test_get_group_details(self):
@@ -299,10 +321,13 @@ class SchedulerUtilsTestCase(test.NoDBTestCase):
             group = self._create_server_group(policy)
             self._get_group_details(group, policy=policy)
 
+    # WRS:extension - pass through instance_props
     def test_get_group_details_with_no_instance_uuid(self):
-        group_info = scheduler_utils._get_group_details(self.context, None)
+        group_info = scheduler_utils._get_group_details(self.context, None,
+                                                        mock.ANY)
         self.assertIsNone(group_info)
 
+    # WRS:extension - pass through instance_props
     def _get_group_details_with_filter_not_configured(self, policy):
         self.flags(enabled_filters=['fake'], group='filter_scheduler')
         self.flags(weight_classes=['fake'], group='filter_scheduler')
@@ -314,6 +339,7 @@ class SchedulerUtilsTestCase(test.NoDBTestCase):
         group.uuid = uuids.fake
         group.members = [instance.uuid]
         group.policies = [policy]
+        spec = objects.RequestSpec(instance_uuid=uuids.instance)
 
         with test.nested(
             mock.patch.object(objects.InstanceGroup, 'get_by_instance_uuid',
@@ -323,9 +349,9 @@ class SchedulerUtilsTestCase(test.NoDBTestCase):
             scheduler_utils._SUPPORTS_AFFINITY = None
             scheduler_utils._SUPPORTS_SOFT_AFFINITY = None
             scheduler_utils._SUPPORTS_SOFT_ANTI_AFFINITY = None
-            self.assertRaises(exception.UnsupportedPolicyException,
+            self.assertRaises(exception.NoValidHost,
                               scheduler_utils._get_group_details,
-                              self.context, uuids.instance)
+                              self.context, uuids.instance, spec)
 
     def test_get_group_details_with_filter_not_configured(self):
         policies = ['anti-affinity', 'affinity',
@@ -333,33 +359,44 @@ class SchedulerUtilsTestCase(test.NoDBTestCase):
         for policy in policies:
             self._get_group_details_with_filter_not_configured(policy)
 
+    # WRS:extension -- besteffort, groupsize
     @mock.patch.object(scheduler_utils, '_get_group_details')
     def test_setup_instance_group_in_request_spec(self, mock_ggd):
+        metadetails = {"wrs-sg:best_effort": "true",
+                       "wrs-sg:group_size": "2",
+                       "wrs-sg:group_exceed": "0"}
         mock_ggd.return_value = scheduler_utils.GroupDetails(
             hosts=set(['hostA', 'hostB']), policies=['policy'],
-            members=['instance1'])
+            members=['instance1'], metadetails=metadetails, name='pele')
         spec = objects.RequestSpec(instance_uuid=uuids.instance)
         spec.instance_group = objects.InstanceGroup(hosts=['hostC'])
-
+        spec.num_instances = 1
+        spec.min_num_instances = 1
         scheduler_utils.setup_instance_group(self.context, spec)
 
         mock_ggd.assert_called_once_with(self.context, uuids.instance,
-                                         ['hostC'])
+                                         spec,
+                                         user_group_hosts=['hostC'])
         # Given it returns a list from a set, make sure it's sorted.
         self.assertEqual(['hostA', 'hostB'], sorted(spec.instance_group.hosts))
         self.assertEqual(['policy'], spec.instance_group.policies)
         self.assertEqual(['instance1'], spec.instance_group.members)
+        self.assertEqual(metadetails, spec.instance_group.metadetails)
+        self.assertEqual('pele', spec.instance_group.name)
 
+    # WRS:extension
     @mock.patch.object(scheduler_utils, '_get_group_details')
     def test_setup_instance_group_with_no_group(self, mock_ggd):
         mock_ggd.return_value = None
         spec = objects.RequestSpec(instance_uuid=uuids.instance)
         spec.instance_group = objects.InstanceGroup(hosts=['hostC'])
+        spec.num_instances = 1
+        spec.min_num_instances = 1
 
         scheduler_utils.setup_instance_group(self.context, spec)
 
-        mock_ggd.assert_called_once_with(self.context, uuids.instance,
-                                         ['hostC'])
+        mock_ggd.assert_called_once_with(self.context, uuids.instance, spec,
+                                         user_group_hosts=['hostC'])
         # Make sure the field isn't touched by the caller.
         self.assertFalse(spec.instance_group.obj_attr_is_set('policies'))
         self.assertEqual(['hostC'], spec.instance_group.hosts)

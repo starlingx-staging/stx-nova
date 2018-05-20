@@ -20,6 +20,7 @@
 
 import copy
 import datetime
+import testtools
 import uuid as stdlib_uuid
 
 import iso8601
@@ -109,6 +110,8 @@ def _make_compute_node(host, node, hv_type, service_id):
                         cpu_allocation_ratio=16.0,
                         ram_allocation_ratio=1.5,
                         disk_allocation_ratio=1.0,
+                        l3_closids=16,
+                        l3_closids_used=1,
                         stats='', numa_topology='')
     # add some random stats
     stats = dict(num_instances=3, num_proj_12345=2,
@@ -2860,6 +2863,30 @@ class InstanceTestCase(test.TestCase, ModelsObjectComparatorMixin):
         self.assertRaises(exception.InstanceUpdateConflict,
                     db.instance_update, self.ctxt, instance['uuid'],
                     {'host': 'h1', 'expected_vm_state': ('spam', 'bar')})
+
+    def test_instance_update_cannot_overwrite_deleting_task_state(self):
+        instance = self.create_instance_with_args(
+            task_state=task_states.DELETING)
+        self.assertRaises(exception.UnexpectedDeletingTaskStateError,
+                    db.instance_update, self.ctxt, instance['uuid'],
+                    {'task_state': 'foo'})
+
+    def test_instance_update_can_set_deleting_task_state(self):
+        instance = self.create_instance_with_args(
+            task_state=task_states.DELETING)
+        db.instance_update(self.ctxt, instance['uuid'],
+                           {'task_state': task_states.DELETING})
+
+    def test_instance_update_can_overwrite_deleting_task_state_on_delete(self):
+        instance = self.create_instance_with_args(
+            task_state=task_states.DELETING)
+        db.instance_update(self.ctxt, instance['uuid'],
+                           {'task_state': None, 'vm_state': vm_states.DELETED})
+
+    def test_instance_update_can_overwrite_none_task_state(self):
+        instance = self.create_instance_with_args(task_state=None)
+        db.instance_update(self.ctxt, instance['uuid'],
+                           {'task_state': 'foo'})
 
     def test_instance_update_with_instance_uuid(self):
         # test instance_update() works when an instance UUID is passed.
@@ -7856,6 +7883,8 @@ class ComputeNodeTestCase(test.TestCase, ModelsObjectComparatorMixin):
                                  cpu_allocation_ratio=16.0,
                                  ram_allocation_ratio=1.5,
                                  disk_allocation_ratio=1.0,
+                                 l3_closids=16,
+                                 l3_closids_used=1,
                                  stats='', numa_topology='')
         # add some random stats
         self.stats = dict(num_instances=3, num_proj_12345=2,
@@ -7922,6 +7951,8 @@ class ComputeNodeTestCase(test.TestCase, ModelsObjectComparatorMixin):
                                  cpu_allocation_ratio=16.0,
                                  ram_allocation_ratio=1.5,
                                  disk_allocation_ratio=1.0,
+                                 l3_closids=16,
+                                 l3_closids_used=1,
                                  stats='', numa_topology='')
         stats = dict(num_instances=2, num_proj_12345=1,
                      num_proj_23456=1, num_vm_building=2)
@@ -8214,6 +8245,8 @@ class ComputeNodeTestCase(test.TestCase, ModelsObjectComparatorMixin):
                                  cpu_allocation_ratio=16.0,
                                  ram_allocation_ratio=1.5,
                                  disk_allocation_ratio=1.0,
+                                 l3_closids=16,
+                                 l3_closids_used=1,
                                  stats='',
                                  numa_topology='')
         db.compute_node_create(self.ctxt, compute_node_dict)
@@ -9110,6 +9143,9 @@ class Ec2TestCase(test.TestCase):
                           self.ctxt, 100500)
 
 
+# US93619: Archiving soft deleted records is not supported. Disabling its
+# related test cases
+@testtools.skip('Archive related test cases are no longer relevant.')
 class ArchiveTestCase(test.TestCase, ModelsObjectComparatorMixin):
 
     def setUp(self):

@@ -12,9 +12,13 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2016-2017 Wind River Systems, Inc.
+#
 
 import mock
 from oslo_utils import timeutils
+import six
 from six.moves import range
 
 from nova import exception
@@ -80,7 +84,12 @@ class CachingSchedulerTestCase(test_scheduler.SchedulerTestCase):
             self.assertTrue(mock_get_hosts.called)
             self.assertEqual({uuids.cell: [host_state]}, result)
 
-    def test_select_destination_raises_with_no_hosts(self):
+    @mock.patch('nova.scheduler.host_manager.HostManager.get_all_host_states')
+    @mock.patch('nova.objects.BuildRequest.get_by_instance_uuid')
+    @mock.patch('nova.objects.Instance.get_by_uuid')
+    def test_select_destination_raises_with_no_hosts(self, mock_get_by_uuid,
+                                                     mock_get_by_instance_uuid,
+                                                     mock_get_all):
         spec_obj = self._get_fake_request_spec()
         self.driver.all_host_states = {uuids.cell: []}
 
@@ -89,10 +98,41 @@ class CachingSchedulerTestCase(test_scheduler.SchedulerTestCase):
                 self.context, spec_obj, [spec_obj.instance_uuid],
                 {}, {})
 
+    @mock.patch('nova.scheduler.host_manager.HostManager.get_all_host_states')
+    @mock.patch('nova.objects.BuildRequest.get_by_instance_uuid')
+    @mock.patch('nova.objects.Instance.get_by_uuid')
+    def test_select_destination_passes_error_msg(self, mock_get_by_uuid,
+                                                 mock_get_by_instance_uuid,
+                                                 mock_get_all):
+        hosts = 2
+        spec_obj = self._get_fake_request_spec()
+        spec_obj.availability_zone = 'not_nova'
+        host_states = []
+        for x in range(hosts):
+            host_state = self._get_fake_host_state(x)
+            host_states.append(host_state)
+        self.driver.all_host_states = {uuids.cell: host_states}
+
+        try:
+            self.driver.select_destinations(
+                    self.context, spec_obj, [spec_obj.instance_uuid], {}, {})
+        except exception.NoValidHost as e:
+            self.assertIn('(AvailabilityZoneFilter) avail zone not_nova '
+                            'not in host AZ: nova', six.text_type(e))
+
+        self.assertIsNotNone(spec_obj.reject_map)
+        self.assertIsInstance(spec_obj.reject_map, dict)
+        self.assertIsNot(spec_obj.reject_map, {})
+        self.assertIn('(AvailabilityZoneFilter) avail zone not_nova '
+                      'not in host AZ: nova', str(spec_obj.reject_map))
+
+    @mock.patch('nova.objects.BuildRequest.get_by_instance_uuid')
+    @mock.patch('nova.objects.Instance.get_by_uuid')
     @mock.patch('nova.db.instance_extra_get_by_instance_uuid',
                 return_value={'numa_topology': None,
                               'pci_requests': None})
-    def test_select_destination_works(self, mock_get_extra):
+    def test_select_destination_works(self, mock_get_extra, mock_get_by_uuid,
+                                      mock_get_by_instance_uuid):
         spec_obj = self._get_fake_request_spec()
         fake_host = self._get_fake_host_state()
         self.driver.all_host_states = {uuids.cell: [fake_host]}
@@ -122,7 +162,9 @@ class CachingSchedulerTestCase(test_scheduler.SchedulerTestCase):
             ephemeral_gb=1,
             vcpus=1,
             swap=0,
+            extra_specs={},
         )
+        image_props = objects.ImageMeta(properties=objects.ImageMetaProps())
         instance_properties = {
             "os_type": "linux",
             "project_id": "1234",
@@ -135,11 +177,14 @@ class CachingSchedulerTestCase(test_scheduler.SchedulerTestCase):
             force_nodes=None,
             retry=None,
             availability_zone=None,
-            image=None,
+            image=image_props,
             instance_group=None,
             pci_requests=None,
             numa_topology=None,
             instance_uuid='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+            # WRS extension
+            display_name='fake-vm',
+            name='instance-00000001',
             **instance_properties
         )
         return request_spec
@@ -165,10 +210,14 @@ class CachingSchedulerTestCase(test_scheduler.SchedulerTestCase):
         host_state.metrics = objects.MonitorMetricList(objects=[])
         return host_state
 
+    @mock.patch('nova.objects.BuildRequest.get_by_instance_uuid')
+    @mock.patch('nova.objects.Instance.get_by_uuid')
     @mock.patch('nova.db.instance_extra_get_by_instance_uuid',
                 return_value={'numa_topology': None,
                               'pci_requests': None})
-    def test_performance_check_select_destination(self, mock_get_extra):
+    def test_performance_check_select_destination(self, mock_get_extra,
+                                                  mock_get_by_uuid,
+                                                  mock_get_by_instance_uuid):
         hosts = 2
         requests = 1
 
@@ -220,10 +269,14 @@ class CachingSchedulerTestCase(test_scheduler.SchedulerTestCase):
         # But this is here so you can do simply performance testing easily.
         self.assertLess(per_request_ms, 1000)
 
-    def test_request_single_cell(self):
+    @mock.patch('nova.objects.BuildRequest.get_by_instance_uuid')
+    @mock.patch('nova.objects.Instance.get_by_uuid')
+    def test_request_single_cell(self, mock_get_by_uuid,
+                                 mock_get_by_instance_uuid):
         spec_obj = self._get_fake_request_spec()
         spec_obj.requested_destination = objects.Destination(
             cell=objects.CellMapping(uuid=uuids.cell2))
+        spec_obj.instance_uuid = '00000000-aaaa-bbbb-cccc-000000000000'
         host_states_cell1 = [self._get_fake_host_state(i)
                              for i in range(1, 5)]
         host_states_cell2 = [self._get_fake_host_state(i)

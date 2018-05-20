@@ -12,6 +12,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2013-2017 Wind River Systems, Inc.
+#
 
 from oslo_log import log as logging
 
@@ -50,5 +53,8 @@ class MetricsFilter(filters.BaseHostFilter):
                         "metrics: %(metrics)s",
                       {'host_state': host_state,
                        'metrics': ', '.join(unavail)})
+            msg = ('Metrics unavailable: %(metrics)s',
+                   {'metrics': ', '.join(unavail)})
+            self.filter_reject(host_state, spec_obj, msg)
             return False
         return True

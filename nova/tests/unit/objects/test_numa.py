@@ -22,12 +22,24 @@ fake_obj_numa = objects.NUMATopology(
             id=0, cpuset=set([1, 2]), memory=512,
             cpu_usage=2, memory_usage=256,
             mempages=[], pinned_cpus=set([]),
-            siblings=[]),
+            siblings=[],
+            l3_cdp=False,
+            l3_size=0,
+            l3_granularity=0,
+            l3_both_used=0,
+            l3_code_used=0,
+            l3_data_used=0),
         objects.NUMACell(
             id=1, cpuset=set([3, 4]), memory=512,
             cpu_usage=1, memory_usage=128,
             mempages=[], pinned_cpus=set([]),
-            siblings=[])])
+            siblings=[],
+            l3_cdp=False,
+            l3_size=0,
+            l3_granularity=0,
+            l3_both_used=0,
+            l3_code_used=0,
+            l3_data_used=0)])
 
 
 class _TestNUMA(object):

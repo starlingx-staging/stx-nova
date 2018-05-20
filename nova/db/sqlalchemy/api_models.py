@@ -9,6 +9,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2017 Wind River Systems, Inc.
+#
 
 
 from oslo_db.sqlalchemy import models
@@ -406,6 +409,20 @@ class InstanceGroupPolicy(API_BASE):
                       nullable=False)
 
 
+class InstanceGroupMetadata(API_BASE):
+    """Represents a key/value pair for an instance group."""
+    __tablename__ = 'instance_group_metadata'
+    __table_args__ = (
+        Index('instance_group_metadata_key_idx', 'key'),
+    )
+    id = Column(Integer, primary_key=True, nullable=False)
+    key = Column(String(255))
+    value = Column(String(255))
+
+    group_id = Column(Integer, ForeignKey('instance_groups.id'),
+                      nullable=False)
+
+
 class InstanceGroup(API_BASE):
     """Represents an instance group.
 
@@ -425,12 +442,20 @@ class InstanceGroup(API_BASE):
     name = Column(String(255))
     _policies = orm.relationship(InstanceGroupPolicy,
             primaryjoin='InstanceGroup.id == InstanceGroupPolicy.group_id')
+    # WRS:extension - metadata
+    _metadata = orm.relationship(InstanceGroupMetadata,
+            primaryjoin='InstanceGroup.id == InstanceGroupMetadata.group_id')
     _members = orm.relationship(InstanceGroupMember,
             primaryjoin='InstanceGroup.id == InstanceGroupMember.group_id')
 
     @property
     def policies(self):
         return [p.policy for p in self._policies]
+
+    # WRS:extension - metadetails
+    @property
+    def metadetails(self):
+        return {m.key: m.value for m in self._metadata}
 
     @property
     def members(self):

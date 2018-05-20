@@ -13,7 +13,11 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2013-2017 Wind River Systems, Inc.
+#
 
+from base64 import b64encode
 import collections
 import datetime
 import ddt
@@ -214,21 +218,32 @@ class ServersControllerTest(ControllerTest):
         uuid = 'br-00000000-0000-0000-0000-000000000000'
         requested_networks = [{'uuid': uuid}]
         res = self.controller._get_requested_networks(requested_networks)
-        self.assertIn((uuid, None, None, None), res.as_tuples())
+        self.assertIn((uuid, None, None, None, None), res.as_tuples())
 
     def test_requested_networks_neutronv2_enabled_with_port(self):
         self.flags(use_neutron=True)
         port = 'eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee'
         requested_networks = [{'port': port}]
         res = self.controller._get_requested_networks(requested_networks)
-        self.assertEqual([(None, None, port, None)], res.as_tuples())
+        self.assertEqual([(None, None, port, None, None)],
+                         res.as_tuples())
 
     def test_requested_networks_neutronv2_enabled_with_network(self):
         self.flags(use_neutron=True)
         network = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
         requested_networks = [{'uuid': network}]
         res = self.controller._get_requested_networks(requested_networks)
-        self.assertEqual([(network, None, None, None)], res.as_tuples())
+        self.assertEqual([(network, None, None, None, None)],
+                         res.as_tuples())
+
+    # WRS: add testcase for wrs-if:vif_model
+    def test_requested_networks_neutronv2_enabled_with_vif_model(self):
+        self.flags(use_neutron=True)
+        network = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
+        requested_networks = [{'uuid': network, 'wrs-if:vif_model': 'virtio'}]
+        res = self.controller._get_requested_networks(requested_networks)
+        self.assertEqual([(network, None, None, None, 'virtio')],
+                         res.as_tuples())
 
     def test_requested_networks_neutronv2_enabled_with_network_and_port(self):
         self.flags(use_neutron=True)
@@ -236,7 +251,8 @@ class ServersControllerTest(ControllerTest):
         port = 'eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee'
         requested_networks = [{'uuid': network, 'port': port}]
         res = self.controller._get_requested_networks(requested_networks)
-        self.assertEqual([(None, None, port, None)], res.as_tuples())
+        self.assertEqual([(None, None, port, None, None)],
+                         res.as_tuples())
 
     def test_requested_networks_with_duplicate_networks_nova_net(self):
         # duplicate networks are allowed only for nova neutron v2.0
@@ -254,8 +270,9 @@ class ServersControllerTest(ControllerTest):
         network = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
         requested_networks = [{'uuid': network}, {'uuid': network}]
         res = self.controller._get_requested_networks(requested_networks)
-        self.assertEqual([(network, None, None, None),
-                          (network, None, None, None)], res.as_tuples())
+        self.assertEqual([(network, None, None, None, None),
+                          (network, None, None, None, None)],
+                         res.as_tuples())
 
     def test_requested_networks_neutronv2_enabled_conflict_on_fixed_ip(self):
         self.flags(use_neutron=True)
@@ -285,7 +302,8 @@ class ServersControllerTest(ControllerTest):
         port = 'eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee'
         requested_networks = [{'uuid': network, 'port': port}]
         res = self.controller._get_requested_networks(requested_networks)
-        self.assertEqual([(None, None, port, None)], res.as_tuples())
+        self.assertEqual([(None, None, port, None, None)],
+                         res.as_tuples())
 
     def test_get_server_by_uuid(self):
         req = self.req('/fake/servers/%s' % FAKE_UUID)
@@ -365,7 +383,8 @@ class ServersControllerTest(ControllerTest):
                         {'version': 4, 'addr': '192.168.1.100',
                          'OS-EXT-IPS:type': 'fixed',
                          'OS-EXT-IPS-MAC:mac_addr': 'aa:aa:aa:aa:aa:aa'},
-                        {'version': 6, 'addr': '2001:db8:0:1::1',
+                        {'version': 6,
+                         'addr': '2001:db8:0:1::1',
                          'OS-EXT-IPS:type': 'fixed',
                          'OS-EXT-IPS-MAC:mac_addr': 'aa:aa:aa:aa:aa:aa'}
                     ]
@@ -1820,7 +1839,13 @@ class ServersControllerDeleteTest(ControllerTest):
         self.stubs.Set(compute_api.API, 'get',
                        lambda api, *a, **k: fake_get(*a, **k))
 
-        self.controller.delete(req, FAKE_UUID)
+        self.stubs.Set(compute_api.API, 'delete',
+                       fakes.fake_actions_to_server_instance_while_resize)
+
+        # self.controller.delete(req, FAKE_UUID)
+        # WRS: prevent delete while resizing, it leads to a race.
+        self.assertRaises(webob.exc.HTTPConflict, self.controller.delete,
+                          req, FAKE_UUID)
 
     def test_delete_server_instance_if_not_launched(self):
         self.flags(reclaim_instance_interval=3600)
@@ -2169,21 +2194,36 @@ class ServersControllerRebuildTestV219(ServersControllerRebuildInstanceTest):
         self.req.api_version_request = \
             api_version_request.APIVersionRequest('2.19')
 
-    def _rebuild_server(self, set_desc, desc):
+    def _rebuild_server(self, set_desc, desc, set_ud=False, ud_enc=None):
         fake_get = fakes.fake_compute_get(vm_state=vm_states.ACTIVE,
                                           display_description=desc,
                                           project_id=self.req_project_id,
-                                          user_id=self.req_user_id)
+                                          user_id=self.req_user_id,
+                                          user_data = ud_enc)
         self.stubs.Set(compute_api.API, 'get',
                        lambda api, *a, **k: fake_get(*a, **k))
 
         if set_desc:
             self.body['rebuild']['description'] = desc
+
+        if set_ud:
+            self.body['rebuild']['userdata'] = ud_enc
+
         self.req.body = jsonutils.dump_as_bytes(self.body)
         server = self.controller._action_rebuild(self.req, FAKE_UUID,
                                                  body=self.body).obj['server']
         self.assertEqual(server['id'], FAKE_UUID)
         self.assertEqual(server['description'], desc)
+        # userdata is an extended attribute.
+
+    # WRS enhancement to support rebuild with new userdata
+    def test_rebuild_server_with_userdata(self):
+        ud_enc = b64encode("some userdata").decode('utf-8')
+        self._rebuild_server(False, '', True, ud_enc)
+
+    def test_rebuild_server_with_empty_userdata(self):
+        ud_enc = b64encode("").decode('utf-8')
+        self._rebuild_server(False, '', True, ud_enc)
 
     def test_rebuild_server_with_description(self):
         self._rebuild_server(True, 'server desc')
@@ -2957,7 +2997,7 @@ class ServersControllerCreateTest(test.TestCase):
 
         def create(*args, **kwargs):
             result = [('76fa36fc-c930-4bf3-8c8a-ea2a2420deb6', None,
-                       None, None)]
+                       None, None, None)]
             self.assertEqual(result, kwargs['requested_networks'].as_tuples())
             return old_create(*args, **kwargs)
 
@@ -3105,6 +3145,9 @@ class ServersControllerCreateTest(test.TestCase):
                     exception.ImageNUMATopologyCPUOutOfRange,
                     exception.ImageNUMATopologyCPUDuplicates,
                     exception.ImageNUMATopologyCPUsUnassigned,
+                    exception.ImageNUMATopologyNodesForbidden,
+                    exception.ImageNUMATopologyNodesIncomplete,
+                    exception.ImageNUMATopologyNodesDuplicates,
                     exception.ImageNUMATopologyMemoryOutOfRange]:
             self._test_create_instance_numa_topology_wrong(exc)
 
@@ -3701,6 +3744,32 @@ class ServersControllerCreateTestV219(ServersControllerCreateTest):
         self.assertRaises(exception.ValidationError, self.controller.create,
                           self.req, body=self.body)
 
+    # WRS: add testcase with wrs-if:vif_model in request
+    def test_create_instance_with_vif_model(self):
+        self._create_instance_req(False)
+        self.flags(use_neutron=True)
+        self.body['server'] = {'networks': [{'uuid': FAKE_UUID,
+                               'wrs-if:vif_model': 'virtio'}]}
+        self.body['server']['name'] = 'test'
+        self.body['server']['flavorRef'] = 2
+        image_uuid = 'c905cedb-7281-47e4-8a62-f26bc5fc4c77'
+        self.body['server']['imageRef'] = image_uuid
+        self.controller.create(self.req, body=self.body).obj
+
+    # WRS: add testcase with wrs-if:vif_model and port_id in request
+    def test_create_instance_with_vif_model_and_port(self):
+        self._create_instance_req(False)
+        self.flags(use_neutron=True)
+        self.body['server'] = {'networks': [{'port': FAKE_UUID,
+                               'uuid': FAKE_UUID,
+                               'wrs-if:vif_model': 'virtio'}]}
+        self.body['server']['name'] = 'test'
+        self.body['server']['flavorRef'] = 2
+        image_uuid = 'c905cedb-7281-47e4-8a62-f26bc5fc4c77'
+        self.body['server']['imageRef'] = image_uuid
+        self.assertRaises(webob.exc.HTTPInternalServerError,
+                          self.controller.create, self.req, body=self.body)
+
 
 class ServersControllerCreateTestV232(test.NoDBTestCase):
     def setUp(self):
@@ -3966,6 +4035,46 @@ class ServersControllerCreateTestV252(test.NoDBTestCase):
             api_version_request.APIVersionRequest('2.52')
         self.assertRaises(
             exception.ValidationError, self._create_server, tags)
+
+
+@ddt.ddt
+class ServersControllerCreateTestV242(ServersControllerCreateTest):
+    def setUp(self):
+        super(ServersControllerCreateTestV242, self).setUp()
+        self.controller = servers.ServersController()
+
+        self.body = {
+            'server': {
+                'name': 'device-tagging-server',
+                'imageRef': '6b0edabb-8cde-4684-a3f4-978960a51378',
+                'flavorRef': '2',
+                'networks': [{
+                    'uuid': 'ff608d40-75e9-48cb-b745-77bb55b5eaf2'
+                }]
+            }
+        }
+
+        self.req = fakes.HTTPRequestV21.blank('/fake/servers', version='2.42')
+        self.req.method = 'POST'
+        self.req.headers['content-type'] = 'application/json'
+
+    def _create_instance_req(self, set_desc, desc=None):
+        if set_desc:
+            self.body['server']['description'] = desc
+        self.req.body = jsonutils.dump_as_bytes(self.body)
+        self.req.api_version_request = \
+            api_version_request.APIVersionRequest('2.42')
+
+    def test_create_server_with_tags_pre_2_42_vif_model(self):
+        self._create_instance_req(False)
+        self.flags(use_neutron=True)
+        self.body['server'] = {'networks': [{'uuid': FAKE_UUID,
+                               'wrs-if:vif_model': 'virtio'}]}
+        self.body['server']['name'] = 'test'
+        self.body['server']['flavorRef'] = 2
+        image_uuid = 'c905cedb-7281-47e4-8a62-f26bc5fc4c77'
+        self.body['server']['imageRef'] = image_uuid
+        self.controller.create(self.req, body=self.body).obj
 
 
 class ServersControllerCreateTestWithMock(test.TestCase):

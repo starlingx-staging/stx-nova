@@ -13,6 +13,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2016-2017 Wind River Systems, Inc.
+#
 
 """
 Handles all requests relating to volumes + cinder.
@@ -107,7 +110,9 @@ def cinderclient(context, microversion=None, skip_version_check=False):
     service_parameters = {'service_type': service_type,
                           'service_name': service_name,
                           'interface': interface,
-                          'region_name': CONF.cinder.os_region_name}
+                          'region_name': CONF.cinder.os_region_name,
+                          # WRS - set retries based on conf option
+                          'retries': CONF.cinder.session_retries}
 
     if CONF.cinder.endpoint_template:
         url = CONF.cinder.endpoint_template % context.to_dict()
@@ -191,6 +196,10 @@ def _untranslate_volume_summary_view(context, vol):
     if hasattr(vol, 'volume_image_metadata'):
         d['volume_image_metadata'] = copy.deepcopy(vol.volume_image_metadata)
 
+    # WRS - pass through volume creation errors
+    if hasattr(vol, 'error'):
+        d['error'] = vol.error
+
     return d
 
 
@@ -257,8 +266,13 @@ def translate_volume_exception(method):
             res = method(self, ctx, volume_id, *args, **kwargs)
         except (keystone_exception.NotFound, cinder_exception.NotFound):
             _reraise(exception.VolumeNotFound(volume_id=volume_id))
+        except keystone_exception.RequestEntityTooLarge as e:
+            _reraise(exception.VolumeLimitExceeded(reason=e.message))
         except cinder_exception.OverLimit as e:
-            _reraise(exception.OverQuota(message=e.message))
+            _reraise(exception.VolumeLimitExceeded(reason=e.message))
+        except (cinder_exception.BadRequest,
+                keystone_exception.BadRequest) as e:
+            _reraise(exception.InvalidInput(reason=e))
         return res
     return translate_cinder_exception(wrapper)
 

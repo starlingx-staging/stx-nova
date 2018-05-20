@@ -12,6 +12,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2013-2017 Wind River Systems, Inc.
+#
 
 """
 Filter support
@@ -21,6 +24,8 @@ from oslo_log import log as logging
 
 from nova.i18n import _LI
 from nova import loadables
+from nova import objects
+from nova import utils
 
 LOG = logging.getLogger(__name__)
 
@@ -58,6 +63,11 @@ class BaseFilter(object):
         else:
             return True
 
+    # WRS:extension - append filter rejection message
+    def filter_reject(self, host_obj, spec_obj, description, append=False):
+        utils.filter_reject(self.__class__.__name__, host_obj, spec_obj,
+                            description, append=append)
+
 
 class BaseFilterHandler(loadables.BaseLoader):
     """Base class to handle loading filter classes.
@@ -67,6 +77,7 @@ class BaseFilterHandler(loadables.BaseLoader):
 
     def get_filtered_objects(self, filters, objs, spec_obj, index=0):
         list_objs = list(objs)
+        n_hosts = len(list_objs)
         LOG.debug("Starting with %d host(s)", len(list_objs))
         # Track the hosts as they are removed. The 'full_filter_results' list
         # contains the host/nodename info for every host that passes each
@@ -102,6 +113,48 @@ class BaseFilterHandler(loadables.BaseLoader):
                 LOG.debug("Filter %(cls_name)s returned "
                           "%(obj_len)d host(s)",
                           {'cls_name': cls_name, 'obj_len': len(list_objs)})
+
+        # WRS:extension - add info logs to improve system debugging
+
+        if len(list_objs) > 0 and isinstance(spec_obj, objects.RequestSpec):
+            if spec_obj.obj_attr_is_set('instance_uuid'):
+                instance_uuid = spec_obj.instance_uuid
+            else:
+                instance_uuid = None
+            if spec_obj.obj_attr_is_set('flavor'):
+                flavor = spec_obj.flavor
+            else:
+                flavor = None
+            if spec_obj.obj_attr_is_set('scheduler_hints'):
+                scheduler_hints = spec_obj.scheduler_hints
+            else:
+                scheduler_hints = None
+            if spec_obj.obj_attr_is_set('name'):
+                name = spec_obj.name
+            else:
+                name = None
+            if spec_obj.obj_attr_is_set('display_name'):
+                display_name = spec_obj.display_name
+            else:
+                display_name = None
+            if spec_obj.obj_attr_is_set('image') and spec_obj.image:
+                image_props = spec_obj.image.properties.to_dict()
+            else:
+                image_props = None
+
+            LOG.info(_LI(
+                'Filters succeeded with %(num)d out of %(tot)d host(s), '
+                'uuid=%(uuid)s, id=%(id)s, name=%(name)s, '
+                'flavor=%(flavor)s, image_props=%(props)s, hints=%(hint)s'
+            ), {'num': len(list_objs),
+                'tot': n_hosts,
+                'uuid': instance_uuid,
+                'id': name,
+                'name': display_name,
+                'flavor': flavor,
+                'props': image_props,
+                'hint': scheduler_hints})
+
         if not list_objs:
             # Log the filtration history
             # NOTE(sbauza): Since the Cells scheduler still provides a legacy

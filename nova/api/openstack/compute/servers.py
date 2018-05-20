@@ -13,6 +13,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2013-2017 Wind River Systems, Inc.
+#
 
 import copy
 
@@ -390,6 +393,7 @@ class ServersController(wsgi.Controller):
 
         networks = []
         network_uuids = []
+
         for network in requested_networks:
             request = objects.NetworkRequest()
             try:
@@ -422,6 +426,10 @@ class ServersController(wsgi.Controller):
                     self._validate_network_id(
                         request.network_id, network_uuids)
                     network_uuids.append(request.network_id)
+
+                # WRS: vif_model is optional
+                if utils.is_neutron():
+                    request.vif_model = network.get('wrs-if:vif_model', None)
 
                 networks.append(request)
             except KeyError as key:
@@ -457,6 +465,12 @@ class ServersController(wsgi.Controller):
         password = self._get_server_admin_password(server_dict)
         name = common.normalize_name(server_dict['name'])
         description = name
+
+        # Validate Metadata before instance creation
+        meta = server_dict.get('metadata', {})
+        if meta:
+            common.validate_metadata(meta)
+
         if api_version_request.is_supported(req, min_version='2.19'):
             description = server_dict.get('description')
 
@@ -613,6 +627,9 @@ class ServersController(wsgi.Controller):
                 exception.ImageNUMATopologyCPUOutOfRange,
                 exception.ImageNUMATopologyCPUDuplicates,
                 exception.ImageNUMATopologyCPUsUnassigned,
+                exception.ImageNUMATopologyNodesForbidden,
+                exception.ImageNUMATopologyNodesIncomplete,
+                exception.ImageNUMATopologyNodesDuplicates,
                 exception.ImageNUMATopologyMemoryOutOfRange,
                 exception.InvalidNUMANodesNumber,
                 exception.InstanceGroupNotFound,
@@ -622,7 +639,8 @@ class ServersController(wsgi.Controller):
                 exception.RealtimeConfigurationInvalid,
                 exception.RealtimeMaskNotFoundOrInvalid,
                 exception.SnapshotNotFound,
-                exception.UnableToAutoAllocateNetwork) as error:
+                exception.UnableToAutoAllocateNetwork,
+                exception.ImageVCPUModelForbidden) as error:
             raise exc.HTTPBadRequest(explanation=error.format_message())
         except (exception.PortInUse,
                 exception.InstanceExists,
@@ -822,6 +840,8 @@ class ServersController(wsgi.Controller):
         except exception.Invalid:
             msg = _("Invalid instance image.")
             raise exc.HTTPBadRequest(explanation=msg)
+        except exception.ResizeError as e:
+            raise exc.HTTPBadRequest(explanation=e.format_message())
 
     @wsgi.response(204)
     @extensions.expected_errors((404, 409))
@@ -887,6 +907,11 @@ class ServersController(wsgi.Controller):
 
         image_href = rebuild_dict["imageRef"]
 
+        # validate metadata before rebuilding
+        meta = rebuild_dict.get('metadata', {})
+        if meta:
+            common.validate_metadata(meta)
+
         password = self._get_server_admin_password(rebuild_dict)
 
         context = req.environ['nova.context']
@@ -898,6 +923,8 @@ class ServersController(wsgi.Controller):
             'name': 'display_name',
             'description': 'display_description',
             'metadata': 'metadata',
+            # WRS adding userdata to rebuild args
+            'userdata': 'userdata',
         }
 
         kwargs = {}
@@ -937,6 +964,7 @@ class ServersController(wsgi.Controller):
         except exception.QuotaError as error:
             raise exc.HTTPForbidden(explanation=error.format_message())
         except (exception.ImageNotActive,
+                exception.ImageUnacceptable,
                 exception.FlavorDiskTooSmall,
                 exception.FlavorMemoryTooSmall,
                 exception.InvalidMetadata,

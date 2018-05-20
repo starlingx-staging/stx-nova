@@ -11,6 +11,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2013-2017 Wind River Systems, Inc.
+#
 
 
 import copy
@@ -606,6 +609,15 @@ class ServicesTestV21(test.TestCase):
         req = FakeRequestWithHostService()
         self.assertRaises(self.service_is_up_exc, self.controller.index, req)
 
+    # WRS: extension - test update create for api v2.1
+    #                - currently works but may be restricted later
+    def test_services_update_create(self):
+        req = FakeRequest()
+        body = {'host': 'host1', 'binary': 'nova-compute'}
+        with mock.patch.object(self.controller.host_api, 'service_create'):
+            res_dict = self.controller.update(req, "create", body=body)
+            self.assertEqual(res_dict['service']['status'], 'created')
+
 
 class ServicesTestV211(ServicesTestV21):
     wsgi_api_version = '2.11'
@@ -917,6 +929,15 @@ class ServicesTestV211(ServicesTestV21):
         self.assertRaises(exception.ValidationError,
             self.controller.update, req, 'force-down', body=req_body)
 
+    # WRS: extension - test update create for api v2.1
+    #                - currently works but may be restricted later
+    def test_services_update_create(self):
+        req = FakeRequest()
+        body = {'host': 'host1', 'binary': 'nova-compute'}
+        with mock.patch.object(self.controller.host_api, 'service_create'):
+            res_dict = self.controller.update(req, "create", body=body)
+            self.assertEqual(res_dict['service']['status'], 'created')
+
 
 class ServicesTestV252(ServicesTestV211):
     """This is a boundary test to ensure that 2.52 behaves the same as 2.11."""
@@ -940,6 +961,10 @@ class ServicesTestV253(test.TestCase):
         self.controller.servicegroup_api = FakeServiceGroupAPI()
         self.req = fakes.HTTPRequest.blank(
             '', version=services_v21.UUID_FOR_ID_MIN_VERSION)
+
+        # WRS: stub out server group messaging
+        self.stubs.Set(compute.cgcs_messaging.CGCSMessaging,
+                       '_do_setup', lambda *a, **kw: None)
 
     def assert_services_equal(self, s1, s2):
         for k in ('binary', 'host'):

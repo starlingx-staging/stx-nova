@@ -31,6 +31,7 @@ class CreateBackupController(wsgi.Controller):
         super(CreateBackupController, self).__init__(*args, **kwargs)
         self.compute_api = compute.API()
 
+    @extensions.block_during_upgrade()
     @wsgi.response(202)
     @extensions.expected_errors((400, 403, 404, 409))
     @wsgi.action('createBackup')

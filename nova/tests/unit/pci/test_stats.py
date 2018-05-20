@@ -164,8 +164,9 @@ class PciDeviceStatsTestCase(test.NoDBTestCase):
         self.assertEqual(0, len(devs))
 
     def test_consume_requests_failed(self):
-        self.assertIsNone(self.pci_stats.consume_requests(
-                          pci_requests_multiple))
+        self.assertRaises(exception.PciDeviceRequestFailed,
+                          self.pci_stats.consume_requests,
+                          pci_requests_multiple)
 
     def test_support_requests_numa(self):
         cells = [objects.InstanceNUMACell(id=0, cpuset=set(), memory=0),
@@ -192,7 +193,10 @@ class PciDeviceStatsTestCase(test.NoDBTestCase):
 
     def test_consume_requests_numa_failed(self):
         cells = [objects.InstanceNUMACell(id=0, cpuset=set(), memory=0)]
-        self.assertIsNone(self.pci_stats.consume_requests(pci_requests, cells))
+        self.assertRaises(exception.PciDeviceRequestFailed,
+                          self.pci_stats.consume_requests,
+                          pci_requests,
+                          cells)
 
     def test_consume_requests_no_numa_info(self):
         cells = [objects.InstanceNUMACell(id=0, cpuset=set(), memory=0)]
@@ -274,16 +278,17 @@ class PciDeviceStatsWithTagsTestCase(test.NoDBTestCase):
         # they are also part of the keys. In this test class, we have
         # two pools with the second one having the tag 'physical_network'
         # and the value 'physnet1'
+        # WRS: Sort function is different than upstream.
         self.assertEqual(2, len(self.pci_stats.pools))
-        self._assertPoolContent(self.pci_stats.pools[0], '1137', '0072',
-                                len(self.pci_untagged_devices))
-        self.assertEqual(self.pci_untagged_devices,
-                         self.pci_stats.pools[0]['devices'])
-        self._assertPoolContent(self.pci_stats.pools[1], '1137', '0071',
+        self._assertPoolContent(self.pci_stats.pools[0], '1137', '0071',
                                 len(self.pci_tagged_devices),
                                 physical_network='physnet1')
         self.assertEqual(self.pci_tagged_devices,
-                         self.pci_stats.pools[1]['devices'])
+        self.pci_stats.pools[0]['devices'])
+        self._assertPoolContent(self.pci_stats.pools[1], '1137', '0072',
+                                len(self.pci_untagged_devices))
+        self.assertEqual(self.pci_untagged_devices,
+        self.pci_stats.pools[1]['devices'])
 
     def test_add_devices(self):
         self._create_pci_devices()
@@ -300,9 +305,10 @@ class PciDeviceStatsWithTagsTestCase(test.NoDBTestCase):
         self.assertEqual(2, len(devs))
         self.assertEqual(set(['0071', '0072']),
                          set([dev.product_id for dev in devs]))
-        self._assertPoolContent(self.pci_stats.pools[0], '1137', '0072', 2)
-        self._assertPoolContent(self.pci_stats.pools[1], '1137', '0071', 3,
+        # WRS: Sort function is different than upstream.
+        self._assertPoolContent(self.pci_stats.pools[0], '1137', '0071', 3,
                                 physical_network='physnet1')
+        self._assertPoolContent(self.pci_stats.pools[1], '1137', '0072', 2)
 
     def test_add_device_no_devspec(self):
         self._create_pci_devices()
@@ -437,10 +443,14 @@ class PciDeviceVFPFStatsTestCase(test.NoDBTestCase):
                         objects.InstancePCIRequest(count=1,
                             spec=[{'product_id': '1528',
                                     'dev_type': 'type-PF'}])]
-        self.assertIsNone(self.pci_stats.consume_requests(pci_requests))
+        self.assertRaises(exception.PciDeviceRequestFailed,
+                          self.pci_stats.consume_requests,
+                          pci_requests)
 
     def test_consume_VF_and_PF_same_prodict_id_failed(self):
         self._create_pci_devices(pf_product_id=1515)
         pci_requests = [objects.InstancePCIRequest(count=9,
                             spec=[{'product_id': '1515'}])]
-        self.assertIsNone(self.pci_stats.consume_requests(pci_requests))
+        self.assertRaises(exception.PciDeviceRequestFailed,
+                          self.pci_stats.consume_requests,
+                          pci_requests)

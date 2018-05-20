@@ -75,6 +75,7 @@ class FixedIPController(wsgi.Controller):
         return fixed_ip_info
 
     @wsgi.Controller.api_version("2.1", MAX_PROXY_API_SUPPORT_VERSION)
+    @extensions.block_during_upgrade()
     @wsgi.response(202)
     @extensions.expected_errors((400, 404))
     @validation.schema(fixed_ips.reserve)
@@ -86,6 +87,7 @@ class FixedIPController(wsgi.Controller):
         return self._set_reserved(context, id, True)
 
     @wsgi.Controller.api_version("2.1", MAX_PROXY_API_SUPPORT_VERSION)
+    @extensions.block_during_upgrade()
     @wsgi.response(202)
     @extensions.expected_errors((400, 404))
     @validation.schema(fixed_ips.unreserve)

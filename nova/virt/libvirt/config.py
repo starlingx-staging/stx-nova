@@ -144,6 +144,127 @@ class LibvirtConfigCapsNUMATopology(LibvirtConfigObject):
         return topo
 
 
+class LibvirtConfigCapsCacheBanks(LibvirtConfigObject):
+
+    def __init__(self, **kwargs):
+        super(LibvirtConfigCapsCacheBanks, self).__init__(
+            root_name="cache",
+            **kwargs)
+
+        self.banks = []
+
+    def parse_dom(self, xmldoc):
+        super(LibvirtConfigCapsCacheBanks, self).parse_dom(xmldoc)
+
+        for xmlbank in xmldoc.getchildren():
+            bank = LibvirtConfigCapsCacheBank()
+            bank.parse_dom(xmlbank)
+            self.banks.append(bank)
+
+    def format_dom(self):
+        cache = super(LibvirtConfigCapsCacheBanks, self).format_dom()
+
+        for b in self.banks:
+            cache.append(b.format_dom())
+
+        return cache
+
+
+class LibvirtConfigCapsCacheBank(LibvirtConfigObject):
+
+    def __init__(self, **kwargs):
+        super(LibvirtConfigCapsCacheBank, self).__init__(root_name="bank",
+                                                        **kwargs)
+
+        self.id = None
+        self.level = None
+        self.type = None
+        self.size = None
+        self.unit = None
+        self.cpus = None
+        self.control = []
+
+    def parse_dom(self, xmldoc):
+        super(LibvirtConfigCapsCacheBank, self).parse_dom(xmldoc)
+
+        self.id = int(xmldoc.get("id"))
+        if xmldoc.get("level") is not None:
+            self.level = int(xmldoc.get("level"))
+        if xmldoc.get("type") is not None:
+            self.type = str(xmldoc.get("type"))
+        if xmldoc.get("size") is not None:
+            self.size = int(xmldoc.get("size"))
+        if xmldoc.get("unit") is not None:
+            self.unit = str(xmldoc.get("unit"))
+        if xmldoc.get("cpus") is not None:
+            self.cpus = hardware.parse_cpu_spec(
+                xmldoc.get("cpus"))
+        for c in xmldoc.getchildren():
+            if c.tag == "control":
+                control = LibvirtConfigCapsCacheControl()
+                control.parse_dom(c)
+                self.control.append(control)
+
+    def format_dom(self):
+        bank = super(LibvirtConfigCapsCacheBank, self).format_dom()
+
+        bank.set("id", str(self.id))
+        if self.level is not None:
+            bank.set("level", str(self.level))
+        if self.type is not None:
+            bank.set("type", str(self.type))
+        if self.size is not None:
+            bank.set("size", str(self.size))
+        if self.unit is not None:
+            bank.set("unit", str(self.unit))
+        if self.type is not None:
+            bank.set("type", str(self.type))
+        if self.cpus is not None:
+            bank.set("cpus",
+                    hardware.format_cpu_spec(self.cpus))
+        control = etree.Element("control")
+        for c in self.control:
+            control.append(c.format_dom())
+        if self.control:
+            bank.extend(control)
+
+        return bank
+
+
+class LibvirtConfigCapsCacheControl(LibvirtConfigObject):
+
+    def __init__(self, **kwargs):
+        super(LibvirtConfigCapsCacheControl, self).__init__(
+            root_name="control", **kwargs)
+
+        self.granularity = None
+        self.unit = None
+        self.type = None
+        self.maxAllocs = None
+
+    def parse_dom(self, xmldoc):
+        super(LibvirtConfigCapsCacheControl, self).parse_dom(xmldoc)
+
+        self.granularity = int(xmldoc.get("granularity"))
+        self.unit = str(xmldoc.get("unit"))
+        self.type = str(xmldoc.get("type"))
+        self.maxAllocs = int(xmldoc.get("maxAllocs"))
+
+    def format_dom(self):
+        control = super(LibvirtConfigCapsCacheControl, self).format_dom()
+
+        if self.granularity is not None:
+            control.set("granularity", str(self.granularity))
+        if self.unit is not None:
+            control.set("unit", str(self.unit))
+        if self.type is not None:
+            control.set("type", str(self.type))
+        if self.maxAllocs is not None:
+            control.set("maxAllocs", str(self.maxAllocs))
+
+        return control
+
+
 class LibvirtConfigCapsNUMACell(LibvirtConfigObject):
 
     def __init__(self, **kwargs):
@@ -267,6 +388,7 @@ class LibvirtConfigCapsHost(LibvirtConfigObject):
         self.cpu = None
         self.uuid = None
         self.topology = None
+        self.cache = None
 
     def parse_dom(self, xmldoc):
         super(LibvirtConfigCapsHost, self).parse_dom(xmldoc)
@@ -281,6 +403,9 @@ class LibvirtConfigCapsHost(LibvirtConfigObject):
             elif c.tag == "topology":
                 self.topology = LibvirtConfigCapsNUMATopology()
                 self.topology.parse_dom(c)
+            elif c.tag == "cache":
+                self.cache = LibvirtConfigCapsCacheBanks()
+                self.cache.parse_dom(c)
 
     def format_dom(self):
         caps = super(LibvirtConfigCapsHost, self).format_dom()
@@ -291,6 +416,8 @@ class LibvirtConfigCapsHost(LibvirtConfigObject):
             caps.append(self.cpu.format_dom())
         if self.topology:
             caps.append(self.topology.format_dom())
+        if self.cache:
+            caps.append(self.cache.format_dom())
 
         return caps
 
@@ -1839,6 +1966,32 @@ class LibvirtConfigGuestCPUTuneVCPUSched(LibvirtConfigObject):
         return root
 
 
+class LibvirtConfigGuestCPUTuneCacheTune(LibvirtConfigObject):
+
+    def __init__(self, **kwargs):
+        super(LibvirtConfigGuestCPUTuneCacheTune, self).__init__(
+            root_name="cachetune",
+            **kwargs)
+
+        self.cacheId = None
+        self.type = None
+        self.sizeKiB = None
+        self.vcpus = None
+
+    def format_dom(self):
+        root = super(LibvirtConfigGuestCPUTuneCacheTune, self).format_dom()
+
+        if self.cacheId is not None:
+            root.set("cacheId", str(self.cacheId))
+        if self.type is not None:
+            root.set("type", str(self.type))
+        if self.sizeKiB is not None:
+            root.set("sizeKiB", str(self.sizeKiB))
+        if self.vcpus is not None:
+            root.set("vcpus", hardware.format_cpu_spec(self.vcpus))
+        return root
+
+
 class LibvirtConfigGuestCPUTune(LibvirtConfigObject):
 
     def __init__(self, **kwargs):
@@ -1850,6 +2003,7 @@ class LibvirtConfigGuestCPUTune(LibvirtConfigObject):
         self.vcpupin = []
         self.emulatorpin = None
         self.vcpusched = []
+        self.cachetune = []
 
     def format_dom(self):
         root = super(LibvirtConfigGuestCPUTune, self).format_dom()
@@ -1867,6 +2021,8 @@ class LibvirtConfigGuestCPUTune(LibvirtConfigObject):
             root.append(vcpu.format_dom())
         for sched in self.vcpusched:
             root.append(sched.format_dom())
+        for cache in self.cachetune:
+            root.append(cache.format_dom())
 
         return root
 
@@ -2000,8 +2156,14 @@ class LibvirtConfigGuestNUMATune(LibvirtConfigObject):
     def format_dom(self):
         root = super(LibvirtConfigGuestNUMATune, self).format_dom()
 
-        if self.memory is not None:
-            root.append(self.memory.format_dom())
+        # WRS: Do not emit numatune memory XML so we get 'default' memory
+        # allocation policy for 4K memory. The 'default' policy is "local
+        # allocation", i.e., allocate memory on the node of the CPU that
+        # triggered the allocation. If the "local node" contains no free
+        # memory, the system will attempt to allocate memory from a "near by"
+        # node.
+        # if self.memory is not None:
+        #     root.append(self.memory.format_dom())
         for node in self.memnodes:
             root.append(node.format_dom())
 
@@ -2106,6 +2268,7 @@ class LibvirtConfigGuest(LibvirtConfigObject):
         self.os_cmdline = None
         self.os_root = None
         self.os_init_path = None
+        self.os_reboot_timeout = "5000"
         self.os_boot_dev = []
         self.os_smbios = None
         self.os_mach_type = None
@@ -2114,6 +2277,8 @@ class LibvirtConfigGuest(LibvirtConfigObject):
         self.metadata = []
         self.idmaps = []
         self.perf_events = []
+        self.os_nvram = None
+        self.os_nvram_template = None
 
     def _format_basic_props(self, root):
         root.append(self._text_node("uuid", self.uuid))
@@ -2153,6 +2318,11 @@ class LibvirtConfigGuest(LibvirtConfigObject):
                 loader.set("type", "pflash")
                 loader.set("readonly", "yes")
                 os.append(loader)
+                nvram = self._text_node("nvram", self.os_nvram)
+                # WRS: preserve existing UEFI variable store file
+                if self.os_nvram_template:
+                    nvram.set("template", self.os_nvram_template)
+                os.append(nvram)
             else:
                 os.append(self._text_node("loader", self.os_loader))
         if self.os_initrd is not None:
@@ -2163,6 +2333,11 @@ class LibvirtConfigGuest(LibvirtConfigObject):
             os.append(self._text_node("root", self.os_root))
         if self.os_init_path is not None:
             os.append(self._text_node("init", self.os_init_path))
+        # WRS: Configure BIOS reboot timeout so that if guest machine fails,
+        # it will reboot after specified time in milliseconds.
+        if self.os_reboot_timeout is not None:
+            bios = etree.Element("bios", rebootTimeout=self.os_reboot_timeout)
+            os.append(bios)
 
         for boot_dev in self.os_boot_dev:
             os.append(etree.Element("boot", dev=boot_dev))

@@ -84,6 +84,7 @@ class FloatingIPBulkController(wsgi.Controller):
         return floating_ip_info
 
     @wsgi.Controller.api_version("2.1", MAX_PROXY_API_SUPPORT_VERSION)
+    @extensions.block_during_upgrade()
     @extensions.expected_errors((400, 409))
     @validation.schema(floating_ips_bulk.create)
     def create(self, req, body):
@@ -113,6 +114,7 @@ class FloatingIPBulkController(wsgi.Controller):
                                                "interface": interface}}
 
     @wsgi.Controller.api_version("2.1", MAX_PROXY_API_SUPPORT_VERSION)
+    @extensions.block_during_upgrade()
     @extensions.expected_errors((400, 404))
     @validation.schema(floating_ips_bulk.delete)
     def update(self, req, id, body):

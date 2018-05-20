@@ -38,6 +38,23 @@ CPU_INFO = """
 "features": [],
 "model": ""}"""
 
+FAKE_VIRT_NUMA_TOPOLOGY_STATS = {
+    'memory_mb_by_node':
+        jsonutils.dumps({"0": {"2M": 3072, "4K": 0},
+                         "1": {"2M": 3072, "4K": 0}}),
+    'memory_mb_used_by_node':
+        jsonutils.dumps({"0": {"2M": 0, "4K": 0},
+                         "1": {"2M": 0, "4K": 0}}),
+    'vcpus_by_node': jsonutils.dumps({"0": 2, "1": 2}),
+    'vcpus_used_by_node':
+        jsonutils.dumps({"0": {"shared": 0.0, "dedicated": 0},
+                         "1": {"shared": 0.0, "dedicated": 0}}),
+    'l3_cache_by_node': jsonutils.dumps({"0": 56320, "1": 56320}),
+    'l3_cache_used_by_node': jsonutils.dumps({"0": 2816, "1": 0}),
+    'l3_cache_granularity': '2816',
+}
+
+
 TEST_HYPERS = [
     dict(id=1,
          uuid=uuids.hyper1,
@@ -58,7 +75,10 @@ TEST_HYPERS = [
          running_vms=2,
          cpu_info=CPU_INFO,
          disk_available_least=100,
-         host_ip=netaddr.IPAddress('1.1.1.1')),
+         stats=FAKE_VIRT_NUMA_TOPOLOGY_STATS,
+         l3_closids=16,
+         l3_closids_used=1,
+         host_ip=netaddr.IPAddress('1.1.1.1'),),
     dict(id=2,
          uuid=uuids.hyper2,
          service_id=2,
@@ -78,6 +98,9 @@ TEST_HYPERS = [
          running_vms=2,
          cpu_info=CPU_INFO,
          disk_available_least=100,
+         stats=FAKE_VIRT_NUMA_TOPOLOGY_STATS,
+         l3_closids=16,
+         l3_closids_used=1,
          host_ip=netaddr.IPAddress('2.2.2.2'))]
 
 
@@ -160,7 +183,9 @@ def fake_compute_node_statistics(context):
         current_workload=0,
         running_vms=0,
         disk_available_least=0,
-        )
+        l3_closids=0,
+        l3_closids_used=0,
+    )
 
     for hyper in TEST_HYPERS_OBJ:
         for key in result:
@@ -207,6 +232,12 @@ class HypervisorsTestV21(test.NoDBTestCase):
                            'status': 'enabled',
                            'service': dict(id=2, host='compute2',
                                         disabled_reason=None)})
+
+    del DETAIL_HYPERS_DICTS[0]['stats']
+    del DETAIL_HYPERS_DICTS[1]['stats']
+    DETAIL_HYPERS_DICTS[0].update(FAKE_VIRT_NUMA_TOPOLOGY_STATS)
+    DETAIL_HYPERS_DICTS[1].update(FAKE_VIRT_NUMA_TOPOLOGY_STATS)
+
     INDEX_HYPER_DICTS = [
         dict(id=1, hypervisor_hostname="hyper1",
              state='up', status='enabled'),
@@ -714,7 +745,9 @@ class HypervisorsTestV21(test.NoDBTestCase):
                     free_disk_gb=250,
                     current_workload=4,
                     running_vms=4,
-                    disk_available_least=200)), result)
+                    disk_available_least=200,
+                    l3_closids=32,
+                    l3_closids_used=2)), result)
 
     def test_statistics_non_admin(self):
         req = self._get_request(False)
@@ -880,7 +913,23 @@ class HypervisorsTestV233(HypervisorsTestV228):
                 'state': 'up',
                 'status': 'enabled',
                 'vcpus': 4,
-                'vcpus_used': 2}
+                'vcpus_by_node': jsonutils.dumps({"0": 2, "1": 2}),
+                'memory_mb_by_node': jsonutils.dumps(
+                    {"0": {"2M": 3072, "4K": 0},
+                     "1": {"2M": 3072, "4K": 0}}),
+                'memory_mb_used_by_node': jsonutils.dumps(
+                    {"0": {"2M": 0, "4K": 0},
+                     "1": {"2M": 0, "4K": 0}}),
+                'vcpus_used': 2,
+                'vcpus_used_by_node': jsonutils.dumps(
+                    {"0": {"shared": 0.0, "dedicated": 0},
+                     "1": {"shared": 0.0, "dedicated": 0}}),
+                'l3_closids': 16,
+                'l3_closids_used': 1,
+                'l3_cache_by_node': jsonutils.dumps({"0": 56320, "1": 56320}),
+                'l3_cache_used_by_node': jsonutils.dumps({"0": 2816, "1": 0}),
+                'l3_cache_granularity': '2816',
+                 }
             ],
             'hypervisors_links': [{'href': link, 'rel': 'next'}]
         }
@@ -1071,7 +1120,22 @@ class HypervisorsTestV253(HypervisorsTestV252):
                 'state': 'up',
                 'status': 'enabled',
                 'vcpus': 4,
-                'vcpus_used': 2}
+                'vcpus_by_node': jsonutils.dumps({"0": 2, "1": 2}),
+                'memory_mb_by_node': jsonutils.dumps(
+                    {"0": {"2M": 3072, "4K": 0},
+                     "1": {"2M": 3072, "4K": 0}}),
+                'memory_mb_used_by_node': jsonutils.dumps(
+                    {"0": {"2M": 0, "4K": 0},
+                     "1": {"2M": 0, "4K": 0}}),
+                'vcpus_used': 2,
+                'vcpus_used_by_node': jsonutils.dumps(
+                    {"0": {"shared": 0.0, "dedicated": 0},
+                     "1": {"shared": 0.0, "dedicated": 0}}),
+                 'l3_cache_by_node': jsonutils.dumps({"0": 56320, "1": 56320}),
+                 'l3_cache_used_by_node': jsonutils.dumps({"0": 2816, "1": 0}),
+                 'l3_cache_granularity': '2816',
+                 'l3_closids': 16,
+                 'l3_closids_used': 1}
             ]
         }
         # There are no links when using the hypervisor_hostname_pattern
@@ -1217,7 +1281,22 @@ class HypervisorsTestV253(HypervisorsTestV252):
                 'state': 'up',
                 'status': 'enabled',
                 'vcpus': 4,
-                'vcpus_used': 2}
+                'vcpus_by_node': jsonutils.dumps({"0": 2, "1": 2}),
+                'memory_mb_by_node': jsonutils.dumps(
+                    {"0": {"2M": 3072, "4K": 0},
+                     "1": {"2M": 3072, "4K": 0}}),
+                'memory_mb_used_by_node': jsonutils.dumps(
+                    {"0": {"2M": 0, "4K": 0},
+                     "1": {"2M": 0, "4K": 0}}),
+                'vcpus_used': 2,
+                'vcpus_used_by_node': jsonutils.dumps(
+                    {"0": {"shared": 0.0, "dedicated": 0},
+                     "1": {"shared": 0.0, "dedicated": 0}}),
+                 'l3_cache_by_node': jsonutils.dumps({"0": 56320, "1": 56320}),
+                 'l3_cache_used_by_node': jsonutils.dumps({"0": 2816, "1": 0}),
+                 'l3_cache_granularity': '2816',
+                 'l3_closids': 16,
+                 'l3_closids_used': 1}
             ],
             'hypervisors_links': [{'href': link, 'rel': 'next'}]
         }

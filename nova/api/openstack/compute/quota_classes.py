@@ -77,6 +77,7 @@ class QuotaClassSetsController(wsgi.Controller):
         values = QUOTAS.get_class_quotas(context, id)
         return self._format_quota_set(id, values, req)
 
+    @extensions.block_during_upgrade()
     @extensions.expected_errors(400)
     @validation.schema(quota_classes.update, "2.0", "2.49")
     @validation.schema(quota_classes.update_v250, "2.50")

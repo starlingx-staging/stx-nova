@@ -14,6 +14,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2016-2017 Wind River Systems, Inc.
+#
 
 """
 Handling of VM disk images.
@@ -72,6 +75,9 @@ def qemu_img_info(path, format=None):
             cmd = cmd + ('--force-share',)
         out, err = utils.execute(*cmd, prlimit=QEMU_IMG_LIMITS)
     except processutils.ProcessExecutionError as exp:
+        if exp.stderr and "No such file or directory" in exp.stderr:
+            raise exception.DiskNotFound(location=path)
+
         # this means we hit prlimits, make the exception more specific
         if exp.exit_code == -9:
             msg = (_("qemu-img aborted by prlimits when inspecting "
@@ -118,12 +124,16 @@ def _convert_image(source, dest, in_format, out_format, run_as_root):
     # on persistent storage when the command exits. Without (2), a host crash
     # may leave a corrupt image in the image cache, which Nova cannot recover
     # automatically.
-    cmd = ('qemu-img', 'convert', '-t', 'none', '-O', out_format)
+    # WRS: add ionice option to qemu-img and execute operation
+    # with disk concurrency sema
+    cmd = ('ionice', '-c2', '-n4',
+           'qemu-img', 'convert', '-t', 'none', '-O', out_format)
     if in_format is not None:
         cmd = cmd + ('-f', in_format)
     cmd = cmd + (source, dest)
     try:
-        utils.execute(*cmd, run_as_root=run_as_root)
+        with utils.disk_op_sema:
+            utils.execute(*cmd, run_as_root=run_as_root)
     except processutils.ProcessExecutionError as exp:
         msg = (_("Unable to convert image to %(format)s: %(exp)s") %
                {'format': out_format, 'exp': exp})
@@ -132,7 +142,14 @@ def _convert_image(source, dest, in_format, out_format, run_as_root):
 
 def fetch(context, image_href, path):
     with fileutils.remove_path_on_error(path):
-        IMAGE_API.download(context, image_href, dest_path=path)
+        # WRS: execute operation with disk concurrency sema
+        LOG.info('virt.images.fetch(): acquiring disk_op_sema')
+        with utils.disk_op_sema:
+            LOG.info('fetch: Downloading %(src)s to %(dest)s',
+            {'src': image_href, 'dest': path})
+            IMAGE_API.download(context, image_href, dest_path=path)
+            LOG.info('fetch: Downloading %(dest)s completed',
+            {'dest': path})
 
 
 def get_info(context, image_href):
@@ -158,7 +175,18 @@ def fetch_to_raw(context, image_href, path):
                 reason=(_("fmt=%(fmt)s backed by: %(backing_file)s") %
                         {'fmt': fmt, 'backing_file': backing_file}))
 
-        if fmt != "raw" and CONF.force_raw_images:
+        if CONF.force_raw_images:
+            force_convert = (fmt != "raw")
+        else:
+            # WRS: we have seen problems with backing file formats
+            #      other than qcow2/raw, so we unconditionally
+            #      force those formats to raw.
+            force_convert = (fmt != 'qcow2') and (fmt != "raw")
+            if force_convert:
+                LOG.info("Ignore force_raw_images:convert %(fmt)s to raw",
+                         {'fmt': fmt})
+
+        if force_convert:
             staged = "%s.converted" % path
             LOG.debug("%s was %s, converting to raw", image_href, fmt)
             with fileutils.remove_path_on_error(staged):

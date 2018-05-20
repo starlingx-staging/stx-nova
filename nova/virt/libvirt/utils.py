@@ -17,6 +17,10 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2016-2017 Wind River Systems, Inc.
+#
+
 
 import errno
 import os
@@ -24,21 +28,29 @@ import re
 
 from oslo_concurrency import processutils
 from oslo_log import log as logging
+from oslo_serialization import jsonutils
+from oslo_utils import importutils
 
 import nova.conf
 from nova.i18n import _
 from nova.objects import fields as obj_fields
 from nova import utils
 from nova.virt.disk import api as disk
+from nova.virt import hardware
 from nova.virt import images
 from nova.virt.libvirt import config as vconfig
 from nova.virt.libvirt.volume import remotefs
 from nova.virt import volumeutils
 
+# WRS: add libvirt_qemu
+libvirt_qemu = None
+
 CONF = nova.conf.CONF
 LOG = logging.getLogger(__name__)
 
 RESIZE_SNAPSHOT_NAME = 'nova-resize'
+SCHED_NORMAL = 0
+SCHED_RT = 1
 
 
 def execute(*args, **kwargs):
@@ -316,14 +328,19 @@ def extract_snapshot(disk_path, source_fmt, out_path, dest_fmt):
     if dest_fmt == 'ploop':
         dest_fmt = 'parallels'
 
-    qemu_img_cmd = ('qemu-img', 'convert', '-f', source_fmt, '-O', dest_fmt)
+    # WRS: add ionice & no caching options to qemu-img
+    qemu_img_cmd = ('ionice', '-c2', '-n4',
+                    'qemu-img', 'convert', '-t', 'none',
+                    '-f', source_fmt, '-O', dest_fmt)
 
     # Conditionally enable compression of snapshots.
     if CONF.libvirt.snapshot_compression and dest_fmt == "qcow2":
         qemu_img_cmd += ('-c',)
 
     qemu_img_cmd += (disk_path, out_path)
-    execute(*qemu_img_cmd)
+    # WRS: execute operation with disk concurrency sema
+    with utils.disk_op_sema:
+        execute(*qemu_img_cmd)
 
 
 def load_file(path):
@@ -556,3 +573,99 @@ def last_bytes(file_like_object, num):
 
     remaining = file_like_object.tell()
     return (file_like_object.read(), remaining)
+
+
+# WRS extension
+def assign_floating_cpusets(domain, instance):
+    """Assign the Linux tasks corresponding to the vCPUs to cpusets
+
+    Each vCPU has a corresponding Linux task that has been affined to
+    individual CPUs or is left to float across all available host CPUs.
+    In the case where the instances are floating, we want to add the
+    vCPU tasks to cpusets to make it easier to re-affine them later
+    when the available floating CPU pool changes.
+    """
+
+    # Do we need to do anything to make sure instance.numa_topology
+    # is available?
+
+    task_mapping = []
+    if instance.numa_topology is None:
+        # Guest has no NUMA restrictions, put it in the global set.
+        task_mapping.append({'node': None, 'vcpus': range(instance.vcpus)})
+    else:
+        for cell in instance.numa_topology.cells:
+            # If we're using dedicated CPUs, then don't do anything.
+            if cell.cpu_policy == 'dedicated':
+                return
+            task_mapping.append({'node': cell.id, 'vcpus': cell.cpuset})
+
+    cpuinfolist = get_cpu_info_qemu(domain)
+    if cpuinfolist is None:
+        return
+
+    # For each mapping, figure out the set of threads that correspond to
+    # the vCPUs in the mapping.
+    for mapping in task_mapping:
+        tids = set()
+        for cpu in mapping['vcpus']:
+            for cpuinfo in cpuinfolist:
+                if cpuinfo['CPU'] == cpu:
+                    tids.add(cpuinfo['thread_id'])
+
+        # Assign the threads to the cpuset
+        hardware.set_cpuset_tasks(mapping['node'], tids)
+
+    # Put all qemu threads that aren't vCPU threads into the floating cpuset.
+    # Place in the same numa node as the VM if it is single numa, otherwise
+    # place in the global floating cpuset. Originally we couldn't use libvirt
+    # emulatorpin because it crashed, but with CentOS we could rework this.
+    vcpu_tasks = [cpuinfo['thread_id'] for cpuinfo in cpuinfolist]
+    qemu_task_strings = os.listdir('/proc/' + str(vcpu_tasks[0]) + '/task')
+    qemu_tasks = [int(task) for task in qemu_task_strings]
+    emulator_tasks = set(qemu_tasks) - set(vcpu_tasks)
+    if len(task_mapping) == 1:
+        node = task_mapping[0]['node']
+    else:
+        node = None
+    hardware.set_cpuset_tasks(node, emulator_tasks)
+
+
+def get_cpu_info_qemu(domain):
+    global libvirt_qemu
+    if libvirt_qemu is None:
+        libvirt_qemu = importutils.import_module('libvirt_qemu')
+
+    # Get CPU information from qemu.  This includes vCPU-to-thread mapping.
+    # The result of this looks like:
+    # {"return":[{"current":true,"CPU":0,"pc":-2130513274,"halted":true,
+    # "thread_id":86064},{"current":false,"CPU":1,"pc":-2130513274,
+    # "halted":true,"thread_id":86065},],"id":"libvirt-156"}
+    try:
+        cpuinfostr = libvirt_qemu.qemuMonitorCommand(
+            domain, '{"execute":"query-cpus"}', 0)
+    except Exception as e:
+        LOG.error('Unable to query cpuset info, '
+                  'qemuMonitorCommand failed: %s', e)
+        return None
+    cpuinfolist = jsonutils.loads(cpuinfostr)['return']
+    return cpuinfolist
+
+
+def set_rt_vcpu_scheduler(domain, vcpu, scheduler):
+    cpuinfolist = get_cpu_info_qemu(domain)
+    if cpuinfolist is None:
+        return None
+
+    tid = None
+    for cpuinfo in cpuinfolist:
+        if cpuinfo['CPU'] == vcpu:
+            tid = cpuinfo['thread_id']
+    if tid:
+        if scheduler == SCHED_RT:
+            execute('chrt', '-f', '-p',
+                    CONF.libvirt.realtime_scheduler_priority, tid)
+        elif scheduler == SCHED_NORMAL:
+            execute('chrt', '-o', '-p', 0, tid)
+
+    return tid

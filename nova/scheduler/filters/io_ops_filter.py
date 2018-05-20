@@ -12,6 +12,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2013-2017 Wind River Systems, Inc.
+#
 
 from oslo_log import log as logging
 
@@ -46,6 +49,9 @@ class IoOpsFilter(filters.BaseHostFilter):
                         "is set to %(max_io_ops)s",
                         {'host_state': host_state,
                          'max_io_ops': max_io_ops})
+            msg = ('Num IO ops:%(io_ops)s, Max IOs per host:%(max_io_ops)s' %
+                   {'io_ops': num_io_ops, 'max_io_ops': max_io_ops})
+            self.filter_reject(host_state, spec_obj, msg)
         return passes
 
 

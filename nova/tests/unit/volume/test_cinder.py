@@ -12,6 +12,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2013-2017 Wind River Systems, Inc.
+#
 
 from cinderclient import api_versions as cinder_api_versions
 from cinderclient import exceptions as cinder_exception
@@ -47,6 +50,7 @@ class FakeVolume(object):
         self.snapshot_id = 'snap_id_1'
         self.metadata = {}
         self.multiattach = multiattach
+        self.error = ''
 
     def get(self, volume_id):
         return self.volume_id
@@ -176,8 +180,8 @@ class CinderApiTestCase(test.NoDBTestCase):
     def test_create_over_quota_failed(self, mock_cinderclient):
         mock_cinderclient.return_value.volumes.create.side_effect = (
             cinder_exception.OverLimit(413))
-        self.assertRaises(exception.OverQuota, self.api.create, self.ctx,
-                          1, '', '')
+        self.assertRaises(exception.VolumeLimitExceeded, self.api.create,
+                          self.ctx, 1, '', '')
         mock_cinderclient.return_value.volumes.create.assert_called_once_with(
             1, user_id=None, imageRef=None, availability_zone=None,
             volume_type=None, description='', snapshot_id=None, name='',

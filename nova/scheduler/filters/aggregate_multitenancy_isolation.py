@@ -12,6 +12,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2013-2017 Wind River Systems, Inc.
+#
 
 from oslo_log import log as logging
 
@@ -48,6 +51,10 @@ class AggregateMultiTenancyIsolation(filters.BaseHostFilter):
             if configured_tenant_ids:
                 if tenant_id not in configured_tenant_ids:
                     LOG.debug("%s fails tenant id on aggregate", host_state)
+                    msg = ('tenant_id %(tid)s not in aggregate: %(agg)s' %
+                           {'tid': tenant_id,
+                            'agg': metadata.get("filter_tenant_id")})
+                    self.filter_reject(host_state, spec_obj, msg)
                     return False
                 LOG.debug("Host tenant id %s matched", tenant_id)
             else:

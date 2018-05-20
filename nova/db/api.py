@@ -14,6 +14,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2016-2017 Wind River Systems, Inc.
+#
 
 """Defines interface for DB access.
 
@@ -739,6 +742,29 @@ def instance_destroy(context, instance_uuid, constraint=None):
     return IMPL.instance_destroy(context, instance_uuid, constraint)
 
 
+def instances_purge_deleted(context, older_than=0):
+    """Removes soft deleted instance data
+
+    :param older_than: Number of days in the past, from today,
+            to purge instance data
+    :returns: number of purged instances.
+    """
+    return IMPL.instances_purge_deleted(context, older_than)
+
+
+def action_events_purge(context, dry_run=False,
+                        keep_time_range=5, max_number=1000):
+    """Removes action events
+
+    :param dry_run: A dry run of the command
+    :param keep_time_range: Number of days worth of events to keep
+    :param max_number: Max number of events to keep
+    :returns: number of purged events.
+    """
+    return IMPL.action_events_purge(context, dry_run,
+                                    keep_time_range, max_number)
+
+
 def instance_get_by_uuid(context, uuid, columns_to_join=None):
     """Get an instance or raise if it does not exist."""
     return IMPL.instance_get_by_uuid(context, uuid, columns_to_join)
@@ -875,13 +901,16 @@ def instance_remove_security_group(context, instance_id, security_group_id):
 ####################
 
 
-def instance_group_create(context, values, policies=None, members=None):
+# WRS:extension - metadata
+def instance_group_create(context, values, policies=None, members=None,
+                          metadata=None):
     """Create a new group.
 
     Each group will receive a unique uuid. This will be used for access to the
     group.
     """
-    return IMPL.instance_group_create(context, values, policies, members)
+    return IMPL.instance_group_create(context, values, policies, members,
+                                      metadata)
 
 
 def instance_group_get(context, group_uuid):
@@ -1143,6 +1172,16 @@ def quota_get_per_project_resources():
 def quota_get_all(context, project_id):
     """Retrieve all user quotas associated with a given project."""
     return IMPL.quota_get_all(context, project_id)
+
+
+def quota_really_get_all(context):
+    """Retrieve all quotas."""
+    return IMPL.quota_really_get_all(context)
+
+
+def quota_user_really_get_all(context):
+    """Retrieve all user quotas."""
+    return IMPL.quota_user_really_get_all(context)
 
 
 def quota_update(context, project_id, resource, limit, user_id=None):

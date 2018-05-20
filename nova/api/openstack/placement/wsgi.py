@@ -25,6 +25,7 @@ from nova import conf
 from nova import config
 
 CONFIG_FILE = 'nova.conf'
+LOG = logging.getLogger(__name__)
 
 
 def setup_logging(config):
@@ -61,5 +62,6 @@ def init_application():
             logging.getLogger(__name__),
             logging.DEBUG)
 
+    LOG.info("Starting placement api")
     # build and return our WSGI app
     return deploy.loadapp(conf.CONF)

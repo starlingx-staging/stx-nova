@@ -11,11 +11,15 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2016-2017 Wind River Systems, Inc.
+#
 
 import copy
 
 from nova.api.validation import parameter_types
 from nova.api.validation.parameter_types import multi_params
+from nova.network import model
 from nova.objects import instance
 
 base_create = {
@@ -71,6 +75,9 @@ base_create_v20['properties']['server'][
 base_create_v219 = copy.deepcopy(base_create)
 base_create_v219['properties']['server'][
     'properties']['description'] = parameter_types.description
+# WRS: add vif_model to networks properties for v2.19
+base_create_v219['properties']['server']['properties']['networks'][
+    'items']['properties']['wrs-if:vif_model'] = {'enum': model.VIF_MODEL_ALL}
 
 
 base_create_v232 = copy.deepcopy(base_create_v219)
@@ -97,6 +104,8 @@ base_create_v237['properties']['server']['properties']['networks'] = {
                                {'type': 'null'}]
                  },
                  'uuid': {'type': 'string', 'format': 'uuid'},
+                 # WRS: add vif_model to networks properties for v2.37
+                 'wrs-if:vif_model': {'enum': model.VIF_MODEL_ALL},
              },
              'additionalProperties': False,
          },
@@ -121,6 +130,9 @@ base_create_v242['properties']['server']['properties']['networks'] = {
                  },
                  'uuid': {'type': 'string', 'format': 'uuid'},
                  'tag': parameter_types.tag,
+                  # WRS: add vif_model
+                 'wrs-if:vif_model': {'type': 'string',
+                                      'enum': model.VIF_MODEL_ALL},
              },
              'additionalProperties': False,
          },
@@ -198,6 +210,10 @@ base_rebuild_v20['properties']['rebuild'][
 base_rebuild_v219 = copy.deepcopy(base_rebuild)
 base_rebuild_v219['properties']['rebuild'][
     'properties']['description'] = parameter_types.description
+
+# WRS: adding userdata to rebuild for 2.19
+base_rebuild_v219['properties']['rebuild'][
+    'properties']['userdata'] = parameter_types.userdata
 
 resize = {
     'type': 'object',

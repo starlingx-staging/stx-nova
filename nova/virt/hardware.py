@@ -11,10 +11,15 @@
 # WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 # License for the specific language governing permissions and limitations
 # under the License.
+#
+# Copyright (c) 2013-2017 Wind River Systems, Inc.
+#
 
 import collections
 import fractions
 import itertools
+import os
+import sys
 
 from oslo_log import log as logging
 from oslo_serialization import jsonutils
@@ -29,7 +34,7 @@ from nova.i18n import _
 from nova import objects
 from nova.objects import fields
 from nova.objects import instance as obj_instance
-
+from nova import utils
 
 CONF = nova.conf.CONF
 LOG = logging.getLogger(__name__)
@@ -37,6 +42,178 @@ LOG = logging.getLogger(__name__)
 MEMPAGES_SMALL = -1
 MEMPAGES_LARGE = -2
 MEMPAGES_ANY = -3
+
+# WRS base path used for floating instance cpusets
+CPUSET_BASE = '/dev/cpuset/floating'
+
+
+# WRS - extra_specs, image_props helper functions
+# NOTE: This must be consistent with _add_pinning_constraint().
+def is_cpu_policy_dedicated(extra_specs, image_props):
+    flavor_policy = extra_specs.get('hw:cpu_policy')
+    image_policy = image_props.get('hw_cpu_policy')
+    if (flavor_policy == fields.CPUAllocationPolicy.DEDICATED or
+        image_policy == fields.CPUAllocationPolicy.DEDICATED):
+        return True
+    return False
+
+
+# NOTE: This must be consistent with _add_pinning_constraint().
+def is_cpu_thread_policy_isolate(extra_specs, image_props):
+    flavor_thread_policy = extra_specs.get('hw:cpu_thread_policy')
+    image_thread_policy = image_props.get('hw_cpu_thread_policy')
+    if (flavor_thread_policy == fields.CPUThreadAllocationPolicy.ISOLATE or
+        image_thread_policy == fields.CPUThreadAllocationPolicy.ISOLATE):
+        return True
+    return False
+
+
+def _get_threads_per_core(host_numa_topology):
+    """Get number of hyperthreading threads per core based on host numa
+       topology siblings.
+    """
+    threads_per_core = 1
+    if (host_numa_topology is None or
+            not hasattr(host_numa_topology, 'cells')):
+        return threads_per_core
+
+    host_cell = host_numa_topology.cells[0]
+    if host_cell.siblings:
+        threads_per_core = max(map(len, host_cell.siblings))
+    return threads_per_core
+
+
+# WRS:extension - normalized vcpu accounting
+# NOTE: We do not need to also check cpu_policy since flavors are validated.
+def unshared_vcpus(vcpus, extra_specs):
+    """Count of unshared vCPUs"""
+    shared_vcpu = extra_specs.get('hw:wrs:shared_vcpu', None)
+    if shared_vcpu is not None:
+        vcpus -= 1
+    return vcpus
+
+
+def normalized_vcpus(vcpus=None, reserved=None, extra_specs=None,
+                     image_props=None, ratio=None, threads_per_core=1):
+    """Normalize vcpu used count based on cpu_policy, cpu_thread_policy,
+       reserved_vcpus, and shared_vcpu.
+
+       Accounting of vcpus_used is adjusted to be out of vcpus_total
+       (i.e. pcpus) using fractional units. When vcpus_used reaches pcpus,
+       the compute node is full.  This routine provides consistency across
+       scheduler (i.e. core_filter, host_manager), and resource tracker..
+
+       Pinned instances effectively have ratio = 1.0.
+       Pinned instances with shared_vcpu require exclusion of 1 vcpu.
+       Non-pinned instances (floaters) are divided by ratio.
+    """
+    if vcpus is None or ratio is None:
+        return 0
+    norm_vcpus = float(vcpus)
+    if extra_specs is None:
+        extra_specs = {}
+    if image_props is None:
+        image_props = {}
+    is_dedicated = is_cpu_policy_dedicated(extra_specs, image_props)
+    is_isolate = is_cpu_thread_policy_isolate(extra_specs, image_props)
+    shared_vcpu = extra_specs.get('hw:wrs:shared_vcpu', None)
+    if is_dedicated:
+        if is_isolate and reserved is not None:
+            n_reserved = len(reserved)
+            if n_reserved > 0:
+                norm_vcpus += len(reserved)
+            else:
+                norm_vcpus *= threads_per_core
+        if shared_vcpu is not None:
+            # NOTE(jgauld): should extend this to handle thread siblings
+            norm_vcpus -= 1
+    else:
+        norm_vcpus = norm_vcpus / ratio
+
+    # Get parent calling functions
+    parent_fname1 = sys._getframe(1).f_code.co_name
+    parent_fname2 = sys._getframe(2).f_code.co_name
+    LOG.debug('{}.{}.normalized_vcpus(), '
+              'vcpus={}, reserved={}, extra_specs={}, image_props={}, '
+              'is_dedicated={}, is_isolate={}, shared_vcpu={}, '
+              'threads_per_core={}, norm_vcpus={}'.
+              format(parent_fname2, parent_fname1,
+                     vcpus, reserved, extra_specs, image_props,
+                     is_dedicated, is_isolate, shared_vcpu, threads_per_core,
+                     norm_vcpus))
+    return norm_vcpus
+
+
+def get_reserved_thread_sibling_pcpus(instance_numa_topology=None,
+                                      host_numa_topology=None):
+    """Get set of reserved thread sibling pcpus.
+
+    When using cpu_thread_policy = isolate, there are thread-siblings
+    corresponding to cpu_pinned that cannot be used, so in effect they are
+    reserved.  These are currently not stored in numa topology object.
+
+    Returns a set of reserved thread sibling pcpus excluding self.
+    """
+    reserved = set()
+
+    # Get parent calling functions
+    parent_fname1 = sys._getframe(1).f_code.co_name
+    parent_fname2 = sys._getframe(2).f_code.co_name
+
+    if (instance_numa_topology is None or
+            not hasattr(instance_numa_topology, 'cells')):
+        LOG.warning(
+            "%(name2)s.%(name1)s.get_reserved_thread_sibling_pcpus(), "
+            "instance_numa_topology not present.",
+            {'name1': parent_fname1, 'name2': parent_fname2})
+        return reserved
+    if (host_numa_topology is None or
+            not hasattr(host_numa_topology, 'cells')):
+        LOG.warning(
+            "%(name2)s.%(name1)s.get_reserved_thread_sibling_pcpus(), "
+            "host_numa_topology not present.",
+            {'name1': parent_fname1, 'name2': parent_fname2})
+        return reserved
+
+    # Deduce the set of thread siblings for each sibling (excluding self),
+    # based on host numa topology.
+    siblings = {}
+    for cell in host_numa_topology.cells:
+        for sibs in cell.siblings:
+            for e in sibs:
+                siblings[e] = sibs.copy() - set([e])
+
+    # Deduce set of pinned pcpus and reserved thread sibling pcpus from
+    # instance numa topology.  Only need to do this for ISOLATE policy.
+    cpu_thread_policy = instance_numa_topology.cells[0]['cpu_thread_policy']
+    if cpu_thread_policy != fields.CPUThreadAllocationPolicy.ISOLATE:
+        return reserved
+    pinned = set()
+    for cell in instance_numa_topology.cells:
+        cpu_pinning = cell['cpu_pinning']
+        if cpu_pinning is not None:
+            for e in cpu_pinning.values():
+                pinned.add(e)
+                if e in siblings:
+                    reserved.update(siblings[e])
+    reserved.difference_update(pinned)
+    return reserved
+
+
+# WRS: shared pcpu extension
+def get_shared_pcpu_map():
+    """Parsing shared_pcpu_map config.
+
+    Returns a map of numa nodes to shared pcpu indices
+    """
+    if not CONF.shared_pcpu_map:
+        return {}
+    shared_pcpu_map = CONF.shared_pcpu_map
+    # Clean out invalid entries
+    for k, v in shared_pcpu_map.items():
+        if not v.isdigit():
+            del shared_pcpu_map[k]
+    return shared_pcpu_map
 
 
 def get_vcpu_pin_set():
@@ -581,7 +758,11 @@ def _get_desirable_cpu_topologies(flavor, image_meta, allow_threads=True,
             if preferred.threads != -1:
                 min_requested_threads = min(preferred.threads,
                                             min_requested_threads)
-
+            # WRS: If flavor is using shared_vcpu, add an extra thread
+            shared_vcpu = flavor.get('extra_specs',
+                                     {}).get("hw:wrs:shared_vcpu", None)
+            if shared_vcpu is not None:
+                min_requested_threads = min_requested_threads + 1
             specified_threads = max(1, min_requested_threads)
             LOG.debug("Filtering topologies best for %d threads",
                       specified_threads)
@@ -650,8 +831,9 @@ def _numa_cell_supports_pagesize_request(host_cell, inst_cell):
 def _pack_instance_onto_cores(available_siblings,
                               instance_cell,
                               host_cell_id,
+                              host_cell_shared_pcpu,
                               threads_per_core=1,
-                              num_cpu_reserved=0):
+                              num_cpu_reserved=0, details=None):
     """Pack an instance onto a set of siblings.
 
     Calculate the pinning for the given instance and its topology,
@@ -745,7 +927,7 @@ def _pack_instance_onto_cores(available_siblings,
                                                         threads_per_core))
 
     def _get_pinning(threads_no, sibling_set, instance_cores,
-                     num_cpu_reserved=0):
+                     num_cpu_reserved=0, details=None):
         """Determines pCPUs/vCPUs mapping
 
         Determines the pCPUs/vCPUs mapping regarding the number of
@@ -765,6 +947,14 @@ def _pack_instance_onto_cores(available_siblings,
         """
         if threads_no * len(sibling_set) < (
                 len(instance_cores) + num_cpu_reserved):
+            # WRS: add details on failure to pin
+            msg = ("NUMA %(N)d: CPUs requested %(R)d > avail %(A)d with "
+                   "cpu thread policy %(P)s" %
+                   {'N': host_cell_id,
+                    'R': len(instance_cores),
+                    'A': len(sibling_set) * threads_no,
+                    'P': instance_cell.cpu_thread_policy})
+            details = utils.details_append(details, msg)
             return None, None
 
         # Determines usable cores according the "threads number"
@@ -790,7 +980,8 @@ def _pack_instance_onto_cores(available_siblings,
             'usable_cores': usable_cores,
             'vcpus_pinning': vcpus_pinning,
         }
-        LOG.info(msg, msg_args)
+        # WRS - demote to debug since this produces noise
+        LOG.debug(msg, msg_args)
 
         cpuset_reserved = None
         if num_cpu_reserved:
@@ -815,7 +1006,8 @@ def _pack_instance_onto_cores(available_siblings,
                 'usable_cores': usable_cores,
                 'cpuset_reserved': cpuset_reserved,
             }
-            LOG.info(msg, msg_args)
+            # WRS - demote to debug since this produces noise
+            LOG.debug(msg, msg_args)
 
         return vcpus_pinning, cpuset_reserved
 
@@ -842,13 +1034,29 @@ def _pack_instance_onto_cores(available_siblings,
             LOG.debug('Host does not have any fully free thread sibling sets.'
                       'It is not possible to emulate a non-SMT behavior '
                       'for the isolate policy without this.')
+            # WRS: add details on failure to pin
+            msg = ("NUMA %(N)d: Cannot use %(P)s cpu thread policy as there "
+                   "are no CPUs with all siblings free" %
+                   {'N': host_cell_id,
+                    'P': instance_cell.cpu_thread_policy})
+            details = utils.details_append(details, msg)
             return
 
         pinning, cpuset_reserved = _get_pinning(
             1,  # we only want to "use" one thread per core
             sibling_sets[threads_per_core],
             instance_cell.cpuset,
-            num_cpu_reserved=num_cpu_reserved)
+            num_cpu_reserved=num_cpu_reserved, details=details)
+        # WRS: add details on failure to pin
+        if not pinning:
+            msg = ("NUMA %(N)d: Cannot use %(P)s cpu thread policy as "
+                   "requested CPUs %(R)d > avail with all siblings "
+                   "free %(A)d" %
+                   {'N': host_cell_id,
+                    'P': instance_cell.cpu_thread_policy,
+                    'R': len(instance_cell),
+                    'A': len(sibling_sets[threads_per_core])})
+            details = utils.details_append(details, msg)
     else:  # REQUIRE, PREFER (explicit, implicit)
         # NOTE(ndipanov): We iterate over the sibling sets in descending order
         # of cores that can be packed. This is an attempt to evenly distribute
@@ -870,7 +1078,7 @@ def _pack_instance_onto_cores(available_siblings,
             pinning, cpuset_reserved = _get_pinning(
                 threads_no, sibling_set,
                 instance_cell.cpuset,
-                num_cpu_reserved=num_cpu_reserved)
+                num_cpu_reserved=num_cpu_reserved, details=details)
             if pinning:
                 break
 
@@ -880,8 +1088,19 @@ def _pack_instance_onto_cores(available_siblings,
         if (instance_cell.cpu_thread_policy !=
                 fields.CPUThreadAllocationPolicy.REQUIRE and
                 not pinning):
-            pinning = list(zip(sorted(instance_cell.cpuset),
-                               itertools.chain(*sibling_set)))
+            # WRS: add check to ensure there are enough available cpus
+            if (len(instance_cell.cpuset) <=
+                         len(list(itertools.chain(*sibling_set)))):
+                pinning = list(zip(sorted(instance_cell.cpuset),
+                              itertools.chain(*sibling_set)))
+
+            # WRS: add details on failure to pin
+            if not pinning:
+                msg = ("NUMA %(N)d: CPUs requested %(R)d > avail %(A)d" %
+                       {'N': host_cell_id,
+                        'R': len(instance_cell.cpuset),
+                        'A': len(list(itertools.chain(*sibling_set)))})
+                details = utils.details_append(details, msg)
 
         threads_no = _threads(instance_cell, threads_no)
 
@@ -897,11 +1116,14 @@ def _pack_instance_onto_cores(available_siblings,
     instance_cell.cpu_topology = topology
     instance_cell.id = host_cell_id
     instance_cell.cpuset_reserved = cpuset_reserved
+    # WRS: add shared pcpu to cell
+    instance_cell.shared_pcpu_for_vcpu = host_cell_shared_pcpu
     return instance_cell
 
 
 def _numa_fit_instance_cell_with_pinning(host_cell, instance_cell,
-                                         num_cpu_reserved=0):
+                                         num_cpu_reserved=0,
+                                         details=None):
     """Determine if cells can be pinned to a host cell.
 
     :param host_cell: objects.NUMACell instance - the host cell that
@@ -913,6 +1135,42 @@ def _numa_fit_instance_cell_with_pinning(host_cell, instance_cell,
     :returns: objects.InstanceNUMACell instance with pinning information,
               or None if instance cannot be pinned to the given host
     """
+
+    details = utils.details_initialize(details=details)
+
+    # WRS: exclude cells based on shared_pcpu mismatch
+    if (instance_cell.shared_vcpu is not None and
+        host_cell.shared_pcpu is None):
+        msg = ("Shared vCPU not enabled on host cell %d, "
+               "required by instance cell %d"
+               % (host_cell.id, instance_cell.id))
+        details = utils.details_append(details, msg)
+        return
+
+    # WRS: exclude shared_vcpu from cpuset if it exists
+    instance_cell.cpuset.discard(instance_cell.shared_vcpu)
+
+    # Check for an empty cpuset after removing the shared_vcpu
+    if instance_cell.shared_vcpu is not None and not instance_cell.cpuset:
+        msg = ("(numa:%(id)d shared vcpu with 0 requested "
+               "dedicated vcpus is not allowed, avail:%(avail)d)" %
+               {'id': host_cell.id,
+                'avail': len(host_cell.cpuset)})
+        details = utils.details_append(details, msg)
+        return
+
+    if host_cell.avail_cpus < len(instance_cell.cpuset):
+        LOG.debug('Not enough available CPUs to schedule instance. '
+                  'Oversubscription is not possible with pinned instances. '
+                  'Required: %(required)s, actual: %(actual)s',
+                  {'required': len(instance_cell.cpuset),
+                   'actual': host_cell.avail_cpus})
+        msg = "NUMA %d: CPUs avail(%d) < required(%d)" \
+              % (host_cell.id, host_cell.avail_cpus,
+                 len(instance_cell.cpuset))
+        details = utils.details_append(details, msg)
+        return
+
     required_cpus = len(instance_cell.cpuset) + num_cpu_reserved
     if host_cell.avail_cpus < required_cpus:
         LOG.debug('Not enough available CPUs to schedule instance. '
@@ -923,6 +1181,10 @@ def _numa_fit_instance_cell_with_pinning(host_cell, instance_cell,
                    'vcpus': len(instance_cell.cpuset),
                    'actual': host_cell.avail_cpus,
                    'num_cpu_reserved': num_cpu_reserved})
+        msg = "NUMA %d: CPUs avail(%d) < required(%d vcpus + %d reserved)" \
+              % (host_cell.id, host_cell.avail_cpus,
+                 len(instance_cell.cpuset), num_cpu_reserved)
+        details = utils.details_append(details, msg)
         return
 
     if host_cell.avail_memory < instance_cell.memory:
@@ -931,6 +1193,9 @@ def _numa_fit_instance_cell_with_pinning(host_cell, instance_cell,
                   'Required: %(required)s, actual: %(actual)s',
                   {'required': instance_cell.memory,
                    'actual': host_cell.memory})
+        msg = "Memory avail(%d) < requested(%d)" \
+              % (host_cell.avail_memory, instance_cell.memory)
+        details = utils.details_append(details, msg)
         return
 
     if host_cell.siblings:
@@ -938,22 +1203,25 @@ def _numa_fit_instance_cell_with_pinning(host_cell, instance_cell,
         # Try to pack the instance cell onto cores
         numa_cell = _pack_instance_onto_cores(
             host_cell.free_siblings, instance_cell, host_cell.id,
+            host_cell.shared_pcpu,
             max(map(len, host_cell.siblings)),
-            num_cpu_reserved=num_cpu_reserved)
+            num_cpu_reserved=num_cpu_reserved, details=details)
     else:
         if (instance_cell.cpu_thread_policy ==
                 fields.CPUThreadAllocationPolicy.REQUIRE):
             LOG.info("Host does not support hyperthreading or "
                      "hyperthreading is disabled, but 'require' "
                      "threads policy was requested.")
+            msg = "Host does not support 'require' threads policy"
+            details = utils.details_append(details, msg)
             return
 
         # Straightforward to pin to available cpus when there is no
         # hyperthreading on the host
         free_cpus = [set([cpu]) for cpu in host_cell.free_cpus]
         numa_cell = _pack_instance_onto_cores(
-            free_cpus, instance_cell, host_cell.id,
-            num_cpu_reserved=num_cpu_reserved)
+            free_cpus, instance_cell, host_cell.id, host_cell.shared_pcpu,
+            num_cpu_reserved=num_cpu_reserved, details=details)
 
     if not numa_cell:
         LOG.debug('Failed to map instance cell CPUs to host cell CPUs')
@@ -962,7 +1230,7 @@ def _numa_fit_instance_cell_with_pinning(host_cell, instance_cell,
 
 
 def _numa_fit_instance_cell(host_cell, instance_cell, limit_cell=None,
-                            cpuset_reserved=0):
+                            cpuset_reserved=0, details=None):
     """Ensure an instance cell can fit onto a host cell
 
     Ensure an instance cell can fit onto a host cell and, if so, return
@@ -981,12 +1249,16 @@ def _numa_fit_instance_cell(host_cell, instance_cell, limit_cell=None,
               '%(host_cell)s', {'cell': instance_cell, 'host_cell': host_cell})
     # NOTE (ndipanov): do not allow an instance to overcommit against
     # itself on any NUMA cell
+    details = utils.details_initialize(details=details)
     if instance_cell.memory > host_cell.memory:
         LOG.debug('Not enough host cell memory to fit instance cell. '
                   'Required: %(required)d, actual: %(actual)d',
                   {'required': instance_cell.memory,
                    'actual': host_cell.memory})
-        return
+        msg = 'Memory of instance(%d) > host_cell(%d) ' \
+              % (instance_cell.memory, host_cell.memory)
+        details = utils.details_append(details, msg)
+        return None
 
     if len(instance_cell.cpuset) + cpuset_reserved > len(host_cell.cpuset):
         LOG.debug('Not enough host cell CPUs to fit instance cell. Required: '
@@ -995,14 +1267,26 @@ def _numa_fit_instance_cell(host_cell, instance_cell, limit_cell=None,
                   {'required': len(instance_cell.cpuset),
                    'actual': len(host_cell.cpuset),
                    'cpuset_reserved': cpuset_reserved})
-        return
+        msg = 'Cpu set of instance(%d) > host_cell(%d) ' \
+              % (len(instance_cell.cpuset),
+                 len(host_cell.cpuset))
+        details = utils.details_append(details, msg)
+        return None
+
+    # WRS: if numa pinning requested confirm correct host numa cell
+    if instance_cell.numa_pinning_requested:
+        if instance_cell.physnode != host_cell.id:
+            msg = "Host NUMA: %d excluded, does not match requested NUMA: %d" \
+                  % (host_cell.id, instance_cell.physnode)
+            details = utils.details_append(details, msg)
+            return None
 
     if instance_cell.cpu_pinning_requested:
         LOG.debug('Pinning has been requested')
         new_instance_cell = _numa_fit_instance_cell_with_pinning(
-            host_cell, instance_cell, cpuset_reserved)
+            host_cell, instance_cell, cpuset_reserved, details=details)
         if not new_instance_cell:
-            return
+            return None
         new_instance_cell.pagesize = instance_cell.pagesize
         instance_cell = new_instance_cell
 
@@ -1010,21 +1294,26 @@ def _numa_fit_instance_cell(host_cell, instance_cell, limit_cell=None,
         LOG.debug('No pinning requested, considering limitations on usable cpu'
                   ' and memory')
         memory_usage = host_cell.memory_usage + instance_cell.memory
-        cpu_usage = host_cell.cpu_usage + len(instance_cell.cpuset)
-        cpu_limit = len(host_cell.cpuset) * limit_cell.cpu_allocation_ratio
+        cpu_usage = (host_cell.cpu_usage + len(instance_cell.cpuset) /
+                     limit_cell.cpu_allocation_ratio)
+        cpu_limit = len(host_cell.cpuset)
         ram_limit = host_cell.memory * limit_cell.ram_allocation_ratio
-        if memory_usage > ram_limit:
-            LOG.debug('Host cell has limitations on usable memory. There is '
-                      'not enough free memory to schedule this instance. '
-                      'Usage: %(usage)d, limit: %(limit)d',
-                      {'usage': memory_usage, 'limit': ram_limit})
-            return
-        if cpu_usage > cpu_limit:
-            LOG.debug('Host cell has limitations on usable CPUs. There are '
-                      'not enough free CPUs to schedule this instance. '
-                      'Usage: %(usage)d, limit: %(limit)d',
-                      {'usage': cpu_usage, 'limit': cpu_limit})
-            return
+        if memory_usage > ram_limit or cpu_usage > cpu_limit:
+            if memory_usage > ram_limit:
+                LOG.debug('Host cell has limitations on usable memory. There '
+                          'is not enough free memory to schedule this '
+                          'instance. Usage: %(usage)d, limit: %(limit)d',
+                          {'usage': memory_usage, 'limit': ram_limit})
+                msg = 'limits: Not enough memory'
+                details = utils.details_append(details, msg)
+            if cpu_usage > cpu_limit:
+                LOG.debug('Host cell has limitations on usable CPUs. There '
+                          'are not enough free CPUs to schedule this '
+                          'instance. Usage: %(usage)d, limit: %(limit)d',
+                          {'usage': cpu_usage, 'limit': cpu_limit})
+                msg = 'limits: Not enough cpus'
+                details = utils.details_append(details, msg)
+            return None
 
     pagesize = None
     if instance_cell.pagesize:
@@ -1033,7 +1322,117 @@ def _numa_fit_instance_cell(host_cell, instance_cell, limit_cell=None,
         if not pagesize:
             LOG.debug('Host does not support requested memory pagesize. '
                       'Requested: %d kB', instance_cell.pagesize)
-            return
+
+            def page_to_readable_units(pgsize):
+                unit = 'K'
+                size = pgsize
+                if pgsize >= units.Ki and pgsize < units.Mi:
+                    unit = 'M'
+                    size = pgsize / units.Ki
+                elif pgsize >= units.Mi:
+                    unit = 'G'
+                    size = pgsize / units.Mi
+                return {'unit': unit, 'size': size}
+
+            def avail_pagesizes_mem(cell):
+                mem = []
+                for mempage in cell.mempages:
+                    ret = page_to_readable_units(mempage.size_kb)
+                    m = '%(sz)s%(U)s: %(A).0f MiB' % \
+                        {'sz': ret['size'], 'U': ret['unit'],
+                         'A': mempage.size_kb * mempage.free / units.Ki,
+                        }
+                    mem.append(m)
+                return mem
+
+            if instance_cell.pagesize == MEMPAGES_SMALL:
+                pgrequest = 'small'
+                msg = "Not enough memory or not pagesize divisible"
+            elif instance_cell.pagesize == MEMPAGES_LARGE:
+                pgrequest = 'large'
+                msg = "Not enough memory or not pagesize divisible"
+            elif instance_cell.pagesize == MEMPAGES_ANY:
+                pgrequest = 'any'
+                msg = "Not enough memory or not pagesize divisible"
+            else:
+                ret = page_to_readable_units(instance_cell.pagesize)
+                pgrequest = "%(sz)s%(U)s" % {'sz': ret['size'],
+                            'U': ret['unit']}
+                if divmod(instance_cell.memory * units.Ki,
+                          instance_cell.pagesize)[1] > 0:
+                    det = "Not pagesize divisible: numa:%(n)d " \
+                          "page: %(pg)s size: %(A).0f MiB" % \
+                          {'n': host_cell.id, 'pg': pgrequest,
+                           'A': instance_cell.memory}
+                    details = utils.details_append(details, det)
+                    return None
+                msg = "Not enough memory"
+
+            m = avail_pagesizes_mem(host_cell)
+            det = "%(msg)s: numa:%(node)d req: %(pg)s:%(A).0f MiB, " \
+                  "(avail: %(m)s)" % \
+                  {'msg': msg, 'node': host_cell.id,
+                   'pg': pgrequest, 'A': instance_cell.memory,
+                   'm': '; '.join(m)}
+            details = utils.details_append(details, det)
+            return None
+
+    # L3 CAT Support
+    if ((not host_cell.has_cachetune) and instance_cell.cachetune_requested):
+        msg = "cache allocation technology not supported"
+        details = utils.details_append(details, msg)
+        return None
+
+    if (instance_cell.cachetune_requested and
+            (not instance_cell.cpu_pinning_requested)):
+        msg = ("L3 cache request requires hw:cpu_policy=%(policy)s" %
+               {'policy': fields.CPUAllocationPolicy.DEDICATED})
+        details = utils.details_append(details, msg)
+        return None
+
+    if (host_cell.has_cachetune and instance_cell.cachetune_requested):
+        # CDP vs unified host check
+        m = []
+        if host_cell.has_cachetune_cdp:
+            cachetune_type = 'cdp'
+            if instance_cell.l3_both_size is not None:
+                m.append('both:%r' % (instance_cell.l3_both_size))
+        else:
+            cachetune_type = 'unified'
+            if (instance_cell.l3_code_size is not None):
+                m.append('code:%s' % (instance_cell.l3_code_size))
+            if (instance_cell.l3_data_size is not None):
+                m.append('data:%s' % (instance_cell.l3_data_size))
+        if m:
+            msg = ("L3 cache request (%(R)s) not supported on '%(T)s' host" %
+                   {'R': ', '.join(m),
+                    'T': cachetune_type})
+            details = utils.details_append(details, msg)
+            return None
+
+        # Cache size check
+        cache_size = sum(utils.roundup(x, host_cell.l3_granularity)
+                         for x in (instance_cell.l3_both_size,
+                                   instance_cell.l3_code_size,
+                                   instance_cell.l3_data_size)
+                         if x is not None)
+        max_alloc = host_cell.max_l3_allocation
+        if cache_size > max_alloc:
+            msg = ("L3 cache request (%(R)d) > max supported "
+                   "allocation (%(M)d)" %
+                   {'R': cache_size,
+                    'M': max_alloc})
+            details = utils.details_append(details, msg)
+            return None
+
+        cache_avail = host_cell.avail_cache
+        if cache_size > cache_avail:
+            msg = ("NUMA %(N)d: L3 cache requested %(R)d > avail %(A)d KiB" %
+                   {'N': host_cell.id,
+                    'R': cache_size,
+                    'A': cache_avail})
+            details = utils.details_append(details, msg)
+            return None
 
     instance_cell.id = host_cell.id
     instance_cell.pagesize = pagesize
@@ -1097,15 +1496,26 @@ def _numa_get_pagesize_constraints(flavor, image_meta):
     if not flavor_request:
         # Nothing was specified for hugepages,
         # let's the default process running.
-        return None
+
+        # WRS - Set default memory pagesize.
+        # This has side-effect of forcing VMs to a numa node.
+        if CONF.default_mempages_size:
+            flavor_request = CONF.default_mempages_size
+            LOG.info("defaulting pagesize to: %s", flavor_request)
+        else:
+            return None
 
     pagesize = check_and_return_pages_size(flavor_request)
-    if image_request and (pagesize in (MEMPAGES_ANY, MEMPAGES_LARGE)):
-        return check_and_return_pages_size(image_request)
-    elif image_request:
-        raise exception.MemoryPageSizeForbidden(
-            pagesize=image_request,
-            against=flavor_request)
+    if image_request:
+        img_pagesize = check_and_return_pages_size(image_request)
+        if (pagesize in (MEMPAGES_ANY, MEMPAGES_LARGE)
+                or pagesize == img_pagesize):
+
+            return img_pagesize
+        else:
+            raise exception.MemoryPageSizeForbidden(
+                pagesize=image_request,
+                against=flavor_request)
 
     return pagesize
 
@@ -1163,7 +1573,7 @@ def _numa_get_mem_map_list(flavor, image_meta):
         return flavor_mem_list
 
 
-def _get_cpu_policy_constraints(flavor, image_meta):
+def _get_cpu_policy_constraints(flavor, image_meta, numa_topology=None):
     """Validate and return the requested CPU policy."""
     flavor_policy, image_policy = _get_flavor_image_meta(
         'cpu_policy', flavor, image_meta)
@@ -1178,6 +1588,15 @@ def _get_cpu_policy_constraints(flavor, image_meta):
         cpu_policy = image_policy
     else:
         cpu_policy = fields.CPUAllocationPolicy.SHARED
+
+    # WRS: If NUMA pinning is enabled, then implicitly enable CPU pinning
+    # unless it has been explicitly disabled.
+    if numa_topology and numa_topology.cells[0].physnode is not None:
+        if (flavor_policy == fields.CPUAllocationPolicy.SHARED or
+                image_policy == fields.CPUAllocationPolicy.SHARED):
+            raise exception.ImageNUMATopologyNodesForbidden()
+        else:
+            cpu_policy = fields.CPUAllocationPolicy.DEDICATED
 
     return cpu_policy
 
@@ -1197,7 +1616,125 @@ def _get_cpu_thread_policy_constraints(flavor, image_meta):
     return policy
 
 
-def _numa_get_constraints_manual(nodes, flavor, cpu_list, mem_list):
+def _get_extra_specs_l3_cache_vcpu_map_list(extra_specs):
+    """Return a list of L3 cache vcpus (vcpu_map) per numa node
+
+    :param extra_specs dictionary
+
+    :raises: None
+    :returns: list of L3 cache vcpus (vcpu_map) per numa node
+    """
+    vcpus = []
+    for cellid in range(objects.ImageMetaProps.NUMA_NODES_MAX):
+        key = "hw:cache_vcpus.%d" % cellid
+        if key not in extra_specs:
+            break
+        vcpus.append(parse_cpu_spec(extra_specs[key]))
+
+    if vcpus:
+        return vcpus
+
+
+def get_l3_cache_vcpu_map_list(extra_specs, image_props):
+    """Return a list of L3 cache vcpus (vcpu_map) per numa node
+
+    :param extra_specs dictionary
+    :param image_props dictionary
+
+    :raises: ImageNUMATopologyForbidden
+    :returns: list of L3 cache vcpus (vcpu_map) per numa node
+    """
+    extra_vcpus = _get_extra_specs_l3_cache_vcpu_map_list(extra_specs)
+    image_vcpus = image_props.get("hw_cache_vcpus", None)
+    # TODO(jgauld): Make hardware properties check as strict as extra-specs.
+
+    if extra_vcpus is None:
+        return image_vcpus
+    else:
+        if image_vcpus is not None:
+            raise exception.ImageNUMATopologyForbidden(
+                name='hw_cache_vcpus')
+        return extra_vcpus
+
+
+def _get_extra_specs_l3_cache_size_KiB_list(extra_specs, prefix):
+    """Return a list of L3 cache size (KiB) per numa node
+    :param extra_specs dictionary
+    :param key prefix string
+
+    :raises: none
+    :returns: list of L3 cache size (KiB) per numa node
+    """
+    size_KiB = []
+
+    for cellid in range(objects.ImageMetaProps.NUMA_NODES_MAX):
+        key = "%s.%d" % (prefix, cellid)
+        if key not in extra_specs:
+            break
+        size_KiB.append(int(extra_specs[key]))
+
+    if size_KiB:
+        return size_KiB
+
+
+def get_l3_cache_size_KiB_list(extra_specs, image_props, prefix):
+    """Return a list of L3 cache size (KiB) per numa node
+
+    :param extra_specs dictionary
+    :param image_props dictionary
+    :param key prefix string, eg, 'hw:cache_l3'
+
+    :raises: ImageNUMATopologyForbidden
+    :returns: list of L3 cache size (KiB) per numa node
+    """
+    extra_size_KiB = _get_extra_specs_l3_cache_size_KiB_list(extra_specs,
+                                                             prefix)
+    hw_prefix = prefix.replace(":", "_")
+    image_size_KiB = image_props.get(hw_prefix, None)
+    # TODO(jgauld): Make hardware properties check as strict as extra-specs.
+
+    if extra_size_KiB is None:
+        return image_size_KiB
+    else:
+        if image_size_KiB is not None:
+            raise exception.ImageNUMATopologyForbidden(
+                name=hw_prefix)
+        return extra_size_KiB
+
+
+# WRS: get numa node list from hw:numa_node.X extra spec
+def _numa_get_flavor_node_map_list(flavor):
+    hw_numa_node = []
+    hw_numa_node_set = False
+    extra_specs = flavor.get("extra_specs", {})
+    for cellid in range(objects.ImageMetaProps.NUMA_NODES_MAX):
+        nodeprop = "hw:numa_node.%d" % cellid
+        if nodeprop not in extra_specs:
+            break
+        hw_numa_node.append(int(extra_specs[nodeprop]))
+        hw_numa_node_set = True
+
+    if hw_numa_node_set:
+        return hw_numa_node
+
+
+# WRS: get numa node list from flavor or image
+def _numa_get_node_map_list(flavor, image_meta):
+    flavor_node_list = _numa_get_flavor_node_map_list(flavor)
+    image_node_list = image_meta.properties.get("hw_numa_node", None)
+
+    if flavor_node_list is None:
+        return image_node_list
+    else:
+        if image_node_list is not None:
+            raise exception.ImageNUMATopologyForbidden(
+                name='hw_numa_node')
+        return flavor_node_list
+
+
+# WRS: add node_list
+def _numa_get_constraints_manual(nodes, flavor, cpu_list, mem_list,
+                                 node_list):
     cells = []
     totalmem = 0
 
@@ -1206,6 +1743,7 @@ def _numa_get_constraints_manual(nodes, flavor, cpu_list, mem_list):
     for node in range(nodes):
         mem = mem_list[node]
         cpuset = cpu_list[node]
+        physnode = node_list[node] if node_list else None
 
         for cpu in cpuset:
             if cpu > (flavor.vcpus - 1):
@@ -1219,7 +1757,7 @@ def _numa_get_constraints_manual(nodes, flavor, cpu_list, mem_list):
             availcpus.remove(cpu)
 
         cells.append(objects.InstanceNUMACell(
-            id=node, cpuset=cpuset, memory=mem))
+            id=node, cpuset=cpuset, memory=mem, physnode=physnode))
         totalmem = totalmem + mem
 
     if availcpus:
@@ -1259,10 +1797,75 @@ def vcpus_realtime_topology(flavor, image):
     if len(vcpus_rt) < 1:
         raise exception.RealtimeMaskNotFoundOrInvalid()
 
+    # WRS: extended realtime validation
+    vcpus_set = set(range(flavor.vcpus))
+    vcpus_em = vcpus_set - vcpus_rt
+
+    # Determine the specific key used to define the mask, noting that mask is
+    # evaluated (image_mask or flavor_mask).
+    ikey = 'hw_cpu_realtime_mask'
+    fkey = 'hw:cpu_realtime_mask'
+    key = None
+    if ikey in image.properties:
+        key = ikey
+    if fkey in flavor.extra_specs:
+        key = fkey
+
+    # Check that vcpu_rt, vcpus_em are within valid range
+    if ((not vcpus_rt.issubset(vcpus_set)) or
+            (not vcpus_em.issubset(vcpus_set))):
+        msg = (_('%(K)s (%(V)s) must be a subset of vCPUs (%(S)s)') %
+               {'K': key,
+                'V': mask,
+                'S': utils.list_to_range(list(vcpus_set))
+                })
+        raise exception.RealtimeMaskNotFoundOrInvalid(msg)
+
+    # Check that we have realtime vCPUs
+    if not vcpus_rt:
+        msg = (_('%(K)s (%(V)s) does not have realtime vCPUS defined') %
+               {'K': key, 'V': mask})
+        raise exception.RealtimeMaskNotFoundOrInvalid(msg)
+
+    # Check that we have normal vCPUs
+    if not vcpus_em:
+        msg = (_('%(K)s (%(V)s) does not have normal vCPUS defined') %
+               {'K': key, 'V': mask})
+        raise exception.RealtimeMaskNotFoundOrInvalid(msg)
+
+    # Check that hw:wrs:shared_vcpu is a subset of non-realtime vcpus
+    shared_vcpu = flavor.get('extra_specs', {}).get("hw:wrs:shared_vcpu", None)
+    if shared_vcpu is not None:
+        shared_vcpus = set([int(shared_vcpu)])
+        if not shared_vcpus.issubset(vcpus_em):
+            msg = (_("hw:wrs:shared_vcpu (%(S)s) is not a subset of "
+                     "non-realtime vCPUs (%(N)s)") %
+                   {"S": utils.list_to_range(list(shared_vcpus)),
+                    "N": utils.list_to_range(list(vcpus_em))})
+            raise exception.RealtimeMaskNotFoundOrInvalid(msg)
+
     return vcpus_rt
 
 
-def _numa_get_constraints_auto(nodes, flavor):
+# WRS: extension
+def _get_pci_affinity_mask(flavor):
+    """Parse pci affinity mask based on flavor extra-spec.
+
+    Returns set of vcpu ids with corresponding pci irq affinity mask.
+    """
+    flavor_map = flavor.get('extra_specs', {}).get("hw:pci_irq_affinity_mask")
+    if not flavor_map:
+        return None
+
+    cpuset_ids = parse_cpu_spec(flavor_map)
+    if not cpuset_ids:
+        raise exception.Invalid(_("No CPUs available after parsing %r") %
+                                flavor_map)
+    return cpuset_ids
+
+
+# WRS: add node_list
+def _numa_get_constraints_auto(nodes, flavor, node_list):
     if ((flavor.vcpus % nodes) > 0 or
         (flavor.memory_mb % nodes) > 0):
         raise exception.ImageNUMATopologyAsymmetric()
@@ -1273,9 +1876,10 @@ def _numa_get_constraints_auto(nodes, flavor):
         mem = int(flavor.memory_mb / nodes)
         start = node * ncpus
         cpuset = set(range(start, start + ncpus))
+        physnode = node_list[node] if node_list else None
 
         cells.append(objects.InstanceNUMACell(
-            id=node, cpuset=cpuset, memory=mem))
+            id=node, cpuset=cpuset, memory=mem, physnode=physnode))
 
     return objects.InstanceNUMATopology(cells=cells)
 
@@ -1317,7 +1921,96 @@ def _validate_numa_nodes(nodes):
         raise exception.InvalidNUMANodesNumber(nodes=nodes)
 
 
-# TODO(sahid): Move numa related to hardware/numa.py
+# L3 CAT Support
+def numa_l3_cache_get_constraints(flavor, image_meta, nodes):
+    """Create lists of L3 cache related info per numa node,
+       and raise exceptions for insuffient or invalid specification.
+
+    :param flavor: Flavor object to read extra specs from
+    :param image_meta: nova.objects.ImageMeta object instance
+    :param nodes: number of numa nodes
+
+    Raises exception.ImageL3CacheIncomplete() if insufficient
+    parameters are specified for CAT.
+
+    Raises exception.ImageL3CacheInvalid() if incorrect
+    parameters are specified for CAT, eg. both unified and CDP.
+
+    :return: cache_vcpus : list of L3 cache vcpus per node (or None),
+             both_size   : list of L3 unified cache size per node (or None),
+             code_size   : list of L3 CDP cache code size per node (or None),
+             data_size   : list of L3 CDP cache data size per node (or None)
+    """
+    extra_specs = flavor.extra_specs
+    image_props = image_meta.properties
+
+    cache_vcpus = get_l3_cache_vcpu_map_list(
+        extra_specs, image_props)
+    if cache_vcpus is not None:
+        wants_vcpus = True
+    else:
+        wants_vcpus = False
+
+    both_size = get_l3_cache_size_KiB_list(
+        extra_specs, image_props, 'hw:cache_l3')
+    if both_size is not None:
+        wants_both = True
+    else:
+        wants_both = False
+
+    code_size = get_l3_cache_size_KiB_list(
+        extra_specs, image_props, 'hw:cache_l3_code')
+    if code_size is not None:
+        wants_code = True
+    else:
+        wants_code = False
+
+    data_size = get_l3_cache_size_KiB_list(
+        extra_specs, image_props, 'hw:cache_l3_data')
+    if data_size is not None:
+        wants_data = True
+    else:
+        wants_data = False
+
+    if wants_code or wants_data:
+        wants_cdp = True
+    else:
+        wants_cdp = False
+
+    # Cannot specify hw:cache_l3.x with either hw:cache_l3_code.x or
+    # hw:cache_l3_data.x
+    if [wants_both, wants_cdp].count(True) == 2:
+        raise exception.ImageL3CacheInvalid(
+            name='hw:cache_l3.x, hw:cache_l3_code.x, hw:cache_l3_data.x')
+
+    # Cannot specify just hw:cache_l3_code.x or just hw:cache_l3_data.x
+    if [wants_code, wants_data].count(True) == 1:
+        raise exception.ImageL3CacheIncomplete(
+            name='hw:cache_l3_code.x, hw:cache_l3_data.x')
+
+    # Cannot specify hw:cache_vcpus.x without hw:cache_l3.x, or
+    # hw:cache_l3_code.x, hw:cache_l3_data.x
+    if (wants_vcpus and
+            ([wants_both, wants_code, wants_data].count(True) == 0)):
+        raise exception.ImageL3CacheIncomplete(
+            name='hw:cache_vcpus.x and hw:cache_l3.x, or '
+                 'hw:cache_vcpus.x, hw:cache_l3_code.x, and '
+                 'hw:cache_l3_data.x')
+
+    # If any node has data set, all nodes must have data set
+    if cache_vcpus is not None and len(cache_vcpus) != nodes:
+        raise exception.ImageL3CacheIncomplete(name='hw:cache_vcpus.x')
+    if both_size is not None and len(both_size) != nodes:
+        raise exception.ImageL3CacheIncomplete(name='hw:cache_l3.x')
+    if code_size is not None and len(code_size) != nodes:
+        raise exception.ImageL3CacheIncomplete(name='hw:cache_l3_code.x')
+    if data_size is not None and len(data_size) != nodes:
+        raise exception.ImageL3CacheIncomplete(name='hw:cache_l3_data.x')
+
+    return (cache_vcpus, both_size, code_size, data_size)
+
+
+# TODO(sahid): Move numa related to hardward/numa.py
 def numa_get_constraints(flavor, image_meta):
     """Return topology related to input request.
 
@@ -1375,14 +2068,23 @@ def numa_get_constraints(flavor, image_meta):
     pagesize = _numa_get_pagesize_constraints(
         flavor, image_meta)
 
+    # WRS: Need to check if we want numa pinning since we allow
+    # pinning a single implicit numa node.
+    node_list = _numa_get_node_map_list(flavor, image_meta)
+
     numa_topology = None
-    if nodes or pagesize:
+    if nodes or pagesize or node_list:
         nodes = nodes or 1
 
         cpu_list = _numa_get_cpu_map_list(flavor, image_meta)
         mem_list = _numa_get_mem_map_list(flavor, image_meta)
 
-        # If one property list is specified both must be
+        # L3 CAT Support
+        cache_vcpus, both_size, code_size, data_size = \
+            numa_l3_cache_get_constraints(flavor, image_meta, nodes)
+
+        # If one property list is specified for cpu/mem then both must be.
+        # The physnode is optional.
         if ((cpu_list is None and mem_list is not None) or
             (cpu_list is not None and mem_list is None)):
             raise exception.ImageNUMATopologyIncomplete()
@@ -1392,18 +2094,49 @@ def numa_get_constraints(flavor, image_meta):
             (mem_list is not None and len(mem_list) != nodes)):
             raise exception.ImageNUMATopologyIncomplete()
 
+        # WRS: Special test for numa nodes, because they can be specified
+        # independently of setting CPUs/RAM.
+        if node_list is not None and len(node_list) != nodes:
+            raise exception.ImageNUMATopologyNodesIncomplete()
+
+        # WRS: A bit of paranoia here.
+        # host nodes must be all specified or all unspecified.
+        if node_list and node_list.count(None) != len(node_list):
+            # If any are not None then they all must be.
+            if any(node is None for node in node_list):
+                raise exception.ImageNUMATopologyNodesIncomplete()
+            # Instance nodes must be pinned to separate host nodes.
+            if len(node_list) != len(set(node_list)):
+                raise exception.ImageNUMATopologyNodesDuplicates()
+
         if cpu_list is None:
             numa_topology = _numa_get_constraints_auto(
-                nodes, flavor)
+                nodes, flavor, node_list)
         else:
             numa_topology = _numa_get_constraints_manual(
-                nodes, flavor, cpu_list, mem_list)
+                nodes, flavor, cpu_list, mem_list, node_list)
+
+        # L3 CAT support
+        # Populate instance numa_topology L3 CAT fields.
+        for node, cell in enumerate(numa_topology.cells):
+            if any(x is not None for x in (both_size, code_size, data_size)):
+                if cache_vcpus is not None:
+                    cell.l3_cpuset = set(cache_vcpus[node])
+                else:
+                    cell.l3_cpuset = set(cell.cpuset)
+            if both_size is not None:
+                cell.l3_both_size = both_size[node]
+            if code_size is not None:
+                cell.l3_code_size = code_size[node]
+            if data_size is not None:
+                cell.l3_data_size = data_size[node]
 
         # We currently support same pagesize for all cells.
         for c in numa_topology.cells:
             setattr(c, 'pagesize', pagesize)
 
-    cpu_policy = _get_cpu_policy_constraints(flavor, image_meta)
+    cpu_policy = _get_cpu_policy_constraints(flavor, image_meta,
+                                             numa_topology=numa_topology)
     cpu_thread_policy = _get_cpu_thread_policy_constraints(flavor, image_meta)
     rt_mask = _get_realtime_mask(flavor, image_meta)
     emu_thread_policy = get_emulator_threads_constraint(flavor, image_meta)
@@ -1423,14 +2156,29 @@ def numa_get_constraints(flavor, image_meta):
             raise exception.CPUThreadPolicyConfigurationInvalid()
         return numa_topology
 
+    # WRS: If cpu pinning is requested we can check for hw:wrs:shared_vcpu
+    # This means we "un-pin" the shared_vcpu index
+    shared_vcpu = flavor.get('extra_specs', {}).get("hw:wrs:shared_vcpu", None)
+    if shared_vcpu is not None:
+        shared_vcpu = int(shared_vcpu)
+
     if numa_topology:
         for cell in numa_topology.cells:
             cell.cpu_policy = cpu_policy
             cell.cpu_thread_policy = cpu_thread_policy
+            # WRS: For multiple cells, we add shared_vcpu to only one
+            if shared_vcpu in cell.cpuset:
+                cell.cpuset.discard(shared_vcpu)
+                cell.shared_vcpu = shared_vcpu
+            else:
+                cell.shared_vcpu = None
     else:
+        cpu_set = set(range(flavor.vcpus))
+        cpu_set.discard(shared_vcpu)
         single_cell = objects.InstanceNUMACell(
             id=0,
-            cpuset=set(range(flavor.vcpus)),
+            cpuset=cpu_set,
+            shared_vcpu=shared_vcpu,
             memory=flavor.memory_mb,
             cpu_policy=cpu_policy,
             cpu_thread_policy=cpu_thread_policy)
@@ -1442,9 +2190,78 @@ def numa_get_constraints(flavor, image_meta):
     return numa_topology
 
 
+# WRS: This code/loop was refactored from numa_fit_instance_to_host().
+def _numa_fit_instance_to_host(host_topology, instance_topology, limits,
+                               details, pci_requests, pci_stats,
+                               pci_strict=True):
+
+    emulator_threads_policy = None
+    if 'emulator_threads_policy' in instance_topology:
+        emulator_threads_policy = instance_topology.emulator_threads_policy
+
+    # If PCI device(s) are not required, prefer host cells that don't have
+    # devices attached. Presence of a given numa_node in a PCI pool is
+    # indicative of a PCI device being associated with that node
+    #
+    # The high level permutations rank algorithm is:
+    # - permute remaining cells
+    # - sort by non-PCI host nodes for non-PCI instances (if PCI not required)
+    # - sort-by cell[0].id
+    for itercells in sorted(
+            itertools.permutations(
+                list(iter(host_topology.cells)),
+                len(instance_topology)),
+            key=lambda x: (sum(y.id in [pool['numa_node']
+                               for pool in pci_stats.pools] for y in x
+                               if not pci_requests and pci_stats),
+                           x[0].id)):
+        host_cell_perm = list(itercells)
+        cells = []
+        for host_cell, instance_cell in zip(
+                host_cell_perm, instance_topology.cells):
+            try:
+                cpuset_reserved = 0
+                if (instance_topology.emulator_threads_isolated
+                    and len(cells) == 0):
+                    # For the case of isolate emulator threads, to
+                    # make predictable where that CPU overhead is
+                    # located we always configure it to be on host
+                    # NUMA node associated to the guest NUMA node
+                    # 0.
+                    cpuset_reserved = 1
+                got_cell = _numa_fit_instance_cell(
+                    host_cell, instance_cell, limits, cpuset_reserved,
+                    details=details)
+            except exception.MemoryPageSizeNotSupported:
+                # This exception will been raised if instance cell's
+                # custom pagesize is not supported with host cell in
+                # _numa_cell_supports_pagesize_request function.
+                break
+            if got_cell is None:
+                break
+            cells.append(got_cell)
+        if len(cells) == len(host_cell_perm):
+            if not pci_requests:
+                return objects.InstanceNUMATopology(
+                    cells=cells,
+                    emulator_threads_policy=emulator_threads_policy)
+            elif pci_stats is not None:
+                if pci_stats.support_requests(pci_requests, cells,
+                                              pci_strict=pci_strict):
+                    return objects.InstanceNUMATopology(
+                        cells=cells,
+                        emulator_threads_policy=emulator_threads_policy)
+                else:
+                    msg = "PCI device not found or already in use"
+                    details = utils.details_append(details, msg)
+
+
+# WRS - pass through metrics
 def numa_fit_instance_to_host(
         host_topology, instance_topology, limits=None,
-        pci_requests=None, pci_stats=None):
+        pci_requests=None, pci_stats=None,
+        details=None,
+        pci_strict=True):
     """Fit the instance topology onto the host topology.
 
     Given a host, instance topology, and (optional) limits, attempt to
@@ -1463,9 +2280,12 @@ def numa_fit_instance_to_host(
     :returns: objects.InstanceNUMATopology with its cell IDs set to host
               cell ids of the first successful permutation, or None
     """
+    details = utils.details_initialize(details=details)
     if not (host_topology and instance_topology):
         LOG.debug("Require both a host and instance NUMA topology to "
                   "fit instance on host.")
+        msg = 'Topology mismatch'
+        details = utils.details_append(details, msg)
         return
     elif len(host_topology) < len(instance_topology):
         LOG.debug("There are not enough NUMA nodes on the system to schedule "
@@ -1473,57 +2293,27 @@ def numa_fit_instance_to_host(
                   "%(actual)s",
                   {'required': len(instance_topology),
                    'actual': len(host_topology)})
+        msg = ("Not enough free cores to schedule "
+               "the instance. Required: %(required)s, actual: "
+               "%(actual)s" %
+               {'required': len(instance_topology),
+                'actual': len(host_topology)})
+        details = utils.details_append(details, msg)
         return
-
-    emulator_threads_policy = None
-    if 'emulator_threads_policy' in instance_topology:
-        emulator_threads_policy = instance_topology.emulator_threads_policy
-
-    host_cells = host_topology.cells
-
-    # If PCI device(s) are not required, prefer host cells that don't have
-    # devices attached. Presence of a given numa_node in a PCI pool is
-    # indicative of a PCI device being associated with that node
-    if not pci_requests and pci_stats:
-        host_cells = sorted(host_cells, key=lambda cell: cell.id in [
-            pool['numa_node'] for pool in pci_stats.pools])
 
     # TODO(ndipanov): We may want to sort permutations differently
     # depending on whether we want packing/spreading over NUMA nodes
-    for host_cell_perm in itertools.permutations(
-            host_cells, len(instance_topology)):
-        cells = []
-        for host_cell, instance_cell in zip(
-                host_cell_perm, instance_topology.cells):
-            try:
-                cpuset_reserved = 0
-                if (instance_topology.emulator_threads_isolated
-                    and len(cells) == 0):
-                    # For the case of isolate emulator threads, to
-                    # make predictable where that CPU overhead is
-                    # located we always configure it to be on host
-                    # NUMA node associated to the guest NUMA node
-                    # 0.
-                    cpuset_reserved = 1
-                got_cell = _numa_fit_instance_cell(
-                    host_cell, instance_cell, limits, cpuset_reserved)
-            except exception.MemoryPageSizeNotSupported:
-                # This exception will been raised if instance cell's
-                # custom pagesize is not supported with host cell in
-                # _numa_cell_supports_pagesize_request function.
-                break
-            if got_cell is None:
-                break
-            cells.append(got_cell)
-
-        if len(cells) != len(host_cell_perm):
-            continue
-
-        if not pci_requests or ((pci_stats is not None) and
-                pci_stats.support_requests(pci_requests, cells)):
-            return objects.InstanceNUMATopology(
-                cells=cells,
-                emulator_threads_policy=emulator_threads_policy)
+    # WRS: This code was re-factored.
+    numa_topology = _numa_fit_instance_to_host(host_topology,
+        instance_topology, limits, details, pci_requests, pci_stats,
+        pci_strict=True)
+    # WRS: If PCI strict allocation didn't succeed and pci_numa_affinity
+    # is set to prefer, try again with best effort.
+    if not numa_topology and pci_requests and not pci_strict:
+        numa_topology = _numa_fit_instance_to_host(host_topology,
+            instance_topology, limits, details, pci_requests, pci_stats,
+            pci_strict=False)
+    return numa_topology
 
 
 def numa_get_reserved_huge_pages():
@@ -1571,7 +2361,7 @@ def _numa_pagesize_usage_from_cell(hostcell, instancecell, sign):
     return topo
 
 
-def numa_usage_from_instances(host, instances, free=False):
+def numa_usage_from_instances(host, instances, free=False, strict=True):
     """Get host topology usage.
 
     Sum the usage from all provided instances to report the overall
@@ -1593,17 +2383,40 @@ def numa_usage_from_instances(host, instances, free=False):
         memory_usage = hostcell.memory_usage
         cpu_usage = hostcell.cpu_usage
 
+        # L3 CAT Support
+        l3_both_used = hostcell.l3_both_used
+        l3_code_used = hostcell.l3_code_used
+        l3_data_used = hostcell.l3_data_used
+
+        # WRS: add shared_pcpu
         newcell = objects.NUMACell(
             id=hostcell.id, cpuset=hostcell.cpuset, memory=hostcell.memory,
             cpu_usage=0, memory_usage=0, mempages=hostcell.mempages,
-            pinned_cpus=hostcell.pinned_cpus, siblings=hostcell.siblings)
+            pinned_cpus=hostcell.pinned_cpus, siblings=hostcell.siblings,
+            shared_pcpu=hostcell.shared_pcpu,
+            l3_cdp=hostcell.l3_cdp,
+            l3_size=hostcell.l3_size,
+            l3_granularity=hostcell.l3_granularity,
+            l3_both_used=0,
+            l3_code_used=0,
+            l3_data_used=0,
+        )
 
         for instance in instances:
             for cellid, instancecell in enumerate(instance.cells):
                 if instancecell.id == hostcell.id:
                     memory_usage = (
                             memory_usage + sign * instancecell.memory)
-                    cpu_usage_diff = len(instancecell.cpuset)
+                    # If we can we want to use the number of unique pcpus since
+                    # it will factor in scaled-down CPUs.  On initial creation
+                    # however we may not have that info so use cpuset instead.
+                    if instancecell.cpu_pinning is not None:
+                        cpu_usage_diff = \
+                            len(set(instancecell.cpu_pinning.values()))
+                    else:
+                        cpu_usage_diff = len(instancecell.cpuset)
+                    if not instance.cpu_pinning_requested:
+                        cpu_usage_diff /= float(CONF.cpu_allocation_ratio)
                     if (instancecell.cpu_thread_policy ==
                             fields.CPUThreadAllocationPolicy.ISOLATE and
                             hostcell.siblings):
@@ -1619,6 +2432,21 @@ def numa_usage_from_instances(host, instances, free=False):
                         # guest NUMA node 0.
                         cpu_usage += sign * len(instancecell.cpuset_reserved)
 
+                    # L3 CAT support
+                    if instance.cpu_pinning_requested:
+                        if instancecell.l3_both_size is not None:
+                            l3_both_used += \
+                                sign * utils.roundup(instancecell.l3_both_size,
+                                                     hostcell.l3_granularity)
+                        if instancecell.l3_code_size is not None:
+                            l3_code_used += \
+                                sign * utils.roundup(instancecell.l3_code_size,
+                                                     hostcell.l3_granularity)
+                        if instancecell.l3_data_size is not None:
+                            l3_data_used += \
+                                sign * utils.roundup(instancecell.l3_data_size,
+                                                     hostcell.l3_granularity)
+
                     if instancecell.pagesize and instancecell.pagesize > 0:
                         newcell.mempages = _numa_pagesize_usage_from_cell(
                             hostcell, instancecell, sign)
@@ -1629,18 +2457,35 @@ def numa_usage_from_instances(host, instances, free=False):
                         if free:
                             if (instancecell.cpu_thread_policy ==
                                     fields.CPUThreadAllocationPolicy.ISOLATE):
-                                newcell.unpin_cpus_with_siblings(pinned_cpus)
+                                e = newcell.unpin_cpus_with_siblings(
+                                        pinned_cpus, strict=strict)
                             else:
-                                newcell.unpin_cpus(pinned_cpus)
+                                e = newcell.unpin_cpus(pinned_cpus,
+                                                       strict=strict)
+                            if e:
+                                LOG.error(
+                                    'Cannot unpin:%(e)s (not pinned); '
+                                    'requested:%(req)s',
+                                    {'e': e, 'req': pinned_cpus})
                         else:
                             if (instancecell.cpu_thread_policy ==
                                     fields.CPUThreadAllocationPolicy.ISOLATE):
-                                newcell.pin_cpus_with_siblings(pinned_cpus)
+                                e = newcell.pin_cpus_with_siblings(
+                                        pinned_cpus, strict=strict)
                             else:
-                                newcell.pin_cpus(pinned_cpus)
+                                e = newcell.pin_cpus(pinned_cpus,
+                                                     strict=strict)
+                            if e:
+                                LOG.error(
+                                    'Overlap pinning:%(e)s; '
+                                    'requested:%(req)s',
+                                    {'e': e, 'req': pinned_cpus})
 
         newcell.cpu_usage = max(0, cpu_usage)
         newcell.memory_usage = max(0, memory_usage)
+        newcell.l3_both_used = max(0, l3_both_used)
+        newcell.l3_code_used = max(0, l3_code_used)
+        newcell.l3_data_used = max(0, l3_data_used)
         cells.append(newcell)
 
     return objects.NUMATopology(cells=cells)
@@ -1704,10 +2549,20 @@ def instance_topology_from_instance(instance):
                     memory=cell['memory'],
                     pagesize=cell.get('pagesize'),
                     cpu_topology=cell.get('cpu_topology'),
+                    # WRS: add physnode
+                    physnode=cell.get('physnode'),
+                    # WRS: add shared_vcpu & shared_pcpu_for_vcpu
+                    shared_vcpu=cell.get('shared_vcpu'),
+                    shared_pcpu_for_vcpu=cell.get('shared_pcpu_for_vcpu'),
                     cpu_pinning=cell.get('cpu_pinning_raw'),
                     cpu_policy=cell.get('cpu_policy'),
                     cpu_thread_policy=cell.get('cpu_thread_policy'),
-                    cpuset_reserved=cell.get('cpuset_reserved'))
+                    cpuset_reserved=cell.get('cpuset_reserved'),
+                    # L3 CAT Support
+                    l3_cpuset=set(cell.get('l3_cpuset') or []),
+                    l3_both_size=cell.get('l3_both_size'),
+                    l3_code_size=cell.get('l3_code_size'),
+                    l3_data_size=cell.get('l3_data_size'))
                          for cell in dict_cells]
                 emulator_threads_policy = instance_numa_topology.get(
                     'emulator_threads_policy')
@@ -1750,7 +2605,8 @@ def host_topology_and_format_from_host(host):
 
 # TODO(ndipanov): Remove when all code paths are using objects
 def get_host_numa_usage_from_instance(host, instance, free=False,
-                                     never_serialize_result=False):
+                                     never_serialize_result=False,
+                                     strict=True):
     """Calculate new host NUMA usage from an instance's NUMA usage.
 
     Until the RPC version is bumped to 5.x, both host and instance
@@ -1781,10 +2637,95 @@ def get_host_numa_usage_from_instance(host, instance, free=False,
 
     updated_numa_topology = (
         numa_usage_from_instances(
-            host_numa_topology, instance_numa_topology, free=free))
+            host_numa_topology, instance_numa_topology,
+            free=free, strict=strict))
 
     if updated_numa_topology is not None:
         if jsonify_result and not never_serialize_result:
             updated_numa_topology = updated_numa_topology._to_json()
 
     return updated_numa_topology
+
+
+def instance_vcpu_to_pcpu(instance, vcpu):
+    return instance.numa_topology.vcpu_to_pcpu(vcpu)
+
+
+# WRS extension
+def update_floating_affinity(host):
+    """Update the CPU affinity for instances with non-dedicated CPUs.
+
+    This is a helper function to update the CPU affinity of floating
+    instances.  We assume that each floating instance is assigned to a cpuset,
+    either global or per-host-NUMA-node.
+
+    The kernel will not allow us to add a CPU to a subset before the global
+    set, or remove a CPU from the global set before removing it from all
+    subsets.  This means that we need to first remove CPUs from the subsets,
+    then set the desired affinity in the global set, then set the desired
+    affinity in the subsets.
+
+    :param resources: the compute node resources
+    :return: None
+    """
+    def get_cpuset_cpus(node):
+        node_str = '' if node is None else '/node' + str(node)
+        filename = CPUSET_BASE + node_str + '/cpuset.cpus'
+        with open(filename, 'r') as f:
+            cpus_string = f.read().rstrip('\n')
+            return set(utils.range_to_list(cpus_string))
+
+    def set_cpuset_cpus(node, cpus):
+        node_str = '' if node is None else '/node' + str(node)
+        filename = CPUSET_BASE + node_str + '/cpuset.cpus'
+        # We want cpus separated by commas with no spaces
+        cpus_string = ','.join(str(e) for e in cpus)
+        try:
+            with open(filename, 'w') as f:
+                # Need to use this version, f.write() with an empty string
+                # doesn't actually do a write() syscall.
+                os.write(f.fileno(), cpus_string)
+        except Exception as e:
+            LOG.error('Unable to assign floating cpuset: %(cpus)r, '
+                      'filename: %(f)s, error=%(e)s',
+                      {'f': filename, 'cpus': cpus_string, 'e': e})
+
+    host_numa_topology, jsonify_result = \
+            host_topology_and_format_from_host(host)
+
+    # Host doesn't report numa topology, can't continue.
+    if host_numa_topology is None or not host_numa_topology.cells:
+        return
+
+    # Handle any CPU deletions from the subsets
+    for cell in host_numa_topology.cells:
+        cur_cpuset_cpus = get_cpuset_cpus(cell.id)
+        new_cpuset_cpus = cur_cpuset_cpus.intersection(cell.free_cpus)
+        set_cpuset_cpus(cell.id, new_cpuset_cpus)
+
+    # Set the new global affinity
+    floating_cpuset = set()
+    for cell in host_numa_topology.cells:
+        floating_cpuset.update(cell.free_cpus)
+    set_cpuset_cpus(None, floating_cpuset)
+
+    # Set the new affinity for all subsets
+    for cell in host_numa_topology.cells:
+        set_cpuset_cpus(cell.id, cell.free_cpus)
+
+
+# WRS extension
+def set_cpuset_tasks(node, tids):
+    """Assign tasks represented by tids to the specified cpuset
+
+    :param node: Either None or a NUMA node number
+    :param tids: a set of Linux task IDs representing qemu vCPUs
+    """
+    node_str = '' if node is None else '/node' + str(node)
+    filename = CPUSET_BASE + node_str + '/tasks'
+    with open(filename, 'w') as f:
+        for tid in tids:
+            f.write(str(tid))
+            # Need to flush because the kernel only takes one TID
+            # per write() syscall.
+            f.flush()

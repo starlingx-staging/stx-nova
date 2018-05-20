@@ -11,6 +11,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2016-2017 Wind River Systems, Inc.
+#
 
 import os
 
@@ -763,18 +766,19 @@ class LibvirtVifTestCase(test.NoDBTestCase):
                 supported = (network_model.VIF_MODEL_RTL8139,
                              network_model.VIF_MODEL_E1000)
             elif virt == 'qemu':
+                # WRS: removed unspported model: VIF_MODEL_SPAPR_VLAN
                 supported = (network_model.VIF_MODEL_LAN9118,
                              network_model.VIF_MODEL_NE2K_PCI,
                              network_model.VIF_MODEL_PCNET,
                              network_model.VIF_MODEL_RTL8139,
-                             network_model.VIF_MODEL_E1000,
-                             network_model.VIF_MODEL_SPAPR_VLAN)
+                             network_model.VIF_MODEL_E1000)
             else:
+                # WRS: removed unspported model: VIF_MODEL_SPAPR_VLAN
                 supported = (network_model.VIF_MODEL_NE2K_PCI,
                              network_model.VIF_MODEL_PCNET,
                              network_model.VIF_MODEL_RTL8139,
-                             network_model.VIF_MODEL_E1000,
-                             network_model.VIF_MODEL_SPAPR_VLAN)
+                             network_model.VIF_MODEL_E1000)
+
             for model in supported:
                 image_meta = objects.ImageMeta.from_dict(
                     {'properties': {'hw_vif_model': model}})

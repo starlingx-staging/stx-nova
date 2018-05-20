@@ -11,6 +11,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2016-2017 Wind River Systems, Inc.
+#
 import copy
 
 from nova.api.validation import parameter_types
@@ -50,3 +53,64 @@ create = {
 create_v215 = copy.deepcopy(create)
 policies = create_v215['properties']['server_group']['properties']['policies']
 policies['items'][0]['enum'].extend(['soft-anti-affinity', 'soft-affinity'])
+
+
+# WRS:extension, group metadata
+positive_integer_not_empty = {
+    'type': ['integer', 'string'],
+    'pattern': '^[0-9]+$', 'minimum': 1
+}
+
+boolean_with_nullstring = copy.deepcopy(parameter_types.boolean)
+boolean_with_nullstring['type'].append('null')
+boolean_with_nullstring['enum'].extend(['', None])
+
+
+server_group_metadata_create = {
+    'type': 'object',
+    'properties': {
+        'wrs-sg:group_size': positive_integer_not_empty,
+        'wrs-sg:best_effort': parameter_types.boolean,
+    },
+    'additionalProperties': False,
+}
+
+server_group_metadata = {
+    'type': 'object',
+    'properties': {
+        'wrs-sg:group_size': {
+            'oneOf': [
+                positive_integer_not_empty,
+                {
+                    'type': ['null', 'string'],
+                    'enum': [None, ''],
+                },
+            ]
+        },
+        'wrs-sg:best_effort': boolean_with_nullstring,
+    },
+    'additionalProperties': False,
+}
+
+# extend group creation to include optional metadata
+properties = create_v215['properties']['server_group']['properties']
+properties['metadata'] = server_group_metadata_create
+
+properties['project_id'] = parameter_types.project_id
+
+# schema for setting metadata on existing group
+set_meta = {
+    'type': 'object',
+    'properties': {
+        'set_metadata': {
+            'type': 'object',
+            'properties': {
+                'metadata': server_group_metadata
+            },
+            'required': ['metadata'],
+            'additionalProperties': False,
+        }
+    },
+    'required': ['set_metadata'],
+    'additionalProperties': False,
+}

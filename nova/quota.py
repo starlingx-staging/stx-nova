@@ -298,6 +298,43 @@ class DbQuotaDriver(object):
                                     defaults=defaults, usages=project_usages,
                                     remains=remains)
 
+    def get_all_project_quotas(self, context):
+        """Get all quota entries.
+
+        The result is a dict where the keys are project IDs and the values are
+        dicts of individual quotas.
+        """
+        quotas = objects.Quotas.get_all_project_quotas(context)
+        results = {}
+        for quota in quotas:
+            if quota.project_id in results:
+                results[quota.project_id][quota.resource] = quota.hard_limit
+            else:
+                results[quota.project_id] = {quota.resource: quota.hard_limit}
+        return results
+
+    def get_all_project_user_quotas(self, context):
+        """Get all project user quota entries.
+
+        The result is a dict where the keys are project IDs and the values
+        are dicts where the keys are user IDs and the values are dicts of
+        individual quotas.
+        """
+        user_quotas = objects.Quotas.get_all_project_user_quotas(context)
+        results = {}
+        for quota in user_quotas:
+            if quota.project_id in results:
+                if quota.user_id in results[quota.project_id]:
+                    results[quota.project_id][quota.user_id][quota.resource] =\
+                        quota.hard_limit
+                else:
+                    results[quota.project_id][quota.user_id] = {
+                        quota.resource: quota.hard_limit}
+            else:
+                results[quota.project_id] = {
+                    quota.user_id: {quota.resource: quota.hard_limit}}
+        return results
+
     def _is_unlimited_value(self, v):
         """A helper method to check for unlimited value.
         """
@@ -1026,6 +1063,12 @@ class NoopQuotaDriver(object):
         """
         return self._get_noop_quotas(resources, usages=usages, remains=remains)
 
+    def get_all_project_quotas(self, context):
+        return {}
+
+    def get_all_project_user_quotas(self, context):
+        return {}
+
     def get_settable_quotas(self, context, resources, project_id,
                             user_id=None):
         """Given a list of resources, retrieve the range of settable quotas for
@@ -1532,6 +1575,12 @@ class QuotaEngine(object):
                                               defaults=defaults,
                                               usages=usages,
                                               remains=remains)
+
+    def get_all_project_quotas(self, context):
+        return self._driver.get_all_project_quotas(context)
+
+    def get_all_project_user_quotas(self, context):
+        return self._driver.get_all_project_user_quotas(context)
 
     def get_settable_quotas(self, context, project_id, user_id=None):
         """Given a list of resources, retrieve the range of settable quotas for

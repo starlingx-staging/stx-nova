@@ -73,6 +73,11 @@ class HypervisorsController(wsgi.Controller):
                           'running_vms', 'disk_available_least', 'host_ip'):
                 hyp_dict[field] = getattr(hypervisor, field)
 
+            # L3 CAT Support
+            if api_version_request.wrs_is_supported(req):
+                for field in ('l3_closids', 'l3_closids_used'):
+                    hyp_dict[field] = getattr(hypervisor, field)
+
             service_id = service.uuid if uuid_for_id else service.id
             hyp_dict['service'] = {
                 'id': service_id,
@@ -88,6 +93,9 @@ class HypervisorsController(wsgi.Controller):
             else:
                 hyp_dict['cpu_info'] = hypervisor.cpu_info
 
+            if api_version_request.wrs_is_supported(req):
+                self._add_stats_to_dict(hypervisor, hyp_dict)
+
         if servers:
             hyp_dict['servers'] = [dict(name=serv['name'], uuid=serv['uuid'])
                                    for serv in servers]
@@ -97,6 +105,24 @@ class HypervisorsController(wsgi.Controller):
             hyp_dict.update(kwargs)
 
         return hyp_dict
+
+    def _add_stats_to_dict(self, hypervisor, hyp_dict):
+        stats = getattr(hypervisor, 'stats')
+        if stats:
+            hyp_dict['vcpus_used_by_node'] = \
+                stats.get('vcpus_used_by_node', None)
+            hyp_dict['vcpus_by_node'] = stats.get('vcpus_by_node', None)
+            hyp_dict['memory_mb_by_node'] = \
+                stats.get('memory_mb_by_node', None)
+            hyp_dict['memory_mb_used_by_node'] = \
+                stats.get('memory_mb_used_by_node', None)
+            # L3 CAT Support
+            hyp_dict['l3_cache_by_node'] = \
+                stats.get('l3_cache_by_node', None)
+            hyp_dict['l3_cache_used_by_node'] = \
+                stats.get('l3_cache_used_by_node', None)
+            hyp_dict['l3_cache_granularity'] = \
+                stats.get('l3_cache_granularity', None)
 
     def _get_compute_nodes_by_name_pattern(self, context, hostname_match):
         compute_nodes = self.host_api.compute_node_search_by_hypervisor(

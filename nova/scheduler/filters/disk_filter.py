@@ -12,6 +12,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2013-2017 Wind River Systems, Inc.
+#
 
 from oslo_log import log as logging
 
@@ -68,6 +71,9 @@ class DiskFilter(filters.BaseHostFilter):
                     "disk.", {'host_state': host_state,
                                'requested_disk': requested_disk,
                                'usable_disk_mb': usable_disk_mb})
+            msg = ('Insufficient disk: req:%(req)s, avail:%(avail)s MB' %
+                   {'req': requested_disk, 'avail': usable_disk_mb})
+            self.filter_reject(host_state, spec_obj, msg)
             return False
 
         disk_gb_limit = disk_mb_limit / 1024

@@ -12,6 +12,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2016-2017 Wind River Systems, Inc.
+#
 
 from oslo_log import log as logging
 
@@ -59,5 +62,9 @@ class AvailabilityZoneFilter(filters.BaseHostFilter):
                       {'host_state': host_state,
                        'az': availability_zone,
                        'host_az': host_az})
+            msg = ('avail zone %(az)s not in host AZ: %(host_az)s' %
+                   {'az': availability_zone,
+                    'host_az': host_az})
+            self.filter_reject(host_state, spec_obj, msg)
 
         return hosts_passes

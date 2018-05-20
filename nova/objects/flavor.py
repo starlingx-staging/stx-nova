@@ -36,6 +36,7 @@ from nova.notifications.objects import flavor as flavor_notification
 from nova import objects
 from nova.objects import base
 from nova.objects import fields
+from webob import exc
 
 
 LOG = logging.getLogger(__name__)
@@ -589,8 +590,50 @@ class Flavor(base.NovaPersistentObject, base.NovaObject,
     def _flavor_destroy(context, flavor_id=None, flavorid=None):
         return _flavor_destroy(context, flavor_id=flavor_id, flavorid=flavorid)
 
+    def is_in_use(self):
+        try:
+            if 'id' not in self:
+                flavor = self._flavor_get_by_flavor_id_from_db(
+                    self._context,
+                    self.flavorid)
+                self.id = flavor['id']
+        except exception.FlavorNotFound:
+            return False
+
+        filters = {'deleted': False, 'instance_type_id': self.id}
+        instances = db.instance_get_all_by_filters(self._context, filters)
+        if not instances:
+            # No instances currently set to this flavor,
+            # check for instances being resized to or from this flavor
+            migration_filters = {'status': 'migrating', 'deleted': False}
+            migrations = objects.MigrationList.get_by_filters(self._context,
+                                                            migration_filters)
+            # No migrations in progress, flavor not in use
+            if not migrations:
+                return False
+            inst_uuid_from_migrations = set([migration.instance_uuid
+                                             for migration in migrations])
+            inst_filters = {'uuid': inst_uuid_from_migrations,
+                            'deleted': False}
+            attrs = ['info_cache', 'security_groups', 'system_metadata']
+            instances = objects.InstanceList.get_by_filters(
+                self._context, inst_filters, expected_attrs=attrs,
+                use_slave=True)
+            for instance in instances:
+                for flv in (instance.new_flavor, instance.old_flavor):
+                    if flv is not None:
+                        if flv.flavorid == self.flavorid:
+                            return True
+            return False
+
+        return bool(instances)
+
     @base.remotable
     def destroy(self):
+        if self.is_in_use():
+            msg = ('Flavor is in use')
+            raise exc.HTTPBadRequest(explanation=msg)
+
         # NOTE(danms): Historically the only way to delete a flavor
         # is via name, which is not very precise. We need to be able to
         # support the light construction of a flavor object and subsequent

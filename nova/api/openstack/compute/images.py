@@ -94,6 +94,7 @@ class ImagesController(wsgi.Controller):
         return self._view_builder.show(req, image)
 
     @wsgi.Controller.api_version("2.1", MAX_PROXY_API_SUPPORT_VERSION)
+    @extensions.block_during_upgrade()
     @extensions.expected_errors((403, 404))
     @wsgi.response(204)
     def delete(self, req, id):

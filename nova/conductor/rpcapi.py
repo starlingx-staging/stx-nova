@@ -12,6 +12,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2013-2017 Wind River Systems, Inc.
+#
 
 """Client side of the conductor RPC API."""
 
@@ -240,7 +243,11 @@ class ConductorAPI(object):
                           args=args, kwargs=kwargs)
 
     def object_action(self, context, objinst, objmethod, args, kwargs):
-        cctxt = self.client.prepare()
+        # WRS - Strip off RPC timeout argument used with base.remoteable
+        # functions, and set the timeout. This enables special handling of
+        # specific methods what don't desire long wait.
+        wrs_rpc_timeout = kwargs.pop('wrs_rpc_timeout', None)
+        cctxt = self.client.prepare(timeout=wrs_rpc_timeout)
         return cctxt.call(context, 'object_action', objinst=objinst,
                           objmethod=objmethod, args=args, kwargs=kwargs)
 
@@ -412,3 +419,19 @@ class ComputeTaskAPI(object):
             del kw['request_spec']
         cctxt = self.client.prepare(version=version)
         cctxt.cast(ctxt, 'rebuild_instance', **kw)
+
+    # WRS: send server group messaging, same api version (1.6) as R2/Kilo
+    def send_server_group_msg(self, context, exclude_instance, instance_id,
+                              instance_uuid, data):
+        """Send message to all instances in the same server group"""
+        cctxt = self.client.prepare(version='1.6')
+        return cctxt.cast(context, 'send_server_group_msg',
+                          exclude_instance=exclude_instance,
+                          instance_id=instance_id,
+                          instance_uuid=instance_uuid, data=data)
+
+    # WRS: get server group status, same api version (1.6) as R2/Kilo
+    def get_server_group_status(self, context, instance_id):
+        cctxt = self.client.prepare(version='1.6')
+        return cctxt.call(context, 'get_server_group_status',
+                          instance_id=instance_id)

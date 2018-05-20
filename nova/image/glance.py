@@ -12,6 +12,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2016-2017 Wind River Systems, Inc.
+#
 
 """Implementation of an image service that uses Glance as the backend."""
 
@@ -28,6 +31,7 @@ import time
 import cryptography
 from cursive import exception as cursive_exception
 from cursive import signature_utils
+from eventlet import tpool
 import glanceclient
 import glanceclient.exc
 from glanceclient.v2 import schemas
@@ -346,33 +350,41 @@ class GlanceImageServiceV2(object):
                                   'for image: %s', image_id)
             return image_chunks
         else:
-            try:
-                for chunk in image_chunks:
+            # WRS: offload image download to another thread to reduce chances
+            #      of nova-compute getting stuck on disk IO
+            def write_image(data, image_chunks, close_file, verifier):
+                try:
+                    for chunk in image_chunks:
+                        if verifier:
+                            verifier.update(chunk)
+                        data.write(chunk)
+                        # Without this periodic tasks get delayed
+                        time.sleep(0)
                     if verifier:
-                        verifier.update(chunk)
-                    data.write(chunk)
-                if verifier:
-                    verifier.verify()
-                    LOG.info('Image signature verification succeeded '
-                             'for image %s', image_id)
-            except cryptography.exceptions.InvalidSignature:
-                data.truncate(0)
-                with excutils.save_and_reraise_exception():
-                    LOG.error('Image signature verification failed '
-                              'for image: %s', image_id)
-            except Exception as ex:
-                with excutils.save_and_reraise_exception():
-                    LOG.error("Error writing to %(path)s: %(exception)s",
-                              {'path': dst_path, 'exception': ex})
-            finally:
-                if close_file:
-                    # Ensure that the data is pushed all the way down to
-                    # persistent storage. This ensures that in the event of a
-                    # subsequent host crash we don't have running instances
-                    # using a corrupt backing file.
-                    data.flush()
-                    os.fsync(data.fileno())
-                    data.close()
+                        verifier.verify()
+                        LOG.info('Image signature verification succeeded '
+                                 'for image %s', image_id)
+                except cryptography.exceptions.InvalidSignature:
+                    data.truncate(0)
+                    with excutils.save_and_reraise_exception():
+                        LOG.error('Image signature verification failed '
+                                  'for image: %s', image_id)
+                except Exception as ex:
+                    with excutils.save_and_reraise_exception():
+                        LOG.error("Error writing to %(path)s: "
+                                  "%(exception)s",
+                                  {'path': dst_path, 'exception': ex})
+                finally:
+                    if close_file:
+                        # Ensure that the data is pushed all the way down to
+                        # persistent storage. This ensures that in the event
+                        # of a subsequent host crash we don't have running
+                        # instances using a corrupt backing file.
+                        data.flush()
+                        os.fsync(data.fileno())
+                        data.close()
+            tpool.execute(write_image, data, image_chunks, close_file,
+                          verifier)
 
     def create(self, context, image_meta, data=None):
         """Store the image data and return the new image object."""
@@ -463,6 +475,18 @@ class GlanceImageServiceV2(object):
                 sent_service_image_meta['container_format'] = 'bare'
 
         location = sent_service_image_meta.pop('location', None)
+
+        # If image cache_raw is enabled, the snapshot will be
+        # a raw image. So we remove all cache_raw related attributes
+        # and set disk_format to raw.
+        if sent_service_image_meta.get('cache_raw', False):
+            cache_raw_attrs_to_remove = [
+                key for key in sent_service_image_meta.keys()
+                    if key.startswith('cache_raw')]
+            for key in cache_raw_attrs_to_remove:
+                del sent_service_image_meta[key]
+            sent_service_image_meta['disk_format'] = 'raw'
+
         image = self._client.call(
             context, 2, 'create', **sent_service_image_meta)
         image_id = image['id']
@@ -836,6 +860,8 @@ def _translate_image_exception(image_id, exc_value):
     if isinstance(exc_value, glanceclient.exc.BadRequest):
         return exception.ImageBadRequest(image_id=image_id,
                                          response=six.text_type(exc_value))
+    if isinstance(exc_value, glanceclient.exc.HTTPOverLimit):
+        return exception.ImageStorageMediaFull(image_id=image_id)
     return exc_value
 
 

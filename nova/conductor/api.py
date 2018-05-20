@@ -11,6 +11,9 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2013-2017 Wind River Systems, Inc.
+#
 
 """Handles all requests to the conductor service."""
 
@@ -155,3 +158,16 @@ class ComputeTaskAPI(object):
                 preserve_ephemeral=preserve_ephemeral,
                 host=host,
                 request_spec=request_spec)
+
+    # WRS: send server group message
+    def send_server_group_msg(self, context, data, exclude_instance=True,
+                              instance_id=None, instance_uuid=None):
+        """Send message to all instances in the same server group"""
+        return self.conductor_compute_rpcapi.send_server_group_msg(context,
+                            exclude_instance, instance_id, instance_uuid, data)
+
+    # WRS: get server group status
+    def get_server_group_status(self, context, instance_id):
+        """Get info on all instances in the same server group"""
+        return self.conductor_compute_rpcapi.get_server_group_status(context,
+                            instance_id)
