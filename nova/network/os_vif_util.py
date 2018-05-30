@@ -280,7 +280,8 @@ def _nova_to_osvif_vif_bridge(vif):
 def _nova_to_osvif_vif_ovs(vif):
     vnic_type = vif.get('vnic_type', model.VNIC_TYPE_NORMAL)
     profile = objects.vif.VIFPortProfileOpenVSwitch(
-        interface_id=vif.get('ovs_interfaceid') or vif['id'])
+        interface_id=vif.get('ovs_interfaceid') or vif['id'],
+        datapath_type=vif['details'].get('datapath_type'))
     if vnic_type == model.VNIC_TYPE_DIRECT:
         profile = objects.vif.VIFPortProfileOVSRepresentor(
             interface_id=vif.get('ovs_interfaceid') or vif['id'],
