@@ -1,0 +1,134 @@
+From 1c0371ff203ac4c3dd3d6558294beb240c7cbcc6 Mon Sep 17 00:00:00 2001
+From: Jack Ding <jack.ding@windriver.com>
+Date: Thu, 8 Mar 2018 21:15:50 -0500
+Subject: [PATCH 124/143] vnics created are doubled after rescheduling
+
+The system_metadata key-pair 'network_allocated': 'True' is deleted by
+instance.save() when handling RescheduledException due to plug_vifs
+timeout. The rescheduling code evaluates missing 'network_allocated'
+as False therefore allocates the network ports again causing vics to
+double.
+
+When entering instance.save() here, instance._orig_system_metadata and
+instance.system_metadata have the same value (both have
+'network_allocated' set to 'True'), so system_metadata is not included
+in obj_what_changed(). As a result, the save() function just uses the
+system_metadata from instance obj stored in db and not updating it.
+However, the instance obj retrieved from db has no 'network_allocated'
+in its system_metadata, likely the result of overwritten by a
+different thread during instance shutdown.
+
+The fix is to force updating the system_metadata in instance.save()
+here so that value of network_allocated is retained.
+---
+ nova/compute/manager.py                     | 11 ++++++++++-
+ nova/objects/instance.py                    |  7 ++++++-
+ nova/tests/unit/compute/test_compute_mgr.py |  9 ++++++---
+ nova/tests/unit/objects/test_objects.py     |  2 +-
+ 4 files changed, 23 insertions(+), 6 deletions(-)
+
+diff --git a/nova/compute/manager.py b/nova/compute/manager.py
+index ddf55e5..5cfcb56 100644
+--- a/nova/compute/manager.py
++++ b/nova/compute/manager.py
+@@ -2035,6 +2035,9 @@ class ComputeManager(manager.Manager):
+             retry['exc'] = traceback.format_exception(*sys.exc_info())
+             # This will be used for setting the instance fault message
+             retry['exc_reason'] = e.kwargs['reason']
++
++            update_network_allocated = False
++
+             # NOTE(comstud): Deallocate networks if the driver wants
+             # us to do so.
+             # NOTE(vladikr): SR-IOV ports should be deallocated to
+@@ -2051,12 +2054,18 @@ class ComputeManager(manager.Manager):
+                 # want to deallocate them before rescheduling. But we need
+                 # to cleanup those network resources setup on this host before
+                 # rescheduling.
++
++                # due to race condition, network_allocated key in
++                # instance.system_metadata might be lost so we need to force
++                # the system_metadata update when save instance.
++                update_network_allocated = True
+                 self.network_api.cleanup_instance_network_on_host(
+                     context, instance, self.host)
+ 
+             self._nil_out_instance_obj_host_and_node(instance)
+             instance.task_state = task_states.SCHEDULING
+-            instance.save()
++            instance.save(
++                force_system_metadata_update=update_network_allocated)
+ 
+             self.compute_task_api.build_instances(context, [instance],
+                     image, filter_properties, admin_password,
+diff --git a/nova/objects/instance.py b/nova/objects/instance.py
+index 43b11cc..8a7929c 100644
+--- a/nova/objects/instance.py
++++ b/nova/objects/instance.py
+@@ -677,7 +677,8 @@ class Instance(base.NovaPersistentObject, base.NovaObject,
+ 
+     @base.remotable
+     def save(self, expected_vm_state=None,
+-             expected_task_state=None, admin_state_reset=False):
++             expected_task_state=None, admin_state_reset=False,
++             force_system_metadata_update=False):
+         """Save updates to this instance
+ 
+         Column-wise updates will be made based on the result of
+@@ -779,6 +780,10 @@ class Instance(base.NovaPersistentObject, base.NovaObject,
+         if expected_vm_state is not None:
+             updates['expected_vm_state'] = expected_vm_state
+ 
++        if force_system_metadata_update:
++            if 'system_metadata' in self:
++                updates['system_metadata'] = self.system_metadata
++
+         expected_attrs = [attr for attr in _INSTANCE_OPTIONAL_JOINED_FIELDS
+                                if self.obj_attr_is_set(attr)]
+         if 'pci_devices' in expected_attrs:
+diff --git a/nova/tests/unit/compute/test_compute_mgr.py b/nova/tests/unit/compute/test_compute_mgr.py
+index 3132667..4ea90bc 100644
+--- a/nova/tests/unit/compute/test_compute_mgr.py
++++ b/nova/tests/unit/compute/test_compute_mgr.py
+@@ -4493,11 +4493,13 @@ class ComputeManagerBuildInstanceTestCase(test.NoDBTestCase):
+ 
+     @staticmethod
+     def _assert_build_instance_update(mock_save,
+-                                      reschedule_update=False):
++                                      reschedule_update=False,
++                                      update_network_allocated=True):
+         if reschedule_update:
+             mock_save.assert_has_calls([
+                 mock.call(expected_task_state=(task_states.SCHEDULING, None)),
+-                mock.call()])
++                mock.call(
++                    force_system_metadata_update=update_network_allocated)])
+         else:
+             mock_save.assert_called_once_with(expected_task_state=
+                                               (task_states.SCHEDULING, None))
+@@ -4950,7 +4952,8 @@ class ComputeManagerBuildInstanceTestCase(test.NoDBTestCase):
+         self._assert_build_instance_hook_called(mock_hooks,
+                                                 build_results.RESCHEDULED)
+         self._instance_action_events(mock_start, mock_finish)
+-        self._assert_build_instance_update(mock_save, reschedule_update=True)
++        self._assert_build_instance_update(mock_save, reschedule_update=True,
++                                           update_network_allocated=False)
+         mock_build_run.assert_called_once_with(self.context, self.instance,
+                 self.image, self.injected_files, self.admin_pass,
+                 self.requested_networks, self.security_groups,
+diff --git a/nova/tests/unit/objects/test_objects.py b/nova/tests/unit/objects/test_objects.py
+index e523427..a9824ae 100644
+--- a/nova/tests/unit/objects/test_objects.py
++++ b/nova/tests/unit/objects/test_objects.py
+@@ -1107,7 +1107,7 @@ object_data = {
+     'IDEDeviceBus': '1.0-29d4c9f27ac44197f01b6ac1b7e16502',
+     'ImageMeta': '1.8-642d1b2eb3e880a367f37d72dd76162d',
+     'ImageMetaProps': '1.19-ab1397610b5c97cb05994675ebe78d76',
+-    'Instance': '2.3-9b20afdc7f46ea0d83f9f0fb4a01f02d',
++    'Instance': '2.3-4ceb84ca0991892b74bd8f91a3418526',
+     'InstanceAction': '1.1-f9f293e526b66fca0d05c3b3a2d13914',
+     'InstanceActionEvent': '1.1-cc5342ce9da679b9ee3f704cbbfbb63f',
+     'InstanceActionEventList': '1.1-13d92fb953030cdbfee56481756e02be',
+-- 
+2.7.4
+

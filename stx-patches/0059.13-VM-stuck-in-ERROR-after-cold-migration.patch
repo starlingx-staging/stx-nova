@@ -1,0 +1,123 @@
+From f528ce77304e465ced66425aa3ee2e080fe85109 Mon Sep 17 00:00:00 2001
+From: "Beliveau, Ludovic" <Ludovic.Beliveau@windriver.com>
+Date: Wed, 27 May 2015 07:23:17 -0400
+Subject: [PATCH] VM stuck in ERROR after cold migration
+
+A cold migration is done in two steps: 1) prep_resize, 2) finish_resize.
+After prep_resize the instance in put in task state RESIZE_MIGRATED.  When
+the audit periodic task runs and the instance is in state RESIZE_MIGREATED,
+the upstream code logic is to free all PCI devices on that was claimed or
+allocated for that instance.  Which doesn't make sense since we just allocated
+PCI devices for the cold migration of this particular instance.
+
+What was then happening is that a PCI device allocated to a running instance
+(the one that was cold migrated) was added back in the pool of available
+PCI devices.  So it was then possible to have two instance that has the
+same PCI device, which will lead to a failure in libvirt because it
+detects that the PCI is already used.
+
+The solution is to not free PCI devices when the instance is in state
+RESIZE_MIGREATED and running on the same node that is executing that code.
+---
+ nova/pci/device.py  |  2 +-
+ nova/pci/manager.py | 40 +++++++++++++++++++++++++++++++++++++---
+ 2 files changed, 38 insertions(+), 4 deletions(-)
+
+diff --git a/nova/pci/device.py b/nova/pci/device.py
+index e399299..c1010ab 100644
+--- a/nova/pci/device.py
++++ b/nova/pci/device.py
+@@ -70,7 +70,7 @@ def allocate(devobj, instance):
+         instance.pci_devices.objects.append(copy.copy(devobj))
+ 
+ 
+-# @check_device_status(dev_status=['available'])
++@check_device_status(dev_status=['available'])
+ def remove(devobj):
+     devobj.status = 'removed'
+     devobj.instance_uuid = None
+diff --git a/nova/pci/manager.py b/nova/pci/manager.py
+index fe5287d..facf271 100644
+--- a/nova/pci/manager.py
++++ b/nova/pci/manager.py
+@@ -153,6 +153,8 @@ class PciDevTracker(object):
+             # NOTE(danms): These devices are created with no context
+             dev_obj = objects.PciDevice.create(dev)
+             self.pci_devs.append(dev_obj)
++            LOG.info("Synchronizing with hypervisor: Adding device %s" %
++                dev_obj.address)
+             self.stats.add_device(dev_obj)
+ 
+     def _claim_instance(self, context, instance):
+@@ -197,11 +199,26 @@ class PciDevTracker(object):
+         # However, the instance contains only allocated devices
+         # information, not the claimed one. So we can't use
+         # instance['pci_devices'] to check the devices to be freed.
++        LOG.info("Freeing instance %s" % instance['uuid'])
++
+         for dev in self.pci_devs:
+             if (dev['status'] in ('claimed', 'allocated') and
+                     dev['instance_uuid'] == instance['uuid']):
+                 self._free_device(dev)
+ 
++    def _instance_on_same_node(self, context, instance):
++        if isinstance(instance, dict):
++            inst_host = instance['host']
++            inst_node = instance['node']
++        else:
++            inst_host = instance.host
++            inst_node = instance.node
++
++        node = objects.ComputeNode.get_by_host_and_nodename(context,
++                                                            inst_host,
++                                                            inst_node)
++        return node.id == self.node_id
++
+     def update_pci_for_instance(self, context, instance):
+         """Update instance's pci usage information.
+ 
+@@ -220,9 +237,22 @@ class PciDevTracker(object):
+             elif self.claims.pop(uuid, None):
+                 self._free_instance(instance)
+         elif task_state == task_states.RESIZE_MIGRATED:
+-            devs = self.allocations.pop(uuid, None)
+-            if devs:
+-                self._free_instance(instance)
++            # It's possible to get called for an instance in state
++            # RESIZE_MIGRATED by the audit periodic task right after we
++            # migrated/evacuated an instance on this node.  Then a PCI device
++            # was being put back on the PCI device pool because of the call
++            # to _free_instance.  The same PCI device would allocated twice
++            # for two different instances.  Not sure why during state
++            # RESIZE_MIGRATED we would want to free the PCI devices of an
++            # instance ?  What is the intention here ? Maybe we should just
++            # clean up an intance on the incoming node ...
++            if not self._instance_on_same_node(context, instance):
++                devs = self.allocations.pop(uuid, None)
++                if devs:
++                    self._free_instance(instance)
++            else:
++                LOG.info("Tried to free instance in state RESIZE_MIGRATED "
++                         "on same node")
+         elif task_state == task_states.RESIZE_FINISH:
+             devs = self.claims.pop(uuid, None)
+             if devs:
+@@ -271,11 +301,15 @@ class PciDevTracker(object):
+         for uuid in self.claims.keys():
+             if uuid not in existed:
+                 devs = self.claims.pop(uuid, [])
++                LOG.info("Cleaning instance %s with PCI devices %s" %
++                         (uuid, [dev.address for dev in devs]))
+                 for dev in devs:
+                     self._free_device(dev)
+         for uuid in self.allocations.keys():
+             if uuid not in existed:
+                 devs = self.allocations.pop(uuid, [])
++                LOG.info("Cleaning instance %s with PCI devices %s" %
++                         (uuid, [dev.address for dev in devs]))
+                 for dev in devs:
+                     self._free_device(dev)
+ 
+-- 
+2.7.4
+

@@ -1,0 +1,81 @@
+From ee9017e6573e826f717c74d317452bbce4b32f64 Mon Sep 17 00:00:00 2001
+From: Daniel Chavolla <daniel.chavolla@windriver.com>
+Date: Mon, 25 Sep 2017 15:57:38 -0400
+Subject: [PATCH 068/143] Support for vxWorks7 guest - add HPET timer support
+
+This commit adds support for the HPET Timer needed by VxWorks guests.
+Added "Guest HPET support" to flavor  extraspecs.
+When this extra-spec is used The HPET timer is activated in libvirt
+
+__TYPE_single
+__TAG_vxworks
+__R5_commit_0e067f1
+---
+ nova/api/openstack/compute/flavors_extraspecs.py |  2 +-
+ nova/virt/libvirt/driver.py                      | 15 ++++++++++-----
+ 2 files changed, 11 insertions(+), 6 deletions(-)
+
+diff --git a/nova/api/openstack/compute/flavors_extraspecs.py b/nova/api/openstack/compute/flavors_extraspecs.py
+index f8893a0..07fe598 100644
+--- a/nova/api/openstack/compute/flavors_extraspecs.py
++++ b/nova/api/openstack/compute/flavors_extraspecs.py
+@@ -342,7 +342,7 @@ class FlavorExtraSpecsController(wsgi.Controller):
+     @staticmethod
+     def _validate_sw_keys(flavor):
+         keys = ['sw:wrs:auto_recovery', 'sw:wrs:srv_grp_messaging',
+-                'sw:wrs:guest:heartbeat', 'sw:wrs:vtpm']
++                'sw:wrs:guest:heartbeat', 'sw:wrs:vtpm', 'sw:wrs:guest:hpet']
+         specs = flavor.extra_specs
+         for key in keys:
+             if key in specs:
+diff --git a/nova/virt/libvirt/driver.py b/nova/virt/libvirt/driver.py
+index ac762d9..1b09832 100644
+--- a/nova/virt/libvirt/driver.py
++++ b/nova/virt/libvirt/driver.py
+@@ -4648,7 +4648,7 @@ class LibvirtDriver(driver.ComputeDriver):
+         if image_meta.properties.get("os_command_line"):
+             guest.os_cmdline = image_meta.properties.os_command_line
+ 
+-    def _set_clock(self, guest, os_type, image_meta, virt_type):
++    def _set_clock(self, guest, os_type, image_meta, virt_type, want_hpet):
+         # NOTE(mikal): Microsoft Windows expects the clock to be in
+         # "localtime". If the clock is set to UTC, then you can use a
+         # registry key to let windows know, but Microsoft says this is
+@@ -4662,9 +4662,9 @@ class LibvirtDriver(driver.ComputeDriver):
+         guest.set_clock(clk)
+ 
+         if virt_type == "kvm":
+-            self._set_kvm_timers(clk, os_type, image_meta)
++            self._set_kvm_timers(clk, os_type, image_meta, want_hpet)
+ 
+-    def _set_kvm_timers(self, clk, os_type, image_meta):
++    def _set_kvm_timers(self, clk, os_type, image_meta, want_hpet):
+         # TODO(berrange) One day this should be per-guest
+         # OS type configurable
+         tmpit = vconfig.LibvirtConfigGuestTimer()
+@@ -4687,7 +4687,10 @@ class LibvirtDriver(driver.ComputeDriver):
+             # qemu -no-hpet is not supported on non-x86 targets.
+             tmhpet = vconfig.LibvirtConfigGuestTimer()
+             tmhpet.name = "hpet"
+-            tmhpet.present = False
++            if want_hpet:
++                tmhpet.present = True
++            else:
++                tmhpet.present = False
+             clk.add_timer(tmhpet)
+ 
+         # Provide Windows guests with the paravirtualized hyperv timer source.
+@@ -5280,7 +5283,9 @@ class LibvirtDriver(driver.ComputeDriver):
+ 
+         self._set_features(guest, instance.os_type, caps, virt_type,
+                            image_meta)
+-        self._set_clock(guest, instance.os_type, image_meta, virt_type)
++        want_hpet = flavor.extra_specs.get("sw:wrs:guest:hpet", False)
++        self._set_clock(guest, instance.os_type, image_meta, virt_type,
++                        want_hpet)
+ 
+         storage_configs = self._get_guest_storage_config(
+                 instance, image_meta, disk_info, rescue, block_device_info,
+-- 
+2.7.4
+

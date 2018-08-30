@@ -1,0 +1,57 @@
+From d2b38f7cc5c38d76be39c21e5c8b9b3a39579a21 Mon Sep 17 00:00:00 2001
+From: "Beliveau, Ludovic" <Ludovic.Beliveau@windriver.com>
+Date: Wed, 29 Apr 2015 22:38:33 -0400
+Subject: [PATCH] SR-IOV: Failed to allocate networks
+
+Only update the binding:profile for a port that has PCI devices included
+in the instance.
+
+The exact reason why the PCI devices field can be missing haven't been found
+yet.
+---
+ nova/network/neutronv2/api.py | 22 ++++++++++++----------
+ 1 file changed, 12 insertions(+), 10 deletions(-)
+
+diff --git a/nova/network/neutronv2/api.py b/nova/network/neutronv2/api.py
+index 63a71ce..eaaa45d 100644
+--- a/nova/network/neutronv2/api.py
++++ b/nova/network/neutronv2/api.py
+@@ -1726,7 +1726,7 @@ class API(base_api.NetworkAPI):
+                                       p['id'])
+ 
+             if p.get(constants.PORT_VIF_MODEL) == 'pci-sriov':
+-                profile = ''
++                profile = None
+                 pci_requests = instance.pci_requests
+                 if pci_requests and pci_requests.requests:
+                     pci_dev = pci_manager.get_instance_pci_devs(
+@@ -1736,15 +1736,17 @@ class API(base_api.NetworkAPI):
+                                     (pci_dev.vendor_id, pci_dev.product_id),
+                                'pci_slot': pci_dev.address,
+                                'physical_network':
+-                                    devspec.get_tags().get('physical_network')
+-                              }
+-                try:
+-                    neutron.update_port(p['id'],
+-                                        {'port': {'binding:profile': profile}})
+-                except Exception:
+-                    with excutils.save_and_reraise_exception():
+-                        LOG.exception(_LE("Unable to update host of port %s"),
+-                                      p['id'])
++                                    devspec.get_tags().get('physical_network')}
++                if profile:
++                    try:
++                        neutron.update_port(p['id'],
++                                            {'port':
++                                                {'binding:profile': profile}})
++                    except Exception:
++                        with excutils.save_and_reraise_exception():
++                            LOG.exception(
++                                _LE("Unable to update host of port %s"),
++                                p['id'])
+ 
+ def _ensure_requested_network_ordering(accessor, unordered, preferred):
+     """Sort a list with respect to the preferred network ordering."""
+-- 
+2.7.4
+

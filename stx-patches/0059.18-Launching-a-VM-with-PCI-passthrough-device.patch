@@ -1,0 +1,74 @@
+From 55c8b477053c2b8f4aad6cd80c9b700c99386146 Mon Sep 17 00:00:00 2001
+From: Ludovic Beliveau <ludovic.beliveau@windriver.com>
+Date: Wed, 28 Oct 2015 09:36:09 -0400
+Subject: [PATCH] Launching a VM with PCI passthrough device
+
+HP wants to use the upstream method for launching instances with PCI
+Passthrough interfaces using flavors (pci_passthrough:alias). We are going to
+populate the alias for them with packstack when the nodes are unlocked.
+
+Also this commit introduces a fix in Nova for supporting multiple pci_alias
+to be configured in an array in the Nova configuration file. This is aligned
+with the puppet nova class. Also, this fix is aligned with the code for
+parsing the pci_passthrough_whitelist which already did support arrays.
+---
+ nova/pci/request.py | 35 +++++++++++++++++++++++++----------
+ 1 file changed, 25 insertions(+), 10 deletions(-)
+
+diff --git a/nova/pci/request.py b/nova/pci/request.py
+index 3251033..e15e079 100644
+--- a/nova/pci/request.py
++++ b/nova/pci/request.py
+@@ -45,6 +45,7 @@ from oslo_serialization import jsonutils
+ import six
+ 
+ from nova import exception
++from nova.i18n import _
+ from nova import objects
+ from nova.pci import utils
+ 
+@@ -112,17 +113,31 @@ def _get_alias_from_config():
+     aliases = {}  # map alias name to alias spec list
+     try:
+         for jsonspecs in jaliases:
+-            spec = jsonutils.loads(jsonspecs)
+-            jsonschema.validate(spec, _ALIAS_SCHEMA)
+-            name = spec.pop("name")
+-            if name not in aliases:
+-                aliases[name] = [spec]
+-            else:
+-                if aliases[name][0]["device_type"] == spec["device_type"]:
+-                    aliases[name].append(spec)
++            # Align with packstack and pci_passthrough_whitelist.  Support
++            # list of pci_alias.
++            try:
++                spec = jsonutils.loads(jsonspecs)
++            except ValueError:
++                raise exception.PciInvalidAlias(
++                          reason=_("Invalid entry: '%s'") % jsonspecs)
++            if isinstance(spec, dict):
++                spec = [spec]
++            elif not isinstance(spec, list):
++                raise exception.PciInvalidAlias(
++                          reason=_("Invalid entry: '%s'; "
++                                   "Expecting list or dict") % jsonspecs)
++
++            for s in spec:
++                jsonschema.validate(s, _ALIAS_SCHEMA)
++                name = s.pop("name")
++                if name not in aliases:
++                    aliases[name] = [s]
+                 else:
+-                    reason = "Device type mismatch for alias '%s'" % name
+-                    raise exception.PciInvalidAlias(reason=reason)
++                    if aliases[name][0]["device_type"] == s["device_type"]:
++                        aliases[name].append(s)
++                    else:
++                        reason = "Device type mismatch for alias '%s'" % name
++                        raise exception.PciInvalidAlias(reason=reason)
+ 
+     except exception.PciInvalidAlias:
+         raise
+-- 
+2.7.4
+

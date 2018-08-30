@@ -1,0 +1,41 @@
+From cb8a6d6f293a1774da790c12976831118e38943f Mon Sep 17 00:00:00 2001
+From: Daniel Chavolla <daniel.chavolla@windriver.com>
+Date: Mon, 26 Feb 2018 19:24:26 -0500
+Subject: [PATCH 110/143] fix for case where all VM's realtime vCPUs
+ are scaled down
+
+Addendum to commit 48a1fc63c57018ba2e41e2.
+This commit adds support for migrating a VM with all its
+realtime vCPUs scaled down.
+---
+ nova/virt/libvirt/driver.py | 14 ++++++++------
+ 1 file changed, 8 insertions(+), 6 deletions(-)
+
+diff --git a/nova/virt/libvirt/driver.py b/nova/virt/libvirt/driver.py
+index 51d777a..850701c 100644
+--- a/nova/virt/libvirt/driver.py
++++ b/nova/virt/libvirt/driver.py
+@@ -4526,12 +4526,14 @@ class LibvirtDriver(driver.ComputeDriver):
+                         flavor, image_meta)
+                     offline_cpus = instance_numa_topology.offline_cpus
+                     vcpus_rt = vcpus_rt - offline_cpus
+-                    vcpusched = vconfig.LibvirtConfigGuestCPUTuneVCPUSched()
+-                    vcpusched.vcpus = vcpus_rt
+-                    vcpusched.scheduler = "fifo"
+-                    vcpusched.priority = (
+-                        CONF.libvirt.realtime_scheduler_priority)
+-                    guest_cpu_tune.vcpusched.append(vcpusched)
++                    if vcpus_rt:
++                        vcpusched = vconfig.\
++                            LibvirtConfigGuestCPUTuneVCPUSched()
++                        vcpusched.vcpus = vcpus_rt
++                        vcpusched.scheduler = "fifo"
++                        vcpusched.priority = (
++                            CONF.libvirt.realtime_scheduler_priority)
++                        guest_cpu_tune.vcpusched.append(vcpusched)
+ 
+                 # Map numa cells to CacheTune banks
+                 cachetune = []
+-- 
+2.7.4
+

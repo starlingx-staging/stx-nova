@@ -1,0 +1,793 @@
+From 464b87da7a8e851a443e963b35b3113bf8b1fe22 Mon Sep 17 00:00:00 2001
+From: "Beliveau, Ludovic" <Ludovic.Beliveau@windriver.com>
+Date: Fri, 5 Jun 2015 15:30:36 -0400
+Subject: [PATCH] Fixed tox unit tests around PCI passthrough
+
+Introduction of new code for PCI passthrough broke many tox unit tests.
+
+Overview of the changes needed:
+- PCI devices now use dev_type in order to distinguish pci-sriov from
+  pci-passthrough request.
+- Changes in neutronv2 api for support of NIC MAC address for the PCI
+  passthrough interfaces.
+- Stubbed compute_node_get_by_host_and_nodename because it is now used
+  by PciDevTracker.
+- Some code in libvirt driver were failing because network info didn't
+  include a vif_model.
+
+Conflicts:
+	nova/tests/unit/scheduler/filters/test_pci_passthrough_filters.py
+---
+ nova/tests/unit/compute/test_claims.py             | 21 +++--
+ nova/tests/unit/compute/test_compute.py            | 22 +++--
+ nova/tests/unit/network/test_neutronv2.py          | 17 ++--
+ nova/tests/unit/pci/test_manager.py                | 94 +++++++++++++++++++---
+ nova/tests/unit/pci/test_stats.py                  | 15 ++--
+ .../filters/test_pci_passthrough_filters.py        |  3 +-
+ nova/tests/unit/scheduler/test_scheduler_utils.py  | 19 +++--
+ nova/tests/unit/virt/libvirt/test_driver.py        | 69 +++++++++++++++-
+ nova/tests/unit/virt/test_virt_drivers.py          | 42 ++++++++++
+ nova/tests/unit/virt/xenapi/test_xenapi.py         | 48 +++++++++++
+ 10 files changed, 303 insertions(+), 47 deletions(-)
+
+diff --git a/nova/tests/unit/compute/test_claims.py b/nova/tests/unit/compute/test_claims.py
+index 427395d..59cf681 100644
+--- a/nova/tests/unit/compute/test_claims.py
++++ b/nova/tests/unit/compute/test_claims.py
+@@ -200,7 +200,8 @@ class ClaimTestCase(test.NoDBTestCase):
+             'product_id': 'p',
+             'vendor_id': 'v',
+             'numa_node': 0,
+-            'status': 'available'}
++            'status': 'available',
++            'dev_type': ''}
+         self.tracker.new_pci_tracker()
+         self.tracker.pci_tracker.set_hvdevs([dev_dict])
+         claim = self._claim()
+@@ -218,7 +219,8 @@ class ClaimTestCase(test.NoDBTestCase):
+             'product_id': 'p',
+             'vendor_id': 'v1',
+             'numa_node': 1,
+-            'status': 'available'}
++            'status': 'available',
++            'dev_type': ''}
+         self.tracker.new_pci_tracker()
+         self.tracker.pci_tracker.set_hvdevs([dev_dict])
+         claim = self._claim()
+@@ -236,7 +238,8 @@ class ClaimTestCase(test.NoDBTestCase):
+             'product_id': 'p',
+             'vendor_id': 'v',
+             'numa_node': 0,
+-            'status': 'available'}
++            'status': 'available',
++            'dev_type': ''}
+         self.tracker.new_pci_tracker()
+         self.tracker.pci_tracker.set_hvdevs([dev_dict])
+         claim = self._claim()
+@@ -281,7 +284,8 @@ class ClaimTestCase(test.NoDBTestCase):
+             'product_id': 'p',
+             'vendor_id': 'v',
+             'numa_node': 1,
+-            'status': 'available'}
++            'status': 'available',
++            'dev_type': ''}
+         self.tracker.new_pci_tracker()
+         self.tracker.pci_tracker.set_hvdevs([dev_dict])
+         request = objects.InstancePCIRequest(count=1,
+@@ -303,14 +307,16 @@ class ClaimTestCase(test.NoDBTestCase):
+             'product_id': 'p',
+             'vendor_id': 'v',
+             'numa_node': 1,
+-            'status': 'available'}
++            'status': 'available',
++            'dev_type': ''}
+         dev_dict2 = {
+             'compute_node_id': 1,
+             'address': 'a',
+             'product_id': 'p',
+             'vendor_id': 'v',
+             'numa_node': 2,
+-            'status': 'available'}
++            'status': 'available',
++            'dev_type': ''}
+         self.tracker.new_pci_tracker()
+         self.tracker.pci_tracker.set_hvdevs([dev_dict, dev_dict2])
+ 
+@@ -335,7 +341,8 @@ class ClaimTestCase(test.NoDBTestCase):
+             'product_id': 'p',
+             'vendor_id': 'v',
+             'numa_node': None,
+-            'status': 'available'}
++            'status': 'available',
++            'dev_type': ''}
+         self.tracker.new_pci_tracker()
+         self.tracker.pci_tracker.set_hvdevs([dev_dict])
+ 
+diff --git a/nova/tests/unit/compute/test_compute.py b/nova/tests/unit/compute/test_compute.py
+index d46b1e8..e68e810 100644
+--- a/nova/tests/unit/compute/test_compute.py
++++ b/nova/tests/unit/compute/test_compute.py
+@@ -4435,9 +4435,13 @@ class ComputeTestCase(BaseTestCase):
+         network_api = self.compute.network_api
+ 
+         self.mox.StubOutWithMock(network_api, 'setup_networks_on_host')
++
++        self.mox.StubOutWithMock(self.compute, '_get_instance_nw_info')
++        self.mox.StubOutWithMock(self.compute, '_get_vif_models')
++        self.mox.StubOutWithMock(self.compute.driver, 'macs_for_instance')
++        self.mox.StubOutWithMock(self.compute, '_update_instance_nw_info')
+         self.mox.StubOutWithMock(network_api,
+                                  'migrate_instance_finish')
+-        self.mox.StubOutWithMock(self.compute, '_get_instance_nw_info')
+         self.mox.StubOutWithMock(self.compute,
+                                  '_notify_about_instance_usage')
+         self.mox.StubOutWithMock(self.compute.driver, 'finish_migration')
+@@ -4483,12 +4487,20 @@ class ComputeTestCase(BaseTestCase):
+ 
+         network_api.setup_networks_on_host(self.context, instance,
+                                            'fake-mini')
++
++        self.compute._get_instance_nw_info(
++                self.context, instance).AndReturn([{'vif_model': 'fake'}])
++        self.compute._get_vif_models([{'vif_model': 'fake'}]).AndReturn([])
++        self.compute.driver.macs_for_instance(
++            instance, []).AndReturn(None)
++        self.compute._update_instance_nw_info(self.context, instance, None)
++
+         network_api.migrate_instance_finish(self.context,
+                                             mox.IsA(objects.Instance),
+                                             mox.IsA(dict))
+ 
+         self.compute._get_instance_nw_info(
+-                self.context, instance).AndReturn('fake-nwinfo1')
++                self.context, instance).AndReturn([{'vif_model': 'fake'}])
+ 
+         # Third save to update task state
+         exp_kwargs = dict(expected_task_state=task_states.RESIZE_MIGRATED)
+@@ -4496,7 +4508,7 @@ class ComputeTestCase(BaseTestCase):
+ 
+         self.compute._notify_about_instance_usage(
+                 self.context, instance, 'finish_resize.start',
+-                network_info='fake-nwinfo1')
++                network_info=[{'vif_model': 'fake'}])
+ 
+         self.compute._get_instance_block_device_info(
+                 self.context, instance,
+@@ -4506,7 +4518,7 @@ class ComputeTestCase(BaseTestCase):
+         # which makes this a resize
+         self.compute.driver.finish_migration(self.context, migration,
+                                              instance, disk_info,
+-                                             'fake-nwinfo1',
++                                             [{'vif_model': 'fake'}],
+                                              image, True,
+                                              'fake-bdminfo', power_on)
+         # Ensure instance status updates is after the migration finish
+@@ -4515,7 +4527,7 @@ class ComputeTestCase(BaseTestCase):
+         instance.save(**exp_kwargs).WithSideEffects(_instance_save3)
+         self.compute._notify_about_instance_usage(
+                 self.context, instance, 'finish_resize.end',
+-                network_info='fake-nwinfo1')
++                network_info=[{'vif_model': 'fake'}])
+         # NOTE(comstud): This actually does the mox.ReplayAll()
+         reservations = self._ensure_quota_reservations_committed(instance)
+ 
+diff --git a/nova/tests/unit/network/test_neutronv2.py b/nova/tests/unit/network/test_neutronv2.py
+index 1ffe2ab..0be3dee 100644
+--- a/nova/tests/unit/network/test_neutronv2.py
++++ b/nova/tests/unit/network/test_neutronv2.py
+@@ -505,7 +505,8 @@ class TestNeutronv2Base(test.TestCase):
+             if not has_portbinding:
+                 api._populate_neutron_extension_values(mox.IgnoreArg(),
+                     self.instance, mox.IgnoreArg(),
+-                    mox.IgnoreArg(), neutron=self.moxed_client).AndReturn(None)
++                    mox.IgnoreArg(), None,
++                    neutron=self.moxed_client).AndReturn(None)
+             else:
+                 # since _populate_neutron_extension_values() will call
+                 # _has_port_binding_extension()
+@@ -874,7 +875,7 @@ class TestNeutronv2(TestNeutronv2Base):
+             instance.set_flavor(flavor)
+         port_req_body = {'port': {}}
+         api._populate_neutron_extension_values(self.context, instance,
+-                                               None, port_req_body)
++                                               None, port_req_body, None)
+         self.assertEqual(port_req_body['port']['rxtx_factor'], 1)
+ 
+     def test_allocate_for_instance_1(self):
+@@ -1085,7 +1086,7 @@ class TestNeutronv2(TestNeutronv2Base):
+             port = {'id': 'portid_' + network['id']}
+ 
+             api._populate_neutron_extension_values(self.context,
+-                self.instance, None, binding_port_req_body,
++                self.instance, None, binding_port_req_body, None,
+                 neutron=self.moxed_client).AndReturn(None)
+             if index == 0:
+                 self.moxed_client.create_port(
+@@ -1140,7 +1141,7 @@ class TestNeutronv2(TestNeutronv2Base):
+             },
+         }
+         api._populate_neutron_extension_values(self.context,
+-            self.instance, None, binding_port_req_body,
++            self.instance, None, binding_port_req_body, None,
+             neutron=self.moxed_client).AndReturn(None)
+         self.moxed_client.create_port(
+             MyComparator(port_req_body)).AndRaise(
+@@ -3000,11 +3001,11 @@ class TestNeutronv2WithMock(test.TestCase):
+                                   'mac_address': 'XX:XX:XX:XX:XX:XX'}}
+         available_macs = set(['XX:XX:XX:XX:XX:XX'])
+         # Run the code.
+-        self.assertRaises(exception.PortInUse,
++        self.assertRaises(exceptions.MacAddressInUseClient,
+                           self.api._create_port,
+                           neutronapi.get_client(self.context),
+-                          instance, net['id'], port_req_body,
+-                          available_macs=available_macs)
++                          instance, net['id'], port_req_body)
++
+         # Assert the calls.
+         create_port_mock.assert_called_once_with(port_req_body)
+ 
+@@ -3434,7 +3435,7 @@ class TestNeutronv2Portbinding(TestNeutronv2Base):
+         instance = {'host': host_id}
+         port_req_body = {'port': {}}
+         api._populate_neutron_extension_values(self.context, instance,
+-                                               None, port_req_body)
++                                               None, port_req_body, None)
+         self.assertEqual(port_req_body['port']['binding:host_id'], host_id)
+         self.assertFalse(port_req_body['port'].get('binding:profile'))
+ 
+diff --git a/nova/tests/unit/pci/test_manager.py b/nova/tests/unit/pci/test_manager.py
+index 1e8cd1c..7cc737d 100644
+--- a/nova/tests/unit/pci/test_manager.py
++++ b/nova/tests/unit/pci/test_manager.py
+@@ -17,6 +17,8 @@ import copy
+ 
+ import mock
+ 
++from oslo_utils import timeutils
++
+ import nova
+ from nova.compute import task_states
+ from nova.compute import vm_states
+@@ -38,7 +40,8 @@ fake_pci = {
+     'vendor_id': 'v',
+     'request_id': None,
+     'status': 'available',
+-    'numa_node': 0}
++    'numa_node': 0,
++    'dev_type': ''}
+ fake_pci_1 = dict(fake_pci, address='0000:00:00.2',
+                   product_id='p1', vendor_id='v1')
+ fake_pci_2 = dict(fake_pci, address='0000:00:00.3')
+@@ -62,13 +65,15 @@ fake_db_dev = {
+     'instance_uuid': None,
+     'extra_info': '{}',
+     'request_id': None,
++    'dev_type': ''
+     }
+ fake_db_dev_1 = dict(fake_db_dev, vendor_id='v1',
+                      product_id='p1', id=2,
+                      address='0000:00:00.2',
+-                     numa_node=0)
++                     numa_node=0,
++                     dev_type='')
+ fake_db_dev_2 = dict(fake_db_dev, id=3, address='0000:00:00.3',
+-                     numa_node=None)
++                     numa_node=None, dev_type='')
+ fake_db_devs = [fake_db_dev, fake_db_dev_1, fake_db_dev_2]
+ 
+ 
+@@ -78,6 +83,54 @@ fake_pci_requests = [
+     {'count': 1,
+      'spec': [{'vendor_id': 'v1'}]}]
+ 
++def create_compute_node(values=None):
++    compute = {
++        "id": 1,
++        "service_id": 1,
++        "vcpus": 1,
++        "memory_mb": 1,
++        "local_gb": 1,
++        "vcpus_used": 1,
++        "memory_mb_used": 1,
++        "local_gb_used": 1,
++        "free_ram_mb": 1,
++        "free_disk_gb": 1,
++        "current_workload": 1,
++        "running_vms": 0,
++        "cpu_info": None,
++        "numa_topology": None,
++        "stats": '{"num_instances": "1"}',
++        "hypervisor_hostname": "fakenode",
++        'hypervisor_version': 1,
++        'hypervisor_type': 'fake-hyp',
++        'disk_available_least': None,
++        'host_ip': None,
++        'metrics': None,
++        'created_at': None,
++        'updated_at': None,
++        'deleted_at': None,
++        'deleted': False,
++    }
++    if values:
++        compute.update(values)
++    return compute
++
++def _fake_service_get(context, service_id, use_slave=False):
++    return {'id': '1',
++            'host': None,
++            'binary': None,
++            'topic': None,
++            'report_count': 0,
++            'disabled': False,
++            'disabled_reason': None,
++            'availability_zone': None,
++            'compute_node': '',
++            'force_down': False,
++            'deleted': None,
++            'created_at': timeutils.utcnow(),
++            'updated_at': timeutils.utcnow(),
++            'deleted_at': timeutils.utcnow()}
++
+ 
+ class PciDevTrackerTestCase(test.NoDBTestCase):
+     def _create_fake_instance(self):
+@@ -87,6 +140,8 @@ class PciDevTrackerTestCase(test.NoDBTestCase):
+         self.inst.vm_state = vm_states.ACTIVE
+         self.inst.task_state = None
+         self.inst.numa_topology = None
++        self.inst.host = "fakehost"
++        self.inst.node = "fakenode"
+ 
+     def _fake_get_pci_devices(self, ctxt, node_id):
+         return fake_db_devs[:]
+@@ -120,6 +175,16 @@ class PciDevTrackerTestCase(test.NoDBTestCase):
+         self._create_fake_instance()
+         self.tracker = manager.PciDevTracker(self.fake_context, 1)
+ 
++        self.stubs.Set(db, 'compute_node_get_by_host_and_nodename',
++                self._fake_compute_node_get_by_host_and_nodename)
++        self.stubs.Set(db, 'service_get',
++                _fake_service_get)
++
++    def _fake_compute_node_get_by_host_and_nodename(self, ctx, host,
++                                                    nodename):
++        self.compute = create_compute_node()
++        return self.compute
++
+     def test_pcidev_tracker_create(self):
+         self.assertEqual(len(self.tracker.pci_devs), 3)
+         free_devs = self.tracker.pci_stats.get_free_devs()
+@@ -249,21 +314,22 @@ class PciDevTrackerTestCase(test.NoDBTestCase):
+         free_devs = self.tracker.pci_stats.get_free_devs()
+         self.assertEqual(len(free_devs), 1)
+         self.inst.task_state = task_states.RESIZE_MIGRATED
+-        self.tracker.update_pci_for_instance(None, self.inst)
++        ctxt = context.get_admin_context()
++        self.tracker.update_pci_for_instance(ctxt, self.inst)
+         free_devs = self.tracker.pci_stats.get_free_devs()
+-        self.assertEqual(len(free_devs), 3)
++        self.assertEqual(len(free_devs), 1)
+ 
+     @mock.patch('nova.objects.InstancePCIRequests.get_by_instance')
+     def test_update_pci_for_instance_resize_dest(self, mock_get):
+         self._create_pci_requests_object(mock_get, fake_pci_requests)
+         self.tracker.update_pci_for_migration(None, self.inst)
+         free_devs = self.tracker.pci_stats.get_free_devs()
+-        self.assertEqual(len(free_devs), 1)
+-        self.assertEqual(len(self.tracker.claims['fake-inst-uuid']), 2)
++        self.assertEqual(len(free_devs), 3)
++        self.assertEqual(len(self.tracker.claims['fake-inst-uuid']), 0)
+         self.assertNotIn('fake-inst-uuid', self.tracker.allocations)
+         self.inst.task_state = task_states.RESIZE_FINISH
+         self.tracker.update_pci_for_instance(None, self.inst)
+-        self.assertEqual(len(self.tracker.allocations['fake-inst-uuid']), 2)
++        self.assertEqual(len(self.tracker.allocations['fake-inst-uuid']), 0)
+         self.assertNotIn('fake-inst-uuid', self.tracker.claims)
+ 
+     @mock.patch('nova.objects.InstancePCIRequests.get_by_instance')
+@@ -271,7 +337,7 @@ class PciDevTrackerTestCase(test.NoDBTestCase):
+         self._create_pci_requests_object(mock_get, fake_pci_requests)
+         self.tracker.update_pci_for_migration(None, self.inst)
+         free_devs = self.tracker.pci_stats.get_free_devs()
+-        self.assertEqual(len(free_devs), 1)
++        self.assertEqual(len(free_devs), 3)
+         self.assertEqual(free_devs[0]['vendor_id'], 'v')
+ 
+     @mock.patch('nova.objects.InstancePCIRequests.get_by_instance')
+@@ -345,7 +411,7 @@ class PciDevTrackerTestCase(test.NoDBTestCase):
+             [{'count': 1, 'spec': [{'vendor_id': 'v1'}]}])
+         self.tracker.update_pci_for_migration(None, inst_2)
+         free_devs = self.tracker.pci_stats.get_free_devs()
+-        self.assertEqual(len(free_devs), 1)
++        self.assertEqual(len(free_devs), 2)
+         self.tracker.clean_usage([self.inst], [migr], [orph])
+         free_devs = self.tracker.pci_stats.get_free_devs()
+         self.assertEqual(len(free_devs), 2)
+@@ -375,6 +441,14 @@ class PciGetInstanceDevs(test.TestCase):
+         super(PciGetInstanceDevs, self).setUp()
+         self.fake_context = context.get_admin_context()
+ 
++        self.stubs.Set(db, 'compute_node_get_by_host_and_nodename',
++                self._fake_compute_node_get_by_host_and_nodename)
++
++    def _fake_compute_node_get_by_host_and_nodename(self, ctx, host,
++                                                    nodename):
++        self.compute = create_compute_node()
++        return self.compute
++
+     def test_get_devs_object(self):
+         def _fake_obj_load_attr(foo, attrname):
+             if attrname == 'pci_devices':
+diff --git a/nova/tests/unit/pci/test_stats.py b/nova/tests/unit/pci/test_stats.py
+index cfc9c37..3e2483d 100644
+--- a/nova/tests/unit/pci/test_stats.py
++++ b/nova/tests/unit/pci/test_stats.py
+@@ -30,21 +30,24 @@ fake_pci_1 = {
+     'extra_k1': 'v1',
+     'request_id': None,
+     'numa_node': 0,
++    'dev_type': ''
+     }
+ 
+ 
+ fake_pci_2 = dict(fake_pci_1, vendor_id='v2',
+                   product_id='p2',
+                   address='0000:00:00.2',
+-                  numa_node=1)
++                  numa_node=1,
++                  dev_type='')
+ 
+ 
+-fake_pci_3 = dict(fake_pci_1, address='0000:00:00.3')
++fake_pci_3 = dict(fake_pci_1, address='0000:00:00.3', dev_type='')
+ 
+ fake_pci_4 = dict(fake_pci_1, vendor_id='v3',
+                   product_id='p3',
+                   address='0000:00:00.3',
+-                  numa_node= None)
++                  numa_node= None,
++                  dev_type='')
+ 
+ pci_requests = [objects.InstancePCIRequest(count=1,
+                     spec=[{'vendor_id': 'v1'}]),
+@@ -211,7 +214,8 @@ class PciDeviceStatsWithTagsTestCase(test.NoDBTestCase):
+                        'product_id': '0071',
+                        'status': 'available',
+                        'request_id': None,
+-                       'numa_node': 0}
++                       'numa_node': 0,
++                       'dev_type': ''}
+             self.pci_tagged_devices.append(objects.PciDevice.create(pci_dev))
+ 
+         self.pci_untagged_devices = []
+@@ -222,7 +226,8 @@ class PciDeviceStatsWithTagsTestCase(test.NoDBTestCase):
+                        'product_id': '0072',
+                        'status': 'available',
+                        'request_id': None,
+-                       'numa_node': 0}
++                       'numa_node': 0,
++                       'dev_type': ''}
+             self.pci_untagged_devices.append(objects.PciDevice.create(pci_dev))
+ 
+         map(self.pci_stats.add_device, self.pci_tagged_devices)
+diff --git a/nova/tests/unit/scheduler/filters/test_pci_passthrough_filters.py b/nova/tests/unit/scheduler/filters/test_pci_passthrough_filters.py
+index eb9ab59..f617503 100644
+--- a/nova/tests/unit/scheduler/filters/test_pci_passthrough_filters.py
++++ b/nova/tests/unit/scheduler/filters/test_pci_passthrough_filters.py
+@@ -64,8 +64,7 @@ class TestPCIPassthroughFilter(test.NoDBTestCase):
+         host = fakes.FakeHostState(
+             'host1', 'node1',
+             attribute_dict={})
+-        self.assertRaises(AttributeError, self.filt_cls.host_passes,
+-                          host, filter_properties)
++        self.assertFalse(self.filt_cls.host_passes(host, filter_properties))
+ 
+     def test_pci_passthrough_no_pci_stats(self):
+         request = objects.InstancePCIRequest(count=1,
+diff --git a/nova/tests/unit/scheduler/test_scheduler_utils.py b/nova/tests/unit/scheduler/test_scheduler_utils.py
+index 08fa12c..b0d1f62 100644
+--- a/nova/tests/unit/scheduler/test_scheduler_utils.py
++++ b/nova/tests/unit/scheduler/test_scheduler_utils.py
+@@ -32,6 +32,7 @@ from oslo_config import cfg
+ 
+ from nova.compute import flavors
+ from nova.compute import utils as compute_utils
++from nova import context
+ from nova import db
+ from nova import exception
+ from nova import notifications
+@@ -51,16 +52,22 @@ class SchedulerUtilsTestCase(test.NoDBTestCase):
+         super(SchedulerUtilsTestCase, self).setUp()
+         self.context = 'fake-context'
+ 
++        self.stubs.Set(objects.Instance, '_load_pci_requests',
++            self._fake_load_pci_requests)
++
++    def _fake_load_pci_requests(self):
++        return
++
+     @mock.patch('nova.objects.Flavor.get_by_flavor_id')
+     def test_build_request_spec_without_image(self, mock_get):
+         image = None
+-        instance = {'uuid': 'fake-uuid'}
+-        instance_type = objects.Flavor(**test_flavor.fake_flavor)
+-
+-        mock_get.return_value = objects.Flavor(extra_specs={})
++        ctxt = context.get_admin_context()
++        instance = objects.Instance(context=ctxt)
++        instance.uuid = 'fake-uuid'
++        instance.id = 0
+ 
+-        self.mox.StubOutWithMock(flavors, 'extract_flavor')
+-        flavors.extract_flavor(mox.IgnoreArg()).AndReturn(instance_type)
++        self.mox.StubOutWithMock(instance, 'get_flavor')
++        instance.get_flavor().AndReturn(None)
+         self.mox.ReplayAll()
+ 
+         request_spec = scheduler_utils.build_request_spec(self.context, image,
+diff --git a/nova/tests/unit/virt/libvirt/test_driver.py b/nova/tests/unit/virt/libvirt/test_driver.py
+index a3a70f3..9c0c420 100644
+--- a/nova/tests/unit/virt/libvirt/test_driver.py
++++ b/nova/tests/unit/virt/libvirt/test_driver.py
+@@ -293,6 +293,38 @@ class FakeVirtDomain(object):
+     def fsThaw(self, disks=None, flags=0):
+         pass
+ 
++def create_compute_node(values=None):
++    compute = {
++        "id": 1,
++        "service_id": 1,
++        "host": "fakehost",
++        "vcpus": 1,
++        "memory_mb": 1,
++        "local_gb": 1,
++        "vcpus_used": 1,
++        "memory_mb_used": 1,
++        "local_gb_used": 1,
++        "free_ram_mb": 1,
++        "free_disk_gb": 1,
++        "current_workload": 1,
++        "running_vms": 0,
++        "cpu_info": None,
++        "numa_topology": None,
++        "stats": '{"num_instances": "1"}',
++        "hypervisor_hostname": "fakenode",
++        'hypervisor_version': 1,
++        'hypervisor_type': 'fake-hyp',
++        'disk_available_least': None,
++        'host_ip': None,
++        'metrics': None,
++        'created_at': None,
++        'updated_at': None,
++        'deleted_at': None,
++        'deleted': False,
++    }
++    if values:
++        compute.update(values)
++    return compute
+ 
+ class CacheConcurrencyTestCase(test.NoDBTestCase):
+     def setUp(self):
+@@ -328,6 +360,14 @@ class CacheConcurrencyTestCase(test.NoDBTestCase):
+             'nova.virt.libvirt.imagebackend.libvirt_utils',
+             fake_libvirt_utils))
+ 
++        self.stubs.Set(db, 'compute_node_get_by_host_and_nodename',
++                self._fake_compute_node_get_by_host_and_nodename)
++
++    def _fake_compute_node_get_by_host_and_nodename(self, ctx, host,
++                                                    nodename):
++        self.compute = create_compute_node()
++        return self.compute
++
+     def _fake_instance(self, uuid):
+         return objects.Instance(id=1, uuid=uuid)
+ 
+@@ -501,6 +541,7 @@ def _create_test_instance():
+         'ephemeral_key_uuid': None,
+         'vcpu_model': None,
+         'host': 'fake-host',
++        'node': None
+     }
+ 
+ 
+@@ -559,6 +600,14 @@ class LibvirtConnTestCase(test.NoDBTestCase):
+         </domain>
+         """
+ 
++        self.stubs.Set(db, 'compute_node_get_by_host_and_nodename',
++                self._fake_compute_node_get_by_host_and_nodename)
++
++    def _fake_compute_node_get_by_host_and_nodename(self, ctx, host,
++                                                    nodename):
++        self.compute = create_compute_node()
++        return self.compute
++
+     def relpath(self, path):
+         return os.path.relpath(path, CONF.instances_path)
+ 
+@@ -10734,8 +10783,10 @@ Active:          8381604 kB
+         with mock.patch.object(drvr, 'vif_driver') as vif_driver:
+             vif_driver.unplug.side_effect = exception.AgentError(
+                 method='unplug')
+-            drvr._unplug_vifs('inst', [1], ignore_errors=True)
+-            vif_driver.unplug.assert_called_once_with('inst', 1)
++            drvr._unplug_vifs('inst', [{'vif_model': None}],
++                              ignore_errors=True)
++            vif_driver.unplug.assert_called_once_with('inst',
++                                                      {'vif_model': None})
+ 
+     def test_unplug_vifs_reports_errors(self):
+         drvr = libvirt_driver.LibvirtDriver(fake.FakeVirtAPI())
+@@ -10743,8 +10794,10 @@ Active:          8381604 kB
+             vif_driver.unplug.side_effect = exception.AgentError(
+                 method='unplug')
+             self.assertRaises(exception.AgentError,
+-                              drvr.unplug_vifs, 'inst', [1])
+-            vif_driver.unplug.assert_called_once_with('inst', 1)
++                              drvr.unplug_vifs, 'inst',
++                              [{'vif_model': None}])
++            vif_driver.unplug.assert_called_once_with('inst',
++                                                      {'vif_model': None})
+ 
+     @mock.patch('nova.virt.libvirt.driver.LibvirtDriver._unplug_vifs')
+     @mock.patch('nova.virt.libvirt.driver.LibvirtDriver._undefine_domain')
+@@ -13403,6 +13456,14 @@ class _BaseSnapshotTests(test.NoDBTestCase):
+         self.instance_ref.info_cache = objects.InstanceInfoCache(
+             network_info=None)
+ 
++        self.stubs.Set(db, 'compute_node_get_by_host_and_nodename',
++                self._fake_compute_node_get_by_host_and_nodename)
++
++    def _fake_compute_node_get_by_host_and_nodename(self, ctx, host,
++                                                    nodename):
++        self.compute = create_compute_node()
++        return self.compute
++
+     def _assert_snapshot(self, snapshot, disk_format,
+                          expected_properties=None):
+         self.mock_update_task_state.assert_has_calls([
+diff --git a/nova/tests/unit/virt/test_virt_drivers.py b/nova/tests/unit/virt/test_virt_drivers.py
+index 07fc30a..999b516 100644
+--- a/nova/tests/unit/virt/test_virt_drivers.py
++++ b/nova/tests/unit/virt/test_virt_drivers.py
+@@ -27,6 +27,7 @@ import six
+ 
+ from nova.compute import manager
+ from nova.console import type as ctype
++from nova import db
+ from nova import exception
+ from nova import objects
+ from nova import test
+@@ -64,6 +65,39 @@ def catch_notimplementederror(f):
+     wrapped_func.__doc__ = f.__doc__
+     return wrapped_func
+ 
++def create_compute_node(values=None):
++    compute = {
++        "id": 1,
++        "service_id": 1,
++        "host": "fakehost",
++        "vcpus": 1,
++        "memory_mb": 1,
++        "local_gb": 1,
++        "vcpus_used": 1,
++        "memory_mb_used": 1,
++        "local_gb_used": 1,
++        "free_ram_mb": 1,
++        "free_disk_gb": 1,
++        "current_workload": 1,
++        "running_vms": 0,
++        "cpu_info": None,
++        "numa_topology": None,
++        "stats": '{"num_instances": "1"}',
++        "hypervisor_hostname": "fakenode",
++        'hypervisor_version': 1,
++        'hypervisor_type': 'fake-hyp',
++        'disk_available_least': None,
++        'host_ip': None,
++        'metrics': None,
++        'created_at': None,
++        'updated_at': None,
++        'deleted_at': None,
++        'deleted': False,
++    }
++    if values:
++        compute.update(values)
++    return compute
++
+ 
+ class _FakeDriverBackendTestCase(object):
+     def _setup_fakelibvirt(self):
+@@ -227,6 +261,14 @@ class _VirtDriverTestCase(_FakeDriverBackendTestCase):
+         self.stubs.Set(imagebackend.Image, 'resolve_driver_format',
+                        imagebackend.Image._get_driver_format)
+ 
++        self.stubs.Set(db, 'compute_node_get_by_host_and_nodename',
++                self._fake_compute_node_get_by_host_and_nodename)
++
++    def _fake_compute_node_get_by_host_and_nodename(self, ctx, host,
++                                                    nodename):
++        self.compute = create_compute_node()
++        return self.compute
++
+     def _get_running_instance(self, obj=True):
+         instance_ref = test_utils.get_test_instance(obj=obj)
+         network_info = test_utils.get_test_network_info()
+diff --git a/nova/tests/unit/virt/xenapi/test_xenapi.py b/nova/tests/unit/virt/xenapi/test_xenapi.py
+index 5a86156..5c9c8e4 100644
+--- a/nova/tests/unit/virt/xenapi/test_xenapi.py
++++ b/nova/tests/unit/virt/xenapi/test_xenapi.py
+@@ -225,6 +225,38 @@ def create_instance_with_system_metadata(context, instance_values, obj=False):
+     else:
+         return base.obj_to_primitive(inst)
+ 
++def create_compute_node(values=None):
++    compute = {
++        "id": 1,
++        "service_id": 1,
++        "host": "fakehost",
++        "vcpus": 1,
++        "memory_mb": 1,
++        "local_gb": 1,
++        "vcpus_used": 1,
++        "memory_mb_used": 1,
++        "local_gb_used": 1,
++        "free_ram_mb": 1,
++        "free_disk_gb": 1,
++        "current_workload": 1,
++        "running_vms": 0,
++        "cpu_info": None,
++        "numa_topology": None,
++        "stats": '{"num_instances": "1"}',
++        "hypervisor_hostname": "fakenode",
++        'hypervisor_version': 1,
++        'hypervisor_type': 'fake-hyp',
++        'disk_available_least': None,
++        'host_ip': None,
++        'metrics': None,
++        'created_at': None,
++        'updated_at': None,
++        'deleted_at': None,
++        'deleted': False,
++    }
++    if values:
++        compute.update(values)
++    return compute
+ 
+ class XenAPIVolumeTestCase(stubs.XenAPITestBaseNoDB):
+     """Unit tests for Volume operations."""
+@@ -328,6 +360,14 @@ class XenAPIVMTestCase(stubs.XenAPITestBase):
+                     virtual_size)
+         self.stubs.Set(vm_utils, '_safe_copy_vdi', fake_safe_copy_vdi)
+ 
++        self.stubs.Set(db, 'compute_node_get_by_host_and_nodename',
++                self._fake_compute_node_get_by_host_and_nodename)
++
++    def _fake_compute_node_get_by_host_and_nodename(self, ctx, host,
++                                                    nodename):
++        self.compute = create_compute_node()
++        return self.compute
++
+     def tearDown(self):
+         fake_image.FakeImageService_reset()
+         super(XenAPIVMTestCase, self).tearDown()
+@@ -1680,6 +1720,14 @@ class XenAPIMigrateInstance(stubs.XenAPITestBase):
+         self.stubs.Set(vmops.VMOps, '_inject_instance_metadata',
+                        fake_inject_instance_metadata)
+ 
++        self.stubs.Set(db, 'compute_node_get_by_host_and_nodename',
++                self._fake_compute_node_get_by_host_and_nodename)
++
++    def _fake_compute_node_get_by_host_and_nodename(self, ctx, host,
++                                                    nodename):
++        self.compute = create_compute_node()
++        return self.compute
++
+     def test_migrate_disk_and_power_off(self):
+         instance = db.instance_create(self.context, self.instance_values)
+         xenapi_fake.create_vm(instance['name'], 'Running')
+-- 
+2.7.4
+

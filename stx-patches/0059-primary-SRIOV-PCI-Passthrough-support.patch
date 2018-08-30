@@ -1,0 +1,1544 @@
+From fb2ce135070bf7c08b11bdd448ad3c88521a30a3 Mon Sep 17 00:00:00 2001
+From: Steven Webster <steven.webster@windriver.com>
+Date: Thu, 9 Apr 2015 12:48:14 -0400
+Subject: [PATCH 059/143] primary: SRIOV/PCI Passthrough support
+
+This commit includes all bug fixes and TiS extensions for basic PCI
+SR-IOV and passthrough operations on Newton
+
+- Proprietary support for vif-model 'pci-sriov' and 'pci-passthrough'.
+  Those can be specified on the boot command and the compute API was
+  modified to create a corresponding PCI Requests.  In upstream, neutron
+  ports have to be created beforehand and passed as port-id with the
+  guest.
+- Remove support InstancePCIRequests with newness since it is not used
+  in TiS.  There is ongoing upstream work to deprecate this since in
+  Newton migration with PCI devices is implemented using
+  MigrationContext.
+- Migration (and related operations such as evacuation, resize, etc.)
+  are based on filtering the list of PCI devices based on the
+  current/destination host (PCI devices from the source node are still
+  referenced in the instance).  In Newton, this is done using
+  MigrationContext.
+- In ComputeManager, many places in the code relies on
+  get_nw_info_for_instance() for getting the network info that is passed
+  to the libvirt driver.  However in most case, this method can return
+  stale data from the cache.  Most of them have been replaces by
+  directly requesting the network info from neutronv2 API
+  (get_instance_nw_info()) which refreshes the port information from
+  neutron.
+- Many race conditions are avoided by manually triggering the resource
+  tracker to update it's resources (call to update_available_resource()).
+  This allow the resource tracker to free any PCI devices that are not
+  referenced by any instances on a given node.
+- On finish revert resize, move code around so that
+  migrate_instance_finish() is called on the neutronv2 API before the
+  libvirt driver actually spawn the guest (else neutron port won't be
+  updated with the right PCI devices).
+- The resource tracker has been fixed for passing around the
+  numa_topology that has been claimed during resize operations.
+- The neutronv2 API has been fixed in order to update the PCI devices
+  addresses with the neutron server.  The libvirt driver uses this
+  information when it builts the instance XML.  Not updating the neutron
+  ports with this information causes the driver to not use the PCI
+  devices that could had been allocated following a resize/migration.
+  The PCI devices are correlated with their corresponding neutron ports
+  based on the pci request id.  This is implemented using
+  MigrationContext in Newton.
+- In TiS kilo, the PciDevTracker contained many fixes in order to
+  support cold migration of instances with PCI devices (such as
+  filtering based on destination node, etc.).  It's also not allocating
+  PCI devices if the instance is resized on the same node since the
+  number of PCI devices needed by the instance doesn't change with the
+  new flavor.  It also contains a few validations on the instance state
+  that helped fixed a few race conditions.
+- The pci_alias supports a list of alias (lists are supported by
+  pci_passthrough_whitelist).  In upstream this is done by having
+  multiple 'pci_alias' statements in the nova configuration file.
+- In TiS, it's supported to have one PCI devices configured in many
+  network provider.  This is not supported in upstream yet.
+- Prevent a guest to live migrate when PCI devices are attached.
+
+This commit is based on the sriov-pf-passthrough-neutron-port blueprint.
+This feature enables nova to specify PCI passthrough devices the same
+way it does for SR-IOV.  Each PCI passthrough devices will have a
+corresponding neutron port created/associated to them.  The patches for this
+blueprint were cherry-picked manually since they are not included in the
+first mitaka release.  These patches are: ebdc4fbd, f62264ca, f0dc0911 and
+5555c67.
+
+This commit also includes fixes for the following jiras:
+- PCI resources not released on cold migration
+  (commit 5288cb0).
+- Evacuation of sr-iov VM fails (commit aaf3d10).
+- SR-IOV: Revert resize fails on cold migration (commit 5397c47).
+- VM's with SRIOV ports fail to auto-evacuate (commit a50b6be).
+- Disabling sr-iov interface doesn't clear pci_stats (commit 3eabba9).
+- Resize doesn't free old PCI device (commit 89e67a3).
+- SR-IOV: Failed to allocate networks (commit d2b38f7).
+- use claimed numa topology to claim PCI (commit 1a7c3e4).
+- VM stuck in ERROR after cold migration (commit f528ce7).
+- Unable to launch VM with sriov and pci-passthrough NICs (commit
+  ec9f871).
+- change update_pci_for_migration to look at allocations (commit
+  2da2d57).
+- Support PCI devices with multiple provider network (commit
+  c84c342).
+- VMs w/ multiple SR-IOV devices on the same tenant network fail
+  migration (commit 0fb05ca).
+- Launching a VM with PCI passthrough device (commit 55c8b477)
+- VMs with pci-passthrough and sriov NICs stuck in ERROR
+  after evacuation while swacting (commit 226e31a99).
+- Pci-passthrough PFs reported in use when no VMs running (commit
+  b103ba2).
+- Pci-passthrough PFs reported in use when no VMs running -
+  delete migration (commit 5a0285fe).
+- nova-compute crashes when attempting to run clean_usage (commit
+  9000f1a)
+
+The following commits are covered by this commit, but no
+specific change in the mitaka code base had to be done:
+- Basic PCI Passthrought support (non-SRIOV) (commit d23a2e79).
+- Cold Migration Support for SR-IOV & PCI Passthrough (commit
+  d178063).
+- Basic SRIOV (& PCI-PASSTHROUGH) VM Networking Support:
+  Implementation (commit 2b038f0)
+- PCI passthrough with DHCP support (commit d80928ca).
+- SRIOV/PCI Passthrough  Robustness (commit 308684f).
+- Fixed some tox unit tests related to PCI (44beb8d).
+- Fixed tox unit tests around PCI passthrough (commit 464b87d).
+- Fixed tox unit tests cause by pci-sriov and pci-passthrough (commit 91502fd).
+- Fix up unit tests for git commit 308684f (commit fa6fd2f).
+
+Notes on Newton port:
+
+- PCI request/instance "newness" was removed in Newton.  All references removed
+  in the rebase
+- Newton introduced the 'migration context', so we no longer have to keep track
+  of instance host/node in rebuild and other contexts.
+- A few modifications were not needed as we've upstreamed the fixes.
+
+(cherry picked from R3 commit ccde2d9)
+
+1f35530 Fix port update failure when VM with PCI devices is reset
+   This issue was introduced by new migration context processing in Newton.
+
+   It is possible that _update_port_binding_for_instance() is called without
+   a migration object and/or for an instance without a migration context, such
+   as when a user unshelves and instance, or resets/reboots a VM.
+
+   If the instance has a port(s) with a PCI device binding (SRIOV or Passthrough),
+   the current logic assumes there is a migration context and associated PCI
+   mapping from old to new devices.  If a 'new' device is not found in the PCI
+   mapping, an exception is thrown.
+
+   In the case of an unshelve/reset, there is no migration context and as such
+   we have an empty PCI mapping (and no new device will be found).
+
+   This fix will only check for a new device if the PCI mapping is not empty,
+   such as in the case of an actual migration.
+
+   This commit should be squashed with ea3e6393d732ff8dc6e233d0518abcc73431b30f
+   during the next release upgrade.
+
+c900520 Update pci mapping on evacuation
+   This commit introduces nova doing a migration upon an evacuation.  This is
+   necessary so that pcipt devices are remapped in nova with their new MACs.
+
+3c1fb33 SRIOV instance scheduling does not work without host
+   aggregation Launching an instance with an SR-IOV port does not require
+   provider network host aggregates. The fix ensures that the provider
+   network scheduler filter is not set if PCI passthrough device is used and
+   the port id is specified.
+
+f0d454b Pike rebase bug 295: Fix support PCI devices with multiple
+   provider networks
+
+__TYPE_primary
+__TAG_sriov,pci,resource
+__R4_commit_8bb3660
+__R3_commit_ccde2d9
+__TCall-pci-sriov,TC8546
+---
+ nova/api/openstack/compute/migrate_server.py       |   7 ++
+ nova/compute/api.py                                |  37 +++++--
+ nova/compute/manager.py                            |  52 ++++++++-
+ nova/network/model.py                              |  10 +-
+ nova/network/neutronv2/api.py                      |  39 +++++--
+ nova/pci/manager.py                                |  36 +++++-
+ nova/pci/request.py                                |  45 +++++---
+ nova/pci/stats.py                                  |  38 ++++++-
+ nova/pci/utils.py                                  |  31 ++++--
+ .../openstack/compute/admin_only_action_common.py  |   1 +
+ nova/tests/unit/compute/test_compute_api.py        |   3 +-
+ nova/tests/unit/conductor/test_conductor.py        |   3 +-
+ nova/tests/unit/network/test_neutronv2.py          |  87 ++++++++++++++-
+ nova/tests/unit/objects/test_objects.py            |   2 +-
+ nova/tests/unit/pci/test_manager.py                | 123 ++++++++++++++++++++-
+ nova/tests/unit/scheduler/test_scheduler_utils.py  |   6 +
+ nova/tests/unit/virt/libvirt/test_driver.py        |  89 +++++++++++++--
+ nova/tests/unit/virt/test_virt_drivers.py          |  45 ++++++++
+ nova/tests/unit/virt/xenapi/test_xenapi.py         |  53 +++++++++
+ nova/virt/libvirt/driver.py                        |  32 +-----
+ nova/virt/libvirt/vif.py                           |   4 +-
+ 21 files changed, 649 insertions(+), 94 deletions(-)
+
+diff --git a/nova/api/openstack/compute/migrate_server.py b/nova/api/openstack/compute/migrate_server.py
+index f4502c9..d0a6be3 100644
+--- a/nova/api/openstack/compute/migrate_server.py
++++ b/nova/api/openstack/compute/migrate_server.py
+@@ -94,6 +94,13 @@ class MigrateServerController(wsgi.Controller):
+ 
+         instance = common.get_instance(self.compute_api, context, id)
+         try:
++            # Live migration with pci devices is only supported with
++            # macvtap (which is currently not supported in Titanium Cloud).
++            if instance.pci_devices:
++                msg = _("Live migration of instance %s is not supported "
++                        "with PCI devices attached.") % id
++                raise exc.HTTPBadRequest(explanation=msg)
++
+             self.compute_api.live_migrate(context, instance, block_migration,
+                                           disk_over_commit, host, force, async)
+         except exception.InstanceUnknownCell as e:
+diff --git a/nova/compute/api.py b/nova/compute/api.py
+index b36cb88..c3c139e 100644
+--- a/nova/compute/api.py
++++ b/nova/compute/api.py
+@@ -78,6 +78,7 @@ from nova.objects import fields as fields_obj
+ from nova.objects import keypair as keypair_obj
+ from nova.objects import quotas as quotas_obj
+ from nova.pci import request as pci_request
++from nova.pci import utils as pci_utils
+ import nova.policy
+ from nova import profiler
+ from nova import rpc
+@@ -90,7 +91,6 @@ from nova.volume import cinder
+ 
+ # - network provider filter
+ from nova import context as novacontext
+-from nova.pci import utils as pci_utils
+ 
+ LOG = logging.getLogger(__name__)
+ 
+@@ -1142,13 +1142,13 @@ class API(base.Base):
+                 admin_context = context
+             else:
+                 admin_context = novacontext.get_admin_context()
+-            system_metadata = base_options['system_metadata']
+             physkey = 'provider:physical_network'
+             hint = {physkey: set()}
+ 
+             hw_vif_model = None
+             properties = boot_meta.get('properties', {})
+-            hw_vif_model = properties.get('hw_vif_model')
++            if properties:
++                hw_vif_model = properties.get('hw_vif_model')
+             if hw_vif_model is None:
+                 hw_vif_model = CONF.default_vif_model
+             for ntwk in requested_networks:
+@@ -1223,10 +1223,33 @@ class API(base.Base):
+                     # if interface is virtual.
+                     # PCI passthrough devices will be filtered
+                     # based on the PCI requests.
+-                    if (not ntwk.port_id and
+-                            pci_utils.vif_model_pci_passthrough(vif_model)):
+-                        pci_request.create_pci_request(system_metadata,
+-                            {'physical_network': physnet})
++                    if pci_utils.vif_model_pci_passthrough(vif_model):
++                        # If a port is specified, PCI requests are already
++                        # created for network requests in
++                        # create_pci_requests_for_sriov_ports().
++                        if not ntwk.port_id:
++                            if vif_model == network_model.VIF_MODEL_PCI_SRIOV:
++                                request = objects.InstancePCIRequest(
++                                    count=1,
++                                    spec=[{pci_request.PCI_NET_TAG: physnet,
++                                           'dev_type': 'type-VF'}],
++                                    alias_name=None,
++                                    request_id=uuidutils.generate_uuid())
++                            elif (vif_model ==
++                                    network_model.VIF_MODEL_PCI_PASSTHROUGH):
++                                request = objects.InstancePCIRequest(
++                                    count=1,
++                                    spec=[{pci_request.PCI_NET_TAG: physnet,
++                                          'dev_type': 'type-PF'}],
++                                    alias_name=None,
++                                    request_id=uuidutils.generate_uuid())
++                            else:
++                                msg = _('Invalid vif-model %s.') % vif_model
++                                raise exception.InvalidInput(reason=msg)
++
++                            requests = base_options.get('pci_requests')
++                            requests.requests.append(request)
++                            ntwk.pci_request_id = request.request_id
+                     else:
+                         if physnet is not None:
+                             hint[physkey].update([physnet])
+diff --git a/nova/compute/manager.py b/nova/compute/manager.py
+index 9ec487b..cf2098d 100644
+--- a/nova/compute/manager.py
++++ b/nova/compute/manager.py
+@@ -94,6 +94,7 @@ from nova.objects import base as obj_base
+ from nova.objects import fields
+ from nova.objects import instance as obj_instance
+ from nova.objects import migrate_data as migrate_data_obj
++from nova.pci import manager as pci_manager
+ from nova.pci import whitelist
+ from nova import rpc
+ from nova import safe_utils
+@@ -3203,7 +3204,12 @@ class ComputeManager(manager.Manager):
+             self.network_api.setup_instance_network_on_host(
+                     context, instance, self.host)
+ 
+-        network_info = instance.get_network_info()
++        # Always use get_instance_nw_info().  In the case
++        # of evacuate get_nw_info_for_instance() returns stale data
++        # from info_cache.  Call to _get_instance_nw_info will also
++        # save the refreshed data in database.
++        network_info = self.network_api.get_instance_nw_info(context, instance)
++
+         if bdms is None:
+             bdms = objects.BlockDeviceMappingList.get_by_instance_uuid(
+                     context, instance.uuid)
+@@ -3303,6 +3309,28 @@ class ComputeManager(manager.Manager):
+                 # Manager-detach
+                 self.detach_volume(context, volume_id, instance)
+ 
++    # Detect if any of the ports have not been updated (based on the
++    # host where this instance is running).
++    def _reboot_require_nw_info_update(self, context, instance, network_info):
++        # Builds two sets of tuples (<host id>, <pci device>) from the VIFs
++        # and the PCI devices contained in the instance.
++        # Currently only support detection of out of sync based on PCI devices
++        # (all pci-sriov and pci-passthrough have 'pci_slot' specified).
++        vifs = set((v.get('host_id'),
++                    v.get('profile', {}).get('pci_slot', ''))
++                   for v in network_info
++                   if v.get('profile', {}).get('pci_slot'))
++
++        pci_devs = pci_manager.get_instance_pci_devs(instance, 'all')
++        pcis = set((objects.ComputeNode.get_by_id(context,
++                                                  p.compute_node_id).host,
++                    p.address)
++                   for p in pci_devs)
++
++        # If the difference between the two sets of tuples is an empty set
++        # then network info is in sync.  Else it's out of sync.
++        return vifs.symmetric_difference(pcis)
++
+     @wrap_exception()
+     @reverts_task_state
+     @wrap_instance_event(prefix='compute')
+@@ -3328,6 +3356,19 @@ class ComputeManager(manager.Manager):
+                                                                  instance)
+ 
+         network_info = self.network_api.get_instance_nw_info(context, instance)
++        # If after a failed rebuild an instance is rebooted it's possible
++        # that during this moment the neutron server is down (possible if a
++        # swact is ongoing).  The neutron ports are then not updated and the
++        # network_info has stale data from the evacuated node (for example the
++        # instance is refering tp the old PCI devices and not the one that
++        # have been allocated during the rebuild).
++        if self._reboot_require_nw_info_update(context, instance,
++                                               network_info):
++            LOG.info("Updating neutron ports", instance=instance)
++            self.network_api.setup_instance_network_on_host(context, instance,
++                                                            self.host)
++            network_info = self.network_api.get_instance_nw_info(context,
++                                                                 instance)
+ 
+         self._notify_about_instance_usage(context, instance, "reboot.start")
+         compute_utils.notify_about_instance_action(
+@@ -4020,6 +4061,15 @@ class ComputeManager(manager.Manager):
+             network_info = self.network_api.get_instance_nw_info(context,
+                                                                  instance)
+ 
++            migration_p = obj_base.obj_to_primitive(migration)
++            self.network_api.migrate_instance_finish(context,
++                                                     instance,
++                                                     migration_p)
++
++            # Refresh network info before driver is called.
++            # Has been upstreamed, but not in Newton
++            network_info = self.network_api.get_instance_nw_info(context,
++                                                                 instance)
+             block_device_info = self._get_instance_block_device_info(
+                     context, instance, refresh_conn_info=True)
+ 
+diff --git a/nova/network/model.py b/nova/network/model.py
+index b560c63..f6e731c 100644
+--- a/nova/network/model.py
++++ b/nova/network/model.py
+@@ -136,6 +136,9 @@ VIF_MODEL_VMXNET = 'vmxnet'
+ VIF_MODEL_VMXNET3 = 'vmxnet3'
+ 
+ VIF_MODEL_AVP = 'avp'
++VIF_MODEL_PCI_SRIOV = 'pci-sriov'
++VIF_MODEL_PCI_PASSTHROUGH = 'pci-passthrough'
++
+ 
+ # change supported vif_models from upstream
+ #   removed: VIF_MODEL_NETFRONT, VIF_MODEL_SPAPR_VLAN, VIF_MODEL_VMXNET,
+@@ -151,6 +154,8 @@ VIF_MODEL_ALL = (
+     VIF_MODEL_LAN9118,
+     VIF_MODEL_SRIOV,
+     VIF_MODEL_AVP,
++    VIF_MODEL_PCI_SRIOV,
++    VIF_MODEL_PCI_PASSTHROUGH,
+ )
+ 
+ # these types have been leaked to guests in network_data.json
+@@ -397,7 +402,7 @@ class VIF(Model):
+                  qbh_params=None, qbg_params=None, active=False,
+                  vnic_type=VNIC_TYPE_NORMAL, profile=None,
+                  mtu=None, vif_model=None,
+-                 preserve_on_delete=False, **kwargs):
++                 preserve_on_delete=False, host_id=None, **kwargs):
+         super(VIF, self).__init__()
+ 
+         self['id'] = id
+@@ -417,6 +422,9 @@ class VIF(Model):
+         # extension: add mtu & vif_model
+         self['mtu'] = mtu
+         self['vif_model'] = vif_model
++        # Store host_id when comparing PCI devices.  This is used to
++        # detect if the instance was rebooted on a different host.
++        self['host_id'] = host_id
+ 
+         self._set_meta(kwargs)
+ 
+diff --git a/nova/network/neutronv2/api.py b/nova/network/neutronv2/api.py
+index 951efb1..c920b6f 100644
+--- a/nova/network/neutronv2/api.py
++++ b/nova/network/neutronv2/api.py
+@@ -966,6 +966,11 @@ class API(base_api.NetworkAPI):
+                 port_req_body['port'].update({constants.PORT_VIF_MODEL:
+                                               request.vif_model})
+ 
++            if request.vif_model == network_model.VIF_MODEL_PCI_SRIOV:
++                port_req_body['port'].update({'binding:vnic_type': 'direct'})
++            if request.vif_model == network_model.VIF_MODEL_PCI_PASSTHROUGH:
++                port_req_body['port'].update({'binding:vnic_type':
++                                              'direct-physical'})
+             try:
+                 self._populate_neutron_extension_values(
+                     context, instance, request.pci_request_id, port_req_body,
+@@ -2511,7 +2516,13 @@ class API(base_api.NetworkAPI):
+ 
+     def setup_instance_network_on_host(self, context, instance, host):
+         """Setup network for specified instance on host."""
+-        self._update_port_binding_for_instance(context, instance, host)
++        migration = None
++        if instance.migration_context:
++            migration = objects.Migration.get_by_id_and_instance(
++                context, instance.migration_context.migration_id, instance.uuid
++            )
++        self._update_port_binding_for_instance(context, instance, host,
++                                               migration)
+ 
+     def cleanup_instance_network_on_host(self, context, instance, host):
+         """Cleanup network for specified instance on host."""
+@@ -2595,16 +2606,28 @@ class API(base_api.NetworkAPI):
+                     pci_mapping = self._get_pci_mapping_for_migration(context,
+                         instance, migration)
+ 
+-                pci_slot = binding_profile.get('pci_slot')
+-                new_dev = pci_mapping.get(pci_slot)
+-                if new_dev:
++                if pci_mapping:
++                    pci_slot = binding_profile.get('pci_slot')
++                    new_dev = pci_mapping.get(pci_slot)
++                    if not new_dev:
++                        raise exception.PortUpdateFailed(port_id=p['id'],
++                            reason=_("Unable to correlate PCI slot %s") %
++                                     pci_slot)
++
+                     binding_profile.update(
+                         self._get_pci_device_profile(new_dev))
+                     updates[BINDING_PROFILE] = binding_profile
+-                else:
+-                    raise exception.PortUpdateFailed(port_id=p['id'],
+-                        reason=_("Unable to correlate PCI slot %s") %
+-                                 pci_slot)
++                    if vnic_type == network_model.VNIC_TYPE_DIRECT_PHYSICAL:
++                        try:
++                            mac = pci_utils.get_mac_by_pci_address(
++                                new_dev.address)
++                        except exception.PciDeviceNotFoundById as e:
++                            raise exception.PortUpdateFailed(port_id=p['id'],
++                                reason=_("Could not determine MAC address for "
++                                         "%(addr)s, error: %(e)s") %
++                                         {"addr": new_dev.address, "e": e})
++                        else:
++                            updates['mac_address'] = mac
+ 
+             port_updates.append((p['id'], updates))
+ 
+diff --git a/nova/pci/manager.py b/nova/pci/manager.py
+index eb97ee7..a6e8b93 100644
+--- a/nova/pci/manager.py
++++ b/nova/pci/manager.py
+@@ -21,7 +21,6 @@ from oslo_log import log as logging
+ from oslo_serialization import jsonutils
+ 
+ from nova import exception
+-from nova.i18n import _LW
+ from nova import objects
+ from nova.objects import fields
+ from nova.pci import stats
+@@ -168,9 +167,9 @@ class PciDevTracker(object):
+                 try:
+                     existed.remove()
+                 except exception.PciDeviceInvalidStatus as e:
+-                    LOG.warning(_LW("Trying to remove device with %(status)s "
+-                                    "ownership %(instance_uuid)s because of "
+-                                    "%(pci_exception)s"),
++                    LOG.warning("Trying to remove device with %(status)s "
++                                "ownership %(instance_uuid)s because of "
++                                "%(pci_exception)s",
+                                 {'status': existed.status,
+                                  'instance_uuid': existed.instance_uuid,
+                                  'pci_exception': e.format_message()})
+@@ -209,6 +208,8 @@ class PciDevTracker(object):
+             dev['compute_node_id'] = self.node_id
+             dev_obj = objects.PciDevice.create(self._context, dev)
+             self.pci_devs.objects.append(dev_obj)
++            LOG.info("Synchronizing with hypervisor: Adding device %s",
++                     dev_obj.address)
+             self.stats.add_device(dev_obj)
+ 
+         self._build_device_tree(self.pci_devs)
+@@ -228,8 +229,8 @@ class PciDevTracker(object):
+             dev.claim(instance_uuid)
+         if instance_numa_topology and any(
+                                         dev.numa_node is None for dev in devs):
+-            LOG.warning(_LW("Assigning a pci device without numa affinity to"
+-            "instance %(instance)s which has numa topology"),
++            LOG.warning("Assigning a pci device without numa affinity to"
++            "instance %(instance)s which has numa topology",
+                         {'instance': instance_uuid})
+         return devs
+ 
+@@ -297,6 +298,9 @@ class PciDevTracker(object):
+         # However, the instance contains only allocated devices
+         # information, not the claimed one. So we can't use
+         # instance['pci_devices'] to check the devices to be freed.
++        LOG.info("Freeing instance %(uuid)s with PCI devices",
++                 {'uuid': instance['uuid']})
++
+         for dev in self.pci_devs:
+             if dev.status in (fields.PciDeviceStatus.CLAIMED,
+                               fields.PciDeviceStatus.ALLOCATED):
+@@ -329,16 +333,36 @@ class PciDevTracker(object):
+         existed |= set(mig['instance_uuid'] for mig in migrations)
+         existed |= set(inst['uuid'] for inst in orphans)
+ 
++        # Discard migration that refers to deleted instance so
++        # that we can properly put back the PCI devices that are pointing
++        # to this instance back in the pool.
++        # The Migration object will call objects.Instance.get_by_uuid() which
++        # will raise the below exception if the instance is deleted.
++        for mig in migrations:
++            try:
++                mig.instance
++            except exception.InstanceNotFound:
++                LOG.info("migration instance not found: %s", mig)
++                existed.discard(mig.instance_uuid)
++
+         # need to copy keys, because the dict is modified in the loop body
+         for uuid in list(self.claims):
+             if uuid not in existed:
+                 devs = self.claims.pop(uuid, [])
++                LOG.info("Cleaning instance %(uuid)s with PCI devices "
++                         "%(addrs)s",
++                         {'uuid': uuid,
++                          'addrs': [dev.address for dev in devs]})
+                 for dev in devs:
+                     self._free_device(dev)
+         # need to copy keys, because the dict is modified in the loop body
+         for uuid in list(self.allocations):
+             if uuid not in existed:
+                 devs = self.allocations.pop(uuid, [])
++                LOG.info("Cleaning instance %(uuid)s with PCI devices "
++                         "%(addrs)s",
++                         {'uuid': uuid,
++                          'addrs': [dev.address for dev in devs]})
+                 for dev in devs:
+                     self._free_device(dev)
+ 
+diff --git a/nova/pci/request.py b/nova/pci/request.py
+index cbdeb26..9f38313 100644
+--- a/nova/pci/request.py
++++ b/nova/pci/request.py
+@@ -103,22 +103,37 @@ def _get_alias_from_config():
+     aliases = {}  # map alias name to alias spec list
+     try:
+         for jsonspecs in jaliases:
+-            spec = jsonutils.loads(jsonspecs)
+-            jsonschema.validate(spec, _ALIAS_SCHEMA)
+-            # It should keep consistent behaviour in configuration
+-            # and extra specs to call strip() function.
+-            name = spec.pop("name").strip()
+-            dev_type = spec.pop('device_type', None)
+-            if dev_type:
+-                spec['dev_type'] = dev_type
+-            if name not in aliases:
+-                aliases[name] = [spec]
+-            else:
+-                if aliases[name][0]["dev_type"] == spec["dev_type"]:
+-                    aliases[name].append(spec)
++            # Align with packstack and pci_passthrough_whitelist.  Support
++            # list of pci_alias.
++            try:
++                spec = jsonutils.loads(jsonspecs)
++            except ValueError:
++                raise exception.PciInvalidAlias(
++                          reason=_("Invalid entry: '%s'") % jsonspecs)
++            if isinstance(spec, dict):
++                spec = [spec]
++            elif not isinstance(spec, list):
++                raise exception.PciInvalidAlias(
++                          reason=_("Invalid entry: '%s'; "
++                                   "Expecting list or dict") % jsonspecs)
++
++            for s in spec:
++                jsonschema.validate(s, _ALIAS_SCHEMA)
++                # It should keep consistent behaviour in configuration
++                # and extra specs to call strip() function.
++                name = s.pop("name").strip()
++                dev_type = s.pop('device_type', None)
++                if dev_type:
++                    s['dev_type'] = dev_type
++                if name not in aliases:
++                    aliases[name] = [s]
+                 else:
+-                    reason = _("Device type mismatch for alias '%s'") % name
+-                    raise exception.PciInvalidAlias(reason=reason)
++                    if aliases[name][0]["dev_type"] == s["dev_type"]:
++                        aliases[name].append(s)
++                    else:
++                        reason = (_("Device type mismatch for alias '%s'") %
++                                  name)
++                        raise exception.PciInvalidAlias(reason=reason)
+ 
+     except exception.PciInvalidAlias:
+         raise
+diff --git a/nova/pci/stats.py b/nova/pci/stats.py
+index e18467a..f2ba3f9 100644
+--- a/nova/pci/stats.py
++++ b/nova/pci/stats.py
+@@ -21,7 +21,6 @@ from oslo_log import log as logging
+ import six
+ 
+ from nova import exception
+-from nova.i18n import _LE
+ from nova.objects import fields
+ from nova.objects import pci_device_pool
+ from nova.pci import utils
+@@ -67,6 +66,28 @@ class PciDeviceStats(object):
+         self.dev_filter = dev_filter or whitelist.Whitelist(
+             CONF.pci.passthrough_whitelist)
+ 
++    @staticmethod
++    def _pools_prettyprint(pools):
++        _pools = "\n"
++        for pool in pools:
++            # Devices are not exported to the scheduler
++            devices = []
++            if 'devices' in pool.keys():
++                devices = [str(device.address) for device
++                                               in pool.get('devices')]
++            else:
++                devices = pool.get('count')
++
++            fmt = ('[vendor:{}, product:{}, numa:{}, physnet:{}, ' +
++                   'dev_type:{}]: {}\n')
++            _pools += fmt.format(pool.get('vendor_id'),
++                                 pool.get('product_id'),
++                                 pool.get('numa_node'),
++                                 pool.get('physical_network'),
++                                 pool.get('dev_type'),
++                                 devices)
++        return _pools
++
+     def _equal_properties(self, dev, entry, matching_keys):
+         return all(dev.get(prop) == entry.get(prop)
+                    for prop in matching_keys)
+@@ -128,6 +149,7 @@ class PciDeviceStats(object):
+ 
+     def remove_device(self, dev):
+         """Remove one device from the first pool that it matches."""
++        LOG.info("Removing device %s", dev.address)
+         dev_pool = self._create_pool_keys_from_dev(dev)
+         if dev_pool:
+             pool = self._find_pool(dev_pool)
+@@ -136,6 +158,7 @@ class PciDeviceStats(object):
+                     compute_node_id=dev.compute_node_id, address=dev.address)
+             pool['devices'].remove(dev)
+             self._decrease_pool_count(self.pools, pool)
++        LOG.info("Pool is now: %s", self._pools_prettyprint(self.pools))
+ 
+     def get_free_devs(self):
+         free_devs = []
+@@ -157,12 +180,12 @@ class PciDeviceStats(object):
+             # Failed to allocate the required number of devices
+             # Return the devices already allocated back to their pools
+             if sum([pool['count'] for pool in pools]) < count:
+-                LOG.error(_LE("Failed to allocate PCI devices for instance."
++                LOG.error("Failed to allocate PCI devices for instance."
+                           " Unassigning devices back to pools."
+                           " This should not happen, since the scheduler"
+                           " should have accurate information, and allocation"
+                           " during claims is controlled via a hold"
+-                          " on the compute node semaphore"))
++                          " on the compute node semaphore")
+                 for d in range(len(alloc_devices)):
+                     self.add_device(alloc_devices.pop())
+                 return None
+@@ -180,6 +203,9 @@ class PciDeviceStats(object):
+                     alloc_devices.append(pci_dev)
+                 if count == 0:
+                     break
++        LOG.info("Allocated devices %(devs)s, pool is now: %(p)s",
++                 {'devs': [str(dev.address) for dev in alloc_devices],
++                  'p': self._pools_prettyprint(self.pools)})
+         return alloc_devices
+ 
+     def _handle_device_dependents(self, pci_dev):
+@@ -240,13 +266,19 @@ class PciDeviceStats(object):
+         # NOTE(vladikr): This code maybe open to race conditions.
+         # Two concurrent requests may succeed when called support_requests
+         # because this method does not remove related devices from the pools
++        LOG.info("request: %s", request)
++
+         count = request.count
+         matching_pools = self._filter_pools_for_spec(pools, request.spec)
++        LOG.info("matching_pools: %s",
++                 self._pools_prettyprint(matching_pools))
+         if numa_cells:
+             matching_pools = self._filter_pools_for_numa_cells(matching_pools,
+                                                           numa_cells)
+         matching_pools = self._filter_non_requested_pfs(request,
+                                                         matching_pools)
++        LOG.info("matching_pools with numa_cells: %s",
++                 self._pools_prettyprint(matching_pools))
+         if sum([pool['count'] for pool in matching_pools]) < count:
+             return False
+         else:
+diff --git a/nova/pci/utils.py b/nova/pci/utils.py
+index a775b0e..cb9f3f3 100644
+--- a/nova/pci/utils.py
++++ b/nova/pci/utils.py
+@@ -30,7 +30,7 @@ from oslo_log import log as logging
+ 
+ 
+ from nova import exception
+-from nova.i18n import _LW
++from nova.network import model as network_model
+ 
+ LOG = logging.getLogger(__name__)
+ 
+@@ -61,9 +61,21 @@ def pci_device_prop_match(pci_dev, specs):
+             pci_dev_v = pci_dev.get(k)
+             if isinstance(v, list) and isinstance(pci_dev_v, list):
+                 if not all(x in pci_dev.get(k) for x in v):
+-                    return False
++                    # check for multi provider net:
++                    if k == 'physical_network':
++                        if (not pci_dev_v or
++                            v not in pci_dev_v.replace(" ", "").split(',')):
++                            return False
++                    else:
++                        return False
+             elif pci_dev_v != v:
+-                return False
++                # check for multi provider net:
++                if k == 'physical_network':
++                    if (not pci_dev_v or
++                        v not in pci_dev_v.replace(" ", "").split(',')):
++                        return False
++                else:
++                    return False
+         return True
+ 
+     return any(_matching_devices(spec) for spec in specs)
+@@ -159,9 +171,9 @@ def get_mac_by_pci_address(pci_addr, pf_interface=False):
+             mac = next(f).strip()
+             return mac
+     except (IOError, StopIteration) as e:
+-        LOG.warning(_LW("Could not find the expected sysfs file for "
+-                        "determining the MAC address of the PCI device "
+-                        "%(addr)s. May not be a NIC. Error: %(e)s"),
++        LOG.warning("Could not find the expected sysfs file for "
++                    "determining the MAC address of the PCI device "
++                    "%(addr)s. May not be a NIC. Error: %(e)s",
+                     {'addr': pci_addr, 'e': e})
+         raise exception.PciDeviceNotFoundById(id=pci_addr)
+ 
+@@ -213,8 +225,11 @@ def get_net_name_by_vf_pci_address(vfaddress):
+ 
+ 
+ def vif_model_pci_passthrough(vif_model):
+-    """Checks whether the supplied VIF model is a pci-passthrough device
++    """Checks whether the supplied VIF model is a pci-passthrough
++    device or pci-sriov
+     :param vif_model: The VIF model to check
+     :return: TRUE if pci-passthrough VIF model, otherwise FALSE
+     """
+-    return vif_model in ['pci-passthrough']
++    # TODO(mpeters): support other (more specific) PCI passthrough models
++    return vif_model in [network_model.VIF_MODEL_PCI_SRIOV,
++                         network_model.VIF_MODEL_PCI_PASSTHROUGH]
+diff --git a/nova/tests/unit/api/openstack/compute/admin_only_action_common.py b/nova/tests/unit/api/openstack/compute/admin_only_action_common.py
+index ebdd2d0..4a35aca 100644
+--- a/nova/tests/unit/api/openstack/compute/admin_only_action_common.py
++++ b/nova/tests/unit/api/openstack/compute/admin_only_action_common.py
+@@ -38,6 +38,7 @@ class CommonMixin(object):
+                 task_state=None, launched_at=timeutils.utcnow())
+         self.compute_api.get(
+             self.context, uuid, expected_attrs=None).AndReturn(instance)
++        instance.pci_devices = None
+         return instance
+ 
+     def _stub_instance_get_failure(self, exc_info, uuid=None):
+diff --git a/nova/tests/unit/compute/test_compute_api.py b/nova/tests/unit/compute/test_compute_api.py
+index 122bbd6..b82b410 100644
+--- a/nova/tests/unit/compute/test_compute_api.py
++++ b/nova/tests/unit/compute/test_compute_api.py
+@@ -881,7 +881,8 @@ class _ComputeAPIUnitTestMixIn(object):
+         inst.save()
+ 
+         updates.update({'deleted_at': delete_time,
+-                        'deleted': True})
++                        'deleted': True,
++                        'uuid': inst.uuid})
+         fake_inst = fake_instance.fake_db_instance(**updates)
+         self.compute_api._local_cleanup_bdm_volumes([], inst, self.context)
+         db.instance_destroy(self.context, inst.uuid,
+diff --git a/nova/tests/unit/conductor/test_conductor.py b/nova/tests/unit/conductor/test_conductor.py
+index f687640..cff62e1 100644
+--- a/nova/tests/unit/conductor/test_conductor.py
++++ b/nova/tests/unit/conductor/test_conductor.py
+@@ -390,12 +390,13 @@ class _BaseTaskTestCase(object):
+     def test_cold_migrate_forced_shutdown(self):
+         self._test_cold_migrate(clean_shutdown=False)
+ 
++    @mock.patch('nova.objects.Instance._load_pci_requests')
+     @mock.patch('nova.objects.BuildRequest.get_by_instance_uuid')
+     @mock.patch('nova.availability_zones.get_host_availability_zone')
+     @mock.patch('nova.objects.Instance.save')
+     @mock.patch.object(objects.RequestSpec, 'from_primitives')
+     def test_build_instances(self, mock_fp, mock_save, mock_getaz,
+-                             mock_buildreq):
++                             mock_buildreq, mock_load_pci_requests):
+         fake_spec = objects.RequestSpec
+         mock_fp.return_value = fake_spec
+         instance_type = flavors.get_default_flavor()
+diff --git a/nova/tests/unit/network/test_neutronv2.py b/nova/tests/unit/network/test_neutronv2.py
+index 213d339..d944228 100644
+--- a/nova/tests/unit/network/test_neutronv2.py
++++ b/nova/tests/unit/network/test_neutronv2.py
+@@ -4106,6 +4106,90 @@ class TestNeutronv2WithMock(test.TestCase):
+         # No ports should be updated if the port's pci binding did not change.
+         update_port_mock.assert_not_called()
+ 
++    @mock.patch.object(pci_whitelist.Whitelist, 'get_devspec')
++    @mock.patch.object(neutronapi, 'get_client', return_value=mock.Mock())
++    def test_setup_instance_network_on_host_with_pci_evacuation_migration(self,
++                                            get_client_mock,
++                                            get_pci_device_devspec_mock):
++        self.api._has_port_binding_extension = mock.Mock(return_value=True)
++
++        devspec = mock.Mock()
++        devspec.get_tags.return_value = {'physical_network': 'physnet1'}
++        get_pci_device_devspec_mock.return_value = devspec
++
++        instance = fake_instance.fake_instance_obj(self.context)
++        migration = objects.Migration(context=self.context.elevated())
++        migration.instance_uuid = instance.uuid
++        migration.migration_type = 'evacuation'
++        migration.create()
++        instance.migration_context = objects.MigrationContext()
++        instance.migration_context.migration_id = migration.id
++        instance.migration_context.old_pci_devices = objects.PciDeviceList(
++            objects=[objects.PciDevice(vendor_id='1377',
++                                       product_id='0047',
++                                       address='0000:0a:00.1',
++                                       compute_node_id=1,
++                                       request_id='1234567890')])
++        instance.migration_context.new_pci_devices = objects.PciDeviceList(
++            objects=[objects.PciDevice(vendor_id='1377',
++                                       product_id='0047',
++                                       address='0000:0b:00.1',
++                                       compute_node_id=2,
++                                       request_id='1234567890')])
++        instance.pci_devices = instance.migration_context.old_pci_devices
++
++        fake_ports = {'ports': [
++                        {'id': 'fake-port-1',
++                         'binding:vnic_type': 'direct',
++                         neutronapi.BINDING_HOST_ID: instance.host,
++                         neutronapi.BINDING_PROFILE:
++                            {'pci_slot': '0000:0a:00.1',
++                             'physical_network': 'phys_net',
++                             'pci_vendor_info': 'pci_vendor_info'}}]}
++        list_ports_mock = mock.Mock(return_value=fake_ports)
++        get_client_mock.return_value.list_ports = list_ports_mock
++
++        update_port_mock = mock.Mock()
++        get_client_mock.return_value.update_port = update_port_mock
++
++        # Try to update the port binding with migration.
++        self.api.setup_instance_network_on_host(self.context, instance,
++                                                   instance.host)
++        # Port should be updated if the port's pci binding changed.
++        update_port_mock.assert_called_once()
++
++    def test_setup_instance_network_on_host_with_migration_context(self):
++        self.api._has_port_binding_extension = mock.Mock(return_value=False)
++        self.api._update_port_binding_for_instance = mock.Mock()
++
++        instance = fake_instance.fake_instance_obj(self.context)
++        migration = objects.Migration(context=self.context.elevated())
++        migration.instance_uuid = instance.uuid
++        migration.migration_type = 'evacuation'
++        migration.create()
++        migration_context = objects.MigrationContext()
++        instance.migration_context = migration_context
++        migration_context.migration_id = migration.id
++        # Try to update the port binding with no migration object.
++        self.api.setup_instance_network_on_host(self.context, instance,
++                                                instance.host)
++        self.assertEqual(
++            self.api._update_port_binding_for_instance.call_args[0][3].id,
++            migration.id
++        )
++
++    def test_setup_instance_network_on_host_without_migration_context(self):
++        self.api._has_port_binding_extension = mock.Mock(return_value=False)
++        self.api._update_port_binding_for_instance = mock.Mock()
++
++        instance = fake_instance.fake_instance_obj(self.context)
++        # Try to update the port binding with no migration object.
++        self.api.setup_instance_network_on_host(self.context, instance,
++                                                instance.host)
++        self.api._update_port_binding_for_instance.assert_called_once_with(
++            self.context, instance, instance.host, None
++        )
++
+     def test_get_pci_mapping_for_migration(self):
+         instance = fake_instance.fake_instance_obj(self.context)
+         instance.migration_context = objects.MigrationContext()
+@@ -5003,7 +5087,8 @@ class TestNeutronv2Portbinding(TestNeutronv2Base):
+         PciDevice = collections.namedtuple('PciDevice',
+                                ['vendor_id', 'product_id', 'address'])
+         mydev = PciDevice(**pci_dev)
+-        profile = {'pci_vendor_info': '1377:0047',
++        profile = {'pci_request_id': 'my_req_id',
++                   'pci_vendor_info': '1377:0047',
+                    'pci_slot': '0000:0a:00.1',
+                    'physical_network': 'phynet1',
+                    'pci_request_id': 'my_req_id',
+diff --git a/nova/tests/unit/objects/test_objects.py b/nova/tests/unit/objects/test_objects.py
+index 55a00ca..9044dcb 100644
+--- a/nova/tests/unit/objects/test_objects.py
++++ b/nova/tests/unit/objects/test_objects.py
+@@ -1106,7 +1106,7 @@ object_data = {
+     'HVSpec': '1.2-de06bcec472a2f04966b855a49c46b41',
+     'IDEDeviceBus': '1.0-29d4c9f27ac44197f01b6ac1b7e16502',
+     'ImageMeta': '1.8-642d1b2eb3e880a367f37d72dd76162d',
+-    'ImageMetaProps': '1.19-9133d4d5dbd6bd014de178fe25c57c04',
++    'ImageMetaProps': '1.19-e1055572992a5ada67a868f08a2db967',
+     'Instance': '2.3-9b20afdc7f46ea0d83f9f0fb4a01f02d',
+     'InstanceAction': '1.1-f9f293e526b66fca0d05c3b3a2d13914',
+     'InstanceActionEvent': '1.1-cc5342ce9da679b9ee3f704cbbfbb63f',
+diff --git a/nova/tests/unit/pci/test_manager.py b/nova/tests/unit/pci/test_manager.py
+index d85e451..b9dd550 100644
+--- a/nova/tests/unit/pci/test_manager.py
++++ b/nova/tests/unit/pci/test_manager.py
+@@ -18,9 +18,13 @@ import copy
+ import mock
+ from oslo_serialization import jsonutils
+ 
++from oslo_utils import timeutils
++
+ import nova
+ from nova.compute import vm_states
+ from nova import context
++from nova import db
++from nova import exception
+ from nova import objects
+ from nova.objects import fields
+ from nova.pci import manager
+@@ -109,6 +113,56 @@ fake_pci_requests = [
+      'spec': [{'vendor_id': 'v1'}]}]
+ 
+ 
++def create_compute_node(values=None):
++    compute = {
++        "id": 1,
++        "service_id": 1,
++        "vcpus": 1,
++        "memory_mb": 1,
++        "local_gb": 1,
++        "vcpus_used": 1,
++        "memory_mb_used": 1,
++        "local_gb_used": 1,
++        "free_ram_mb": 1,
++        "free_disk_gb": 1,
++        "current_workload": 1,
++        "running_vms": 0,
++        "cpu_info": None,
++        "numa_topology": None,
++        "stats": '{"num_instances": "1"}',
++        "hypervisor_hostname": "fakenode",
++        'hypervisor_version': 1,
++        'hypervisor_type': 'fake-hyp',
++        'disk_available_least': None,
++        'host_ip': None,
++        'metrics': None,
++        'created_at': None,
++        'updated_at': None,
++        'deleted_at': None,
++        'deleted': False,
++    }
++    if values:
++        compute.update(values)
++    return compute
++
++
++def _fake_service_get(context, service_id, use_slave=False):
++    return {'id': '1',
++            'host': None,
++            'binary': None,
++            'topic': None,
++            'report_count': 0,
++            'disabled': False,
++            'disabled_reason': None,
++            'availability_zone': None,
++            'compute_node': '',
++            'force_down': False,
++            'deleted': None,
++            'created_at': timeutils.utcnow(),
++            'updated_at': timeutils.utcnow(),
++            'deleted_at': timeutils.utcnow()}
++
++
+ class PciDevTrackerTestCase(test.NoDBTestCase):
+     def _create_fake_instance(self):
+         self.inst = objects.Instance()
+@@ -117,6 +171,8 @@ class PciDevTrackerTestCase(test.NoDBTestCase):
+         self.inst.vm_state = vm_states.ACTIVE
+         self.inst.task_state = None
+         self.inst.numa_topology = None
++        self.inst.host = "fakehost"
++        self.inst.node = "fakenode"
+ 
+     def _fake_get_pci_devices(self, ctxt, node_id):
+         return self.fake_devs
+@@ -159,6 +215,16 @@ class PciDevTrackerTestCase(test.NoDBTestCase):
+         self._create_fake_instance()
+         self._create_tracker(fake_db_devs[:])
+ 
++        self.stubs.Set(db, 'compute_node_get_by_host_and_nodename',
++                self._fake_compute_node_get_by_host_and_nodename)
++        self.stubs.Set(db, 'service_get',
++                _fake_service_get)
++
++    def _fake_compute_node_get_by_host_and_nodename(self, ctx, host,
++                                                    nodename):
++        self.compute = create_compute_node()
++        return self.compute
++
+     def test_pcidev_tracker_create(self):
+         self.assertEqual(len(self.tracker.pci_devs), 3)
+         free_devs = self.tracker.pci_stats.get_free_devs()
+@@ -425,7 +491,9 @@ class PciDevTrackerTestCase(test.NoDBTestCase):
+     def test_clean_usage(self):
+         inst_2 = copy.copy(self.inst)
+         inst_2.uuid = uuidsentinel.instance2
+-        migr = {'instance_uuid': 'uuid2', 'vm_state': vm_states.BUILDING}
++        migr = objects.Migration()
++        migr.instance_uuid = 'uuid2'
++        migr.vm_state = vm_states.BUILDING
+         orph = {'uuid': 'uuid3', 'vm_state': vm_states.BUILDING}
+ 
+         pci_requests_obj = self._create_pci_requests_object(
+@@ -443,7 +511,9 @@ class PciDevTrackerTestCase(test.NoDBTestCase):
+         self.assertEqual(len(free_devs), 1)
+         self.assertEqual(free_devs[0].vendor_id, 'v')
+ 
+-        self.tracker.clean_usage([self.inst], [migr], [orph])
++        with mock.patch.object(nova.objects.Migration, 'instance',
++                           return_value=nova.objects.Instance):
++            self.tracker.clean_usage([self.inst], [migr], [orph])
+         free_devs = self.tracker.pci_stats.get_free_devs()
+         self.assertEqual(len(free_devs), 2)
+         self.assertEqual(
+@@ -499,8 +569,54 @@ class PciDevTrackerTestCase(test.NoDBTestCase):
+         self.assertIn(pci_device.id, free_pci_device_ids)
+         self.assertIsNone(self.tracker.allocations.get(instance_uuid))
+ 
++    @mock.patch('nova.objects.InstancePCIRequests.get_by_instance')
++    def test_clean_usage_multiple_migrations_same_instance(self, mock_get):
++        inst_2 = copy.copy(self.inst)
++        inst_2.uuid = uuidsentinel.instance2
++        migr = objects.Migration()
++        migr.instance_uuid = 'uuid2'
++        migr.vm_state = vm_states.BUILDING
++        migr2 = objects.Migration()
++        migr2.instance_uuid = 'uuid2'
++        migr2.vm_state = vm_states.BUILDING
++        orph = {'uuid': 'uuid3', 'vm_state': vm_states.BUILDING}
++
++        pci_requests_obj = self._create_pci_requests_object(
++            [{'count': 1, 'spec': [{'vendor_id': 'v'}]}], self.inst.uuid)
++        self.tracker.claim_instance(mock.sentinel.context, pci_requests_obj,
++                                    None)
++        self.tracker.update_pci_for_instance(None, self.inst, sign=1)
++        pci_requests_obj = self._create_pci_requests_object(
++            [{'count': 1, 'spec': [{'vendor_id': 'v1'}]}], inst_2.uuid)
++        self.tracker.claim_instance(mock.sentinel.context, pci_requests_obj,
++                                    None)
++        self.tracker.update_pci_for_instance(None, inst_2, sign=1)
++        free_devs = self.tracker.pci_stats.get_free_devs()
++        self.assertEqual(len(free_devs), 1)
++        self.assertEqual(free_devs[0].vendor_id, 'v')
++
++        with mock.patch.object(nova.objects.Instance, 'get_by_uuid',
++                       side_effect=exception.InstanceNotFound(instance_id='')):
++            self.tracker.clean_usage([self.inst], [migr, migr2], [orph])
++        free_devs = self.tracker.pci_stats.get_free_devs()
++        self.assertEqual(len(free_devs), 2)
++        self.assertEqual(
++            set([dev.vendor_id for dev in free_devs]),
++            set(['v', 'v1']))
++
+ 
+ class PciGetInstanceDevs(test.NoDBTestCase):
++    def setUp(self):
++        super(PciGetInstanceDevs, self).setUp()
++        self.fake_context = context.get_admin_context()
++
++        self.stubs.Set(objects.ComputeNode, 'get_by_host_and_nodename',
++                self._fake_compute_node_get_by_host_and_nodename)
++
++    def _fake_compute_node_get_by_host_and_nodename(self, ctx, host,
++                                                    nodename):
++        self.compute = create_compute_node()
++        return self.compute
+ 
+     def test_get_devs_object(self):
+         def _fake_obj_load_attr(foo, attrname):
+@@ -513,7 +629,8 @@ class PciGetInstanceDevs(test.NoDBTestCase):
+                 _fake_obj_load_attr)
+ 
+         self.load_attr_called = False
+-        manager.get_instance_pci_devs(objects.Instance())
++        manager.get_instance_pci_devs(
++            objects.Instance(host='fakehost', node='fakenode'))
+         self.assertTrue(self.load_attr_called)
+ 
+     def test_get_devs_no_pci_devices(self):
+diff --git a/nova/tests/unit/scheduler/test_scheduler_utils.py b/nova/tests/unit/scheduler/test_scheduler_utils.py
+index 5d7a4b5..39f7804 100644
+--- a/nova/tests/unit/scheduler/test_scheduler_utils.py
++++ b/nova/tests/unit/scheduler/test_scheduler_utils.py
+@@ -44,6 +44,12 @@ class SchedulerUtilsTestCase(test.NoDBTestCase):
+         super(SchedulerUtilsTestCase, self).setUp()
+         self.context = 'fake-context'
+ 
++        self.stubs.Set(objects.Instance, '_load_pci_requests',
++            self._fake_load_pci_requests)
++
++    def _fake_load_pci_requests(self):
++        return
++
+     def test_build_request_spec_without_image(self):
+         instance = {'uuid': uuids.instance}
+         instance_type = objects.Flavor(**test_flavor.fake_flavor)
+diff --git a/nova/tests/unit/virt/libvirt/test_driver.py b/nova/tests/unit/virt/libvirt/test_driver.py
+index db61c17..8a0abe6 100755
+--- a/nova/tests/unit/virt/libvirt/test_driver.py
++++ b/nova/tests/unit/virt/libvirt/test_driver.py
+@@ -542,6 +542,42 @@ class FakeVirtDomain(object):
+         pass
+ 
+ 
++def create_compute_node(context, values=None):
++    compute = {
++        "id": 1,
++        "service_id": 1,
++        "host": "fakehost",
++        "vcpus": 1,
++        "memory_mb": 1,
++        "local_gb": 1,
++        "vcpus_used": 1,
++        "memory_mb_used": 1,
++        "local_gb_used": 1,
++        "free_ram_mb": 1,
++        "free_disk_gb": 1,
++        "current_workload": 1,
++        "running_vms": 0,
++        "cpu_info": None,
++        "numa_topology": None,
++        "hypervisor_hostname": "fakenode",
++        'hypervisor_version': 1,
++        'hypervisor_type': 'fake-hyp',
++        'disk_available_least': None,
++        'host_ip': None,
++        'metrics': None,
++        'created_at': None,
++        'updated_at': None,
++        'deleted_at': None,
++        'deleted': False,
++        'disk_allocation_ratio': 1.0,
++        'cpu_allocation_ratio': 16.0,
++        'ram_allocation_ratio': 1.5,
++    }
++    if values:
++        compute.update(values)
++    return objects.ComputeNode(context, **compute)
++
++
+ class CacheConcurrencyTestCase(test.NoDBTestCase):
+     def setUp(self):
+         super(CacheConcurrencyTestCase, self).setUp()
+@@ -576,6 +612,14 @@ class CacheConcurrencyTestCase(test.NoDBTestCase):
+             'nova.virt.libvirt.imagebackend.libvirt_utils',
+             fake_libvirt_utils))
+ 
++        self.stubs.Set(objects.ComputeNode, 'get_by_host_and_nodename',
++                self._fake_compute_node_get_by_host_and_nodename)
++
++    def _fake_compute_node_get_by_host_and_nodename(self, ctx, host,
++                                                    nodename):
++        self.compute = create_compute_node(ctx)
++        return self.compute
++
+     def _fake_instance(self, uuid):
+         return objects.Instance(id=1, uuid=uuid)
+ 
+@@ -730,6 +774,7 @@ def _create_test_instance():
+         'vcpu_model': None,
+         'host': 'fake-host-infra',
+         'task_state': None,
++        'node': None
+     }
+ 
+ 
+@@ -793,6 +838,14 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+         </domain>
+         """
+ 
++        self.stubs.Set(objects.ComputeNode, 'get_by_host_and_nodename',
++                self._fake_compute_node_get_by_host_and_nodename)
++
++    def _fake_compute_node_get_by_host_and_nodename(self, ctx, host,
++                                                    nodename):
++        self.compute = create_compute_node(ctx)
++        return self.compute
++
+     def relpath(self, path):
+         return os.path.relpath(path, CONF.instances_path)
+ 
+@@ -11616,7 +11669,8 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+         instance_ref['image_ref'] = 'my_fake_image'
+         instance = objects.Instance(**instance_ref)
+         instance['pci_devices'] = objects.PciDeviceList(
+-            objects=[objects.PciDevice(address='0000:00:00.0')])
++            objects=[objects.PciDevice(address='0000:00:00.0',
++                                       compute_node_id=1)])
+ 
+         image_meta = objects.ImageMeta.from_dict(self.test_image_meta)
+ 
+@@ -12965,7 +13019,8 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+         # pci_manager.get_instance_pci_devs will not return an empty list
+         # which will eventually fail the assertion for detachDeviceFlags
+         expected_pci_device_obj = (
+-            objects.PciDevice(address=expeted_pci_slot, request_id=None))
++            objects.PciDevice(address=expeted_pci_slot, request_id=None,
++                              compute_node_id=1, status='allocated'))
+         instance.pci_devices = objects.PciDeviceList()
+         instance.pci_devices.objects = [expected_pci_device_obj]
+ 
+@@ -13013,8 +13068,14 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+         # which will eventually fail the assertion for detachDeviceFlags
+         instance.pci_devices = objects.PciDeviceList()
+         instance.pci_devices.objects = [
+-            objects.PciDevice(address='0000:00:00.0', request_id=None),
+-            objects.PciDevice(address='0000:00:00.1', request_id=None)
++            objects.PciDevice(address='0000:00:00.0',
++                              compute_node_id=1,
++                              request_id=None,
++                              status='allocated'),
++            objects.PciDevice(address='0000:00:00.1',
++                              compute_node_id=1,
++                              request_id=None,
++                              status='allocated')
+         ]
+ 
+         domain = FakeVirtDomain()
+@@ -15636,8 +15697,10 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+         with mock.patch.object(drvr, 'vif_driver') as vif_driver:
+             vif_driver.unplug.side_effect = exception.AgentError(
+                 method='unplug')
+-            drvr._unplug_vifs(instance, [1], ignore_errors=True)
+-            vif_driver.unplug.assert_called_once_with(instance, 1)
++            drvr._unplug_vifs(instance, [{'vif_model': None}],
++                              ignore_errors=True)
++            vif_driver.unplug.assert_called_once_with(instance,
++                                                      {'vif_model': None})
+ 
+     def test_unplug_vifs_reports_errors(self):
+         drvr = libvirt_driver.LibvirtDriver(fake.FakeVirtAPI())
+@@ -15646,8 +15709,10 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+             vif_driver.unplug.side_effect = exception.AgentError(
+                 method='unplug')
+             self.assertRaises(exception.AgentError,
+-                              drvr.unplug_vifs, instance, [1])
+-            vif_driver.unplug.assert_called_once_with(instance, 1)
++                              drvr.unplug_vifs, instance,
++                              [{'vif_model': None}])
++            vif_driver.unplug.assert_called_once_with(instance,
++                                                      {'vif_model': None})
+ 
+     @mock.patch('nova.virt.libvirt.driver.LibvirtDriver._unplug_vifs')
+     @mock.patch('nova.virt.libvirt.driver.LibvirtDriver._undefine_domain')
+@@ -19868,6 +19933,14 @@ class _BaseSnapshotTests(test.NoDBTestCase):
+         self.instance_ref.info_cache = objects.InstanceInfoCache(
+             network_info=None)
+ 
++        self.stubs.Set(objects.ComputeNode, 'get_by_host_and_nodename',
++                self._fake_compute_node_get_by_host_and_nodename)
++
++    def _fake_compute_node_get_by_host_and_nodename(self, ctx, host,
++                                                    nodename):
++        self.compute = create_compute_node(ctx)
++        return self.compute
++
+     def _assert_snapshot(self, snapshot, disk_format,
+                          expected_properties=None):
+         self.mock_update_task_state.assert_has_calls([
+diff --git a/nova/tests/unit/virt/test_virt_drivers.py b/nova/tests/unit/virt/test_virt_drivers.py
+index 02b949d..7630713 100644
+--- a/nova/tests/unit/virt/test_virt_drivers.py
++++ b/nova/tests/unit/virt/test_virt_drivers.py
+@@ -78,6 +78,43 @@ def catch_notimplementederror(f):
+     return wrapped_func
+ 
+ 
++def create_compute_node(values=None):
++    compute = {
++        "id": 1,
++        "service_id": 1,
++        "host": "fakehost",
++        "vcpus": 1,
++        "memory_mb": 1,
++        "local_gb": 1,
++        "vcpus_used": 1,
++        "memory_mb_used": 1,
++        "local_gb_used": 1,
++        "free_ram_mb": 1,
++        "free_disk_gb": 1,
++        "current_workload": 1,
++        "running_vms": 0,
++        "cpu_info": None,
++        "numa_topology": None,
++        "stats": '{"num_instances": "1"}',
++        "hypervisor_hostname": "fakenode",
++        'hypervisor_version': 1,
++        'hypervisor_type': 'fake-hyp',
++        'disk_available_least': None,
++        'host_ip': None,
++        'metrics': None,
++        'created_at': None,
++        'updated_at': None,
++        'deleted_at': None,
++        'deleted': False,
++        'disk_allocation_ratio': 1.0,
++        'cpu_allocation_ratio': 16.0,
++        'ram_allocation_ratio': 1.5,
++    }
++    if values:
++        compute.update(values)
++    return compute
++
++
+ class _FakeDriverBackendTestCase(object):
+     def _setup_fakelibvirt(self):
+         # So that the _supports_direct_io does the test based
+@@ -257,6 +294,14 @@ class _VirtDriverTestCase(_FakeDriverBackendTestCase):
+                        imagebackend.Image._get_driver_format)
+         os_vif.initialize()
+ 
++        self.stubs.Set(objects.ComputeNode, 'get_by_host_and_nodename',
++                self._fake_compute_node_get_by_host_and_nodename)
++
++    def _fake_compute_node_get_by_host_and_nodename(self, ctx, host,
++                                                    nodename):
++        self.compute = create_compute_node()
++        return self.compute
++
+     def _get_running_instance(self, obj=True):
+         instance_ref = test_utils.get_test_instance(obj=obj)
+         network_info = test_utils.get_test_network_info()
+diff --git a/nova/tests/unit/virt/xenapi/test_xenapi.py b/nova/tests/unit/virt/xenapi/test_xenapi.py
+index e0cf2de..f1d932a 100644
+--- a/nova/tests/unit/virt/xenapi/test_xenapi.py
++++ b/nova/tests/unit/virt/xenapi/test_xenapi.py
+@@ -225,6 +225,43 @@ def create_instance_with_system_metadata(context, instance_values):
+     return inst
+ 
+ 
++def create_compute_node(values=None):
++    compute = {
++        "id": 1,
++        "service_id": 1,
++        "host": "fakehost",
++        "vcpus": 1,
++        "memory_mb": 1,
++        "local_gb": 1,
++        "vcpus_used": 1,
++        "memory_mb_used": 1,
++        "local_gb_used": 1,
++        "free_ram_mb": 1,
++        "free_disk_gb": 1,
++        "current_workload": 1,
++        "running_vms": 0,
++        "cpu_info": None,
++        "numa_topology": None,
++        "stats": '{"num_instances": "1"}',
++        "hypervisor_hostname": "fakenode",
++        'hypervisor_version': 1,
++        'hypervisor_type': 'fake-hyp',
++        'disk_available_least': None,
++        'host_ip': None,
++        'metrics': None,
++        'created_at': None,
++        'updated_at': None,
++        'deleted_at': None,
++        'deleted': False,
++        'disk_allocation_ratio': 1.0,
++        'cpu_allocation_ratio': 16.0,
++        'ram_allocation_ratio': 1.5,
++    }
++    if values:
++        compute.update(values)
++    return compute
++
++
+ class XenAPIVolumeTestCase(stubs.XenAPITestBaseNoDB):
+     """Unit tests for Volume operations."""
+     def setUp(self):
+@@ -332,6 +369,13 @@ class XenAPIVMTestCase(stubs.XenAPITestBase,
+             self._update_last_dom_id(vm_ref)
+         self.stubs.Set(vmops.VMOps, '_unpause_and_wait',
+                        fake_unpause_and_wait)
++        self.stubs.Set(objects.ComputeNode, 'get_by_host_and_nodename',
++                self._fake_compute_node_get_by_host_and_nodename)
++
++    def _fake_compute_node_get_by_host_and_nodename(self, ctx, host,
++                                                    nodename):
++        self.compute = create_compute_node()
++        return self.compute
+ 
+     def tearDown(self):
+         fake_image.FakeImageService_reset()
+@@ -1685,6 +1729,13 @@ class XenAPIMigrateInstance(stubs.XenAPITestBase):
+             pass
+         self.stub_out('nova.virt.xenapi.vmops.VMOps._unpause_and_wait',
+                        fake_unpause_and_wait)
++        self.stubs.Set(objects.ComputeNode, 'get_by_host_and_nodename',
++                self._fake_compute_node_get_by_host_and_nodename)
++
++    def _fake_compute_node_get_by_host_and_nodename(self, ctx, host,
++                                                    nodename):
++        self.compute = create_compute_node()
++        return self.compute
+ 
+     def _create_instance(self, **kw):
+         values = self.instance_values.copy()
+@@ -1694,6 +1745,8 @@ class XenAPIMigrateInstance(stubs.XenAPITestBase):
+                                          ephemeral_gb=0)
+         instance.create()
+         return instance
++        self.stubs.Set(objects.ComputeNode, 'get_by_host_and_nodename',
++                self._fake_compute_node_get_by_host_and_nodename)
+ 
+     @mock.patch.object(vmops.VMOps, '_migrate_disk_resizing_up')
+     @mock.patch.object(vm_utils, 'get_sr_path')
+diff --git a/nova/virt/libvirt/driver.py b/nova/virt/libvirt/driver.py
+index a1200fe..d778e03 100644
+--- a/nova/virt/libvirt/driver.py
++++ b/nova/virt/libvirt/driver.py
+@@ -5185,13 +5185,12 @@ class LibvirtDriver(driver.ComputeDriver):
+         for vif in network_info:
+             config = self.vif_driver.get_config(
+                 instance, vif, image_meta,
+-                    flavor, virt_type, self._host)
++                flavor, virt_type, self._host)
+ 
+             # override guest PCI address
+             vif_pci_address = self._get_guest_vif_pci_address(vif)
+             if vif_pci_address is not None:
+                 config.guest_pci_address = vif_pci_address
+-
+                 domain, bus, slot, func = \
+                     pci_utils.get_pci_address_fields(vif_pci_address)
+                 max_pci_bus = max(int(bus, 16), max_pci_bus)
+@@ -5294,33 +5293,8 @@ class LibvirtDriver(driver.ComputeDriver):
+         virt_type = guest.virt_type
+         if virt_type in ('xen', 'qemu', 'kvm'):
+             # Get all generic PCI devices (non-SR-IOV).
+-            def get_from_network_info(pci_dev, network_info):
+-                for vif in network_info:
+-                    if (vif.get('profile', {}).get('pci_slot')
+-                            == pci_dev.get('address')):
+-                        return vif
+-                return None
+-
+-            for pci_dev in pci_manager.get_instance_pci_devs(instance, 'all'):
+-                config = self._get_guest_pci_device(pci_dev)
+-
+-                # Don't include PCI devices that were included in the
+-                # loop over network_info above (SR-IOV PCI devices for vNIC).
+-                # Else libvirt will complain that a given PCI device is
+-                # already allocated.
+-                vif = get_from_network_info(pci_dev, network_info)
+-                if (vif is None or vif.get('vnic_type')
+-                        != network_model.VNIC_TYPE_DIRECT):
+-                    # override guest PCI address
+-                    vif_pci_address = self._get_guest_vif_pci_address(vif)
+-                    if vif_pci_address is not None:
+-                        config.guest_pci_address = vif_pci_address
+-
+-                        domain, bus, slot, func = \
+-                            pci_utils.get_pci_address_fields(vif_pci_address)
+-                        max_pci_bus = max(int(bus, 16), max_pci_bus)
+-
+-                    guest.add_device(config)
++            for pci_dev in pci_manager.get_instance_pci_devs(instance):
++                guest.add_device(self._get_guest_pci_device(pci_dev))
+         else:
+             # PCI devices is only supported for hypervisors
+             #  'xen', 'qemu' and 'kvm'.
+diff --git a/nova/virt/libvirt/vif.py b/nova/virt/libvirt/vif.py
+index 6a5bd4e..3759d1b 100644
+--- a/nova/virt/libvirt/vif.py
++++ b/nova/virt/libvirt/vif.py
+@@ -73,7 +73,9 @@ def is_vif_model_valid_for_virt(virt_type, vif_model):
+                 network_model.VIF_MODEL_RTL8139,
+                 network_model.VIF_MODEL_E1000,
+                 network_model.VIF_MODEL_SPAPR_VLAN,
+-                network_model.VIF_MODEL_AVP],
++                network_model.VIF_MODEL_AVP,
++                network_model.VIF_MODEL_PCI_SRIOV,
++                network_model.VIF_MODEL_PCI_PASSTHROUGH],
+         'xen': [network_model.VIF_MODEL_NETFRONT,
+                 network_model.VIF_MODEL_NE2K_PCI,
+                 network_model.VIF_MODEL_PCNET,
+-- 
+2.7.4
+

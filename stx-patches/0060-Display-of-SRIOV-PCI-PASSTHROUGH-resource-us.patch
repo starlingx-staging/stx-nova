@@ -1,0 +1,381 @@
+From ed0c69196a2c227e15fb1ad7c32b84b32a22acb0 Mon Sep 17 00:00:00 2001
+From: Steven Webster <steven.webster@windriver.com>
+Date: Wed, 29 Jul 2015 11:08:12 -0400
+Subject: [PATCH 060/143] Display of SRIOV & PCI-PASSTHROUGH resource
+ usage
+
+This commit introduce a new feature for displaying the PCI device usage in the
+system (pci-sriov and pci-passthrough).  The usage is displayed by provider
+network and show both the number of configured devices and the number of used
+devices (for pci-sriov/VF and pci-passthrough/PF).
+
+Nova compute was modified to report the number of configured PCI devices per
+PCI pool and this is stored persistently in the database.
+
+A new REST API call has been introduced to get the PCI usage.  A new
+'wrs-providernet' resource has been added and a call to 'show' on this resource
+provides the aggregated values of PCI usage for each computes.
+
+Includes following commits:
+- Display of SRIOV & PCI-PASSTHROUGH resource usage - Fixed
+  pep8 warnings (commit ad8935ca).
+- NOVA extensions authorization policy (partly commit
+  ebbf689f)
+
+Also includes R4 commit 2b0a8db:
+Remove verbose redundant logging of PCI pools
+
+This removes a multitude of redundant and repeated PCI pools output
+whenever nova restarts.
+
+We still see the final full set of PCI devices, however we just do not
+see "Adding device X" and "Pool is now: X" as the list is incrememntally
+processed.
+
+Notes on port to Newton:
+
+- Added separate policy file for wrs-providernet and fixed related
+  unit tests
+
+Notes on port to Pike:
+
+- wrs_providernets policy was refactored and discoverable rule has been
+  removed as per blueprints policy-docs and  remove-discoverable-policy-rules
+
+- subclass of extensions.V21APIExtensionBase was removed
+  from wrs_providernets.py
+
+21b4e36 Fix wrs_providernets extension loading error
+   Nova API was failing to load providernets extension as it was
+   accessing extensions.os_compute_soft_authorizer which was removed
+   upstream in Newton.  This meant server group information was missing
+   from nova show and vm-topology would throw an exception.
+
+__TYPE_upstreamable
+__TAG_sriov,pci,resource,api
+__R4_commit_133da54
+__R3_commit_8c82484
+__TC8530
+---
+ nova/api/openstack/compute/extension_info.py   |  8 +++
+ nova/api/openstack/compute/routes.py           |  8 +++
+ nova/api/openstack/compute/wrs_providernets.py | 73 ++++++++++++++++++++++++++
+ nova/pci/manager.py                            | 14 +++--
+ nova/pci/stats.py                              | 46 ++++++++++++++--
+ nova/policies/__init__.py                      |  2 +
+ nova/policies/wrs_providernets.py              | 32 +++++++++++
+ nova/tests/unit/test_policy.py                 |  1 +
+ 8 files changed, 177 insertions(+), 7 deletions(-)
+ create mode 100644 nova/api/openstack/compute/wrs_providernets.py
+ create mode 100644 nova/policies/wrs_providernets.py
+
+diff --git a/nova/api/openstack/compute/extension_info.py b/nova/api/openstack/compute/extension_info.py
+index 77e6bfa..ec9946d 100644
+--- a/nova/api/openstack/compute/extension_info.py
++++ b/nova/api/openstack/compute/extension_info.py
+@@ -849,6 +849,14 @@ EXTENSION_LIST = [
+         "updated": "2014-12-03T00:00:00Z"
+     },
+     {
++        "alias": "wrs-providernet",
++        "description": "Provider Network support.",
++        "links": [],
++        "name": "Wrs_providernets",
++        "namespace": "http://docs.openstack.org/compute/ext/fake_xml",
++        "updated": "2014-12-03T00:00:00Z"
++    },
++    {
+         "alias": "wrs-sg",
+         "description": "Adds wrs-sg:server_group on Servers.",
+         "links": [],
+diff --git a/nova/api/openstack/compute/routes.py b/nova/api/openstack/compute/routes.py
+index bcfc906..5e95794 100644
+--- a/nova/api/openstack/compute/routes.py
++++ b/nova/api/openstack/compute/routes.py
+@@ -93,6 +93,7 @@ from nova.api.openstack.compute import used_limits
+ from nova.api.openstack.compute import versionsV21
+ from nova.api.openstack.compute import virtual_interfaces
+ from nova.api.openstack.compute import volumes
++from nova.api.openstack.compute import wrs_providernets
+ from nova.api.openstack.compute import wrs_server_groups
+ from nova.api.openstack.compute import wrs_server_if
+ from nova.api.openstack.compute import wrs_server_resources
+@@ -395,6 +396,10 @@ volumes_controller = functools.partial(_create_controller,
+     volumes.VolumeController, [], [])
+ 
+ 
++wrs_providernets_controller = functools.partial(_create_controller,
++    wrs_providernets.WrsController, [], [])
++
++
+ # NOTE(alex_xu): This is structure of this route list as below:
+ # (
+ #     ('Route path': {
+@@ -880,6 +885,9 @@ ROUTE_LIST = (
+         'PUT': [server_tags_controller, 'update'],
+         'DELETE': [server_tags_controller, 'delete']
+     }),
++    ('/wrs-providernet/{id}', {
++        'GET': [wrs_providernets_controller, 'show']
++    }),
+ )
+ 
+ 
+diff --git a/nova/api/openstack/compute/wrs_providernets.py b/nova/api/openstack/compute/wrs_providernets.py
+new file mode 100644
+index 0000000..9600aa1
+--- /dev/null
++++ b/nova/api/openstack/compute/wrs_providernets.py
+@@ -0,0 +1,73 @@
++#
++# Copyright (c) 2015 Wind River Systems, Inc.
++#
++#
++#
++#
++#
++
++"""The Provider Network Extension."""
++
++from neutronclient.common import exceptions as n_exc
++from nova.api.openstack import extensions
++from nova.api.openstack import wsgi
++from nova.i18n import _
++from nova.network.neutronv2 import api as neutronapi
++from nova import objects
++from nova.policies import wrs_providernets as wrs_providernet_policies
++
++from oslo_log import log as logging
++from webob import exc
++
++
++LOG = logging.getLogger(__name__)
++
++
++ALIAS = "wrs-providernet"
++
++
++class WrsController(wsgi.Controller):
++    def __init__(self):
++        super(WrsController, self).__init__()
++
++    @extensions.expected_errors(404)
++    def show(self, req, id):
++        context = req.environ['nova.context']
++        context.can(wrs_providernet_policies.BASE_POLICY_NAME)
++
++        neutron = neutronapi.get_client(context)
++        try:
++            providernet = neutron.show_providernet(id).get('providernet', {})
++        except n_exc.NeutronClientException:
++            LOG.exception("Neutron Error getting provider network %s", id)
++            msg = _("Error getting provider network")
++            raise exc.HTTPNotFound(explanation=msg)
++
++        physnet = providernet.get('name')
++        pci_pfs_configured = 0
++        pci_pfs_count = 0
++        pci_vfs_configured = 0
++        pci_vfs_count = 0
++        nodes = objects.ComputeNodeList.get_all(context)
++        for node in nodes:
++            if node.pci_device_pools and node.pci_device_pools.objects:
++                for pool in node.pci_device_pools.objects:
++                    tags = pool.tags
++                    if physnet in tags.get('physical_network', {}):
++                        dev_type = tags.get('dev_type', {})
++                        configured = int(tags.get('configured', '0'))
++
++                        if 'type-PF' in dev_type:
++                            pci_pfs_configured += configured
++                            pci_pfs_count += pool.count
++
++                        if 'type-VF' in dev_type:
++                            pci_vfs_configured += configured
++                            pci_vfs_count += pool.count
++
++        return {'providernet':
++                {'id': id, 'name': physnet,
++                 'pci_pfs_configured': pci_pfs_configured,
++                 'pci_pfs_used': pci_pfs_configured - pci_pfs_count,
++                 'pci_vfs_configured': pci_vfs_configured,
++                 'pci_vfs_used': pci_vfs_configured - pci_vfs_count}}
+diff --git a/nova/pci/manager.py b/nova/pci/manager.py
+index a6e8b93..4049475 100644
+--- a/nova/pci/manager.py
++++ b/nova/pci/manager.py
+@@ -83,8 +83,13 @@ class PciDevTracker(object):
+                 self.claims[uuid].append(dev)
+             elif dev.status == fields.PciDeviceStatus.ALLOCATED:
+                 self.allocations[uuid].append(dev)
++
++                # The instances that are already running in the
++                # hypervisor need to be accounted for in the number of
++                # configured device of a compute.
++                self.stats.add_device(dev, sync=True, do_append=False)
+             elif dev.status == fields.PciDeviceStatus.AVAILABLE:
+-                self.stats.add_device(dev)
++                self.stats.add_device(dev, sync=True)
+ 
+     def save(self, context):
+         for dev in self.pci_devs:
+@@ -209,8 +214,11 @@ class PciDevTracker(object):
+             dev_obj = objects.PciDevice.create(self._context, dev)
+             self.pci_devs.objects.append(dev_obj)
+             LOG.info("Synchronizing with hypervisor: Adding device %s",
+-                     dev_obj.address)
+-            self.stats.add_device(dev_obj)
++                dev_obj.address)
++            # This case is executed only when a compute node is configured
++            # with a new pci-sriov or pci-passthrough configuration.  Need to
++            # synchronize the number of configured PCI devices in this case.
++            self.stats.add_device(dev_obj, sync=True)
+ 
+         self._build_device_tree(self.pci_devs)
+ 
+diff --git a/nova/pci/stats.py b/nova/pci/stats.py
+index f2ba3f9..26fceca 100644
+--- a/nova/pci/stats.py
++++ b/nova/pci/stats.py
+@@ -98,6 +98,10 @@ class PciDeviceStats(object):
+             pool_keys = pool.copy()
+             del pool_keys['count']
+             del pool_keys['devices']
++
++            # 'configured' is not a pool key.
++            del pool_keys['configured']
++
+             if (len(pool_keys.keys()) == len(dev_pool.keys()) and
+                 self._equal_properties(dev_pool, pool_keys, dev_pool.keys())):
+                 return pool
+@@ -119,19 +123,53 @@ class PciDeviceStats(object):
+             pool.update(tags)
+         return pool
+ 
+-    def add_device(self, dev):
+-        """Add a device to its matching pool."""
++    def add_device(self, dev, sync=False, do_append=True):
++        """Add a device to its matching pool.
++
++        :param dev: A PCI device to add to one of the pools.  The device is
++            then available for allocation to an instance.
++        :param sync: If this flag is set to True it specifies that this device
++            is being synchronized with the set of discovered devices by the
++            hypervisor.  This is only done at nova compute startup.  This is
++            how we know how many PCI devices have been configured (versus
++            'count' that specifies how many are available).  If this flag is
++            set to False it specifies that the PCI device should be put
++            back to the pool after it became available again (for e.g. after
++            an instance is terminate).
++        :param do_append: If this flag is set to True it specifies that the
++            PCI device should be added to the pools.  If this flag is set to
++            Flase it specifies that this device should not be added to the
++            pool.  This scenario happen when the nova compute process is
++            started and initialized and the list of PCI is synchronized with
++            the hypervisor.  In this particular case some instances are
++            already running and those devices should only be accounted as
++            configured and not be added to the list of available devices.
++        """
+         dev_pool = self._create_pool_keys_from_dev(dev)
+         if dev_pool:
+             pool = self._find_pool(dev_pool)
+             if not pool:
+                 dev_pool['count'] = 0
++                dev_pool['configured'] = 0
+                 dev_pool['devices'] = []
+                 self.pools.append(dev_pool)
+                 self.pools.sort(key=lambda item: len(item))
+                 pool = dev_pool
+-            pool['count'] += 1
+-            pool['devices'].append(dev)
++
++            # Do not add allocated PCI devices to the pool.  These are
++            # reported by the hypervisor on already running instances.  Only
++            # available devices should be added to the pool.
++            if do_append:
++                pool['count'] += 1
++                pool['devices'].append(dev)
++
++            # On nova compute process boot up, PciDevTracker initialize
++            # the pool with the PCI devices discovered from the hypervisor.
++            # PciDevTracker during init is the only one calling this function
++            # with 'sync=True'.  PciDevice objects are created in the database
++            # in set_hvdevs.
++            if sync:
++                pool['configured'] += 1
+ 
+     @staticmethod
+     def _decrease_pool_count(pool_list, pool, count=1):
+diff --git a/nova/policies/__init__.py b/nova/policies/__init__.py
+index 485e290..5c585da 100644
+--- a/nova/policies/__init__.py
++++ b/nova/policies/__init__.py
+@@ -94,6 +94,7 @@ from nova.policies import used_limits
+ from nova.policies import virtual_interfaces
+ from nova.policies import volumes
+ from nova.policies import volumes_attachments
++from nova.policies import wrs_providernets
+ from nova.policies import wrs_server_groups
+ from nova.policies import wrs_server_if
+ from nova.policies import wrs_server_resources
+@@ -175,6 +176,7 @@ def list_rules():
+         virtual_interfaces.list_rules(),
+         volumes.list_rules(),
+         volumes_attachments.list_rules(),
++        wrs_providernets.list_rules(),
+         wrs_server_if.list_rules(),
+         wrs_server_groups.list_rules(),
+         wrs_server_resources.list_rules()
+diff --git a/nova/policies/wrs_providernets.py b/nova/policies/wrs_providernets.py
+new file mode 100644
+index 0000000..26cc650
+--- /dev/null
++++ b/nova/policies/wrs_providernets.py
+@@ -0,0 +1,32 @@
++#
++# Copyright (c) 2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
++
++from oslo_policy import policy
++
++from nova.policies import base
++
++
++BASE_POLICY_NAME = 'os_compute_api:wrs-providernet'
++
++
++wrs_providernet_policies = [
++    policy.DocumentedRuleDefault(
++        BASE_POLICY_NAME,
++        base.RULE_ADMIN_OR_OWNER,
++        """Show PCI usage aggregated values for a provider network.""",
++        [
++            {
++                'method': 'GET',
++                'path': '/wrs-providernet/{network_id}'
++           }
++        ]),
++]
++
++
++def list_rules():
++    return wrs_providernet_policies
+diff --git a/nova/tests/unit/test_policy.py b/nova/tests/unit/test_policy.py
+index 44745f9..4516178 100644
+--- a/nova/tests/unit/test_policy.py
++++ b/nova/tests/unit/test_policy.py
+@@ -456,6 +456,7 @@ class RealRolePolicyTestCase(test.NoDBTestCase):
+ "os_compute_api:wrs-if",
+ "os_compute_api:wrs-sg",
+ "os_compute_api:wrs-res",
++"os_compute_api:wrs-providernet",
+ )
+ 
+         self.non_admin_only_rules = (
+-- 
+2.7.4
+

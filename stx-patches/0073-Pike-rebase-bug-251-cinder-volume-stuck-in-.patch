@@ -1,0 +1,82 @@
+From 24d78ceff570625cd88a3cb0f81cc4fc223ca832 Mon Sep 17 00:00:00 2001
+From: Jack Ding <jack.ding@windriver.com>
+Date: Fri, 1 Dec 2017 16:32:52 -0500
+Subject: [PATCH 073/143] Pike rebase: bug 251 cinder volume stuck in
+ attaching state
+
+Upstream commit 6380573 introduced behaviour of reserving volumes before
+an instance is scheduled. In case of a scheduling failure, build_request
+
+info is only present in build_request, there is no way for a later
+instance cleaning to unreserve the volumes. As a result, the volumes
+reserved would stuck in 'attaching' state even after the instance is deleted.
+
+Fix: in case of a schedule failure, unreserve the volume before
+build_request is destroyed.
+
+__TYPE_upstreamable
+---
+ nova/conductor/manager.py                   | 7 +++++++
+ nova/tests/unit/conductor/test_conductor.py | 6 +++++-
+ 2 files changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/nova/conductor/manager.py b/nova/conductor/manager.py
+index af00cf2..4f3724b 100644
+--- a/nova/conductor/manager.py
++++ b/nova/conductor/manager.py
+@@ -58,6 +58,7 @@ from nova.scheduler import client as scheduler_client
+ from nova.scheduler import utils as scheduler_utils
+ from nova import servicegroup
+ from nova import utils
++from nova.volume import cinder
+ 
+ LOG = logging.getLogger(__name__)
+ CONF = cfg.CONF
+@@ -234,6 +235,7 @@ class ComputeTaskManager(base.Base):
+         self.image_api = image.API()
+         self.network_api = network.API()
+         self.servicegroup_api = servicegroup.API()
++        self.volume_api = cinder.API()
+         self.scheduler_client = scheduler_client.SchedulerClient()
+         self.notifier = rpc.get_notifier('compute', CONF.host)
+ 
+@@ -1054,6 +1056,11 @@ class ComputeTaskManager(base.Base):
+         instances = instances or []
+         instances_by_uuid = {inst.uuid: inst for inst in instances}
+         for build_request in build_requests:
++            # unreserve volumes now since volume info will be lost
++            # once build_request is destroyed
++            for bdm in build_request.block_device_mappings:
++                if bdm.volume_id:
++                    self.volume_api.unreserve_volume(context, bdm.volume_id)
+             if build_request.instance_uuid not in instances_by_uuid:
+                 # This is an instance object with no matching db entry.
+                 instance = build_request.get_new_instance(context)
+diff --git a/nova/tests/unit/conductor/test_conductor.py b/nova/tests/unit/conductor/test_conductor.py
+index cff62e1..fa1486c 100644
+--- a/nova/tests/unit/conductor/test_conductor.py
++++ b/nova/tests/unit/conductor/test_conductor.py
+@@ -1966,8 +1966,11 @@ class ConductorTaskTestCase(_BaseTaskTestCase, test_compute.BaseTestCase):
+                                       build_requests=1)
+         self.assertTrue(mock_cm_get.called)
+ 
+-    def test_bury_in_cell0(self):
++    @mock.patch('nova.volume.cinder.API.unreserve_volume')
++    def test_bury_in_cell0(self, mock_unreserve_vol):
+         bare_br = self.params['build_requests'][0]
++        # trigger unreserve_volume
++        bare_br.block_device_mappings[0].volume_id = 'foo'
+ 
+         inst_br = fake_build_request.fake_req_obj(self.ctxt)
+         del inst_br.instance.id
+@@ -2011,6 +2014,7 @@ class ConductorTaskTestCase(_BaseTaskTestCase, test_compute.BaseTestCase):
+         }
+ 
+         self.assertEqual(expected, inst_states)
++        self.assertTrue(mock_unreserve_vol.called)
+ 
+     def test_reset(self):
+         with mock.patch('nova.compute.rpcapi.ComputeAPI') as mock_rpc:
+-- 
+2.7.4
+

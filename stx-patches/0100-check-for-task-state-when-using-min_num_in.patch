@@ -1,0 +1,42 @@
+From 40271d18033745f616250e6844b5300fa722f446 Mon Sep 17 00:00:00 2001
+From: Daniel Chavolla <daniel.chavolla@windriver.com>
+Date: Tue, 13 Feb 2018 14:41:58 -0500
+Subject: [PATCH 100/143] check for task state when using
+ min_num_instances
+
+The mininum instance count was introduced to determine if a launch with
+multiple instances was successful.
+This commit adds a check so that min_num_instances is only used by the
+filter scheduler when launching a set of instances, not when for
+example a migration is scheduled.
+---
+ nova/scheduler/filter_scheduler.py | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/nova/scheduler/filter_scheduler.py b/nova/scheduler/filter_scheduler.py
+index 0275f61..867b13d 100644
+--- a/nova/scheduler/filter_scheduler.py
++++ b/nova/scheduler/filter_scheduler.py
+@@ -35,6 +35,7 @@ from oslo_log import log as logging
+ from oslo_utils import strutils
+ from six.moves import range
+ 
++from nova.compute import task_states
+ import nova.conf
+ from nova.i18n import _
+ from nova import rpc
+@@ -147,7 +148,10 @@ class FilterScheduler(driver.Scheduler):
+         # check against minimum number of instances for success if set
+         #      otherwise default to num_instances
+         if hasattr(spec_obj, 'min_num_instances'):
+-            num_instances = spec_obj.min_num_instances
++            task_state = spec_obj.scheduler_hints.get('task_state')
++            if task_state and (task_state == task_states.SCHEDULING):
++                num_instances = spec_obj.min_num_instances
++
+         selected_hosts = self._schedule(context, spec_obj, instance_uuids,
+             alloc_reqs_by_rp_uuid, provider_summaries)
+ 
+-- 
+2.7.4
+

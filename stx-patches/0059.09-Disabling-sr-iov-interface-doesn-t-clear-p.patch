@@ -1,0 +1,34 @@
+From 3eabba9cbbd99e2f82621ffc791eb05fc37e2ab8 Mon Sep 17 00:00:00 2001
+From: "Beliveau, Ludovic" <Ludovic.Beliveau@windriver.com>
+Date: Mon, 27 Apr 2015 20:20:27 -0400
+Subject: [PATCH] Disabling sr-iov interface doesn't clear pci_stats
+
+For clearing pci_stats when nova compute boots.  The PCI stats will get
+created properly based on the PciResourceTracker.
+
+Conflicts:
+	nova/compute/resource_tracker.py
+---
+ nova/compute/resource_tracker.py | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/nova/compute/resource_tracker.py b/nova/compute/resource_tracker.py
+index 374ac77..62a982c 100644
+--- a/nova/compute/resource_tracker.py
++++ b/nova/compute/resource_tracker.py
+@@ -453,6 +453,12 @@ class ResourceTracker(object):
+         # database. If we get one we are done.
+         self.compute_node = self._get_compute_node(context)
+         if self.compute_node:
++            # On initial startup of nova-compute we will wipe the
++            # pci_stats in the DB to ensure that the DB reflects the
++            # current export status of this compute node
++            self.compute_node.update({'pci_device_pools': []})
++            self.conductor_api.compute_node_update(
++                context, self.compute_node, {'pci_stats': ''})
+             return
+ 
+         # there was no local copy and none in the database
+-- 
+2.7.4
+

@@ -1,0 +1,42 @@
+From 6f89cbc9211a6142d298100563e7272852a7f8ac Mon Sep 17 00:00:00 2001
+From: Jack Ding <jack.ding@windriver.com>
+Date: Thu, 8 Mar 2018 13:18:38 -0500
+Subject: [PATCH 123/143] Fix tox error introduced by 0f35483
+
+---
+ nova/tests/unit/compute/test_rpcapi.py | 8 +++++---
+ 1 file changed, 5 insertions(+), 3 deletions(-)
+
+diff --git a/nova/tests/unit/compute/test_rpcapi.py b/nova/tests/unit/compute/test_rpcapi.py
+index 7d75c49..2271475 100644
+--- a/nova/tests/unit/compute/test_rpcapi.py
++++ b/nova/tests/unit/compute/test_rpcapi.py
+@@ -518,11 +518,12 @@ class ComputeRpcAPITestCase(test.NoDBTestCase):
+         self._test_compute_api('restore_instance', 'cast',
+                 instance=self.fake_instance_obj, version='4.0')
+ 
+-    def test_pre_live_migration(self):
++    @mock.patch('nova.objects.instance.Instance.get_network_info')
++    def test_pre_live_migration(self, mock_getnet):
+         self._test_compute_api('pre_live_migration', 'call',
+                 instance=self.fake_instance_obj,
+                 block_migration='block_migration', disk='disk', host='host',
+-                migrate_data=None, version='4.8')
++                migrate_data=None, version='4.8', timeout=60)
+ 
+     def test_prep_resize(self):
+         self._test_compute_api('prep_resize', 'cast',
+@@ -862,8 +863,9 @@ class ComputeRpcAPITestCase(test.NoDBTestCase):
+                                callret=None,
+                                calltype='cast')
+ 
++    @mock.patch('nova.objects.instance.Instance.get_network_info')
+     @mock.patch('nova.objects.migrate_data.LiveMigrateData.from_legacy_dict')
+-    def test_pre_live_migration_converts_objects(self, mock_fld):
++    def test_pre_live_migration_converts_objects(self, mock_fld, mock_getnet):
+         obj = migrate_data_obj.LiveMigrateData()
+         inst = self.fake_instance_obj
+         result = self._test_simple_call('pre_live_migration',
+-- 
+2.7.4
+

@@ -1,0 +1,36 @@
+From 4148da7126e859608788e8d29e1c1dd7f162cc0b Mon Sep 17 00:00:00 2001
+From: Chris Friesen <chris.friesen@windriver.com>
+Date: Mon, 12 Mar 2018 08:44:07 -0600
+Subject: [PATCH 125/143] increment  pre_live_migration() RPC
+ timeout for each vif again
+
+The previous commit to bump the RPC timeout per-vif was useful but didn't
+go far enough.
+
+labs have been observed to take 5 secs per vif during live
+migration, so we need to bump the RPC timeout some more to allow for that.
+---
+ nova/compute/rpcapi.py | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/nova/compute/rpcapi.py b/nova/compute/rpcapi.py
+index ddf10ad..ce999c5 100644
+--- a/nova/compute/rpcapi.py
++++ b/nova/compute/rpcapi.py
+@@ -783,9 +783,11 @@ class ComputeAPI(object):
+                 migrate_data.block_migration):
+             timeout = 300
+ 
+-        # add a bit of time for each vif.
++        # add a bit of time for each vif.  AIO labs are resource-
++        # constrained, have been observed to take 5sec per vif so we allow
++        # a little more than that.
+         num_vifs = len(instance.get_network_info())
+-        timeout += num_vifs * 2
++        timeout += num_vifs * 6
+ 
+         cctxt = client.prepare(server=host, version=version, timeout=timeout)
+         result = cctxt.call(ctxt, 'pre_live_migration',
+-- 
+2.7.4
+

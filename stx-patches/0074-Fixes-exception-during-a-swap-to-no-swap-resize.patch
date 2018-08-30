@@ -1,0 +1,210 @@
+From 12184dbfd72805d21d44947ba9ce19037b918e2f Mon Sep 17 00:00:00 2001
+From: Kam Nasim <kam.nasim@windriver.com>
+Date: Fri, 1 Apr 2016 18:32:47 +0000
+Subject: [PATCH 074/143] Fixes exception during a swap to no swap resize
+
+The root cause of this failure was that the swap record for an instance
+in  the block_device_mapping table in db is being used by
+get_disk-mapping() to create the swap disk mapping EVEN if the (new)
+flavor has 0 swap. This would subsequently cause the exception as the
+disk.swap file didn't exist.
+
+To fix said error, a check is being added to get_disk_mapping() to
+ensure that flavor has swap > 0 before accessing db record. The original
+swap mapping will stay in the block_device_mapping table in the database
+after resizing to flavor with swap = 0 (or another flavor with a
+different swap size), but libvirt xml and associated swap disk will now
+be based on a new flavor.
+
+Additionally, this commit has to partially revert Matt Riedemann's
+<mriedem@us.ibm.com> lazy-loading optimization in the unit test (Bug:
+1530952) in the UT to ensure flavor info is only retrieved once. However
+as per our change we will always need to retrieve the swap information
+from within the instance flavor.
+
+Co-authored-by: Gerry Kopec <gerry.kopec@windriver.com>
+
+Change-Id: I1027e4d296a7cdc68b37169dbec556ea666a81a9
+Closes-Bug: #1552777
+Signed-off-by: Kam Nasim <kam.nasim@windriver.com>
+
+Ported from: https://review.openstack.org/#/c/300616/6
+Pike Rebase Bug 275: nova Resize rejected when remove swap disk.
+Error: Cannot access storage file '/etc/nova/instances/.../disk.swap
+
+__TYPE_upstream
+---
+ nova/tests/unit/virt/libvirt/test_blockinfo.py | 65 +++++++++++++++++++-------
+ nova/tests/unit/virt/libvirt/test_driver.py    |  8 ++++
+ nova/virt/libvirt/blockinfo.py                 | 24 +++++-----
+ 3 files changed, 70 insertions(+), 27 deletions(-)
+
+diff --git a/nova/tests/unit/virt/libvirt/test_blockinfo.py b/nova/tests/unit/virt/libvirt/test_blockinfo.py
+index ebb1c10..d5154d2 100644
+--- a/nova/tests/unit/virt/libvirt/test_blockinfo.py
++++ b/nova/tests/unit/virt/libvirt/test_blockinfo.py
+@@ -179,14 +179,9 @@ class LibvirtBlockInfoTest(test.NoDBTestCase):
+         instance_ref = objects.Instance(**self.test_instance)
+         image_meta = objects.ImageMeta.from_dict(self.test_image_meta)
+ 
+-        with mock.patch.object(instance_ref, 'get_flavor',
+-                               return_value=instance_ref.flavor) as get_flavor:
+-            mapping = blockinfo.get_disk_mapping("kvm", instance_ref,
+-                                                 "virtio", "ide",
+-                                                 image_meta)
+-        # Since there was no block_device_info passed to get_disk_mapping we
+-        # expect to get the swap info from the flavor in the instance.
+-        get_flavor.assert_called_once_with()
++        mapping = blockinfo.get_disk_mapping("kvm", instance_ref,
++                                             "virtio", "ide",
++                                             image_meta)
+ 
+         expect = {
+             'disk': {'bus': 'virtio', 'dev': 'vda',
+@@ -499,6 +494,11 @@ class LibvirtBlockInfoTest(test.NoDBTestCase):
+             'swap': {'device_name': '/dev/vdb',
+                      'swap_size': 10},
+             }
++
++        # NOTE (knasim): ensure that the swap size is also
++        # set in the instance flavor as this will now be checked
++        instance_ref.flavor.swap = block_device_info['swap']['swap_size']
++
+         mapping = blockinfo.get_disk_mapping("kvm", instance_ref,
+                                              "virtio", "ide",
+                                              image_meta,
+@@ -513,6 +513,34 @@ class LibvirtBlockInfoTest(test.NoDBTestCase):
+             }
+         self.assertEqual(expect, mapping)
+ 
++    def test_get_disk_mapping_no_swap_in_instance_flavor(self):
++        # A disk mapping with a swap device at position vdb but
++        # no swap specified in instance flavor should cause
++        # disk.swap to not be present in the mapping
++
++        instance_ref = objects.Instance(**self.test_instance)
++        image_meta = objects.ImageMeta.from_dict(self.test_image_meta)
++
++        block_device_info = {
++            'swap': {'device_name': '/dev/vdb',
++                     'swap_size': 10},
++            }
++
++        instance_ref.flavor.swap = 0
++
++        mapping = blockinfo.get_disk_mapping("kvm", instance_ref,
++                                             "virtio", "ide",
++                                             image_meta,
++                                             block_device_info)
++
++        expect = {
++            'disk': {'bus': 'virtio', 'dev': 'vda',
++                     'type': 'disk', 'boot_index': '1'},
++            'root': {'bus': 'virtio', 'dev': 'vda',
++                     'type': 'disk', 'boot_index': '1'},
++            }
++        self.assertEqual(expect, mapping)
++
+     def test_get_disk_mapping_blockdev_root(self):
+         # A disk mapping with a blockdev replacing the default root
+         instance_ref = objects.Instance(**self.test_instance)
+@@ -656,6 +684,11 @@ class LibvirtBlockInfoTest(test.NoDBTestCase):
+                  'delete_on_termination': True},
+                 ]
+             }
++
++        # NOTE (knasim): ensure that the swap size is also
++        # set in the instance flavor as this will now be checked
++        instance_ref.flavor.swap = block_device_info['swap']['swap_size']
++
+         mapping = blockinfo.get_disk_mapping("kvm", instance_ref,
+                                              "virtio", "ide",
+                                              image_meta,
+@@ -704,14 +737,14 @@ class LibvirtBlockInfoTest(test.NoDBTestCase):
+                         'disk_bus': 'virtio',
+                         'delete_on_termination': True}
+ 
+-        with mock.patch.object(instance_ref, 'get_flavor') as get_flavor_mock:
+-            blockinfo.get_disk_mapping("kvm", instance_ref,
+-                                       "virtio", "ide",
+-                                       image_meta,
+-                                       block_device_info)
+-        # we should have gotten the swap info from block_device_info rather
+-        # than the flavor information on the instance
+-        self.assertFalse(get_flavor_mock.called)
++        # NOTE (knasim): ensure that the swap size is also
++        # set in the instance flavor as this will now be checked
++        instance_ref.flavor.swap = block_device_info['swap']['swap_size']
++
++        blockinfo.get_disk_mapping("kvm", instance_ref,
++                                   "virtio", "ide",
++                                   image_meta,
++                                   block_device_info)
+ 
+         self.assertEqual(expected_swap, block_device_info['swap'])
+         self.assertEqual(expected_ephemeral,
+diff --git a/nova/tests/unit/virt/libvirt/test_driver.py b/nova/tests/unit/virt/libvirt/test_driver.py
+index b8a806a..a21bb3e 100755
+--- a/nova/tests/unit/virt/libvirt/test_driver.py
++++ b/nova/tests/unit/virt/libvirt/test_driver.py
+@@ -7178,6 +7178,9 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+     def _check_xml_and_disk_bus(self, image_meta,
+                                 block_device_info, wantConfig):
+         instance_ref = objects.Instance(**self.test_instance)
++        # NOTE (knasim): Set minimal default swap size
++        # in instance flavor
++        instance_ref.flavor.swap = 1
+         network_info = _fake_network_info(self, 1)
+ 
+         drv = libvirt_driver.LibvirtDriver(fake.FakeVirtAPI(), True)
+@@ -15327,6 +15330,11 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+                              'volume_size': 512,
+                              'guest_format': 'swap',
+                              'destination_type': 'local'}))]
++
++        # NOTE (knasim): ensure that the swap size is also
++        # set in the instance flavor as this will now be checked
++        instance.flavor.swap = 512
++
+         block_device_mapping = [
+             objects.BlockDeviceMapping(
+                 **fake_block_device.AnonFakeDbBlockDeviceDict(
+diff --git a/nova/virt/libvirt/blockinfo.py b/nova/virt/libvirt/blockinfo.py
+index 567a79f..5d5adfb 100644
+--- a/nova/virt/libvirt/blockinfo.py
++++ b/nova/virt/libvirt/blockinfo.py
+@@ -585,18 +585,20 @@ def get_disk_mapping(virt_type, instance,
+         update_bdm(eph, eph_info)
+ 
+     swap = driver.block_device_info_get_swap(block_device_info)
+-    if swap and swap.get('swap_size', 0) > 0:
+-        swap_info = get_info_from_bdm(
+-            instance, virt_type, image_meta,
+-            swap, mapping, disk_bus)
+-        mapping['disk.swap'] = swap_info
+-        update_bdm(swap, swap_info)
+-    elif instance.get_flavor()['swap'] > 0:
+-        swap_info = get_next_disk_info(mapping, disk_bus,
+-            assigned_devices=pre_assigned_device_names)
+-        if not block_device.volume_in_mapping(swap_info['dev'],
+-                                              block_device_info):
++    # NOTE (knasim): only map swap disk if supported in flavor
++    if instance.get_flavor()['swap'] > 0:
++        if swap and swap.get('swap_size', 0) > 0:
++            swap_info = get_info_from_bdm(
++                instance, virt_type, image_meta,
++                swap, mapping, disk_bus)
+             mapping['disk.swap'] = swap_info
++            update_bdm(swap, swap_info)
++        else:
++            swap_info = get_next_disk_info(mapping, disk_bus,
++                assigned_devices=pre_assigned_device_names)
++            if not block_device.volume_in_mapping(swap_info['dev'],
++                                                  block_device_info):
++                mapping['disk.swap'] = swap_info
+ 
+     block_device_mapping = driver.block_device_info_get_mapping(
+         block_device_info)
+-- 
+2.7.4
+

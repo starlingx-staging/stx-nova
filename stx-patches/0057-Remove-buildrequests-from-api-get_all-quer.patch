@@ -1,0 +1,102 @@
+From b5fbdb12e4400b6fded8d24f41d7510637b3977d Mon Sep 17 00:00:00 2001
+From: Al Bailey <al.bailey@windriver.com>
+Date: Fri, 16 Jun 2017 21:59:10 -0400
+Subject: [PATCH 057/143] Remove buildrequests from api get_all
+ queries to fix pagination
+
+__TYPE_single
+__R4_commit_1b97e2a
+---
+ nova/compute/api.py                         | 31 +++++++++++++++++------------
+ nova/tests/unit/compute/test_compute_api.py |  5 +++++
+ 2 files changed, 23 insertions(+), 13 deletions(-)
+
+diff --git a/nova/compute/api.py b/nova/compute/api.py
+index 5676561..b36cb88 100644
+--- a/nova/compute/api.py
++++ b/nova/compute/api.py
+@@ -2521,19 +2521,24 @@ class API(base.Base):
+         # [sorted instances with no host] + [sorted instances with host].
+         # This means BuildRequest and cell0 instances first, then cell
+         # instances
+-        try:
+-            build_requests = objects.BuildRequestList.get_by_filters(
+-                context, filters, limit=limit, marker=marker,
+-                sort_keys=sort_keys, sort_dirs=sort_dirs)
+-            # If we found the marker in we need to set it to None
+-            # so we don't expect to find it in the cells below.
+-            marker = None
+-        except exception.MarkerNotFound:
+-            # If we didn't find the marker in the build requests then keep
+-            # looking for it in the cells.
+-            build_requests = objects.BuildRequestList()
+-        build_req_instances = objects.InstanceList(
+-            objects=[build_req.instance for build_req in build_requests])
++
++        # Remove buildrequests from api get_all queries
++        #      to fix pagination
++        # try:
++        #     build_requests = objects.BuildRequestList.get_by_filters(
++        #         context, filters, limit=limit, marker=marker,
++        #         sort_keys=sort_keys, sort_dirs=sort_dirs)
++        #     # If we found the marker in we need to set it to None
++        #     # so we don't expect to find it in the cells below.
++        #     marker = None
++        # except exception.MarkerNotFound:
++        #     # If we didn't find the marker in the build requests then keep
++        #     # looking for it in the cells.
++        #     build_requests = objects.BuildRequestList()
++        # build_req_instances = objects.InstanceList(
++        #     objects=[build_req.instance for build_req in build_requests])
++        build_req_instances = objects.InstanceList(objects=[])
++
+         # Only subtract from limit if it is not None
+         limit = (limit - len(build_req_instances)) if limit else limit
+ 
+diff --git a/nova/tests/unit/compute/test_compute_api.py b/nova/tests/unit/compute/test_compute_api.py
+index 0abca38..122bbd6 100644
+--- a/nova/tests/unit/compute/test_compute_api.py
++++ b/nova/tests/unit/compute/test_compute_api.py
+@@ -22,6 +22,7 @@
+ 
+ import contextlib
+ import datetime
++import testtools
+ 
+ import ddt
+ import iso8601
+@@ -4720,6 +4721,7 @@ class _ComputeAPIUnitTestMixIn(object):
+             )
+         return instances
+ 
++    @testtools.skip('build requests filtering dupes break pagination')
+     @mock.patch.object(objects.BuildRequestList, 'get_by_filters')
+     @mock.patch.object(objects.CellMapping, 'get_by_uuid',
+                        side_effect=exception.CellMappingNotFound(uuid='fake'))
+@@ -4753,6 +4755,7 @@ class _ComputeAPIUnitTestMixIn(object):
+             for i, instance in enumerate(build_req_instances + cell_instances):
+                 self.assertEqual(instance, instances[i])
+ 
++    @testtools.skip('build requests filtering dupes break pagination')
+     @mock.patch.object(objects.BuildRequestList, 'get_by_filters')
+     @mock.patch.object(objects.CellMapping, 'get_by_uuid',
+                        side_effect=exception.CellMappingNotFound(uuid='fake'))
+@@ -4787,6 +4790,7 @@ class _ComputeAPIUnitTestMixIn(object):
+             for i, instance in enumerate(build_req_instances + cell_instances):
+                 self.assertEqual(instance, instances[i])
+ 
++    @testtools.skip('build requests filtering dupes break pagination')
+     @mock.patch.object(objects.BuildRequestList, 'get_by_filters')
+     @mock.patch.object(objects.CellMapping, 'get_by_uuid',
+                        side_effect=exception.CellMappingNotFound(uuid='fake'))
+@@ -4875,6 +4879,7 @@ class _ComputeAPIUnitTestMixIn(object):
+             for i, instance in enumerate(cell0_instances + cell_instances):
+                 self.assertEqual(instance, instances[i])
+ 
++    @testtools.skip('build requests filtering dupes break pagination')
+     @mock.patch.object(context, 'target_cell')
+     @mock.patch.object(objects.BuildRequestList, 'get_by_filters')
+     @mock.patch.object(objects.CellMapping, 'get_by_uuid')
+-- 
+2.7.4
+

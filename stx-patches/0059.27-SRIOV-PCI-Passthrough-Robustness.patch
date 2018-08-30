@@ -1,0 +1,434 @@
+From 308684fa4d53b23b665869db702319fcb8c41816 Mon Sep 17 00:00:00 2001
+From: "Beliveau, Ludovic" <Ludovic.Beliveau@windriver.com>
+Date: Mon, 4 May 2015 19:58:04 -0400
+Subject: [PATCH] SRIOV/PCI Passthrough  Robustness
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+This commit brings the following changes:
+- In compute API, removed re-allocating a new InstancePCIRequest with
+  is_new=True.  Logic in PciDevTracker will take allocate a new PCI Device
+  based on the existing InstancePCIRequest if needed.  This simplifies the
+  code.
+- On rebuild_instance, always get instance_nw_info based on Neutron update
+  (like on binding:profile).  The cache is not up to date during evacuation.
+- In Neutronv2 NetworkAPI, only update the Neutron port once when there are
+  many individual attributes to update.  Call to update_port are expensive.
+- Don’t save pci_requests in Instance DB object anymore.  Let’s the PCI
+  tracker do it and avoid potential problems.
+- Improved PCI device pool logging to better troubleshoot problems when they
+  appear.
+
+NOTE:  the instance.pci_requests field is not automatically
+loaded when loading an instance object from the DB, it is an optional
+field that needs to be specifically requested (since most of the time
+it's not needed).
+
+The fix is to explicitly load the PCI requests for the instance before
+going into the scheduler.
+
+Without this the instance will appear as though it has no PCI requests
+for cold migrate/resize/evacuate, which causes the scheduler to place it
+onto nodes that don't have the required resources.
+
+Change-Id: I150ccf127c473c5f74f227cf3a7bf61272571fe6
+---
+ nova/compute/api.py                   | 32 -------------------------
+ nova/compute/claims.py                |  5 ++--
+ nova/compute/manager.py               |  9 ++++---
+ nova/compute/resource_tracker.py      |  3 +--
+ nova/network/neutronv2/api.py         | 45 ++++++++++++++++-------------------
+ nova/objects/instance.py              |  5 ++--
+ nova/objects/instance_pci_requests.py |  7 ------
+ nova/pci/manager.py                   | 20 ++++++----------
+ nova/pci/request.py                   |  9 ++++---
+ nova/pci/stats.py                     | 30 +++++++++++++++++++++--
+ nova/scheduler/utils.py               |  4 ++++
+ 11 files changed, 74 insertions(+), 95 deletions(-)
+
+diff --git a/nova/compute/api.py b/nova/compute/api.py
+index b1dbee7..6e68c07 100644
+--- a/nova/compute/api.py
++++ b/nova/compute/api.py
+@@ -2756,22 +2756,6 @@ class API(base.Base):
+                                "scaled-down vCPUs.  Scale up and retry.")
+                     raise exception.ResizeError(reason=reason)
+ 
+-        network_info = self.network_api.get_instance_nw_info(context, instance)
+-        pci_requests = []
+-        for vif in network_info:
+-            if pci_utils.vif_model_pci_passthrough(vif['vif_model']):
+-                meta = vif['network']['meta']
+-                request = objects.InstancePCIRequest(
+-                    count=1,
+-                    is_new=True,
+-                    spec=[{pci_request.PCI_NET_TAG: meta['physical_network']}],
+-                    request_id=str(uuid.uuid4()))
+-                pci_requests.append(request)
+-
+-        instance.pci_requests = objects.InstancePCIRequests(
+-            requests=pci_requests,
+-            instance_uuid=instance.uuid)
+-
+         instance.task_state = task_states.RESIZE_PREP
+         instance.progress = 0
+         instance.update(extra_instance_updates)
+@@ -3425,22 +3409,6 @@ class API(base.Base):
+                           'expected to be down, but it was up.'), inst_host)
+             raise exception.ComputeServiceInUse(host=inst_host)
+ 
+-        network_info = self.network_api.get_instance_nw_info(context, instance)
+-        pci_requests = []
+-        for vif in network_info:
+-            if pci_utils.vif_model_pci_passthrough(vif['vif_model']):
+-                meta = vif['network']['meta']
+-                request = objects.InstancePCIRequest(
+-                    count=1,
+-                    is_new=True,
+-                    spec=[{pci_request.PCI_NET_TAG: meta['physical_network']}],
+-                    request_id=str(uuid.uuid4()))
+-                pci_requests.append(request)
+-
+-        instance.pci_requests = objects.InstancePCIRequests(
+-            requests=pci_requests,
+-            instance_uuid=instance.uuid)
+-
+         instance.task_state = task_states.REBUILDING
+         instance.save(expected_task_state=[None])
+         self._record_action_start(context, instance, instance_actions.EVACUATE)
+diff --git a/nova/compute/claims.py b/nova/compute/claims.py
+index d9a6290..69340a5 100644
+--- a/nova/compute/claims.py
++++ b/nova/compute/claims.py
+@@ -313,9 +313,8 @@ class ResizeClaim(Claim):
+             self.instance_type, self.image_meta)
+ 
+     def _test_pci(self):
+-        pci_requests = objects.InstancePCIRequests.\
+-                       get_by_instance_uuid_and_newness(
+-                           self.context, self.instance['uuid'], True)
++        pci_requests = objects.InstancePCIRequests.get_by_instance_uuid(
++            self.context, self.instance['uuid'])
+         if pci_requests.requests:
+             claim = self.tracker.pci_tracker.stats.support_requests(
+                 pci_requests.requests)
+diff --git a/nova/compute/manager.py b/nova/compute/manager.py
+index 781dfee..32e39f9 100644
+--- a/nova/compute/manager.py
++++ b/nova/compute/manager.py
+@@ -3112,9 +3112,12 @@ class ComputeManager(manager.Manager):
+                 self.network_api.setup_instance_network_on_host(
+                         context, instance, self.host)
+ 
+-            network_info = compute_utils.get_nw_info_for_instance(instance)
+-            if recreate:
+-                network_info = self._get_instance_nw_info(context, instance)
++            # Always use _get_instance_nw_info().  In the case
++            # of evacuate get_nw_info_for_instance() returns stale data
++            # from info_cache.  Call to _get_instance_nw_info will also
++            # save the refreshed data in database.
++            # network_info = compute_utils.get_nw_info_for_instance(instance)
++            network_info = self._get_instance_nw_info(context, instance)
+ 
+             if bdms is None:
+                 bdms = objects.BlockDeviceMappingList.get_by_instance_uuid(
+diff --git a/nova/compute/resource_tracker.py b/nova/compute/resource_tracker.py
+index 41e598c..19cfc80 100644
+--- a/nova/compute/resource_tracker.py
++++ b/nova/compute/resource_tracker.py
+@@ -924,8 +924,7 @@ class ResourceTracker(object):
+             usage = self._get_usage_dict(
+                         itype, numa_topology=numa_topology)
+             if self.pci_tracker:
+-                self.pci_tracker.update_pci_for_migration(context, instance,
+-                                                          incoming=incoming)
++                self.pci_tracker.update_pci_for_migration(context, instance)
+ 
+             self._update_usage(context, resources, usage)
+             if self.pci_tracker:
+diff --git a/nova/network/neutronv2/api.py b/nova/network/neutronv2/api.py
+index eaaa45d..cba6682 100644
+--- a/nova/network/neutronv2/api.py
++++ b/nova/network/neutronv2/api.py
+@@ -1714,40 +1714,35 @@ class API(base_api.NetworkAPI):
+         data = neutron.list_ports(**search_opts)
+         ports = data['ports']
+         for p in ports:
++            updates = {}
++
+             # If the host hasn't changed, like in the case of resizing to the
+             # same host, there is nothing to do.
+             if p.get('binding:host_id') != host:
++                updates.update({'port': {'binding:host_id': host}})
++
++            if p.get(constants.PORT_VIF_MODEL) == 'pci-sriov':
++                pci_dev = pci_manager.get_instance_pci_devs(
++                    instance, 'all').pop()
++                devspec = pci_whitelist.get_pci_device_devspec(pci_dev)
++                profile = {'pci_vendor_info': "%s:%s" %
++                                (pci_dev.vendor_id, pci_dev.product_id),
++                           'pci_slot': pci_dev.address,
++                           'physical_network':
++                                devspec.get_tags().get('physical_network')}
++
++                LOG.info("Updating PCI binding %s for port %s" %
++                         (profile, p['id']))
++                updates.update({'port': {'binding:profile': profile}})
++
++            if updates:
+                 try:
+-                    neutron.update_port(p['id'],
+-                                        {'port': {'binding:host_id': host}})
++                    neutron.update_port(p['id'], updates)
+                 except Exception:
+                     with excutils.save_and_reraise_exception():
+                         LOG.exception(_LE("Unable to update host of port %s"),
+                                       p['id'])
+ 
+-            if p.get(constants.PORT_VIF_MODEL) == 'pci-sriov':
+-                profile = None
+-                pci_requests = instance.pci_requests
+-                if pci_requests and pci_requests.requests:
+-                    pci_dev = pci_manager.get_instance_pci_devs(
+-                        instance, 'all').pop()
+-                    devspec = pci_whitelist.get_pci_device_devspec(pci_dev)
+-                    profile = {'pci_vendor_info': "%s:%s" %
+-                                    (pci_dev.vendor_id, pci_dev.product_id),
+-                               'pci_slot': pci_dev.address,
+-                               'physical_network':
+-                                    devspec.get_tags().get('physical_network')}
+-                if profile:
+-                    try:
+-                        neutron.update_port(p['id'],
+-                                            {'port':
+-                                                {'binding:profile': profile}})
+-                    except Exception:
+-                        with excutils.save_and_reraise_exception():
+-                            LOG.exception(
+-                                _LE("Unable to update host of port %s"),
+-                                p['id'])
+-
+ def _ensure_requested_network_ordering(accessor, unordered, preferred):
+     """Sort a list with respect to the preferred network ordering."""
+     if preferred:
+diff --git a/nova/objects/instance.py b/nova/objects/instance.py
+index 4576f0b..8166f19 100644
+--- a/nova/objects/instance.py
++++ b/nova/objects/instance.py
+@@ -690,9 +690,8 @@ class Instance(base.NovaPersistentObject, base.NovaObject,
+                     context, self.uuid)
+ 
+     def _save_pci_requests(self, context):
+-        if self.pci_requests and self.task_state == task_states.RESIZE_PREP:
+-            with self.pci_requests.obj_alternate_context(context):
+-                self.pci_requests.save()
++        # NOTE(danms): No need for this yet.
++        pass
+ 
+     def _save_pci_devices(self, context):
+         # NOTE(yjiang5): All devices held by PCI tracker, only PCI tracker
+diff --git a/nova/objects/instance_pci_requests.py b/nova/objects/instance_pci_requests.py
+index 2a07b14..d011586 100644
+--- a/nova/objects/instance_pci_requests.py
++++ b/nova/objects/instance_pci_requests.py
+@@ -101,13 +101,6 @@ class InstancePCIRequests(base.NovaObject,
+             db_pci_requests = db_pci_requests['pci_requests']
+         return cls.obj_from_db(context, instance_uuid, db_pci_requests)
+ 
+-    @classmethod
+-    def get_by_instance_uuid_and_newness(cls, context, instance_uuid, is_new):
+-        requests = cls.get_by_instance_uuid(context, instance_uuid)
+-        requests.requests = [x for x in requests.requests
+-                             if x.new == is_new]
+-        return requests
+-
+     @staticmethod
+     def _load_legacy_requests(sysmeta_value, is_new=False):
+         if sysmeta_value is None:
+diff --git a/nova/pci/manager.py b/nova/pci/manager.py
+index 59cb383..2e5402d 100644
+--- a/nova/pci/manager.py
++++ b/nova/pci/manager.py
+@@ -154,17 +154,12 @@ class PciDevTracker(object):
+             self.pci_devs.append(dev_obj)
+             self.stats.add_device(dev_obj)
+ 
+-    def _claim_instance(self, context, instance, is_new=False):
+-        PCIrequest = objects.InstancePCIRequests
+-        if is_new:
+-            pci_requests = PCIrequest.get_by_instance_uuid_and_newness(context,
+-                instance['uuid'],
+-                is_new=True)
+-        else:
+-            pci_requests = PCIrequest.get_by_instance(context, instance)
+-
+-        if not pci_requests.requests:
++    def _claim_instance(self, context, instance):
++        pci_requests = objects.InstancePCIRequests.get_by_instance(context,
++                                                                   instance)
++        if not pci_requests or not pci_requests.requests:
+             return None
++
+         instance_numa_topology = hardware.instance_topology_from_instance(
+             instance)
+         instance_cells = None
+@@ -239,8 +234,7 @@ class PciDevTracker(object):
+                 self._allocate_instance(instance, devs)
+                 self.allocations[uuid] = devs
+ 
+-    def update_pci_for_migration(self, context, instance,
+-                                 sign=1, incoming=False):
++    def update_pci_for_migration(self, context, instance, sign=1):
+         """Update instance's pci usage information when it is migrated.
+ 
+         The caller should hold the COMPUTE_RESOURCE_SEMAPHORE lock.
+@@ -253,7 +247,7 @@ class PciDevTracker(object):
+         if sign == 1 and uuid not in self.claims:
+             if task_state == task_states.RESIZE_PREP:
+                 instance['pci_devices'] = PciDeviceList()
+-                devs = self._claim_instance(context, instance, 'new_')
++                devs = self._claim_instance(context, instance)
+                 if devs:
+                     self._allocate_instance(instance, devs)
+                     self.allocations[uuid] = devs
+diff --git a/nova/pci/request.py b/nova/pci/request.py
+index d245a4e..3251033 100644
+--- a/nova/pci/request.py
++++ b/nova/pci/request.py
+@@ -132,7 +132,7 @@ def _get_alias_from_config():
+     return aliases
+ 
+ 
+-def _translate_alias_to_requests(alias_spec, is_new=False):
++def _translate_alias_to_requests(alias_spec):
+     """Generate complete pci requests from pci aliases in extra_spec."""
+ 
+     pci_aliases = _get_alias_from_config()
+@@ -146,13 +146,12 @@ def _translate_alias_to_requests(alias_spec, is_new=False):
+             request = objects.InstancePCIRequest(
+                 count=int(count),
+                 spec=copy.deepcopy(pci_aliases[name]),
+-                alias_name=name,
+-                is_new=is_new)
++                alias_name=name)
+             pci_requests.append(request)
+     return pci_requests
+ 
+ 
+-def get_pci_requests_from_flavor(flavor, is_new=False):
++def get_pci_requests_from_flavor(flavor):
+     """Get flavor's pci request.
+ 
+     The pci_passthrough:alias scope in flavor extra_specs
+@@ -190,5 +189,5 @@ def get_pci_requests_from_flavor(flavor, is_new=False):
+     if ('extra_specs' in flavor and
+             'pci_passthrough:alias' in flavor['extra_specs']):
+         pci_requests = _translate_alias_to_requests(
+-            flavor['extra_specs']['pci_passthrough:alias'], is_new)
++            flavor['extra_specs']['pci_passthrough:alias'])
+     return objects.InstancePCIRequests(requests=pci_requests)
+diff --git a/nova/pci/stats.py b/nova/pci/stats.py
+index 8eb5da0..6388007 100644
+--- a/nova/pci/stats.py
++++ b/nova/pci/stats.py
+@@ -60,6 +60,23 @@ class PciDeviceStats(object):
+                       for pci_pool in stats] if stats else []
+         self.pools.sort(self.pool_cmp)
+ 
++    @staticmethod
++    def _pools_prettyprint(pools):
++        _pools = "\n"
++        for pool in pools:
++            devices = []
++            if 'devices' in pool.keys():
++                devices = [str(device.address) for device in pool['devices']]
++            else:
++                devices = pool['count']
++
++            _pools += '{}.{}.{}.{}:{}\n'.format(pool['vendor_id'],
++                                                pool['product_id'],
++                                                pool['numa_node'],
++                                                pool['physical_network'],
++                                                devices)
++        return _pools
++
+     def _equal_properties(self, dev, entry, matching_keys):
+         return all(dev.get(prop) == entry.get(prop)
+                    for prop in matching_keys)
+@@ -93,6 +110,7 @@ class PciDeviceStats(object):
+ 
+     def add_device(self, dev):
+         """Add a device to its matching pool."""
++        LOG.info("Adding device %s" % dev.address)
+         dev_pool = self._create_pool_keys_from_dev(dev)
+         if dev_pool:
+             pool = self._find_pool(dev_pool)
+@@ -104,6 +122,7 @@ class PciDeviceStats(object):
+                 pool = dev_pool
+             pool['count'] += 1
+             pool['devices'].append(dev)
++        LOG.info("Pool is now: %s" % self._pools_prettyprint(self.pools))
+ 
+     @staticmethod
+     def _decrease_pool_count(pool_list, pool, count=1):
+@@ -121,6 +140,7 @@ class PciDeviceStats(object):
+ 
+     def remove_device(self, dev):
+         """Remove one device from the first pool that it matches."""
++        LOG.info("Removing device %s" % dev.address)
+         dev_pool = self._create_pool_keys_from_dev(dev)
+         if dev_pool:
+             pool = self._find_pool(dev_pool)
+@@ -129,6 +149,7 @@ class PciDeviceStats(object):
+                     compute_node_id=dev.compute_node_id, address=dev.address)
+             pool['devices'].remove(dev)
+             self._decrease_pool_count(self.pools, pool)
++        LOG.info("Pool is now: %s" % self._pools_prettyprint(self.pools))
+ 
+     def get_free_devs(self):
+         free_devs = []
+@@ -172,6 +193,9 @@ class PciDeviceStats(object):
+                     alloc_devices.append(pci_dev)
+                 if count == 0:
+                     break
++        LOG.info("Allocated devices %s, pool is now: %s" %
++                 ([str(dev.address) for dev in alloc_devices],
++                 self._pools_prettyprint(self.pools)))
+         return alloc_devices
+ 
+     @staticmethod
+@@ -196,11 +220,13 @@ class PciDeviceStats(object):
+ 
+         count = request.count
+         matching_pools = self._filter_pools_for_spec(pools, request.spec)
+-        LOG.info("matching_pools: %s" % matching_pools)
++        LOG.info("matching_pools: %s" %
++                 self._pools_prettyprint(matching_pools))
+         if numa_cells:
+             matching_pools = self._filter_pools_for_numa_cells(matching_pools,
+                                                           numa_cells)
+-        LOG.info("matching_pools with numa_cells: %s" % matching_pools)
++        LOG.info("matching_pools with numa_cells: %s" %
++                 self._pools_prettyprint(matching_pools))
+         if sum([pool['count'] for pool in matching_pools]) < count:
+             return False
+         else:
+diff --git a/nova/scheduler/utils.py b/nova/scheduler/utils.py
+index 446aa86..c986343 100644
+--- a/nova/scheduler/utils.py
++++ b/nova/scheduler/utils.py
+@@ -99,6 +99,10 @@ def build_request_spec(ctxt, image, instances, instance_type=None):
+         else:
+             instance_type = flavors.extract_flavor(instance)
+ 
++    # We're going into the scheduler, so query the DB for any pci
++    # requests for this instance so that we can take them into account.
++    instance._load_pci_requests()
++
+     if isinstance(instance, objects.Instance):
+         instance = instance_obj.compat_instance(instance)
+ 
+-- 
+2.7.4
+

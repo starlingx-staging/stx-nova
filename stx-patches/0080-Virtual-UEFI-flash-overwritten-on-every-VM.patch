@@ -1,0 +1,210 @@
+From 590b9a66d4e957e96dbdbc0d4bc41c288dbe80f2 Mon Sep 17 00:00:00 2001
+From: Jack Ding <jack.ding@windriver.com>
+Date: Thu, 21 Dec 2017 16:24:40 -0500
+Subject: [PATCH 080/143] Virtual UEFI flash overwritten on every VM start
+
+Issue: UEFI variable store is not persistent during stop/start
+and cold migrate.
+
+Solution:
+Set nvram file for UEFI variable store to instance folder
+/etc/nova/instances/<UUID> instead of default folder
+/var/lib/libvirt/qemu/nvram/.
+
+When instance is initiated, nvram in xml file looks like this:
+<nvram>/etc/nova/instances/<UUID>/instance-00000012_VARS.fd</nvram>
+
+qemu will create the file
+/etc/nova/instances/<UUID>/instance-00000012_VARS.fd
+by copying from master nvram file specified in qemu config.
+
+Upon a cold migrate or resize, this file will be migrated over to target
+node.  Upon a stop/start or cold-migrate/resize, the file is preserved and
+reused by constructing xml like the following.
+<nvram
+template='/etc/nova/instances/<UUID>/instance-00000012_VARS.fd'
+>/etc/nova/instances/<UUID>/instance-00000012_VARS.fd</nvram>
+The template option basically tells qemu to copy the file to itself.
+
+__TYPE_upstreamable
+---
+ nova/tests/unit/virt/libvirt/fake_libvirt_utils.py |  4 ++++
+ nova/tests/unit/virt/libvirt/test_config.py        |  2 ++
+ nova/tests/unit/virt/libvirt/test_driver.py        |  2 +-
+ nova/virt/libvirt/config.py                        |  7 ++++++
+ nova/virt/libvirt/driver.py                        | 27 ++++++++++++++++++----
+ nova/virt/libvirt/guest.py                         |  7 ++++--
+ 6 files changed, 41 insertions(+), 8 deletions(-)
+
+diff --git a/nova/tests/unit/virt/libvirt/fake_libvirt_utils.py b/nova/tests/unit/virt/libvirt/fake_libvirt_utils.py
+index ff6f161..de3eaa5 100644
+--- a/nova/tests/unit/virt/libvirt/fake_libvirt_utils.py
++++ b/nova/tests/unit/virt/libvirt/fake_libvirt_utils.py
+@@ -192,3 +192,7 @@ def last_bytes(file_like_object, num):
+ 
+ def assign_floating_cpusets(domain, instance):
+     pass
++
++
++def path_exists(path):
++    pass
+diff --git a/nova/tests/unit/virt/libvirt/test_config.py b/nova/tests/unit/virt/libvirt/test_config.py
+index f19eb75..be2eded 100644
+--- a/nova/tests/unit/virt/libvirt/test_config.py
++++ b/nova/tests/unit/virt/libvirt/test_config.py
+@@ -2260,6 +2260,7 @@ class LibvirtConfigGuestTest(LibvirtConfigBaseTest):
+         obj.os_type = "x86_64"
+         obj.os_loader = '/tmp/OVMF_CODE.fd'
+         obj.os_loader_type = 'pflash'
++        obj.os_nvram = '/foo/bar/instance-00000012_VARS.fd'
+         xml = obj.to_xml()
+ 
+         self.assertXmlEqual(xml, """
+@@ -2271,6 +2272,7 @@ class LibvirtConfigGuestTest(LibvirtConfigBaseTest):
+               <os>
+                 <type>x86_64</type>
+                 <loader readonly='yes' type='pflash'>/tmp/OVMF_CODE.fd</loader>
++                <nvram>/foo/bar/instance-00000012_VARS.fd</nvram>
+                 <bios rebootTimeout="5000"/>
+               </os>
+             </domain>""")
+diff --git a/nova/tests/unit/virt/libvirt/test_driver.py b/nova/tests/unit/virt/libvirt/test_driver.py
+index a21bb3e..1d8ed20 100755
+--- a/nova/tests/unit/virt/libvirt/test_driver.py
++++ b/nova/tests/unit/virt/libvirt/test_driver.py
+@@ -12789,7 +12789,7 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+             self.assertTrue(disks[name].cache.called)
+ 
+         mock_destroy.assert_called_once_with(instance)
+-        mock_undefine.assert_called_once_with(instance)
++        mock_undefine.assert_called_once_with(instance, keep_nvram=True)
+ 
+         mock_create_domain_and_network.assert_called_once_with(self.context,
+             dummyxml, instance, network_info,
+diff --git a/nova/virt/libvirt/config.py b/nova/virt/libvirt/config.py
+index 3a009ec..ac0eb57 100644
+--- a/nova/virt/libvirt/config.py
++++ b/nova/virt/libvirt/config.py
+@@ -2321,6 +2321,8 @@ class LibvirtConfigGuest(LibvirtConfigObject):
+         self.metadata = []
+         self.idmaps = []
+         self.perf_events = []
++        self.os_nvram = None
++        self.os_nvram_template = None
+ 
+     def _format_basic_props(self, root):
+         root.append(self._text_node("uuid", self.uuid))
+@@ -2360,6 +2362,11 @@ class LibvirtConfigGuest(LibvirtConfigObject):
+                 loader.set("type", "pflash")
+                 loader.set("readonly", "yes")
+                 os.append(loader)
++                nvram = self._text_node("nvram", self.os_nvram)
++                # preserve existing UEFI variable store file
++                if self.os_nvram_template:
++                    nvram.set("template", self.os_nvram_template)
++                os.append(nvram)
+             else:
+                 os.append(self._text_node("loader", self.os_loader))
+         if self.os_initrd is not None:
+diff --git a/nova/virt/libvirt/driver.py b/nova/virt/libvirt/driver.py
+index df17b89..a7644a2 100644
+--- a/nova/virt/libvirt/driver.py
++++ b/nova/virt/libvirt/driver.py
+@@ -1050,12 +1050,12 @@ class LibvirtDriver(driver.ComputeDriver):
+         if not destroy_disks:
+             self._cleanup_lvm(instance, preserve_disk_filter="Resize")
+ 
+-    def _undefine_domain(self, instance):
++    def _undefine_domain(self, instance, keep_nvram=False):
+         try:
+             guest = self._host.get_guest(instance)
+             try:
+                 support_uefi = self._has_uefi_support()
+-                guest.delete_configuration(support_uefi)
++                guest.delete_configuration(support_uefi, keep_nvram=keep_nvram)
+             except libvirt.libvirtError as e:
+                 with excutils.save_and_reraise_exception() as ctxt:
+                     errcode = e.get_error_code()
+@@ -1475,7 +1475,7 @@ class LibvirtDriver(driver.ComputeDriver):
+             #             re-defined regardless.
+             if guest.has_persistent_configuration():
+                 support_uefi = self._has_uefi_support()
+-                guest.delete_configuration(support_uefi)
++                guest.delete_configuration(support_uefi, keep_nvram=True)
+ 
+             try:
+                 # Start copy with VIR_DOMAIN_BLOCK_REBASE_REUSE_EXT flag to
+@@ -2095,7 +2095,7 @@ class LibvirtDriver(driver.ComputeDriver):
+             #             re-defined regardless.
+             if guest.has_persistent_configuration():
+                 support_uefi = self._has_uefi_support()
+-                guest.delete_configuration(support_uefi)
++                guest.delete_configuration(support_uefi, keep_nvram=True)
+ 
+             # NOTE (rmk): Establish a temporary mirror of our root disk and
+             #             issue an abort once we have a complete copy.
+@@ -2680,7 +2680,8 @@ class LibvirtDriver(driver.ComputeDriver):
+         # Domain XML will be redefined so we can safely undefine it
+         # from libvirt. This ensure that such process as create serial
+         # console for guest will run smoothly.
+-        self._undefine_domain(instance)
++        # preserve existing UEFI variable store file
++        self._undefine_domain(instance, keep_nvram=True)
+ 
+         # Convert the system metadata to image metadata
+         # NOTE(mdbooth): This is a workaround for stateless Nova compute
+@@ -4990,6 +4991,14 @@ class LibvirtDriver(driver.ComputeDriver):
+                     guest.os_loader = DEFAULT_UEFI_LOADER_PATH[
+                         caps.host.cpu.arch]
+                     guest.os_loader_type = "pflash"
++                    guest.os_nvram = "%s/%s_VARS.fd" % (
++                        libvirt_utils.get_instance_path(instance),
++                        instance.name)
++                    # preserve existing UEFI variable store file.
++                    # If the file does not exist, qemu will create it by
++                    # copying from master nvram file specified in qemu config.
++                    if libvirt_utils.path_exists(guest.os_nvram):
++                        guest.os_nvram_template = guest.os_nvram
+                 else:
+                     raise exception.UEFINotSupported()
+             guest.os_mach_type = self._get_machine_type(image_meta, caps)
+@@ -8593,6 +8602,14 @@ class LibvirtDriver(driver.ComputeDriver):
+                                              host=dest, on_execute=on_execute,
+                                              on_completion=on_completion)
+ 
++            # Migrate UEFI variable store file
++            nvram_file = "%s/%s_VARS.fd" % (inst_base_resize, instance.name)
++            if libvirt_utils.path_exists(nvram_file):
++                LOG.info("Moving the UEFI variable store file %s", nvram_file)
++                libvirt_utils.copy_image(nvram_file,
++                                         inst_base,
++                                         host=dest, on_execute=on_execute,
++                                         on_completion=on_completion)
+         except Exception:
+             with excutils.save_and_reraise_exception():
+                 self._cleanup_remote_migration(dest, inst_base,
+diff --git a/nova/virt/libvirt/guest.py b/nova/virt/libvirt/guest.py
+index 97c8758..6792a0f 100755
+--- a/nova/virt/libvirt/guest.py
++++ b/nova/virt/libvirt/guest.py
+@@ -306,12 +306,15 @@ class Guest(object):
+         if vcpus is not None and len(vcpus) > 1:
+             return vcpus[1]
+ 
+-    def delete_configuration(self, support_uefi=False):
++    def delete_configuration(self, support_uefi=False, keep_nvram=False):
+         """Undefines a domain from hypervisor."""
+         try:
+             flags = libvirt.VIR_DOMAIN_UNDEFINE_MANAGED_SAVE
+             if support_uefi:
+-                flags |= libvirt.VIR_DOMAIN_UNDEFINE_NVRAM
++                if keep_nvram:
++                    flags |= libvirt.VIR_DOMAIN_UNDEFINE_KEEP_NVRAM
++                else:
++                    flags |= libvirt.VIR_DOMAIN_UNDEFINE_NVRAM
+             self._domain.undefineFlags(flags)
+         except libvirt.libvirtError:
+             LOG.debug("Error from libvirt during undefineFlags. %d"
+-- 
+2.7.4
+

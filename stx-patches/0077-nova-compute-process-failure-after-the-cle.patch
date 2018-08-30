@@ -1,0 +1,49 @@
+From d565ace208ebe62198e5c693ad1a18d025d81d7a Mon Sep 17 00:00:00 2001
+From: Jim Gauld <james.gauld@windriver.com>
+Date: Wed, 6 Dec 2017 16:35:05 -0500
+Subject: [PATCH 077/143] nova-compute process failure after the
+ cleanup from evacuate
+
+Handle exception in nova-compute init_host _destroy_evacuated_instances
+in the case where compute comes up after the successful evacuation and
+then deletion of an instance.
+
+Any code that touches the deleted instance will fail, so this is a
+catch-all so we do not end up with a dead compute. There are subsequent
+audits that finalize the cleanup of deleted instances, ports, and disk.
+
+__TYPE_single
+---
+ nova/compute/manager.py | 16 +++++++++++++---
+ 1 file changed, 13 insertions(+), 3 deletions(-)
+
+diff --git a/nova/compute/manager.py b/nova/compute/manager.py
+index d8f8f2a..85f4856 100644
+--- a/nova/compute/manager.py
++++ b/nova/compute/manager.py
+@@ -701,9 +701,19 @@ class ComputeManager(manager.Manager):
+                          instance=instance)
+                 # always destroy disks if the instance was deleted
+                 destroy_disks = True
+-            self.driver.destroy(context, instance,
+-                                network_info,
+-                                bdi, destroy_disks)
++
++            # - We cannot recover if this fails.
++            try:
++                self.driver.destroy(context, instance,
++                                    network_info,
++                                    bdi, destroy_disks)
++            except exception.InstanceNotFound as e:
++                LOG.error("Failed to destroy evacuated instance, error=%s",
++                          e, instance=instance)
++                migration.status = 'completed'
++                migration.save()
++                # Skip any subsequent cleanup that requires 'instance'.
++                continue
+ 
+             # delete the allocation of the evacuated instance from this host
+             if migration.source_node not in compute_nodes:
+-- 
+2.7.4
+

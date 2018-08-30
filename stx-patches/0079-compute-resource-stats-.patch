@@ -1,0 +1,94 @@
+From fc71169327183cb60fc528a9016660441652a10d Mon Sep 17 00:00:00 2001
+From: Jim Gauld <james.gauld@windriver.com>
+Date: Thu, 21 Dec 2017 12:40:17 -0500
+Subject: [PATCH 079/143] compute resource stats periodically wiped
+
+This removes resource_tracker calls to _update() during
+_init_compute_node() so that we do not persist incorrect host
+numa_topology data in the database and to the scheduler for a period
+during the resource tracker audit. The host numa_topology usage gets
+cleared by _copy_resources() and only is correct once the usage is
+recalculated by resource tracker audit. This removes a redundant
+database update during the audit.
+
+This appears to be an upstream bug.
+
+__TYPE_upstreamable
+---
+ nova/compute/resource_tracker.py                 | 10 ++++++++--
+ nova/tests/unit/compute/test_resource_tracker.py | 12 ++++--------
+ 2 files changed, 12 insertions(+), 10 deletions(-)
+
+diff --git a/nova/compute/resource_tracker.py b/nova/compute/resource_tracker.py
+index ce74168..df77dbf 100644
+--- a/nova/compute/resource_tracker.py
++++ b/nova/compute/resource_tracker.py
+@@ -845,7 +845,10 @@ class ResourceTracker(object):
+             cn = self.compute_nodes[nodename]
+             self._copy_resources(cn, resources)
+             self._setup_pci_tracker(context, cn, resources)
+-            self._update(context, cn)
++            # Do not update database here by calling _update().
++            # The host numa_topology usage was cleared by _copy_resources(),
++            # and we need this recalculated by resource tracker audit.
++            # self._update(context, cn)
+             return
+ 
+         # now try to get the compute node record from the
+@@ -855,7 +858,10 @@ class ResourceTracker(object):
+             self.compute_nodes[nodename] = cn
+             self._copy_resources(cn, resources)
+             self._setup_pci_tracker(context, cn, resources)
+-            self._update(context, cn)
++            # Do not update database here by calling _update().
++            # The host numa_topology usage was cleared by _copy_resources(),
++            # and we need this recalculated by resource tracker audit.
++            # self._update(context, cn)
+             return
+ 
+         # there was no local copy and none in the database
+diff --git a/nova/tests/unit/compute/test_resource_tracker.py b/nova/tests/unit/compute/test_resource_tracker.py
+index 453ea18..58df23c 100644
+--- a/nova/tests/unit/compute/test_resource_tracker.py
++++ b/nova/tests/unit/compute/test_resource_tracker.py
+@@ -994,9 +994,8 @@ class TestInitComputeNode(BaseTestCase):
+     @mock.patch('nova.objects.ComputeNode.create')
+     @mock.patch('nova.objects.Service.get_by_compute_host')
+     @mock.patch('nova.objects.ComputeNode.get_by_host_and_nodename')
+-    @mock.patch('nova.compute.resource_tracker.ResourceTracker.'
+-                '_update')
+-    def test_no_op_init_compute_node(self, update_mock, get_mock, service_mock,
++    # - remove _update mock
++    def test_no_op_init_compute_node(self, get_mock, service_mock,
+                                      create_mock, pci_mock):
+         self._setup_rt()
+ 
+@@ -1010,15 +1009,13 @@ class TestInitComputeNode(BaseTestCase):
+         self.assertFalse(get_mock.called)
+         self.assertFalse(create_mock.called)
+         self.assertTrue(pci_mock.called)
+-        self.assertTrue(update_mock.called)
+ 
+     @mock.patch('nova.objects.PciDeviceList.get_by_compute_node',
+                 return_value=objects.PciDeviceList())
+     @mock.patch('nova.objects.ComputeNode.create')
+     @mock.patch('nova.objects.ComputeNode.get_by_host_and_nodename')
+-    @mock.patch('nova.compute.resource_tracker.ResourceTracker.'
+-                '_update')
+-    def test_compute_node_loaded(self, update_mock, get_mock, create_mock,
++    # - remove _update mock
++    def test_compute_node_loaded(self, get_mock, create_mock,
+                                  pci_mock):
+         self._setup_rt()
+ 
+@@ -1034,7 +1031,6 @@ class TestInitComputeNode(BaseTestCase):
+         get_mock.assert_called_once_with(mock.sentinel.ctx, _HOSTNAME,
+                                          _NODENAME)
+         self.assertFalse(create_mock.called)
+-        self.assertTrue(update_mock.called)
+ 
+     @mock.patch('nova.objects.PciDeviceList.get_by_compute_node',
+                 return_value=objects.PciDeviceList(objects=[]))
+-- 
+2.7.4
+

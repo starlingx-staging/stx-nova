@@ -1,0 +1,1078 @@
+From 6b534a69b5358b1aa589010972b3370787149629 Mon Sep 17 00:00:00 2001
+From: Daniel Chavolla <daniel.chavolla@windriver.com>
+Date: Wed, 17 Jan 2018 21:32:59 -0500
+Subject: [PATCH 084/143] Claim and report zero root disk for
+ boot-from-volume instances
+
+porting of upstream commit 795eb94e7cc47b34c4
+Claim and report zero root disk for boot-from-volume instances:
+https://git.openstack.org/cgit/openstack/nova/commit/?id=795eb94e7cc47b34c4b43899cdda4ecc4a388dc9
+
+Prior to the Pike rebase, we used to deal with this issue by having a
+root_gb field in the Instance object, and using that field to claim and
+report disk usage instead of looking at flavor.root_gb
+
+This upstream commit rather makes a shadow instance object with adjusted
+root_gb in the resource tracker. It uses that shadow instance for
+tracking purposes but preserves the original flavor.root_gb in the database
+
+__TYPE_upstream
+---
+ nova/compute/resource_tracker.py                 | 126 ++++++++++++++-----
+ nova/scheduler/client/report.py                  |   5 +
+ nova/tests/functional/api/client.py              |   3 +-
+ nova/tests/functional/test_boot_from_volume.py   | 152 +++++++++++++++++++++++
+ nova/tests/unit/compute/test_compute_mgr.py      |   5 +-
+ nova/tests/unit/compute/test_resource_tracker.py | 149 ++++++++++++++++++----
+ nova/tests/unit/volume/fake.py                   |  78 ++++++++++++
+ 7 files changed, 465 insertions(+), 53 deletions(-)
+ create mode 100644 nova/tests/functional/test_boot_from_volume.py
+ create mode 100644 nova/tests/unit/volume/fake.py
+
+diff --git a/nova/compute/resource_tracker.py b/nova/compute/resource_tracker.py
+index df77dbf..06d6344 100644
+--- a/nova/compute/resource_tracker.py
++++ b/nova/compute/resource_tracker.py
+@@ -304,6 +304,33 @@ class ResourceTracker(object):
+         cn = self.compute_nodes[nodename]
+         self._put_compat_cpu(instance, cpu, cn)
+ 
++    def _copy_if_bfv(self, instance, instance_type=None):
++        instance_copy = None
++        instance_type_copy = None
++        if instance.is_volume_backed():
++            instance_copy = instance.obj_clone()
++            instance_copy.flavor.root_gb = 0
++            if instance_type is not None:
++                instance_type_copy = instance_type.obj_clone()
++                instance_type_copy.root_gb = 0
++        if instance_copy is None:
++            # If we didn't need to clone the object, use original
++            instance_copy = instance
++        if instance_type_copy is None:
++            # If we didn't need to clone the object, use original
++            instance_type_copy = instance_type
++        return instance_copy, instance_type_copy
++
++    def _copy_instance_type_if_bfv(self, instance, instance_type):
++        instance_type_copy = None
++        if instance.is_volume_backed():
++            instance_type_copy = instance_type.obj_clone()
++            instance_type_copy.root_gb = 0
++        if instance_type_copy is None:
++            # If we didn't need to clone the object, use original
++            instance_type_copy = instance_type
++        return instance_type_copy
++
+     @utils.synchronized(COMPUTE_RESOURCE_SEMAPHORE)
+     def instance_claim(self, context, instance, nodename, limits=None):
+         """Indicate that some resources are needed for an upcoming compute
+@@ -345,22 +372,26 @@ class ResourceTracker(object):
+                         "until resources have been claimed.",
+                         instance=instance)
+ 
++        # TODO(melwitt/jaypipes): Remove this after resource-providers can
++        # handle claims and reporting for boot-from-volume.
++        inst_copy_zero_disk, _ = self._copy_if_bfv(instance)
++
+         # get the overhead required to build this instance:
+-        overhead = self.driver.estimate_instance_overhead(instance)
++        overhead = self.driver.estimate_instance_overhead(inst_copy_zero_disk)
+         LOG.debug("Memory overhead for %(flavor)d MB instance; %(overhead)d "
+-                  "MB", {'flavor': instance.flavor.memory_mb,
++                  "MB", {'flavor': inst_copy_zero_disk.flavor.memory_mb,
+                           'overhead': overhead['memory_mb']})
+         LOG.debug("Disk overhead for %(flavor)d GB instance; %(overhead)d "
+-                  "GB", {'flavor': instance.flavor.root_gb,
++                  "GB", {'flavor': inst_copy_zero_disk.flavor.root_gb,
+                          'overhead': overhead.get('disk_gb', 0)})
+         LOG.debug("CPU overhead for %(flavor)d vCPUs instance; %(overhead)d "
+-                  "vCPU(s)", {'flavor': instance.flavor.vcpus,
++                  "vCPU(s)", {'flavor': inst_copy_zero_disk.flavor.vcpus,
+                               'overhead': overhead.get('vcpus', 0)})
+ 
+         cn = self.compute_nodes[nodename]
+         pci_requests = objects.InstancePCIRequests.get_by_instance_uuid(
+             context, instance.uuid)
+-        claim = claims.Claim(context, instance, nodename, self, cn,
++        claim = claims.Claim(context, inst_copy_zero_disk, nodename, self, cn,
+                              pci_requests, overhead=overhead, limits=limits)
+ 
+         # self._set_instance_host_and_node() will save instance to the DB
+@@ -369,11 +400,16 @@ class ResourceTracker(object):
+         # so that the resource audit knows about any cpus we've pinned.
+         instance_numa_topology = claim.claimed_numa_topology
+         instance.numa_topology = instance_numa_topology
++        inst_copy_zero_disk.numa_topology = instance_numa_topology
++        # NOTE(melwitt): We don't pass the copy with zero disk here to avoid
++        # saving instance.flavor.root_gb=0 to the database.
+         self._set_instance_host_and_node(instance, nodename)
+ 
+         if self.pci_tracker:
+             # NOTE(jaypipes): ComputeNode.pci_device_pools is set below
+             # in _update_usage_from_instance().
++            #  NOTE(melwitt): We don't pass the copy with zero disk here to
++            # avoid saving instance.flavor.root_gb=0 to the database.
+             self.pci_tracker.claim_instance(context, instance, pci_requests,
+                                             instance_numa_topology)
+ 
+@@ -389,8 +425,8 @@ class ResourceTracker(object):
+         self.tracked_in_progress.append(instance.uuid)
+ 
+         # Mark resources in-use and update stats
+-        self._update_usage_from_instance(context, instance, nodename,
+-                                         strict=True)
++        self._update_usage_from_instance(context, inst_copy_zero_disk,
++                                         nodename, strict=True)
+ 
+         elevated = context.elevated()
+         # persist changes to the compute node:
+@@ -451,12 +487,16 @@ class ResourceTracker(object):
+         should be turned into finalize  a resource claim or free
+         resources after the compute operation is finished.
+         """
++        # TODO(melwitt/jaypipes): Remove this after resource-providers can
++        # handle claims and reporting for boot-from-volume.
++        inst_copy_zero_disk, new_itype_copy_zero_disk = self._copy_if_bfv(
++            instance, new_instance_type)
+         image_meta = image_meta or {}
+         if migration:
+             self._claim_existing_migration(migration, nodename)
+         else:
+-            migration = self._create_migration(context, instance,
+-                                               new_instance_type,
++            migration = self._create_migration(context, inst_copy_zero_disk,
++                                               new_itype_copy_zero_disk,
+                                                nodename, move_type)
+ 
+         if self.disabled(nodename):
+@@ -465,15 +505,16 @@ class ResourceTracker(object):
+             return claims.NopClaim(migration=migration)
+ 
+         # get memory overhead required to build this instance:
+-        overhead = self.driver.estimate_instance_overhead(new_instance_type)
++        overhead = self.driver.estimate_instance_overhead(
++            new_itype_copy_zero_disk)
+         LOG.debug("Memory overhead for %(flavor)d MB instance; %(overhead)d "
+-                  "MB", {'flavor': new_instance_type.memory_mb,
++                  "MB", {'flavor': new_itype_copy_zero_disk.memory_mb,
+                           'overhead': overhead['memory_mb']})
+         LOG.debug("Disk overhead for %(flavor)d GB instance; %(overhead)d "
+-                  "GB", {'flavor': instance.flavor.root_gb,
++                  "GB", {'flavor': new_itype_copy_zero_disk.root_gb,
+                          'overhead': overhead.get('disk_gb', 0)})
+         LOG.debug("CPU overhead for %(flavor)d vCPUs instance; %(overhead)d "
+-                  "vCPU(s)", {'flavor': instance.flavor.vcpus,
++                  "vCPU(s)", {'flavor': new_itype_copy_zero_disk.vcpus,
+                               'overhead': overhead.get('vcpus', 0)})
+ 
+         cn = self.compute_nodes[nodename]
+@@ -482,6 +523,8 @@ class ResourceTracker(object):
+         # there was no change on resize. This will cause allocating
+         # the old/new pci device in the resize phase. In the future
+         # we would like to optimise this.
++        # NOTE(melwitt): We don't pass the copy with zero disk here to avoid
++        # saving root_gb=0 to the database.
+         new_pci_requests = pci_request.get_pci_requests_from_flavor(
+             new_instance_type)
+         new_pci_requests.instance_uuid = instance.uuid
+@@ -493,9 +536,9 @@ class ResourceTracker(object):
+             for request in instance.pci_requests.requests:
+                 if request.alias_name is None:
+                     new_pci_requests.requests.append(request)
+-        claim = claims.MoveClaim(context, instance, nodename,
+-                                 new_instance_type, image_meta, self, cn,
+-                                 new_pci_requests, overhead=overhead,
++        claim = claims.MoveClaim(context, inst_copy_zero_disk, nodename,
++                                 new_itype_copy_zero_disk, image_meta, self,
++                                 cn, new_pci_requests, overhead=overhead,
+                                  limits=limits)
+ 
+         claim.migration = migration
+@@ -545,12 +588,13 @@ class ResourceTracker(object):
+             instance=instance)
+ 
+         instance.migration_context = mig_context
++        inst_copy_zero_disk.migration_context = mig_context
+         instance.save()
+ 
+         # Mark the resources in-use for the resize landing on this
+         # compute host:
+-        self._update_usage_from_migration(context, instance, migration,
+-                                          nodename, strict=True)
++        self._update_usage_from_migration(context, inst_copy_zero_disk,
++                                          migration, nodename, strict=True)
+         elevated = context.elevated()
+         self._update(elevated, cn)
+ 
+@@ -706,8 +750,12 @@ class ResourceTracker(object):
+                                                         migration)
+ 
+             if instance_type is not None:
++                # TODO(melwitt/jaypipes): Remove this after resource-providers
++                # can handle claims and reporting for boot-from-volume.
++                itype_copy = self._copy_instance_type_if_bfv(instance,
++                                                             instance_type)
+                 usage = self._get_usage_dict(
+-                        instance_type, numa_topology=numa_topology)
++                        itype_copy, numa_topology=numa_topology)
+                 self._drop_pci_devices(instance, nodename, prefix)
+                 # non-strict pinning accounting when freeing
+                 self._update_usage(usage, nodename, sign=-1, strict=False,
+@@ -726,8 +774,12 @@ class ResourceTracker(object):
+ 
+             if not instance_type:
+                 instance_type = instance.flavor
++            # TODO(melwitt/jaypipes): Remove this after resource-providers
++            # can handle claims and reporting for boot-from-volume.
++            itype_copy = self._copy_instance_type_if_bfv(instance,
++                                                         instance_type)
+             usage = self._get_usage_dict(
+-                        instance_type, numa_topology=numa_topology)
++                        itype_copy, numa_topology=numa_topology)
+             # non-strict pinning accounting when freeing
+             self._update_usage(usage, nodename, sign=-1, strict=False,
+                                from_migration=True)
+@@ -1772,8 +1824,12 @@ class ResourceTracker(object):
+ 
+         if itype:
+             cn = self.compute_nodes[nodename]
++            # TODO(melwitt/jaypipes): Remove this after resource-providers
++            # can handle claims and reporting for boot-from-volume.
++            itype_copy = self._copy_instance_type_if_bfv(instance, itype)
++
+             usage = self._get_usage_dict(
+-                        itype, numa_topology=numa_topology)
++                        itype_copy, numa_topology=numa_topology)
+             if self.pci_tracker and sign:
+                 self.pci_tracker.update_pci_for_instance(
+                     context, instance, sign=sign)
+@@ -1914,21 +1970,35 @@ class ResourceTracker(object):
+         is_removed_instance = not is_new_instance and (is_removed or
+             instance['vm_state'] in vm_states.ALLOW_RESOURCE_REMOVAL)
+ 
++        # Avoid changing the original instance in the case of boot from volume
++        inst_copy_zero_disk = None
++
+         if is_new_instance:
+-            self.tracked_instances[uuid] = obj_base.obj_to_primitive(instance)
++            # TODO(melwitt/jaypipes): Remove this after resource-providers
++            # can handle claims and reporting for boot-from-volume.
++            inst_copy_zero_disk, _ = self._copy_if_bfv(instance)
++
++            self.tracked_instances[uuid] = obj_base.obj_to_primitive(
++                    inst_copy_zero_disk)
+             sign = 1
+ 
+         if is_removed_instance:
++            # TODO(melwitt/jaypipes): Remove this after resource-providers
++            # can handle claims and reporting for boot-from-volume.
++            inst_copy_zero_disk, _ = self._copy_if_bfv(instance)
++
+             self.tracked_instances.pop(uuid)
+             sign = -1
+ 
+         cn = self.compute_nodes[nodename]
+-
+-        self.stats.update_stats_for_instance(instance, is_removed_instance)
++        self.stats.update_stats_for_instance(inst_copy_zero_disk or instance,
++                                             is_removed_instance)
+ 
+         # if it's a new or deleted instance:
+         if is_new_instance or is_removed_instance:
+             if self.pci_tracker:
++                # NOTE(melwitt): We don't pass the copy with zero disk here to
++                # avoid saving instance.flavor.root_gb=0 to the database.
+                 self.pci_tracker.update_pci_for_instance(context,
+                                                          instance,
+                                                          sign=sign)
+@@ -1940,9 +2010,9 @@ class ResourceTracker(object):
+                 self.scheduler_client.reportclient.update_instance_allocation(
+                     cn, instance, sign)
+             # new instance, update compute node resource usage:
+-            self._update_usage(self._get_usage_dict(instance), nodename,
+-                               sign=sign, update_affinity=update_affinity,
+-                               strict=strict)
++            self._update_usage(self._get_usage_dict(inst_copy_zero_disk),
++                               nodename, sign=sign,
++                               update_affinity=update_affinity, strict=strict)
+ 
+             # Display instances that audit includes via _update_usage.
+             pstate = instance.get('power_state')
+@@ -2324,7 +2394,7 @@ class ResourceTracker(object):
+                      # get vcpus from instance object directly so that
+                      # it reflects actual used vcpus after scaling
+                      'vcpus': object_or_dict.vcpus,
+-                     'root_gb': object_or_dict.root_gb,
++                     'root_gb': object_or_dict.flavor.root_gb,
+                      'ephemeral_gb': object_or_dict.flavor.ephemeral_gb,
+                      'numa_topology': object_or_dict.numa_topology,
+                      'uuid': object_or_dict.uuid}
+diff --git a/nova/scheduler/client/report.py b/nova/scheduler/client/report.py
+index 8042d53..b13752b 100644
+--- a/nova/scheduler/client/report.py
++++ b/nova/scheduler/client/report.py
+@@ -1262,6 +1262,11 @@ class SchedulerReportClient(object):
+                       'allocation: %s', peer_alloc['resources'])
+             new_allocs.append(peer_alloc)
+ 
++        # Remove any zero allocations.
++        for alloc in new_allocs:
++            alloc['resources'] = {key: val for key, val
++                                  in alloc['resources'].items() if val}
++
+         payload = {'allocations': new_allocs}
+         payload['project_id'] = project_id
+         payload['user_id'] = user_id
+diff --git a/nova/tests/functional/api/client.py b/nova/tests/functional/api/client.py
+index 17656a2..5831bdb 100644
+--- a/nova/tests/functional/api/client.py
++++ b/nova/tests/functional/api/client.py
+@@ -220,7 +220,8 @@ class TestOpenStackClient(object):
+             headers['Content-Type'] = 'application/json'
+             kwargs['body'] = jsonutils.dumps(body)
+ 
+-        kwargs.setdefault('check_response_status', [200, 201, 202])
++        # 204 needed for confirm resize
++        kwargs.setdefault('check_response_status', [200, 201, 202, 204])
+         return APIResponse(self.api_request(relative_uri, **kwargs))
+ 
+     def api_put(self, relative_uri, body, **kwargs):
+diff --git a/nova/tests/functional/test_boot_from_volume.py b/nova/tests/functional/test_boot_from_volume.py
+new file mode 100644
+index 0000000..cefc84f
+--- /dev/null
++++ b/nova/tests/functional/test_boot_from_volume.py
+@@ -0,0 +1,152 @@
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++from nova import context
++from nova import objects
++from nova.tests.functional import integrated_helpers
++from nova.tests.functional import test_servers
++from nova.tests.unit.volume import fake as volume_fake
++
++
++class BootFromVolumeTest(integrated_helpers.InstanceHelperMixin,
++                         test_servers.ServersTestBase):
++    def _setup_scheduler_service(self):
++        self.flags(driver='filter_scheduler', group='scheduler')
++        self.flags(enabled_filters=['DiskFilter'], group='filter_scheduler')
++        return self.start_service('scheduler')
++
++    def _get_hypervisor_stats(self):
++        response = self.admin_api.api_get('/os-hypervisors/statistics')
++        return response.body['hypervisor_statistics']
++
++    def _verify_zero_local_gb_used(self):
++        stats = self._get_hypervisor_stats()
++        self.assertEqual(0, stats['local_gb_used'])
++
++    def _verify_instance_flavor_not_zero(self, instance_uuid):
++        # We are trying to avoid saving instance records with root_gb=0
++        ctxt = context.RequestContext('fake', self.api.project_id)
++        instance = objects.Instance.get_by_uuid(ctxt, instance_uuid)
++        self.assertNotEqual(0, instance.root_gb)
++        self.assertNotEqual(0, instance.flavor.root_gb)
++
++    def _verify_request_spec_flavor_not_zero(self, instance_uuid):
++        # We are trying to avoid saving request spec records with root_gb=0
++        ctxt = context.RequestContext('fake', self.api.project_id)
++        rspec = objects.RequestSpec.get_by_instance_uuid(ctxt, instance_uuid)
++        self.assertNotEqual(0, rspec.flavor.root_gb)
++
++    def setUp(self):
++        # These need to be set up before services are started, else they
++        # won't be reflected in the running service.
++        volume_fake.stub_out_volume_api(self)
++        self.flags(allow_resize_to_same_host=True)
++        super(BootFromVolumeTest, self).setUp()
++        self.admin_api = self.api_fixture.admin_api
++
++    def test_boot_from_volume_larger_than_local_gb(self):
++        # Verify no local disk is being used currently
++        self._verify_zero_local_gb_used()
++
++        # Create flavors with disk larger than available host local disk
++        flavor_id = self._create_flavor(memory_mb=64, vcpu=1, disk=8192,
++                                        ephemeral=0)
++        flavor_id_alt = self._create_flavor(memory_mb=64, vcpu=1, disk=16384,
++                                            ephemeral=0)
++
++        # Boot a server with a flavor disk larger than the available local
++        # disk. It should succeed for boot from volume.
++        server = self._build_server(flavor_id)
++        image_uuid = server['imageRef']
++        server['imageRef'] = ''
++        bdm = {'boot_index': 0, 'uuid': image_uuid, 'source_type': 'image',
++               'volume_size': 8192, 'destination_type': 'volume',
++               'delete_on_termination': True}
++        server['block_device_mapping_v2'] = [bdm]
++        created_server = self.api.post_server({"server": server})
++        server_id = created_server['id']
++        self._wait_for_state_change(self.api, created_server, 'ACTIVE')
++
++        # Check that hypervisor local disk reporting is still 0
++        self._verify_zero_local_gb_used()
++        # Check that instance has not been saved with 0 root_gb
++        self._verify_instance_flavor_not_zero(server_id)
++        # Check that request spec has not been saved with 0 root_gb
++        self._verify_request_spec_flavor_not_zero(server_id)
++
++        # Do actions that could change local disk reporting and verify they
++        # don't change local disk reporting.
++
++        # Resize
++        post_data = {'resize': {'flavorRef': flavor_id_alt}}
++        self.api.post_server_action(server_id, post_data)
++        self._wait_for_state_change(self.api, created_server, 'VERIFY_RESIZE')
++
++        # Check that hypervisor local disk reporting is still 0
++        self._verify_zero_local_gb_used()
++        # Check that instance has not been saved with 0 root_gb
++        self._verify_instance_flavor_not_zero(server_id)
++        # Check that request spec has not been saved with 0 root_gb
++        self._verify_request_spec_flavor_not_zero(server_id)
++
++        # Confirm the resize
++        post_data = {'confirmResize': None}
++        self.api.post_server_action(server_id, post_data)
++        self._wait_for_state_change(self.api, created_server, 'ACTIVE')
++
++        # Check that hypervisor local disk reporting is still 0
++        self._verify_zero_local_gb_used()
++        # Check that instance has not been saved with 0 root_gb
++        self._verify_instance_flavor_not_zero(server_id)
++        # Check that request spec has not been saved with 0 root_gb
++        self._verify_request_spec_flavor_not_zero(server_id)
++
++        # Shelve
++        post_data = {'shelve': None}
++        self.api.post_server_action(server_id, post_data)
++        self._wait_for_state_change(self.api, created_server,
++                                    'SHELVED_OFFLOADED')
++
++        # Check that hypervisor local disk reporting is still 0
++        self._verify_zero_local_gb_used()
++        # Check that instance has not been saved with 0 root_gb
++        self._verify_instance_flavor_not_zero(server_id)
++        # Check that request spec has not been saved with 0 root_gb
++        self._verify_request_spec_flavor_not_zero(server_id)
++
++        # Unshelve
++        post_data = {'unshelve': None}
++        self.api.post_server_action(server_id, post_data)
++        self._wait_for_state_change(self.api, created_server, 'ACTIVE')
++
++        # Check that hypervisor local disk reporting is still 0
++        self._verify_zero_local_gb_used()
++        # Check that instance has not been saved with 0 root_gb
++        self._verify_instance_flavor_not_zero(server_id)
++        # Check that request spec has not been saved with 0 root_gb
++        self._verify_request_spec_flavor_not_zero(server_id)
++
++        # Rebuild
++        # We can do this only if it's last because it's not supported
++        # for boot from volume because it gives the instance an image_ref,
++        # which makes the virt driver think it's not boot from volume.
++        # Also: https://bugs.launchpad.net/nova/+bug/1470702
++        post_data = {'rebuild': {'imageRef': image_uuid}}
++        self.api.post_server_action(server_id, post_data)
++        self._wait_for_state_change(self.api, created_server, 'ACTIVE')
++
++        # Check that hypervisor local disk reporting is still 0
++        self._verify_zero_local_gb_used()
++        # Check that instance has not been saved with 0 root_gb
++        self._verify_instance_flavor_not_zero(server_id)
++        # Check that request spec has not been saved with 0 root_gb
++        self._verify_request_spec_flavor_not_zero(server_id)
+diff --git a/nova/tests/unit/compute/test_compute_mgr.py b/nova/tests/unit/compute/test_compute_mgr.py
+index 7952374..3132667 100644
+--- a/nova/tests/unit/compute/test_compute_mgr.py
++++ b/nova/tests/unit/compute/test_compute_mgr.py
+@@ -2362,6 +2362,7 @@ class ComputeManagerUnitTestCase(test.NoDBTestCase):
+ 
+         self.assertTrue(dest_check_data.is_volume_backed)
+ 
++    @mock.patch.object(compute_utils, 'is_volume_backed_instance')
+     @mock.patch.object(objects.Migration, 'id', return_value=1)
+     @mock.patch.object(compute_utils, 'EventReporter')
+     @mock.patch.object(objects.Instance, 'save')
+@@ -2372,7 +2373,8 @@ class ComputeManagerUnitTestCase(test.NoDBTestCase):
+                                                  move_claim_class_mock,
+                                                  nop_claim_class_mock,
+                                                  save_mock, event_mock,
+-                                                 mock_mig_id, do_raise=False,
++                                                 mock_mig_id, mock_volume,
++                                                 do_raise=False,
+                                                  has_mig_data=False,
+                                                  migration=False,
+                                                  node=False,
+@@ -2425,6 +2427,7 @@ class ComputeManagerUnitTestCase(test.NoDBTestCase):
+         compute_node.hypervisor_hostname = hypervisor_hostname
+         compute_node.disk_available_least = 0
+         fake_rt.compute_nodes[hypervisor_hostname] = compute_node
++        mock_volume.return_value = False
+ 
+         if fail_claim:
+             claim_class_mock.side_effect = (
+diff --git a/nova/tests/unit/compute/test_resource_tracker.py b/nova/tests/unit/compute/test_resource_tracker.py
+index 58df23c..17eab91 100644
+--- a/nova/tests/unit/compute/test_resource_tracker.py
++++ b/nova/tests/unit/compute/test_resource_tracker.py
+@@ -628,6 +628,8 @@ class TestUpdateAvailableResources(BaseTestCase):
+         self.assertTrue(obj_base.obj_equal_prims(expected_resources,
+                                                  actual_resources))
+ 
++    @mock.patch('nova.compute.utils.is_volume_backed_instance',
++                return_value=False)
+     @mock.patch('nova.objects.InstancePCIRequests.get_by_instance',
+                 return_value=objects.InstancePCIRequests(requests=[]))
+     @mock.patch('nova.objects.PciDeviceList.get_by_compute_node',
+@@ -637,7 +639,7 @@ class TestUpdateAvailableResources(BaseTestCase):
+     @mock.patch('nova.objects.InstanceList.get_by_host_and_node')
+     def test_some_instances_no_migrations(self, get_mock, migr_mock,
+                                           get_cn_mock, pci_mock,
+-                                          instance_pci_mock):
++                                          instance_pci_mock, is_bfv_mock):
+         # Setup virt resources to match used resources to number
+         # of defined instances on the hypervisor
+         # Note that the usage numbers here correspond to only the first
+@@ -650,7 +652,8 @@ class TestUpdateAvailableResources(BaseTestCase):
+                               local_gb_used=1)
+         self._setup_rt(virt_resources=virt_resources)
+ 
+-        get_mock.return_value = _INSTANCE_FIXTURES
++        all_instances = [inst.obj_clone() for inst in _INSTANCE_FIXTURES]
++        get_mock.return_value = all_instances
+         migr_mock.return_value = []
+         get_cn_mock.return_value = _COMPUTE_NODE_FIXTURES[0]
+ 
+@@ -674,6 +677,8 @@ class TestUpdateAvailableResources(BaseTestCase):
+         actual_resources = update_mock.call_args[0][1]
+         self.assertTrue(obj_base.obj_equal_prims(expected_resources,
+                                                  actual_resources))
++        is_bfv_mock.assert_called_once_with(all_instances[0]._context,
++                                            all_instances[0])
+ 
+     @mock.patch('nova.objects.InstancePCIRequests.get_by_instance',
+                 return_value=objects.InstancePCIRequests(requests=[]))
+@@ -738,6 +743,8 @@ class TestUpdateAvailableResources(BaseTestCase):
+         self.assertTrue(obj_base.obj_equal_prims(expected_resources,
+                                                  actual_resources))
+ 
++    @mock.patch('nova.compute.utils.is_volume_backed_instance',
++                return_value=False)
+     @mock.patch('nova.objects.InstancePCIRequests.get_by_instance',
+                 return_value=objects.InstancePCIRequests(requests=[]))
+     @mock.patch('nova.objects.PciDeviceList.get_by_compute_node',
+@@ -748,7 +755,7 @@ class TestUpdateAvailableResources(BaseTestCase):
+     @mock.patch('nova.objects.InstanceList.get_by_host_and_node')
+     def test_no_instances_source_migration(self, get_mock, get_inst_mock,
+                                            migr_mock, get_cn_mock, pci_mock,
+-                                           instance_pci_mock):
++                                           instance_pci_mock, is_bfv_mock):
+         # We test the behavior of update_available_resource() when
+         # there is an active migration that involves this compute node
+         # as the source host not the destination host, and the resource
+@@ -799,7 +806,10 @@ class TestUpdateAvailableResources(BaseTestCase):
+         actual_resources = update_mock.call_args[0][1]
+         self.assertTrue(obj_base.obj_equal_prims(expected_resources,
+                                                  actual_resources))
++        is_bfv_mock.assert_called_once_with(instance._context, instance)
+ 
++    @mock.patch('nova.compute.utils.is_volume_backed_instance',
++                return_value=False)
+     @mock.patch('nova.objects.InstancePCIRequests.get_by_instance',
+                 return_value=objects.InstancePCIRequests(requests=[]))
+     @mock.patch('nova.objects.PciDeviceList.get_by_compute_node',
+@@ -810,7 +820,7 @@ class TestUpdateAvailableResources(BaseTestCase):
+     @mock.patch('nova.objects.InstanceList.get_by_host_and_node')
+     def test_no_instances_dest_migration(self, get_mock, get_inst_mock,
+                                          migr_mock, get_cn_mock, pci_mock,
+-                                         instance_pci_mock):
++                                         instance_pci_mock, is_bfv_mock):
+         # We test the behavior of update_available_resource() when
+         # there is an active migration that involves this compute node
+         # as the destination host not the source host, and the resource
+@@ -859,7 +869,10 @@ class TestUpdateAvailableResources(BaseTestCase):
+         actual_resources = update_mock.call_args[0][1]
+         self.assertTrue(obj_base.obj_equal_prims(expected_resources,
+                                                  actual_resources))
++        is_bfv_mock.assert_called_once_with(instance._context, instance)
+ 
++    @mock.patch('nova.compute.utils.is_volume_backed_instance',
++                return_value=False)
+     @mock.patch('nova.objects.InstancePCIRequests.get_by_instance',
+                 return_value=objects.InstancePCIRequests(requests=[]))
+     @mock.patch('nova.objects.PciDeviceList.get_by_compute_node',
+@@ -870,7 +883,7 @@ class TestUpdateAvailableResources(BaseTestCase):
+     @mock.patch('nova.objects.InstanceList.get_by_host_and_node')
+     def test_no_instances_dest_evacuation(self, get_mock, get_inst_mock,
+                                           migr_mock, get_cn_mock, pci_mock,
+-                                          instance_pci_mock):
++                                          instance_pci_mock, is_bfv_mock):
+         # We test the behavior of update_available_resource() when
+         # there is an active evacuation that involves this compute node
+         # as the destination host not the source host, and the resource
+@@ -916,7 +929,10 @@ class TestUpdateAvailableResources(BaseTestCase):
+         actual_resources = update_mock.call_args[0][1]
+         self.assertTrue(obj_base.obj_equal_prims(expected_resources,
+                                                  actual_resources))
++        is_bfv_mock.assert_called_once_with(instance._context, instance)
+ 
++    @mock.patch('nova.compute.utils.is_volume_backed_instance',
++                return_value=False)
+     @mock.patch('nova.objects.InstancePCIRequests.get_by_instance',
+                 return_value=objects.InstancePCIRequests(requests=[]))
+     @mock.patch('nova.objects.PciDeviceList.get_by_compute_node',
+@@ -932,7 +948,8 @@ class TestUpdateAvailableResources(BaseTestCase):
+                                                       get_cn_mock,
+                                                       get_mig_ctxt_mock,
+                                                       pci_mock,
+-                                                      instance_pci_mock):
++                                                      instance_pci_mock,
++                                                      is_bfv_mock):
+         # We test the behavior of update_available_resource() when
+         # there is an active migration that involves this compute node
+         # as the destination host AND the source host, and the resource
+@@ -958,7 +975,8 @@ class TestUpdateAvailableResources(BaseTestCase):
+         resizing_instance = _MIGRATION_INSTANCE_FIXTURES[inst_uuid].obj_clone()
+         resizing_instance.migration_context = (
+             _MIGRATION_CONTEXT_FIXTURES[resizing_instance.uuid])
+-        all_instances = _INSTANCE_FIXTURES + [resizing_instance]
++        all_instances = ([inst.obj_clone() for inst in _INSTANCE_FIXTURES] +
++                         [resizing_instance])
+         get_mock.return_value = all_instances
+         get_inst_mock.return_value = resizing_instance
+         get_cn_mock.return_value = _COMPUTE_NODE_FIXTURES[0]
+@@ -985,6 +1003,11 @@ class TestUpdateAvailableResources(BaseTestCase):
+         actual_resources = update_mock.call_args[0][1]
+         self.assertTrue(obj_base.obj_equal_prims(expected_resources,
+                                                  actual_resources))
++        # 2 calls because of the resizing instance
++        self.assertEqual(2, is_bfv_mock.call_count)
++        expected_call1 = mock.call(all_instances[0]._context, all_instances[0])
++        expected_call2 = mock.call(all_instances[2]._context, all_instances[2])
++        is_bfv_mock.assert_has_calls([expected_call1, expected_call2])
+ 
+ 
+ class TestInitComputeNode(BaseTestCase):
+@@ -1408,9 +1431,12 @@ class TestInstanceClaim(BaseTestCase):
+         self.assertEqual(_NODENAME, self.instance.node)
+         self.assertIsInstance(claim, claims.NopClaim)
+ 
++    @mock.patch('nova.compute.utils.is_volume_backed_instance',
++                return_value=False)
+     @mock.patch('nova.objects.InstancePCIRequests.get_by_instance_uuid')
+     @mock.patch('nova.objects.MigrationList.get_in_progress_by_host_and_node')
+-    def test_update_usage_with_claim(self, migr_mock, pci_mock):
++    def test_update_usage_with_claim(self, migr_mock, pci_mock,
++                                     is_bfv_mock):
+         # Test that RT.update_usage() only changes the compute node
+         # resources if there has been a claim first.
+         pci_mock.return_value = objects.InstancePCIRequests(requests=[])
+@@ -1440,10 +1466,14 @@ class TestInstanceClaim(BaseTestCase):
+             cn = self.rt.compute_nodes[_NODENAME]
+             update_mock.assert_called_once_with(self.elevated, cn)
+             self.assertTrue(obj_base.obj_equal_prims(expected, cn))
++            is_bfv_mock.assert_called_once_with(self.instance._context,
++                                                self.instance)
+ 
++    @mock.patch('nova.compute.utils.is_volume_backed_instance',
++                return_value=False)
+     @mock.patch('nova.objects.InstancePCIRequests.get_by_instance_uuid')
+     @mock.patch('nova.objects.MigrationList.get_in_progress_by_host_and_node')
+-    def test_update_usage_removed(self, migr_mock, pci_mock):
++    def test_update_usage_removed(self, migr_mock, pci_mock, is_bfv_mock):
+         # Test that RT.update_usage() removes the instance when update is
+         # called in a removed state
+         pci_mock.return_value = objects.InstancePCIRequests(requests=[])
+@@ -1481,10 +1511,14 @@ class TestInstanceClaim(BaseTestCase):
+             self.rt.update_usage(self.ctx, self.instance, _NODENAME)
+         cn = self.rt.compute_nodes[_NODENAME]
+         self.assertTrue(obj_base.obj_equal_prims(expected_updated, cn))
++        is_bfv_mock.assert_called_once_with(self.instance._context,
++                                            self.instance)
+ 
++    @mock.patch('nova.compute.utils.is_volume_backed_instance',
++                return_value=False)
+     @mock.patch('nova.objects.InstancePCIRequests.get_by_instance_uuid')
+     @mock.patch('nova.objects.MigrationList.get_in_progress_by_host_and_node')
+-    def test_claim(self, migr_mock, pci_mock):
++    def test_claim(self, migr_mock, pci_mock, is_bfv_mock):
+         pci_mock.return_value = objects.InstancePCIRequests(requests=[])
+ 
+         disk_used = self.instance.root_gb + self.instance.ephemeral_gb
+@@ -1512,14 +1546,18 @@ class TestInstanceClaim(BaseTestCase):
+         self.assertEqual(self.rt.host, self.instance.host)
+         self.assertEqual(self.rt.host, self.instance.launched_on)
+         self.assertEqual(_NODENAME, self.instance.node)
++        is_bfv_mock.assert_called_once_with(self.instance._context,
++                                            self.instance)
+ 
++    @mock.patch('nova.compute.utils.is_volume_backed_instance',
++                return_value=False)
+     @mock.patch('nova.pci.stats.PciDeviceStats.support_requests',
+                 return_value=True)
+     @mock.patch('nova.pci.manager.PciDevTracker.claim_instance')
+     @mock.patch('nova.objects.InstancePCIRequests.get_by_instance_uuid')
+     @mock.patch('nova.objects.MigrationList.get_in_progress_by_host_and_node')
+     def test_claim_with_pci(self, migr_mock, pci_mock,
+-                            pci_claim_mock, pci_stats_mock):
++                            pci_claim_mock, pci_stats_mock, is_bfv_mock):
+         # Test that a claim involving PCI requests correctly claims
+         # PCI devices on the host and sends an updated pci_device_pools
+         # attribute of the ComputeNode object.
+@@ -1569,11 +1607,16 @@ class TestInstanceClaim(BaseTestCase):
+                                                    None)
+             pci_stats_mock.assert_called_once_with([request])
+             self.assertTrue(obj_base.obj_equal_prims(expected, cn))
++            is_bfv_mock.assert_called_once_with(self.instance._context,
++                                                self.instance)
+ 
++    @mock.patch('nova.compute.utils.is_volume_backed_instance',
++                return_value=False)
+     @mock.patch('nova.objects.InstancePCIRequests.get_by_instance_uuid')
+     @mock.patch('nova.objects.MigrationList.get_in_progress_by_host_and_node')
+     @mock.patch('nova.objects.ComputeNode.save')
+-    def test_claim_abort_context_manager(self, save_mock, migr_mock, pci_mock):
++    def test_claim_abort_context_manager(self, save_mock, migr_mock, pci_mock,
++                                         is_bfv_mock):
+         pci_mock.return_value = objects.InstancePCIRequests(requests=[])
+ 
+         cn = self.rt.compute_nodes[_NODENAME]
+@@ -1610,10 +1653,13 @@ class TestInstanceClaim(BaseTestCase):
+         self.assertEqual(0, cn.memory_mb_used)
+         self.assertEqual(0, cn.running_vms)
+ 
++    @mock.patch('nova.compute.utils.is_volume_backed_instance',
++                return_value=False)
+     @mock.patch('nova.objects.InstancePCIRequests.get_by_instance_uuid')
+     @mock.patch('nova.objects.MigrationList.get_in_progress_by_host_and_node')
+     @mock.patch('nova.objects.ComputeNode.save')
+-    def test_claim_abort(self, save_mock, migr_mock, pci_mock):
++    def test_claim_abort(self, save_mock, migr_mock, pci_mock,
++                         is_bfv_mock):
+         pci_mock.return_value = objects.InstancePCIRequests(requests=[])
+         disk_used = self.instance.root_gb + self.instance.ephemeral_gb
+ 
+@@ -1650,11 +1696,16 @@ class TestInstanceClaim(BaseTestCase):
+         self.assertEqual(0, cn.local_gb_used)
+         self.assertEqual(0, cn.memory_mb_used)
+         self.assertEqual(0, cn.running_vms)
++        is_bfv_mock.assert_called_once_with(self.instance._context,
++                                            self.instance)
+ 
++    @mock.patch('nova.compute.utils.is_volume_backed_instance',
++                return_value=False)
+     @mock.patch('nova.objects.InstancePCIRequests.get_by_instance_uuid')
+     @mock.patch('nova.objects.MigrationList.get_in_progress_by_host_and_node')
+     @mock.patch('nova.objects.ComputeNode.save')
+-    def test_claim_limits(self, save_mock, migr_mock, pci_mock):
++    def test_claim_limits(self, save_mock, migr_mock, pci_mock,
++                          is_bfv_mock):
+         pci_mock.return_value = objects.InstancePCIRequests(requests=[])
+ 
+         good_limits = {
+@@ -1669,12 +1720,17 @@ class TestInstanceClaim(BaseTestCase):
+             self.assertRaises(exc.ComputeResourcesUnavailable,
+                     self.rt.instance_claim,
+                     self.ctx, self.instance, _NODENAME, bad_limits)
++            is_bfv_mock.assert_called_once_with(self.instance._context,
++                                                self.instance)
+ 
++    @mock.patch('nova.compute.utils.is_volume_backed_instance',
++                return_value=False)
+     @mock.patch('nova.virt.hardware.update_floating_affinity')
+     @mock.patch('nova.objects.InstancePCIRequests.get_by_instance_uuid')
+     @mock.patch('nova.objects.MigrationList.get_in_progress_by_host_and_node')
+     @mock.patch('nova.objects.ComputeNode.save')
+-    def test_claim_numa(self, save_mock, migr_mock, pci_mock, affinity_mock):
++    def test_claim_numa(self, save_mock, migr_mock, pci_mock, affinity_mock,
++                        is_bfv_mock):
+         pci_mock.return_value = objects.InstancePCIRequests(requests=[])
+         cn = self.rt.compute_nodes[_NODENAME]
+ 
+@@ -1695,6 +1751,8 @@ class TestInstanceClaim(BaseTestCase):
+             new_numa = cn.numa_topology
+             new_numa = objects.NUMATopology.obj_from_db_obj(new_numa)
+             self.assertEqualNUMAHostTopology(expected_numa, new_numa)
++            is_bfv_mock.assert_called_once_with(self.instance._context,
++                                                    self.instance)
+ 
+ 
+ class TestResize(BaseTestCase):
+@@ -1926,6 +1984,11 @@ class TestResize(BaseTestCase):
+             self.rt.compute_nodes[_NODENAME],
+             ignore=['stats']
+         ))
++        # The second call is from removing the allocations during the
++        # drop_move_claim.
++        self.assertEqual(2, is_bfv_mock.call_count)
++        call = mock.call(instance._context, instance)
++        is_bfv_mock.assert_has_calls([call, call])
+ 
+         cn = self.rt.compute_nodes[_NODENAME]
+         cn_uuid = cn.uuid
+@@ -1942,6 +2005,8 @@ class TestResize(BaseTestCase):
+     def test_instance_build_resize_confirm(self):
+         self._test_instance_build_resize()
+ 
++    @mock.patch('nova.compute.utils.is_volume_backed_instance',
++                return_value=False)
+     @mock.patch('nova.objects.Service.get_minimum_version',
+                 return_value=22)
+     @mock.patch('nova.pci.stats.PciDeviceStats.support_requests',
+@@ -1956,7 +2021,7 @@ class TestResize(BaseTestCase):
+     @mock.patch('nova.objects.ComputeNode.save')
+     def test_resize_claim_dest_host_with_pci(self, save_mock, get_mock,
+             migr_mock, get_cn_mock, pci_mock, pci_req_mock, pci_claim_mock,
+-            pci_dev_save_mock, pci_supports_mock, version_mock):
++            pci_dev_save_mock, pci_supports_mock, version_mock, is_bfv_mock):
+         # Starting from an empty destination compute node, perform a resize
+         # operation for an instance containing SR-IOV PCI devices on the
+         # original host.
+@@ -2047,9 +2112,12 @@ class TestResize(BaseTestCase):
+         self.assertEqual(1, len(pci_req_mock.return_value.requests))
+         self.assertEqual(request, pci_req_mock.return_value.requests[0])
+         alloc_mock.assert_called_once_with(instance)
++        is_bfv_mock.assert_called_once_with(instance._context, instance)
+ 
++    @mock.patch('nova.compute.utils.is_volume_backed_instance',
++                return_value=False)
+     @mock.patch('nova.scheduler.utils.resources_from_flavor')
+-    def test_drop_move_claim_on_revert(self, mock_resources):
++    def test_drop_move_claim_on_revert(self, mock_resources, is_bfv_mock):
+         self._setup_rt()
+         cn = _COMPUTE_NODE_FIXTURES[0].obj_clone()
+         self.rt.compute_nodes[_NODENAME] = cn
+@@ -2087,7 +2155,11 @@ class TestResize(BaseTestCase):
+                 # Check that we grabbed resourced for the right flavor...
+                 mock_resources.assert_called_once_with(instance,
+                     instance.flavor)
++                is_bfv_mock.assert_called_once_with(instance._context,
++                                                    instance)
+ 
++    @mock.patch('nova.compute.utils.is_volume_backed_instance',
++                return_value=False)
+     @mock.patch('nova.objects.Service.get_minimum_version',
+                 return_value=22)
+     @mock.patch('nova.objects.InstancePCIRequests.get_by_instance',
+@@ -2099,7 +2171,8 @@ class TestResize(BaseTestCase):
+     @mock.patch('nova.objects.InstanceList.get_by_host_and_node')
+     @mock.patch('nova.objects.ComputeNode.save')
+     def test_resize_claim_two_instances(self, save_mock, get_mock, migr_mock,
+-            get_cn_mock, pci_mock, instance_pci_mock, version_mock):
++            get_cn_mock, pci_mock, instance_pci_mock, version_mock,
++            is_bfv_mock):
+         # Issue two resize claims against a destination host with no prior
+         # instances on it and validate that the accounting for resources is
+         # correct.
+@@ -2216,9 +2289,15 @@ class TestResize(BaseTestCase):
+         self.assertEqual(2, len(self.rt.tracked_migrations),
+                          "Expected 2 tracked migrations but got %s"
+                          % self.rt.tracked_migrations)
++        self.assertEqual(2, is_bfv_mock.call_count)
++        calls = [mock.call(instance1._context, instance1),
++                 mock.call(instance2._context, instance2)]
++        is_bfv_mock.assert_has_calls(calls)
+ 
+ 
+ class TestRebuild(BaseTestCase):
++    @mock.patch('nova.compute.utils.is_volume_backed_instance',
++                return_value=False)
+     @mock.patch('nova.objects.Service.get_minimum_version',
+                 return_value=22)
+     @mock.patch('nova.objects.InstancePCIRequests.get_by_instance',
+@@ -2230,7 +2309,7 @@ class TestRebuild(BaseTestCase):
+     @mock.patch('nova.objects.InstanceList.get_by_host_and_node')
+     @mock.patch('nova.objects.ComputeNode.save')
+     def test_rebuild_claim(self, save_mock, get_mock, migr_mock, get_cn_mock,
+-            pci_mock, instance_pci_mock, version_mock):
++            pci_mock, instance_pci_mock, version_mock, is_bfv_mock):
+         # Rebuild an instance, emulating an evacuate command issued against the
+         # original instance. The rebuild operation uses the resource tracker's
+         # _move_claim() method, but unlike with resize_claim(), rebuild_claim()
+@@ -2312,6 +2391,14 @@ class TestRebuild(BaseTestCase):
+         from_inst_mock.assert_called_once_with(instance)
+         mig_save_mock.assert_called_once_with()
+         inst_save_mock.assert_called_once_with()
++        # First call from update_available_resource, only the first fixture
++        # will be included because it is ACTIVE, not DELETED
++        self.assertEqual(2, is_bfv_mock.call_count)
++        call1 = mock.call(_INSTANCE_FIXTURES[0]._context,
++                          _INSTANCE_FIXTURES[0])
++        # Second call is from the rebuild_claim
++        call2 = mock.call(instance._context, instance)
++        is_bfv_mock.assert_has_calls([call1, call2])
+ 
+ 
+ class TestUpdateUsageFromMigrations(BaseTestCase):
+@@ -2444,9 +2531,11 @@ class TestUpdateUsageFromInstance(BaseTestCase):
+         self.rt.compute_nodes[_NODENAME] = cn
+         self.instance = _INSTANCE_FIXTURES[0].obj_clone()
+ 
++    @mock.patch('nova.compute.utils.is_volume_backed_instance',
++                return_value=False)
+     @mock.patch('nova.compute.resource_tracker.ResourceTracker.'
+                 '_update_usage')
+-    def test_building(self, mock_update_usage):
++    def test_building(self, mock_update_usage, mock_vol_backed):
+         self.instance.vm_state = vm_states.BUILDING
+         self.rt._update_usage_from_instance(mock.sentinel.ctx, self.instance,
+                                             _NODENAME)
+@@ -2454,10 +2543,14 @@ class TestUpdateUsageFromInstance(BaseTestCase):
+         mock_update_usage.assert_called_once_with(
+             self.rt._get_usage_dict(self.instance), _NODENAME, sign=1,
+             update_affinity=True, strict=True)
++        mock_vol_backed.assert_called_once_with(self.instance._context,
++                                                self.instance)
+ 
++    @mock.patch('nova.compute.utils.is_volume_backed_instance',
++                return_value=False)
+     @mock.patch('nova.compute.resource_tracker.ResourceTracker.'
+                 '_update_usage')
+-    def test_shelve_offloading(self, mock_update_usage):
++    def test_shelve_offloading(self, mock_update_usage, mock_vol_backed):
+         self.instance.vm_state = vm_states.SHELVED_OFFLOADED
+         self.rt.tracked_instances = {
+             self.instance.uuid: obj_base.obj_to_primitive(self.instance)
+@@ -2468,10 +2561,14 @@ class TestUpdateUsageFromInstance(BaseTestCase):
+         mock_update_usage.assert_called_once_with(
+             self.rt._get_usage_dict(self.instance), _NODENAME, sign=-1,
+             update_affinity=True, strict=True)
++        mock_vol_backed.assert_called_once_with(self.instance._context,
++                                                self.instance)
+ 
++    @mock.patch('nova.compute.utils.is_volume_backed_instance',
++                return_value=False)
+     @mock.patch('nova.compute.resource_tracker.ResourceTracker.'
+                 '_update_usage')
+-    def test_unshelving(self, mock_update_usage):
++    def test_unshelving(self, mock_update_usage, mock_vol_backed):
+         self.instance.vm_state = vm_states.SHELVED_OFFLOADED
+         self.rt._update_usage_from_instance(mock.sentinel.ctx, self.instance,
+                                             _NODENAME)
+@@ -2479,10 +2576,14 @@ class TestUpdateUsageFromInstance(BaseTestCase):
+         mock_update_usage.assert_called_once_with(
+             self.rt._get_usage_dict(self.instance), _NODENAME, sign=1,
+             update_affinity=True, strict=True)
++        mock_vol_backed.assert_called_once_with(self.instance._context,
++                                                self.instance)
+ 
++    @mock.patch('nova.compute.utils.is_volume_backed_instance',
++                return_value=False)
+     @mock.patch('nova.compute.resource_tracker.ResourceTracker.'
+                 '_update_usage')
+-    def test_deleted(self, mock_update_usage):
++    def test_deleted(self, mock_update_usage, mock_vol_backed):
+         self.instance.vm_state = vm_states.DELETED
+         self.rt.tracked_instances = {
+                 self.instance.uuid: obj_base.obj_to_primitive(self.instance)
+@@ -2494,6 +2595,8 @@ class TestUpdateUsageFromInstance(BaseTestCase):
+         mock_update_usage.assert_called_once_with(
+             self.rt._get_usage_dict(self.instance), _NODENAME, sign=-1,
+             update_affinity=True, strict=False)
++        mock_vol_backed.assert_called_once_with(self.instance._context,
++                                                self.instance)
+ 
+     @mock.patch('nova.objects.Instance.get_by_uuid')
+     def test_remove_deleted_instances_allocations_deleted_instance(self,
+diff --git a/nova/tests/unit/volume/fake.py b/nova/tests/unit/volume/fake.py
+new file mode 100644
+index 0000000..9ff124a
+--- /dev/null
++++ b/nova/tests/unit/volume/fake.py
+@@ -0,0 +1,78 @@
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++import copy
++
++from oslo_utils import uuidutils
++
++from nova import exception
++import nova.volume.cinder
++
++
++class FakeVolumeAPI(nova.volume.cinder.API):
++    def __init__(self):
++        self.volumes = {}
++
++    def initialize_connection(self, context, volume_id, connector):
++        return {'connector': connector}
++
++    def terminate_connection(self, context, volume_id, connector):
++        pass
++
++    def create(self, context, size, name, description, snapshot=None,
++               image_id=None, volume_type=None, metadata=None,
++               availability_zone=None):
++        vol_id = uuidutils.generate_uuid()
++        if snapshot is not None:
++            snapshot_id = snapshot['id']
++        else:
++            snapshot_id = None
++        data = dict(snapshot_id=snapshot_id,
++                    volume_type=volume_type,
++                    user_id=context.user_id,
++                    project_id=context.project_id,
++                    availability_zone=availability_zone,
++                    metadata=metadata,
++                    imageRef=image_id,
++                    display_name=name,
++                    display_description=description,
++                    id=vol_id,
++                    status='available',
++                    attach_status='detached',
++                    attachments={})
++        self.volumes[vol_id] = data
++        return copy.deepcopy(self.volumes[vol_id])
++
++    def get(self, context, volume_id):
++        volume = self.volumes.get(volume_id)
++        if volume:
++            return copy.deepcopy(volume)
++        raise exception.VolumeNotFound(volume_id=volume_id)
++
++    def attach(self, context, volume_id, instance_uuid, mountpoint, mode='rw'):
++        volume = self.volumes.get(volume_id)
++        if not volume:
++            raise exception.VolumeNotFound(volume_id=volume_id)
++        volume['attach_status'] = 'attached'
++        volume['status'] = 'in-use'
++
++    def detach(self, context, volume_id, instance_uuid=None,
++               attachment_id=None):
++        volume = self.volumes.get(volume_id)
++        if not volume:
++            raise exception.VolumeNotFound(volume_id=volume_id)
++        volume['attach_status'] = 'detached'
++        volume['status'] = 'available'
++
++
++def stub_out_volume_api(test):
++    test.stub_out('nova.volume.cinder.API', FakeVolumeAPI)
+-- 
+2.7.4
+

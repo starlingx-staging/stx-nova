@@ -1,0 +1,57 @@
+From aaf3d10f3ef2e9f8f788f52b9ca8c4f75a6280ce Mon Sep 17 00:00:00 2001
+From: "Beliveau, Ludovic" <Ludovic.Beliveau@windriver.com>
+Date: Wed, 22 Apr 2015 23:10:49 -0400
+Subject: [PATCH] Evacuation of sr-iov VM fails
+
+Resize has been broken in a recent commit with the neutron API extensions.
+There was still one instance in the code that was using binding:vif_model
+and not constants.PORT_VIF_MODEL.
+
+On rebuild instance, the network info cache was used and this information was
+based on the incoming PCI device and wasn't not using the Neutron ports update.
+---
+ nova/compute/manager.py       | 7 +++++++
+ nova/network/neutronv2/api.py | 2 +-
+ 2 files changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/nova/compute/manager.py b/nova/compute/manager.py
+index b5ec4f1..c48086c 100644
+--- a/nova/compute/manager.py
++++ b/nova/compute/manager.py
+@@ -3106,6 +3106,9 @@ class ComputeManager(manager.Manager):
+                         context, instance, self.host)
+ 
+             network_info = compute_utils.get_nw_info_for_instance(instance)
++            if recreate:
++                network_info = self._get_instance_nw_info(context, instance)
++
+             if bdms is None:
+                 bdms = objects.BlockDeviceMappingList.get_by_instance_uuid(
+                         context, instance.uuid)
+@@ -3772,6 +3775,10 @@ class ComputeManager(manager.Manager):
+             instance.task_state = None
+             instance.save(expected_task_state=[None, task_states.DELETING])
+ 
++            # Don't wait for the next scheduled periodic task to get
++            # executed, sync the resources right away
++            self.update_available_resource(nova.context.get_admin_context())
++
+             self._notify_about_instance_usage(
+                 context, instance, "resize.confirm.end",
+                 network_info=network_info)
+diff --git a/nova/network/neutronv2/api.py b/nova/network/neutronv2/api.py
+index c6f08bd..63a71ce 100644
+--- a/nova/network/neutronv2/api.py
++++ b/nova/network/neutronv2/api.py
+@@ -1725,7 +1725,7 @@ class API(base_api.NetworkAPI):
+                         LOG.exception(_LE("Unable to update host of port %s"),
+                                       p['id'])
+ 
+-            if p.get('binding:vif_model') == 'pci-sriov':
++            if p.get(constants.PORT_VIF_MODEL) == 'pci-sriov':
+                 profile = ''
+                 pci_requests = instance.pci_requests
+                 if pci_requests and pci_requests.requests:
+-- 
+2.7.4
+

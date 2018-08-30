@@ -1,0 +1,74 @@
+From 1555d82b2b61bb87d04df3727eb61b6c596e02cc Mon Sep 17 00:00:00 2001
+From: Gerry Kopec <Gerry.Kopec@windriver.com>
+Date: Fri, 2 Mar 2018 18:47:01 -0500
+Subject: [PATCH 115/143] Do not bypass scheduler when using forced hosts
+
+Nova scheduler will skip evaluation of filters in the case where there
+are forced_hosts or forced_nodes. This occurs if one specifies the
+destination host as a boot option, e.g.
+nova boot --availability-zone nova:compute-x
+
+This update ensures that scheduler filters are always evaluated,
+so we prevent launch of VMs on hosts that do not support them.
+E.g. make sure host has sufficient: network provider, PCI device,
+NUMA topology, etc.
+
+This commit is based on portion of R4 commit:
+42672319 Do not bypass scheduler when using forced hosts or live migrate
+---
+ nova/scheduler/host_manager.py                 | 25 ++++++++++++++-----------
+ nova/tests/unit/scheduler/test_host_manager.py |  2 +-
+ 2 files changed, 15 insertions(+), 12 deletions(-)
+
+diff --git a/nova/scheduler/host_manager.py b/nova/scheduler/host_manager.py
+index c3e0acd..5260e93 100644
+--- a/nova/scheduler/host_manager.py
++++ b/nova/scheduler/host_manager.py
+@@ -672,17 +672,20 @@ class HostManager(object):
+                 _match_forced_hosts(name_to_cls_map, force_hosts)
+             if force_nodes:
+                 _match_forced_nodes(name_to_cls_map, force_nodes)
+-            check_type = ('scheduler_hints' in spec_obj and
+-                          spec_obj.scheduler_hints.get('_nova_check_type'))
+-            if not check_type and (force_hosts or force_nodes):
+-                # NOTE(deva,dansmith): Skip filters when forcing host or node
+-                # unless we've declared the internal check type flag, in which
+-                # case we're asking for a specific host and for filtering to
+-                # be done.
+-                if name_to_cls_map:
+-                    return name_to_cls_map.values()
+-                else:
+-                    return []
++            # Always evaluate scheduler filters so we prevent launches on
++            # hosts that do not support the VM.  Note the commented out
++            # original code skips scheduler filters.
++            # check_type = ('scheduler_hints' in spec_obj and
++            #               spec_obj.scheduler_hints.get('_nova_check_type'))
++            # if not check_type and (force_hosts or force_nodes):
++            #    # NOTE(deva,dansmith): Skip filters when forcing host or node
++            #    # unless we've declared the internal check type flag, in which
++            #    # case we're asking for a specific host and for filtering to
++            #    # be done.
++            #    if name_to_cls_map:
++            #        return name_to_cls_map.values()
++            #    else:
++            #        return []
+             hosts = six.itervalues(name_to_cls_map)
+ 
+         return self.filter_handler.get_filtered_objects(self.enabled_filters,
+diff --git a/nova/tests/unit/scheduler/test_host_manager.py b/nova/tests/unit/scheduler/test_host_manager.py
+index 5eb5aef..b5e60d1 100644
+--- a/nova/tests/unit/scheduler/test_host_manager.py
++++ b/nova/tests/unit/scheduler/test_host_manager.py
+@@ -373,7 +373,7 @@ class HostManagerTestCase(test.NoDBTestCase):
+                 'get_filtered_objects') as fake_filter:
+             result = self.host_manager.get_filtered_hosts(self.fake_hosts,
+                     fake_properties)
+-            self.assertFalse(fake_filter.called)
++            self.assertTrue(fake_filter.called)
+ 
+         self._verify_result(info, result, False)
+ 
+-- 
+2.7.4
+

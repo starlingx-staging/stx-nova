@@ -1,0 +1,872 @@
+From 464c2723d448862cae011d5ba6180c92363ac249 Mon Sep 17 00:00:00 2001
+From: Jim Gauld <james.gauld@windriver.com>
+Date: Wed, 22 Feb 2017 11:22:08 -0500
+Subject: [PATCH 066/143] PCI Interrupt affinity for PT, SRIOV, crypto
+
+This is a port of commits:
+d035095 ENG:PCI Interrupt affinity for PT, SRIOV, crypto
+43a8854 PCI IRQ affinity - improve msi irq detection
+
+This affines the MSI IRQs associated with PCI devices from
+PCI/PT, SRIOV, or crypto (pci-alias) to cpus associated with
+pinned VMs only (i.e., hw:cpu_policy=dedicated).
+
+The IRQ affinity cpuset is defined in either of two ways:
+1) subset of pcpus corresponding to the VM's pinned cpuset,
+   and the numa node where PCI devices is located
+2) flavor extra-specs hw:pci_irq_affinity_mask=<vcpus_cpulist>,
+   where 'vcpus_cpulist' is a subset of specific vcpus within
+   0 to flavor.vcpus - 1.  This will map the specific vcpus to
+   pcpus of the VM. There is extra-spec validation to make sure
+   that vcpus_cpulist is valid and within range of 0 to
+   flavor.vcpus - 1.  There is semantic check enforcing we have
+   hw:cpu_policy=dedicated.
+
+The affining of IRQs is done asynchronously after creating domain
+and networks, since it takes significant time to detect msi_irqs and
+have them configured.
+- pci alias/crypto devices take approximately 20 seconds per device
+  to configure (e.g., pci_passthrough:alias=qat-vf:<N>). Specifying
+  a large N can take minutes to configure and have irqs show up.
+- subsequent MSI-X irqs may show up a few minutes after the first irqs.
+
+The pci irq detection algorithm polls PCI devices in parallel until
+msi_irq_timeout=45 is reached. Subsequent created pci irqs are detected
+by a compute periodic task.
+
+After detection, IRQs smp_affinity_list is set.
+
+Synchronization on instance.uuid is applied when setting pci irqs to
+ensure the device remains associated with the instance while we
+affine irqs.
+
+On compute, see the new PCI affinity log after detection complete,
+many seconds after VIFs are ready, e.g.:
+2016-12-28 18:59:19.116 75159 INFO nova.virt.libvirt.driver \
+ [req-ba28cdfd-e888-404f-b7f5-1331733807ff fb131b1450a44bbc839cb1b181f88a95 b7006bae78f14d4ba7e0d0a18fbaf60c - - -] \
+ [instance: cec3d9b2-7775-4365-86db-de1d6fe235fa] IRQs affined for pci_addr=0000:83:04.6, dev_id=pci_0000_83_04_6, \
+ dev_type=type-VF, vendor_id=8086, product_id=0443, irqs=66, msi_irqs:66, numa_node=1, cpulist=10,35,30,15
+
+b73cdde,b244108 Expose nova show wrs-res:pci_devices and instance tracking logs
+
+   This is a port of commit 5033f3d9451e0b45096c3645d210db43d714dc68.
+
+   This update exposes PCI devices via 'nova show <uuid>" as the extended
+   field: wrs-res:pci_devices.  The same information is also displayed in
+   the compute resource audit as instance tracking for corresponding host
+   and node, and as migrations in progress tracking log for appropriate
+   incoming or outgoing host.
+
+   This displays the per-PCI info: pci address, numa node, type (eg, VF,
+   PF), vendor_id, product_id.
+
+   Example:
+   nova list --all --fields=wrs-res:pci_devices
+   +--------------------------------------+---------------------------------------------------------------+
+   | ID                                   | wrs-res: Pci Devices                                          |
+   +--------------------------------------+---------------------------------------------------------------+
+   | aeedebac-bfc7-4f66-ae5d-dba628e8badc | node:1, addr:0000:83:04.6, type:VF, vendor:8086, product:0443 |
+   +--------------------------------------+---------------------------------------------------------------+
+
+   Example: compute resource audit - instance tracking
+
+   2016-12-23 17:32:02.467 207630 INFO nova.compute.resource_tracker
+   [req-d78b9251-d988-4a4f-b1bf-685bd639c9ab - - - - -]
+   [instance: aeedebac-bfc7-4f66-ae5d-dba628e8badc] sign=1, id=instance-000000b1,
+   name=vm-x-crypto, vm_mode=active, task_state=None, power_state=running,
+   numa_topology=node:1,  1024MB, pgsize:2M, 1s,2c,2t, vcpus:0-3, pcpus:35,15,10,30,
+   siblings:{0,1},{2,3}, pol:ded, thr:pre ; pci_devices=node:1, addr:0000:83:04.6,
+   type:VF, vendor:8086, product:0443
+
+   Example: compute resource audit - migrations in progress; incoming or outgoing
+
+   2016-12-22 22:29:46.209 52386 INFO nova.compute.resource_tracker
+   [req-233dd911-5877-4606-a8fc-33f35f341faf
+   fb131b1450a44bbc839cb1b181f88a95 a0adcc2b80524e3db6b17b460e791163 - - -]
+   [instance: aeedebac-bfc7-4f66-ae5d-dba628e8badc] Migration(id=36,
+   change=incoming, status=pre-migrating, type=evacuation); sign=1,
+   id=instance-000000b1, name=vm-x-crypto, source_compute=compute-1,
+   source_node=compute-1, dest_compute=compute-0, dest_node=compute-0,
+   numa_topology=node:0,  1024MB, pgsize:2M, 1s,4c,1t, vcpus:0-3,
+   pcpus:3-6, pol:ded, thr:pre ; pci_devices=node:0, addr:0000:0b:04.6,
+   type:VF, vendor:8086, product:0443
+
+00fab36 check if pci_devices attr exists when show instance detail
+   This commit fixed the following errors during launching an instance:
+   "The server has either erred or is incapable of performing the requested
+   operation."
+   "OrphanedObjectError: Cannot call obj_load_attr on orphaned Instance
+   object."
+   "Flavor not found ()"
+
+fff514d PCI: Fix migrate revert, resize revert for PCI/SRIOV
+   Fix a porting error when delivering commit ea3e6393d73 to Newton.
+   The calls to migrate_instance finish and the refresh of the network
+   info were already upstreamed.  The duplicate call was causing an
+   exception for a PCI/SRIOV revert.
+
+__TYPE_primary
+__TAG_pci,irqaffinity
+__R4_commit_b47e8a9
+__R3_commit_d035095,43a8854
+---
+ nova/api/openstack/compute/flavors_extraspecs.py   |  38 ++++
+ nova/api/openstack/compute/wrs_server_resources.py |  15 +-
+ nova/compute/manager.py                            |  31 +++-
+ nova/compute/resource_tracker.py                   |  27 ++-
+ nova/conf/compute.py                               |  17 ++
+ nova/conf/libvirt.py                               |  14 ++
+ nova/pci/manager.py                                |  27 +++
+ nova/pci/utils.py                                  | 193 +++++++++++++++++++++
+ nova/tests/unit/api/openstack/fakes.py             |   2 +
+ nova/virt/driver.py                                |   5 +
+ nova/virt/hardware.py                              |  17 ++
+ nova/virt/libvirt/driver.py                        | 113 ++++++++++++
+ 12 files changed, 485 insertions(+), 14 deletions(-)
+
+diff --git a/nova/api/openstack/compute/flavors_extraspecs.py b/nova/api/openstack/compute/flavors_extraspecs.py
+index 6e9711a..f8893a0 100644
+--- a/nova/api/openstack/compute/flavors_extraspecs.py
++++ b/nova/api/openstack/compute/flavors_extraspecs.py
+@@ -185,6 +185,43 @@ class FlavorExtraSpecsController(wsgi.Controller):
+                         })
+                 raise webob.exc.HTTPBadRequest(explanation=msg)
+ 
++    # Validate pci irq affinity mask
++    @staticmethod
++    def _validate_pci_irq_affinity_mask(flavor):
++        key = 'hw:pci_irq_affinity_mask'
++        if key in flavor.extra_specs:
++            value = flavor.extra_specs[key]
++
++            # check that we can properly parse the mask
++            try:
++                cpuset_ids = hardware._get_pci_affinity_mask(flavor)
++            except Exception as e:
++                msg = (_("Invalid %(K)s '%(V)s'; reason: %(R)s.") %
++                       {'K': key,
++                        'V': value,
++                        'R': e.format_message()
++                        })
++                raise webob.exc.HTTPBadRequest(explanation=msg)
++
++            # check that cpuset_ids are within valid range
++            flavor_cpuset = set(range(flavor.vcpus))
++            if not cpuset_ids.issubset(flavor_cpuset):
++                msg = _('%(K)s value (%(V)s) must be a subset of vcpus '
++                        '(%(S)s)') \
++                        % {'K': key, 'V': value,
++                           'S': utils.list_to_range(list(flavor_cpuset))}
++                raise webob.exc.HTTPBadRequest(explanation=msg)
++
++            # Check that we have specified dedicated cpus
++            if flavor.extra_specs.get(CPU_POLICY_KEY) != \
++                    fields.CPUAllocationPolicy.DEDICATED:
++                msg = _('%(K)s is only valid when %(P)s is %(D)s.  Either '
++                        'set extra spec %(P)s to %(D)s or do not set %(K)s.') \
++                      % {'K': key,
++                         'P': CPU_POLICY_KEY,
++                         'D': fields.CPUAllocationPolicy.DEDICATED}
++                raise webob.exc.HTTPConflict(explanation=msg)
++
+     # Validate hw:cpu_realtime_mask and interaction with
+     # hw:wrs:shared_vcpu .
+     @staticmethod
+@@ -383,6 +420,7 @@ class FlavorExtraSpecsController(wsgi.Controller):
+         self._validate_vswitch_numa_affinity(flavor)
+         self._validate_cpu_thread_policy(flavor)
+         self._validate_pci_numa_affinity(flavor)
++        self._validate_pci_irq_affinity_mask(flavor)
+         self._validate_shared_vcpu(flavor)
+         self._validate_min_vcpus(flavor)
+         self._validate_numa_node(flavor)
+diff --git a/nova/api/openstack/compute/wrs_server_resources.py b/nova/api/openstack/compute/wrs_server_resources.py
+index dfa1b45..190c311 100644
+--- a/nova/api/openstack/compute/wrs_server_resources.py
++++ b/nova/api/openstack/compute/wrs_server_resources.py
+@@ -27,8 +27,9 @@ from nova.api.openstack import wsgi
+ from nova.api import validation
+ from nova import compute
+ from nova import exception
+-from nova.i18n import _LW
+ from nova.objects import instance_numa_topology as it_obj
++from nova.pci import manager as pci_manager
++from nova.pci import utils as pci_utils
+ from nova.policies import wrs_server_resources as wrs_res_policies
+ from nova import utils
+ from oslo_log import log as logging
+@@ -52,7 +53,7 @@ class WrsServerResourcesController(wsgi.Controller):
+             numa_topology = it_obj.InstanceNUMATopology.get_by_instance_uuid(
+                 context, instance['uuid'])
+         except exception.NumaTopologyNotFound:
+-            LOG.warning(_LW("Instance does not have numa_topology"),
++            LOG.warning("Instance does not have numa_topology",
+                         instance=instance)
+             numa_topology = None
+ 
+@@ -68,6 +69,15 @@ class WrsServerResourcesController(wsgi.Controller):
+         return utils.format_instance_numa_topology(
+             numa_topology=numa_topology, instance=instance, delim='\n')
+ 
++    def _get_pci_devices(self, instance):
++        # Get pci_devices associated with instance (i.e., at destination).
++        pci_devices = pci_manager.get_instance_pci_devs_by_host_and_node(
++            instance, request_id='all')
++        if not pci_devices:
++            return ''
++        return pci_utils.format_instance_pci_devices(
++            pci_devices=pci_devices, delim='\n')
++
+     def _extend_server(self, context, server, instance):
+         vcpus = instance["vcpus"]
+         server["wrs-res:vcpus"] = [instance.get("min_vcpus") or vcpus,
+@@ -75,6 +85,7 @@ class WrsServerResourcesController(wsgi.Controller):
+                                    instance.get("max_vcpus") or vcpus
+                                   ]
+         server["wrs-res:topology"] = self._get_numa_topology(context, instance)
++        server["wrs-res:pci_devices"] = self._get_pci_devices(instance)
+ 
+     def _scale(self, req, instance_id, resource, direction):
+         """Begin the scale process with given instance."""
+diff --git a/nova/compute/manager.py b/nova/compute/manager.py
+index cf2098d..2ad0404 100644
+--- a/nova/compute/manager.py
++++ b/nova/compute/manager.py
+@@ -4061,15 +4061,6 @@ class ComputeManager(manager.Manager):
+             network_info = self.network_api.get_instance_nw_info(context,
+                                                                  instance)
+ 
+-            migration_p = obj_base.obj_to_primitive(migration)
+-            self.network_api.migrate_instance_finish(context,
+-                                                     instance,
+-                                                     migration_p)
+-
+-            # Refresh network info before driver is called.
+-            # Has been upstreamed, but not in Newton
+-            network_info = self.network_api.get_instance_nw_info(context,
+-                                                                 instance)
+             block_device_info = self._get_instance_block_device_info(
+                     context, instance, refresh_conn_info=True)
+ 
+@@ -6645,6 +6636,28 @@ class ComputeManager(manager.Manager):
+             for instance in to_unrescue:
+                 self.compute_api.unrescue(context, instance)
+ 
++    @periodic_task.periodic_task(spacing=CONF.pci_affine_interval)
++    def _affine_pci_dev_instances(self, context):
++        """Periodically reaffine pci device irqs.  This will correct the
++        affinity setting of dynamically created irqs.
++        """
++        filters = {'vm_state': vm_states.ACTIVE,
++                   'task_state': None,
++                   'deleted': False,
++                   'host': self.host}
++        instances = objects.InstanceList.get_by_filters(
++            context, filters, expected_attrs=[], use_slave=True)
++        for instance in instances:
++            if len(instance.pci_devices.objects) == 0:
++                continue
++            try:
++                self.driver.affine_pci_dev_irqs(instance, wait_for_irqs=False)
++            except NotImplementedError:
++                return
++            except Exception as e:
++                LOG.info("Error affining pci device irqs: %s.",
++                         e, instance=instance)
++
+     @periodic_task.periodic_task
+     def _poll_unconfirmed_resizes(self, context):
+         if CONF.resize_confirm_window == 0:
+diff --git a/nova/compute/resource_tracker.py b/nova/compute/resource_tracker.py
+index 4721f82..6b40a12 100644
+--- a/nova/compute/resource_tracker.py
++++ b/nova/compute/resource_tracker.py
+@@ -52,6 +52,7 @@ from nova.objects import fields
+ from nova.objects import migration as migration_obj
+ from nova.pci import manager as pci_manager
+ from nova.pci import request as pci_request
++from nova.pci import utils as pci_utils
+ from nova import rpc
+ from nova.scheduler import client as scheduler_client
+ from nova.scheduler import utils as scheduler_utils
+@@ -1679,13 +1680,22 @@ class ResourceTracker(object):
+                 change = 'same_node'
+             topo = utils.format_instance_numa_topology(
+                 numa_topology=numa_topology, instance=instance, delim=', ')
++            # Get pci_devices associated with this 'host' and 'nodename'.
++            pci_devices = pci_manager.get_instance_pci_devs_by_host_and_node(
++                instance, request_id='all', host=self.host, nodename=nodename)
++            if pci_devices:
++                devs = '; pci_devices='
++                devs += pci_utils.format_instance_pci_devices(
++                    pci_devices=pci_devices, delim='; ')
++            else:
++                devs = ''
+             LOG.info(
+                 'Migration(id=%(mid)s, change=%(change)s, '
+                 'status=%(status)s, type=%(type)s); '
+                 'sign=%(sign)d, id=%(name)s, name=%(display_name)s, '
+                 'source_compute=%(sc)s, source_node=%(sn)s, '
+                 'dest_compute=%(dc)s, dest_node=%(dn)s, '
+-                'numa_topology=%(topo)s',
++                'numa_topology=%(topo)s, %(pci_devs)s',
+                 {'mid': migration.id, 'change': change,
+                  'status': migration.status,
+                  'type': migration.migration_type,
+@@ -1697,6 +1707,7 @@ class ResourceTracker(object):
+                  'dc': migration.dest_compute,
+                  'dn': migration.dest_node,
+                  'topo': topo,
++                 'pci_devs': devs,
+                  }, instance=instance)
+ 
+     def _update_usage_from_migrations(self, context, migrations, nodename):
+@@ -1848,11 +1859,20 @@ class ResourceTracker(object):
+                 pstate = power_state.NOSTATE
+             topo = utils.format_instance_numa_topology(
+                 numa_topology=instance.get('numa_topology'),
+-                instance=instance, delim=', ')
++                instance=instance, delim='; ')
++            # Get pci_devices associated with this instance
++            pci_devices = pci_manager.get_instance_pci_devs_by_host_and_node(
++                instance, request_id='all', host=self.host, nodename=nodename)
++            if pci_devices:
++                devs = '; pci_devices='
++                devs += pci_utils.format_instance_pci_devices(
++                    pci_devices=pci_devices, delim='; ')
++            else:
++                devs = ''
+             LOG.info(
+                 'sign=%(sign)s, id=%(name)s, name=%(display_name)s, '
+                 'vm_mode=%(vm)s, task_state=%(task)s, power_state=%(power)s, '
+-                'numa_topology=%(topo)s',
++                'numa_topology=%(topo)s, %(pci_devs)s',
+                 {'sign': sign,
+                 'name': getter(instance, 'name'),
+                 'display_name': getter(instance, 'display_name'),
+@@ -1860,6 +1880,7 @@ class ResourceTracker(object):
+                 'task': instance.get('task_state'),
+                 'power': power_state.STATE_MAP[pstate],
+                 'topo': topo,
++                'pci_devs': devs,
+                 }, instance=instance)
+ 
+         cn.current_workload = self.stats.calculate_workload()
+diff --git a/nova/conf/compute.py b/nova/conf/compute.py
+index 86df5fb..a17c750 100644
+--- a/nova/conf/compute.py
++++ b/nova/conf/compute.py
+@@ -957,6 +957,23 @@ Possible values:
+ * 0: Will run at the default periodic interval.
+ * Any value < 0: Disables the option.
+ * Any positive integer in seconds.
++"""),
++    cfg.IntOpt('pci_affine_interval',
++               default=60,
++help="""
++Number of seconds between pci affinity updates
++
++This option specifies how often the pci_affine_interval
++periodic task should run. A number less than 0 means to disable the
++task completely. Leaving this at the default of 0 will cause this to
++run at the default periodic interval. Setting it to any positive
++value will cause it to run at approximately that number of seconds.
++
++Possible values:
++
++* 0: Will run at the default periodic interval.
++* Any value < 0: Disables the option.
++* Any positive integer in seconds.
+ """)
+ ]
+ 
+diff --git a/nova/conf/libvirt.py b/nova/conf/libvirt.py
+index 5e40998..12928b9 100644
+--- a/nova/conf/libvirt.py
++++ b/nova/conf/libvirt.py
+@@ -1074,6 +1074,19 @@ libvirt_wrs_vif_dpdk_opts = [
+                      '"cpu=0"]'),
+ ]
+ 
++# add options for PCI IRQ affinity, msi irq detection parameters
++libvirt_pci_irq_opts = [
++    cfg.IntOpt('msi_irq_timeout',
++               default=45,
++               help='Number of seconds to wait for msi irq configuration'),
++    cfg.IntOpt('msi_irq_since',
++               default=6,
++               help='Number of seconds to wait for msi irqs to stabilize.'),
++    cfg.IntOpt('msi_irq_check_interval',
++               default=2,
++               help='Check interval in seconds for msi irqs to stabilize.'),
++]
++
+ ALL_OPTS = list(itertools.chain(
+     libvirt_general_opts,
+     libvirt_imagebackend_opts,
+@@ -1092,6 +1105,7 @@ ALL_OPTS = list(itertools.chain(
+     libvirt_remotefs_opts,
+     libvirt_volume_vzstorage_opts,
+     libvirt_wrs_vif_dpdk_opts,
++    libvirt_pci_irq_opts,
+ ))
+ 
+ 
+diff --git a/nova/pci/manager.py b/nova/pci/manager.py
+index fc7c0c8..cf60951 100644
+--- a/nova/pci/manager.py
++++ b/nova/pci/manager.py
+@@ -21,6 +21,7 @@ from oslo_log import log as logging
+ from oslo_serialization import jsonutils
+ 
+ from nova.compute import task_states
++from nova import context
+ from nova import exception
+ from nova import objects
+ from nova.objects import fields
+@@ -419,3 +420,29 @@ def get_instance_pci_devs(inst, request_id=None):
+         return []
+     return [device for device in pci_devices if
+                    device.request_id == request_id or request_id == 'all']
++
++
++# extension
++def get_instance_pci_devs_by_host_and_node(inst, request_id=None,
++                                           host=None, nodename=None):
++    """Get the PCI devices allocated to one or all requests for an instance,
++       optionally filtering out devices for a specific host and node.
++    """
++    if not hasattr(inst, 'pci_devices'):
++        return []
++    pci_devices = inst.pci_devices
++    if ((not pci_devices) or
++            all(x is None for x in [inst.host, inst.node, host, nodename])):
++        return []
++    ctxt = context.get_admin_context()
++    if host is not None or nodename is not None:
++        _host = host
++        _node = nodename
++    else:
++        _host = inst.host
++        _node = inst.node
++    node = objects.ComputeNode.get_by_host_and_nodename(ctxt, _host, _node)
++    return [device for device in pci_devices if
++            (device.request_id == request_id or request_id == 'all')
++            and device.status == 'allocated'
++            and device.compute_node_id == node.id]
+diff --git a/nova/pci/utils.py b/nova/pci/utils.py
+index cb9f3f3..d909864 100644
+--- a/nova/pci/utils.py
++++ b/nova/pci/utils.py
+@@ -22,6 +22,7 @@
+ #
+ 
+ 
++import errno
+ import glob
+ import os
+ import re
+@@ -31,6 +32,8 @@ from oslo_log import log as logging
+ 
+ from nova import exception
+ from nova.network import model as network_model
++from nova import utils
++from nova.virt import hardware
+ 
+ LOG = logging.getLogger(__name__)
+ 
+@@ -133,6 +136,196 @@ def is_physical_function(domain, bus, slot, function):
+     return False
+ 
+ 
++def get_irqs_by_pci_address(pci_addr):
++    """Get list of PCI IRQs based on a VF's pci address
++
++    Raises PciDeviceNotFoundById in case the pci device is not found,
++    or when there is an underlying problem getting associated irqs.
++    :param pci_addr: PCI address
++    :return: irqs, msi_irqs
++    """
++    irqs = set()
++    msi_irqs = set()
++
++    dev_path = "/sys/bus/pci/devices/%s" % (pci_addr)
++    if not os.path.isdir(dev_path):
++        raise exception.PciDeviceNotFoundById(id=pci_addr)
++
++    _irqs = set()
++    irq_path = "/sys/bus/pci/devices/%s/irq" % (pci_addr)
++    try:
++        with open(irq_path) as f:
++            _irqs.update([int(x) for x in f.readline().split() if int(x) > 0])
++    except Exception as e:
++        LOG.error('get_irqs_by_pci_address: '
++                  'pci_addr=%(A)s: irq_path=%(P)s; error=%(E)s',
++                  {'A': pci_addr, 'P': irq_path, 'E': e})
++        raise exception.PciDeviceNotFoundById(id=pci_addr)
++
++    _msi_irqs = set()
++    msi_path = "/sys/bus/pci/devices/%s/msi_irqs" % (pci_addr)
++    try:
++        _msi_irqs.update([int(x) for x in os.listdir(msi_path) if int(x) > 0])
++    except OSError as e:
++        # msi_path disappears during configuration; do not treat
++        # non-existance as fatal
++        if e.errno == errno.ENOENT:
++            return (irqs, msi_irqs)
++        else:
++            LOG.error('get_irqs_by_pci_address: '
++                      'pci_addr=%(A)s: msi_path=%(P)s; error=%(E)s',
++                      {'A': pci_addr, 'P': msi_path, 'E': e})
++            raise exception.PciDeviceNotFoundById(id=pci_addr)
++    except Exception as e:
++        LOG.error('get_irqs_by_pci_address: '
++                  'pci_addr=%(A)s: msi_path=%(P)s; error=%(E)s',
++                  {'A': pci_addr, 'P': msi_path, 'E': e})
++        raise exception.PciDeviceNotFoundById(id=pci_addr)
++
++    # Return only configured irqs, ignore any that are missing.
++    for irq in _irqs:
++        irq_path = "/proc/irq/%s" % (irq)
++        if os.path.isdir(irq_path):
++            irqs.update([irq])
++    for irq in _msi_irqs:
++        irq_path = "/proc/irq/%s" % (irq)
++        if os.path.isdir(irq_path):
++            msi_irqs.update([irq])
++    return (irqs, msi_irqs)
++
++
++def get_pci_irqs_pinned_cpuset(flavor=None, numa_topology=None,
++                               pci_numa_node=None):
++    """Get pinned cpuset where pci irq are affined.
++
++    :param flavor: flavor
++    :param pci_numa_node: numa node of a specific PCI device
++    :param numa_topology: instance numa topology
++    :return: cpuset, cpulist
++    """
++    cpuset = set()
++    cpulist = ''
++
++    if numa_topology is None or pci_numa_node is None or pci_numa_node < 0:
++        return (cpuset, cpulist)
++
++    # Determine full affinity cpuset, but restrict to pci's numa node
++    for cell in numa_topology.cells:
++        if cell.id == pci_numa_node:
++            if cell.cpu_pinning is not None:
++                cpuset.update(set(cell.cpu_pinning.values()))
++
++    # Use extra-spec hw:pci_irq_affinity_mask only when the instance is pinned.
++    if cpuset:
++        pci_cpuset = hardware._get_pci_affinity_mask(flavor)
++        if pci_cpuset:
++            cpuset = set()
++            for cell in numa_topology.cells:
++                if cell.cpu_pinning is not None:
++                    for vcpu in cell.cpuset:
++                        if vcpu in pci_cpuset:
++                            vcpu_cell, pcpu = numa_topology.vcpu_to_pcpu(vcpu)
++                            cpuset.update(set([pcpu]))
++
++    cpulist = utils.list_to_range(input_list=list(cpuset))
++    return (cpuset, cpulist)
++
++
++def set_irqs_affinity_by_pci_address(pci_addr, flavor=None,
++                                     numa_topology=None):
++    """Set cpu affinity for list of PCI IRQs with a VF's pci address,
++    but restrict cpuset to the numa node of the PCI.
++
++    Return list
++    Raises PciDeviceNotFoundById in case the pci device is not found,
++    or when there is an underlying problem getting associated irqs.
++    :param pci_addr: PCI address
++    :param flavor: flavor
++    :param numa_topology: instance numa topology
++    :return: irqs, msi_irqs, numa_node, cpulist
++    """
++    irqs = set()
++    msi_irqs = set()
++    numa_node = None
++    cpulist = ''
++
++    if numa_topology is None:
++        return (irqs, msi_irqs, numa_node, cpulist)
++
++    # Get the irqs associated with pci addr
++    _irqs, _msi_irqs = get_irqs_by_pci_address(pci_addr)
++
++    # Obtain physical numa_node for this pci addr
++    numa_path = "/sys/bus/pci/devices/%s/numa_node" % (pci_addr)
++    try:
++        with open(numa_path) as f:
++            numa_node = [int(x) for x in f.readline().split()][0]
++    except Exception as e:
++        LOG.error('set_irqs_affinity_by_pci_address: '
++                  'pci_addr=%(A)s: numa_path=%(P)s; error=%(E)s',
++                  {'A': pci_addr, 'P': numa_path, 'E': e})
++        raise exception.PciDeviceNotFoundById(id=pci_addr)
++
++    # Skip irq configuration if there is no associated numa node
++    if numa_node is None or numa_node < 0:
++        return (irqs, msi_irqs, numa_node, cpulist)
++
++    # Determine the pinned cpuset where irqs are to be affined
++    cpuset, cpulist = get_pci_irqs_pinned_cpuset(flavor=flavor,
++                                                 numa_topology=numa_topology,
++                                                 pci_numa_node=numa_node)
++
++    # Skip irq configuration if there are no pinned cpus
++    if not cpuset:
++        return (irqs, msi_irqs, numa_node, cpulist)
++
++    # Set IRQ affinity, but do not treat errors as fatal.
++    for irq in _irqs:
++        irq_aff_path = "/proc/irq/%s/smp_affinity_list" % (irq)
++        try:
++            with open(irq_aff_path, 'w') as f:
++                f.write(cpulist)
++            irqs.update([irq])
++        except Exception as e:
++            LOG.warning("Could not affine pci_addr:%(A)s, irq:%(I)s, "
++                        "error=%(E)s",
++                        {"A": pci_addr, "I": irq, "E": e})
++    for irq in _msi_irqs:
++        irq_aff_path = "/proc/irq/%s/smp_affinity_list" % (irq)
++        try:
++            with open(irq_aff_path, 'w') as f:
++                f.write(cpulist)
++            msi_irqs.update([irq])
++        except Exception as e:
++            LOG.warning("Could not affine pci_addr:%(A)s, irq:%(I)s, "
++                        "error=%(E)s",
++                        {"A": pci_addr, "I": irq, "E": e})
++    return (irqs, msi_irqs, numa_node, cpulist)
++
++
++def format_instance_pci_devices(pci_devices=None,
++                                delim='\n'):
++    """Returns formated pci devices list.
++
++    :param pci_devices: `nova.objects.PciDeviceList` object
++    """
++    if pci_devices is None:
++        return ''
++
++    devs = []
++    for pci_dev in pci_devices:
++        str = ('node:%s, addr:%s, type:%s, vendor:%s, product:%s'
++               % (pci_dev.numa_node,
++                  pci_dev.address,
++                  pci_dev.dev_type.replace('type-', ''),
++                  pci_dev.vendor_id,
++                  pci_dev.product_id
++                  ))
++        devs.append(str)
++
++    return '%s' % (delim.join(devs))
++
++
+ def _get_sysfs_netdev_path(pci_addr, pf_interface):
+     """Get the sysfs path based on the PCI address of the device.
+ 
+diff --git a/nova/tests/unit/api/openstack/fakes.py b/nova/tests/unit/api/openstack/fakes.py
+index e009646..285b0b4 100644
+--- a/nova/tests/unit/api/openstack/fakes.py
++++ b/nova/tests/unit/api/openstack/fakes.py
+@@ -572,6 +572,8 @@ def stub_instance_obj(ctxt, *args, **kwargs):
+     db_inst = stub_instance(*args, **kwargs)
+     expected = ['metadata', 'system_metadata', 'flavor',
+                 'info_cache', 'security_groups']
++    # extension
++    expected.append('pci_devices')
+     inst = objects.Instance._from_db_object(ctxt, objects.Instance(),
+                                             db_inst,
+                                             expected_attrs=expected)
+diff --git a/nova/virt/driver.py b/nova/virt/driver.py
+index 0546998..eabeca9 100644
+--- a/nova/virt/driver.py
++++ b/nova/virt/driver.py
+@@ -1653,6 +1653,11 @@ class ComputeDriver(object):
+     def get_disk_available_least(self):
+         return 0
+ 
++    # extension
++    def affine_pci_dev_irqs(self, instance, wait_for_irqs=True):
++        """Affine PCI device irqs to VM's pcpus."""
++        raise NotImplementedError()
++
+ 
+ def load_compute_driver(virtapi, compute_driver=None):
+     """Load a compute driver module.
+diff --git a/nova/virt/hardware.py b/nova/virt/hardware.py
+index ec2d167..8c0d20b 100644
+--- a/nova/virt/hardware.py
++++ b/nova/virt/hardware.py
+@@ -1707,6 +1707,23 @@ def vcpus_realtime_topology(flavor, image):
+     return vcpus_rt
+ 
+ 
++# extension
++def _get_pci_affinity_mask(flavor):
++    """Parse pci affinity mask based on flavor extra-spec.
++
++    Returns set of vcpu ids with corresponding pci irq affinity mask.
++    """
++    flavor_map = flavor.get('extra_specs', {}).get("hw:pci_irq_affinity_mask")
++    if not flavor_map:
++        return None
++
++    cpuset_ids = parse_cpu_spec(flavor_map)
++    if not cpuset_ids:
++        raise exception.Invalid(_("No CPUs available after parsing %r") %
++                                flavor_map)
++    return cpuset_ids
++
++
+ # add node_list
+ def _numa_get_constraints_auto(nodes, flavor, node_list):
+     if ((flavor.vcpus % nodes) > 0 or
+diff --git a/nova/virt/libvirt/driver.py b/nova/virt/libvirt/driver.py
+index d778e03..ac762d9 100644
+--- a/nova/virt/libvirt/driver.py
++++ b/nova/virt/libvirt/driver.py
+@@ -479,6 +479,10 @@ class LibvirtDriver(driver.ComputeDriver):
+         # avoid any re-calculation when computing resources.
+         self._reserved_hugepages = hardware.numa_get_reserved_huge_pages()
+ 
++        self._msi_irq_count = {}
++        self._msi_irq_since = {}
++        self._msi_irq_elapsed = {}
++
+     def _get_volume_drivers(self):
+         driver_registry = dict()
+ 
+@@ -3011,6 +3015,108 @@ class LibvirtDriver(driver.ComputeDriver):
+         timer = loopingcall.FixedIntervalLoopingCall(_wait_for_boot)
+         timer.start(interval=0.5).wait()
+ 
++    def affine_pci_dev_irqs(self, instance, wait_for_irqs=True):
++        """Affine PCI device irqs to VM's pcpus."""
++
++        def _wait_for_msi_irqs(instance):
++            """Check each pci device has the expected number of msi irqs."""
++            _prev = self._msi_irq_count.copy()
++            addrs = set()
++            for pci_dev in instance.pci_devices.objects:
++                addr = pci_dev.address
++                addrs.update([addr])
++                try:
++                    irqs, msi_irqs = pci_utils.get_irqs_by_pci_address(addr)
++                except Exception as e:
++                    msi_irqs = set()
++                    LOG.error('_wait_for_msi_irqs: pci_addr=%(A)s, '
++                              'error=%(E)s',
++                              {'A': addr, 'E': e})
++                self._msi_irq_count[addr] = len(msi_irqs)
++                self._msi_irq_elapsed[addr] += \
++                    CONF.libvirt.msi_irq_check_interval
++                if _prev[addr] == self._msi_irq_count[addr]:
++                    self._msi_irq_since[addr] += \
++                        CONF.libvirt.msi_irq_check_interval
++                else:
++                    self._msi_irq_since[pci_dev.address] = 0
++
++            # Done when msi irq counts have not changed for some time
++            if all((self._msi_irq_count[k] > 0) and
++                   (self._msi_irq_since[k] >= CONF.libvirt.msi_irq_since)
++                   for k in addrs):
++                raise loopingcall.LoopingCallDone()
++
++            # Abort due to timeout
++            if all(self._msi_irq_elapsed[k] >= CONF.libvirt.msi_irq_timeout
++                   for k in addrs):
++                msg = (_("reached %(timeout)s seconds timeout, waiting for "
++                         "msi irqs of pci_addrs: %(addrs)s")
++                       % {'addrs': list(addrs),
++                          'timeout': CONF.libvirt.msi_irq_timeout})
++                LOG.warning(msg)
++                raise loopingcall.LoopingCallDone()
++
++        # Determine how many msi irqs we expect to be configured.
++        if len(instance.pci_devices.objects) == 0:
++            return
++
++        # Initialize msi irq tracking.
++        for pci_dev in instance.pci_devices.objects:
++            if wait_for_irqs or (pci_dev.address not in self._msi_irq_count):
++                self._msi_irq_count[pci_dev.address] = 0
++                self._msi_irq_since[pci_dev.address] = 0
++                self._msi_irq_elapsed[pci_dev.address] = 0
++
++        # Wait for msi irqs to be configured.
++        if wait_for_irqs:
++            timer = loopingcall.FixedIntervalLoopingCall(
++                _wait_for_msi_irqs, instance)
++            timer.start(interval=CONF.libvirt.msi_irq_check_interval).wait()
++
++        @utils.synchronized(instance.uuid)
++        def do_affine_pci_dev_instance():
++            """Set pci device irq affinity for this instance."""
++            instance.refresh()
++            numa_topology = instance.get('numa_topology')
++            flavor = instance.get_flavor()
++            for pci_dev in instance.pci_devices.objects:
++                try:
++                    irqs, msi_irqs, pci_numa_node, pci_cpulist = \
++                        pci_utils.set_irqs_affinity_by_pci_address(
++                            pci_dev.address, flavor=flavor,
++                            numa_topology=numa_topology)
++                except Exception as e:
++                    irqs = set()
++                    msi_irqs = set()
++                    pci_numa_node = None
++                    pci_cpulist = ''
++                    LOG.error("Could not affine irqs for pci_addr:%(A)s, "
++                              "error: %(E)s",
++                              {"A": pci_dev.address, "E": e},
++                              instance=instance)
++
++                # Log irqs affined when there is a change in the counts.
++                msi_irq_count = len(msi_irqs)
++                if ((msi_irq_count != self._msi_irq_count[pci_dev.address]) or
++                        wait_for_irqs):
++                    self._msi_irq_count[pci_dev.address] = msi_irq_count
++                    LOG.info("IRQs affined for pci_addr=%(A)s, "
++                             "dev_id=%(D)s, dev_type=%(T)s, "
++                             "vendor_id=%(V)s, product_id=%(P)s, "
++                             "irqs=%(I)s, msi_irqs:%(M)s, "
++                             "numa_node=%(N)s, cpulist=%(C)s",
++                             {'A': pci_dev.address,
++                              'D': pci_dev.dev_id,
++                              'T': pci_dev.dev_type,
++                              'V': pci_dev.vendor_id,
++                              'P': pci_dev.product_id,
++                              'I': ', '.join(map(str, irqs)),
++                              'M': ', '.join(map(str, msi_irqs)),
++                              'N': pci_numa_node, 'C': pci_cpulist},
++                             instance=instance)
++        do_affine_pci_dev_instance()
++
+     def _flush_libvirt_console(self, pty):
+         out, err = utils.execute('dd',
+                                  'if=%s' % pty,
+@@ -5650,6 +5756,13 @@ class LibvirtDriver(driver.ComputeDriver):
+ 
+         self._set_cpu_latency(instance.numa_topology, 'low')
+ 
++        # Affine irqs associated with PCI/PT and SRIOV network devices.
++        # This chooses the subset of cpus from instance numa_topology that
++        # reside on the same numa node as the PCI device.
++        # This is done asynchronously since it takes a while for the msi irqs
++        # to be configured.
++        utils.spawn_n(self.affine_pci_dev_irqs, instance)
++
+         # Resume only if domain has been paused
+         if pause:
+             guest.resume()
+-- 
+2.7.4
+

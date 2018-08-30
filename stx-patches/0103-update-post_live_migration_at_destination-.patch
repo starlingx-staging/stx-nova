@@ -1,0 +1,39 @@
+From 5f1e5e1867404313cc0144acae6aeb29c9cc7461 Mon Sep 17 00:00:00 2001
+From: Daniel Chavolla <daniel.chavolla@windriver.com>
+Date: Thu, 15 Feb 2018 14:51:37 -0500
+Subject: [PATCH 103/143] update post_live_migration_at_destination() to Pike
+
+During the Pike rebase, write_instance_config()@nova/virt/libvirt/host.py
+was modified to return an object of type Guest instead of a domain.
+The function post_live_migration_at_destination()@nova/virt/libvirt/driver.py
+needs to be updated as well to now handle a Guest object when calling this
+function.
+This missing change was producing the following error in
+post_live_migration_at_destination() when calling
+libvirt_utils.assign_floating_cpusets():
+
+"Unable to query cpuset info, qemuMonitorCommand failed:
+'Guest' object has no attribute '_o'"
+---
+ nova/virt/libvirt/driver.py | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/nova/virt/libvirt/driver.py b/nova/virt/libvirt/driver.py
+index 6e09e3f..8450c1a 100644
+--- a/nova/virt/libvirt/driver.py
++++ b/nova/virt/libvirt/driver.py
+@@ -8225,9 +8225,9 @@ class LibvirtDriver(driver.ComputeDriver):
+ 
+         # Make sure we define the migrated instance in libvirt
+         xml = guest.get_xml_desc()
+-        domain = self._host.write_instance_config(xml)
++        guest_from_xml = self._host.write_instance_config(xml)
+         # put floating vCPU tasks in proper cpusets
+-        libvirt_utils.assign_floating_cpusets(domain, instance)
++        libvirt_utils.assign_floating_cpusets(guest_from_xml.domain, instance)
+         self._set_cpu_latency(instance.numa_topology, 'low')
+ 
+     def _get_instance_disk_info_from_config(self, guest_config,
+-- 
+2.7.4
+

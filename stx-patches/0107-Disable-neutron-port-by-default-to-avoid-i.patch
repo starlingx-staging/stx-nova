@@ -1,0 +1,31 @@
+From 079f0a37863ca664d1879a97b0f989d5d2449a03 Mon Sep 17 00:00:00 2001
+From: Teresa Ho <teresa.ho@windriver.com>
+Date: Wed, 21 Feb 2018 11:01:53 -0500
+Subject: [PATCH 107/143] Disable neutron port by default to avoid
+ issue with L2 network configurations
+
+When neutron port security is enabled, the mac filters are also enabled which
+causes issues with layer 2 network configuration that do not terminate or
+originate traffic using its own MAC address.
+This update is to have the neutron port security extension disabled by
+default.
+---
+ nova/network/neutronv2/api.py | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/nova/network/neutronv2/api.py b/nova/network/neutronv2/api.py
+index 8bbf8aa..c18511b 100644
+--- a/nova/network/neutronv2/api.py
++++ b/nova/network/neutronv2/api.py
+@@ -779,7 +779,7 @@ class API(base_api.NetworkAPI):
+ 
+             try:
+                 port_security_enabled = network.get(
+-                    'port_security_enabled', True)
++                    'port_security_enabled', False)
+                 if port_security_enabled:
+                     if not network.get('subnets'):
+                         # Neutron can't apply security groups to a port
+-- 
+2.7.4
+

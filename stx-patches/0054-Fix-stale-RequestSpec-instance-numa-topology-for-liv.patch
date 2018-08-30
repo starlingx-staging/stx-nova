@@ -1,0 +1,414 @@
+From 58e885e022727ce041d29412e24db76a1b3757f5 Mon Sep 17 00:00:00 2001
+From: Jim Gauld <james.gauld@windriver.com>
+Date: Wed, 14 Sep 2016 12:37:03 -0400
+Subject: [PATCH 054/143] Fix stale RequestSpec instance numa topology for
+ live-migration
+
+This updates request_spec flavor and numa_topology fields for
+live-migration since they can be stale after a server resize.
+
+Without this, we get mismatches between what is claimed and
+the number of vcpus and placement on host, resulting in a VM
+with more or less vcpus than expected.
+
+This update is a candidate for upstreaming.
+
+(cherry picked from R3 commit 2196e49)
+
+2a35dd8 Update RequestSpec instance numa topology for resize
+   This updates request_spec numa_topology field for resize, otherwise we
+   use numa_topology from when the instance was first created.
+
+   The required numa_topology changes when we do resize.
+   Without this, we may not be able to schedule the resize due to
+   NumaTopologyFilter having wrong numa_topology, or there can be a
+   mismatch between what is claimed and the number of vcpus and
+   placement on host, resulting in a VM with more or less vcpus than
+   expected.
+
+   This update is a candidate for upstreaming.
+
+   (cherry picked from R3 commit c077976)
+
+23e5bcc Fix handling of RequestSpec ignore_hosts during evacuate
+   Upstream in Newton, a change (commit 74ab427) was put in to save the
+   RequestSpec after resize/cold migrate.  This interacted with our
+   change to add the current host to the ignore_hosts list for a cold
+   migrate.  This caused the ignored host to be filtered out in subsequent
+   evacuates when the RequestSpec was re-used.  In a two compute system,
+   this can result in the instance not being evacuated at all.
+
+   Fix is to ignore existing RequestSpec ignore_hosts during evacuate.
+   This is similar to what happens on cold and live migrates.
+
+   Upstream can trigger this scenario on a resize if
+   CONF.allow_resize_to_same_host is False.
+   This issue is tracked by upstream bug 1669054
+
+de08199 Update RequestSpec numa topology on resize
+   During testing of Newton rebase, observed issues with incorrect
+   scheduling decisions when resizing an instance:
+   bug 180   resizing vm to a flavor with shared_vcpu set is allowed, when
+             host does not have any shared vcpu configured
+   Regression: Invalid resize command not rejected, VM has
+             error state
+
+   Underlying issue is that the numa_topology in the instance RequestSpec
+   was based on the old flavor.  Fix is to regenerate numa_topology based
+   on the new flavor.  This was fixed in R3/Mitaka by commit c077976, but
+   in Newton, upstream (commit 76dfb4b) added direct use of the existing
+   RequestSpec on resize/cold migrate which triggered the problem.
+
+   This fix also enables the updated RequestSpec numa_topology to be
+   saved in the db but note that the numa_topology in instance and
+   RequestSpec can still become misaligned if a resize is reverted.
+
+   This commit also resolves bug 187 (nova: instance goes into error state
+   when resizing to invalid cpu pinning config), as numa_get_constraints()
+   will be called to regenerate numa_topology.  If there's a pinning
+   mismatch error, the exception thrown will be handled by the existing
+   mechanism in _cold_migrate() and the instance will be set to active
+   state and an error msg given back to the user.
+
+   This change is a candidate for upstreaming.
+
+af2b933 Update RequestSpec numa topology on evacuate
+   During evacuation, RequestSpec numa_topology will be used to schedule
+   an instance.  However it can become stale if the instance has been
+   resized causing the scheduler to make incorrect decisions.
+
+   To resolve, update flavor and numa_topology in RequestSpec from instance
+   on evacuation.  Note that commit bd53bd8 reduces chances of stale data
+   by saving the revised numa_topology in the RequestSpec during resize but
+   there are scenarios (e.g. resize revert) where this can become misaligned
+   so need to refresh.
+
+   This change is a candidate for upstreaming.
+
+132eae7 Bug 181 fix: claim _test_numa_topology() to look into destination extra_spec
+
+   This commit fixes second issue for  Bug 181  - resize to a flavor with
+   vswitch numa affinity strict condition not met - is allowed.
+
+   The second issue described in this bug is :
+   ---
+   2: In resize, compute claim _test_numa_topology, we have updates
+   requested_topology (we see cpuset with correct number of vcpus),
+   but the extra_specs from flavor is from the source so we get
+   vswitch_strict = False which is wrong, so we can schedule on numa 1.
+
+   The claims is getting flavor like this, but does not reflect
+   the destination:
+
+   extra_specs = self.instance.flavor.get('extra_specs', {})
+   ---
+
+   The fix is to get the extra_specs info from the destination flavor
+   instead when resizing.
+
+cefd4c3 Cold migration fail due to hosts list grow in instance_group
+   Due to commit de08199 instance_group.hosts is carried over in request_spec
+   from the last migration and added to the next migration, so after a few
+   migrations the instance_group.hosts will grow to contain all hosts available
+   and next migration will fail.
+   Fix is to clean up instance_group.hosts after migration is executed.
+
+Port to Pike:
+   Removed part of changes in conductor.tasks.migrate._execute() as
+   they no longer apply.
+
+75153fc Pike rebase: Fix stale numa topology for resize and evacuation
+   This updates request_spec field numa_topology when we do
+   scheduler/manager.py select_destinations(). The numa_topology can get
+   stale if we do an evacuation or live-migration after a resize.
+   The stale numa_topology issue was introduced by porting Pike changes
+   in handling of request_spec.  We were missing update of numa_topology
+   in conductor/tasks/migrate.py _execute().
+
+__TYPE_primary
+__TAG_livemigration,resource
+__R4_commit_ef63525
+__R3_commit_3ec451f
+__TC6570,TC6573
+---
+ nova/compute/claims.py                             |  8 +++++++
+ nova/conductor/manager.py                          | 14 ++++++++---
+ nova/conductor/tasks/live_migrate.py               |  4 ++++
+ nova/conductor/tasks/migrate.py                    |  7 ++++++
+ nova/scheduler/manager.py                          | 14 +++++++++++
+ nova/scheduler/utils.py                            | 27 ++++++++++++++++++++++
+ .../unit/conductor/tasks/test_live_migrate.py      |  1 +
+ nova/tests/unit/conductor/tasks/test_migrate.py    |  4 +++-
+ nova/tests/unit/conductor/test_conductor.py        | 14 +++++++----
+ 9 files changed, 85 insertions(+), 8 deletions(-)
+
+diff --git a/nova/compute/claims.py b/nova/compute/claims.py
+index d86c483..2ab8344 100644
+--- a/nova/compute/claims.py
++++ b/nova/compute/claims.py
+@@ -126,6 +126,10 @@ class Claim(NopClaim):
+         return retval
+ 
+     @property
++    def flavor(self):
++        return self.instance.flavor
++
++    @property
+     def numa_topology(self):
+         if self._numa_topology_loaded:
+             return self._numa_topology
+@@ -360,6 +364,10 @@ class MoveClaim(Claim):
+         return hardware.numa_get_constraints(self.instance_type,
+                                              self.image_meta)
+ 
++    @property
++    def flavor(self):
++        return self.instance_type
++
+     def abort(self):
+         """Compute operation requiring claimed resources has failed or
+         been aborted.
+diff --git a/nova/conductor/manager.py b/nova/conductor/manager.py
+index f11b3ea..9c2602b 100644
+--- a/nova/conductor/manager.py
++++ b/nova/conductor/manager.py
+@@ -339,7 +339,7 @@ class ComputeTaskManager(base.Base):
+         # _set_vm_state_and_notify() accepts it
+         legacy_spec = request_spec.to_legacy_request_spec_dict()
+         try:
+-            task.execute()
++            request_spec = task.execute()
+         except exception.NoValidHost as ex:
+             vm_state = instance.vm_state
+             if not vm_state:
+@@ -900,8 +900,16 @@ class ComputeTaskManager(base.Base):
+                 elif recreate:
+                     # NOTE(sbauza): Augment the RequestSpec object by excluding
+                     # the source host for avoiding the scheduler to pick it
+-                    request_spec.ignore_hosts = request_spec.ignore_hosts or []
+-                    request_spec.ignore_hosts.append(instance.host)
++                    # overwrite ignore_hosts list in RequestSpec with
++                    # source host.  This drops any ignore_hosts from previous
++                    # requests which could prevent evacuate from scheduling
++                    # properly.
++                    request_spec.ignore_hosts = [instance.host]
++                    # The request_spec has stale flavor and numa_topology,
++                    # so these fields must be updated. This occurs when we do
++                    # an evacuation after a reverted resize.
++                    request_spec.flavor = instance.flavor
++                    request_spec.numa_topology = instance.numa_topology
+                     # NOTE(sbauza): Force_hosts/nodes needs to be reset
+                     # if we want to make sure that the next destination
+                     # is not forced to be the original host
+diff --git a/nova/conductor/tasks/live_migrate.py b/nova/conductor/tasks/live_migrate.py
+index 8acbf79..9db921c 100644
+--- a/nova/conductor/tasks/live_migrate.py
++++ b/nova/conductor/tasks/live_migrate.py
+@@ -313,6 +313,10 @@ class LiveMigrationTask(base.TaskBase):
+             # is not forced to be the original host
+             request_spec.reset_forced_destinations()
+ 
++            # The request_spec has stale flavor, so this field must be
++            # updated. This occurs when we do a live-migration after a resize.
++            request_spec.flavor = self.instance.flavor
++
+             # The request_spec has stale instance_group information.
+             # Update from db to get latest members and metadetails.
+             if hasattr(request_spec, 'instance_group') and \
+diff --git a/nova/conductor/tasks/migrate.py b/nova/conductor/tasks/migrate.py
+index 11ca101..a329e3d 100644
+--- a/nova/conductor/tasks/migrate.py
++++ b/nova/conductor/tasks/migrate.py
+@@ -121,5 +121,12 @@ class MigrationTask(base.TaskBase):
+             request_spec=legacy_spec, filter_properties=legacy_props,
+             node=node, clean_shutdown=self.clean_shutdown)
+ 
++        # return request_spec for save to db but need to clear retry and
++        # instance_group hosts so that next request starts cleanly
++        self.request_spec.retry = None
++        if self.request_spec.instance_group:
++            self.request_spec.instance_group.hosts = []
++        return self.request_spec
++
+     def rollback(self):
+         pass
+diff --git a/nova/scheduler/manager.py b/nova/scheduler/manager.py
+index cf47290..b8c1a8d 100644
+--- a/nova/scheduler/manager.py
++++ b/nova/scheduler/manager.py
+@@ -37,6 +37,7 @@ from nova import quota
+ from nova.scheduler import client as scheduler_client
+ from nova.scheduler import utils
+ from nova import utils as nova_utils
++from nova.virt import hardware
+ 
+ 
+ LOG = logging.getLogger(__name__)
+@@ -120,6 +121,19 @@ class SchedulerManager(manager.Manager):
+                                                            request_spec,
+                                                            filter_properties)
+         resources = utils.resources_from_request_spec(spec_obj)
++
++        # The request_spec has stale numa_topology, so must be updated.
++        # We can get stale numa_topology if we do an evacuation or
++        # live-migration after a resize,
++        instance_type = spec_obj.flavor
++        image_meta = objects.ImageMeta(properties=image_props)
++        try:
++            spec_obj.numa_topology = \
++                hardware.numa_get_constraints(instance_type, image_meta)
++        except Exception as ex:
++            LOG.error("Cannot get numa constraints, error=%(err)r",
++                    {'err': ex})
++
+         alloc_reqs_by_rp_uuid, provider_summaries = None, None
+         if self.driver.USES_ALLOCATION_CANDIDATES:
+             res = self.placement_client.get_allocation_candidates(resources)
+diff --git a/nova/scheduler/utils.py b/nova/scheduler/utils.py
+index d5f29b7..3df486d 100644
+--- a/nova/scheduler/utils.py
++++ b/nova/scheduler/utils.py
+@@ -40,6 +40,8 @@ from nova.objects import fields
+ from nova.objects import instance as obj_instance
+ from nova.objects.resource_provider import ResourceClass
+ from nova import rpc
++from nova import utils
++from nova.virt import hardware
+ 
+ 
+ LOG = logging.getLogger(__name__)
+@@ -103,12 +105,32 @@ def build_request_spec(ctxt, image, instances, instance_type=None):
+         else:
+             instance_type = flavors.extract_flavor(instance)
+ 
++    # The request_spec requires an updated requested numa_topology,
++    # otherwise we use numa_topology from when instance was first created.
++    # The required numa topology changes when we do resize.
++    requested_topology = None
+     if isinstance(instance, obj_instance.Instance):
+         instance = obj_base.obj_to_primitive(instance)
+         # obj_to_primitive doesn't copy this enough, so be sure
+         # to detach our metadata blob because we modify it below.
+         instance['system_metadata'] = dict(instance.get('system_metadata', {}))
+ 
++        if isinstance(instance_type, objects.Flavor):
++            if isinstance(image, dict) and 'properties' in image:
++                image_meta = objects.ImageMeta.from_dict(image)
++            else:
++                image_meta = objects.ImageMeta.from_dict(
++                    utils.get_image_from_system_metadata(
++                        instance['system_metadata']))
++            try:
++                requested_topology = hardware.numa_get_constraints(
++                    instance_type, image_meta)
++                instance['numa_topology'] = requested_topology
++            except Exception as ex:
++                LOG.error(
++                    "Cannot get numa constraints, error=%(err)r",
++                    {'err': ex})
++
+     if isinstance(instance_type, objects.Flavor):
+         instance_type = obj_base.obj_to_primitive(instance_type)
+         # NOTE(danms): Replicate this old behavior because the
+@@ -128,6 +150,11 @@ def build_request_spec(ctxt, image, instances, instance_type=None):
+             'instance_properties': instance,
+             'instance_type': instance_type,
+             'num_instances': len(instances)}
++
++    # Update requested numa topology, needed for resize.
++    if requested_topology is not None:
++        request_spec.update({'numa_topology': requested_topology})
++
+     return jsonutils.to_primitive(request_spec)
+ 
+ 
+diff --git a/nova/tests/unit/conductor/tasks/test_live_migrate.py b/nova/tests/unit/conductor/tasks/test_live_migrate.py
+index 4f25fc1..3df2ec3 100644
+--- a/nova/tests/unit/conductor/tasks/test_live_migrate.py
++++ b/nova/tests/unit/conductor/tasks/test_live_migrate.py
+@@ -59,6 +59,7 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
+         self.disk_over_commit = "doc"
+         self.migration = objects.Migration()
+         self.fake_spec = objects.RequestSpec()
++        self.instance.flavor = objects.Flavor()
+         self._generate_task()
+ 
+     def _generate_task(self):
+diff --git a/nova/tests/unit/conductor/tasks/test_migrate.py b/nova/tests/unit/conductor/tasks/test_migrate.py
+index 092942b..4d5c50a 100644
+--- a/nova/tests/unit/conductor/tasks/test_migrate.py
++++ b/nova/tests/unit/conductor/tasks/test_migrate.py
+@@ -41,7 +41,9 @@ class MigrationTaskTestCase(test.NoDBTestCase):
+             system_metadata={'image_hw_disk_bus': 'scsi'})
+         self.instance = objects.Instance._from_db_object(
+             self.context, inst_object, inst, [])
+-        self.request_spec = objects.RequestSpec(image=objects.ImageMeta())
++        self.request_spec = objects.RequestSpec(image=objects.ImageMeta(
++                                    properties=objects.ImageMetaProps()))
++        self.request_spec.instance_group = None
+         self.hosts = [dict(host='host1', nodename=None, limits={})]
+         self.filter_properties = {'limits': {}, 'retry': {'num_attempts': 1,
+                                   'hosts': [['host1', None]]}}
+diff --git a/nova/tests/unit/conductor/test_conductor.py b/nova/tests/unit/conductor/test_conductor.py
+index 1834022..f687640 100644
+--- a/nova/tests/unit/conductor/test_conductor.py
++++ b/nova/tests/unit/conductor/test_conductor.py
+@@ -363,6 +363,7 @@ class _BaseTaskTestCase(object):
+ 
+         fake_spec = fake_request_spec.fake_spec_obj()
+         spec_from_components.return_value = fake_spec
++        migration_task_execute.return_value = fake_spec
+ 
+         scheduler_hint = {'filter_properties': {}}
+ 
+@@ -403,7 +404,8 @@ class _BaseTaskTestCase(object):
+         instances = [objects.Instance(context=self.context,
+                                       id=i,
+                                       uuid=uuids.fake,
+-                                      flavor=instance_type) for i in range(2)]
++                                      flavor=instance_type,
++                                      numa_topology=None) for i in range(2)]
+         instance_type_p = obj_base.obj_to_primitive(instance_type)
+         instance_properties = obj_base.obj_to_primitive(instances[0])
+         instance_properties['system_metadata'] = flavors.save_flavor_info(
+@@ -2195,7 +2197,8 @@ class ConductorTaskTestCase(_BaseTaskTestCase, test_compute.BaseTestCase):
+             project_id=self.context.project_id)
+         resvs = 'fake-resvs'
+         image = 'fake-image'
+-        fake_spec = objects.RequestSpec(image=objects.ImageMeta())
++        fake_spec = objects.RequestSpec(image=objects.ImageMeta(
++                                        properties=objects.ImageMetaProps()))
+         spec_fc_mock.return_value = fake_spec
+         legacy_request_spec = fake_spec.to_legacy_request_spec_dict()
+         metadata_mock.return_value = image
+@@ -2251,7 +2254,8 @@ class ConductorTaskTestCase(_BaseTaskTestCase, test_compute.BaseTestCase):
+         image = 'fake-image'
+         resvs = 'fake-resvs'
+ 
+-        fake_spec = objects.RequestSpec(image=objects.ImageMeta())
++        fake_spec = objects.RequestSpec(image=objects.ImageMeta(
++                                        properties=objects.ImageMetaProps()))
+         spec_fc_mock.return_value = fake_spec
+         legacy_request_spec = fake_spec.to_legacy_request_spec_dict()
+ 
+@@ -2386,7 +2390,8 @@ class ConductorTaskTestCase(_BaseTaskTestCase, test_compute.BaseTestCase):
+             project_id=self.context.project_id)
+         image = 'fake-image'
+         resvs = 'fake-resvs'
+-        fake_spec = objects.RequestSpec(image=objects.ImageMeta())
++        fake_spec = objects.RequestSpec(image=objects.ImageMeta(
++                                        properties=objects.ImageMetaProps()))
+         legacy_request_spec = fake_spec.to_legacy_request_spec_dict()
+         spec_fc_mock.return_value = fake_spec
+ 
+@@ -2455,6 +2460,7 @@ class ConductorTaskTestCase(_BaseTaskTestCase, test_compute.BaseTestCase):
+         fake_spec = fake_request_spec.fake_spec_obj()
+ 
+         image_mock.return_value = image
++        task_exec_mock.return_value = fake_spec
+         # Just make sure we have an original flavor which is different from
+         # the new one
+         self.assertNotEqual(flavor, fake_spec.flavor)
+-- 
+2.7.4
+

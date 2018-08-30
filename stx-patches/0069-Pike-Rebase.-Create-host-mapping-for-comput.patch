@@ -1,0 +1,72 @@
+From e76331fdfd6897244d2e65bb3dab1b24c94266a5 Mon Sep 17 00:00:00 2001
+From: Jack Ding <jack.ding@windriver.com>
+Date: Fri, 3 Nov 2017 17:22:01 -0400
+Subject: [PATCH 069/143] Pike Rebase. Create host mapping for compute node.
+
+This change adds an entry in nova_api host_mappings table for
+the compute node while creating host service. This enables VIM
+to carry on with its create_host_services operation.
+
+__TYPE_single
+---
+ nova/compute/api.py                              | 15 +++++++++++++++
+ nova/compute/resource_tracker.py                 |  2 ++
+ nova/tests/unit/compute/test_resource_tracker.py |  3 ++-
+ 3 files changed, 19 insertions(+), 1 deletion(-)
+
+diff --git a/nova/compute/api.py b/nova/compute/api.py
+index c3c139e..542d9a7 100644
+--- a/nova/compute/api.py
++++ b/nova/compute/api.py
+@@ -4779,6 +4779,21 @@ class HostAPI(base.Base):
+                 # Not an error if the service exists already.
+                 pass
+ 
++            # host_mapping already exists for a host reinstall
++            try:
++                objects.HostMapping.get_by_host(context, host)
++            except exception.HostMappingNotFound:
++                LOG.info("Creating host mapping for compute host "
++                         "'%(host)s'", {'host': host})
++
++                cell_mappings = objects.CellMappingList.get_all(context)
++                for cm in cell_mappings:
++                    if not cm.is_cell0():
++                        host_mapping = objects.HostMapping(context, host=host,
++                                                           cell_mapping=cm)
++                        host_mapping.create()
++                        break
++
+     def _service_delete(self, context, service_id):
+         """Performs the actual Service deletion operation."""
+         try:
+diff --git a/nova/compute/resource_tracker.py b/nova/compute/resource_tracker.py
+index 6b40a12..302d6c5 100644
+--- a/nova/compute/resource_tracker.py
++++ b/nova/compute/resource_tracker.py
+@@ -842,6 +842,8 @@ class ResourceTracker(object):
+         # to be initialized with resource values.
+         cn = objects.ComputeNode(context)
+         cn.host = self.host
++        # host mapping is already done at service_create
++        cn.mapped = 1
+         self._copy_resources(cn, resources)
+         self.compute_nodes[nodename] = cn
+         cn.create()
+diff --git a/nova/tests/unit/compute/test_resource_tracker.py b/nova/tests/unit/compute/test_resource_tracker.py
+index f78a4d7..a47fb5b 100644
+--- a/nova/tests/unit/compute/test_resource_tracker.py
++++ b/nova/tests/unit/compute/test_resource_tracker.py
+@@ -1092,7 +1092,8 @@ class TestInitComputeNode(BaseTestCase):
+             disk_allocation_ratio=1.0,
+             stats={},
+             pci_device_pools=objects.PciDevicePoolList(objects=[]),
+-            uuid=uuids.compute_node_uuid
++            uuid=uuids.compute_node_uuid,
++            mapped=1
+         )
+ 
+         def set_cn_id():
+-- 
+2.7.4
+

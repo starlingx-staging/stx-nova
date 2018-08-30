@@ -1,0 +1,44 @@
+From c84c34268523e37f69df4304f7d39babafb93bd5 Mon Sep 17 00:00:00 2001
+From: "Beliveau, Ludovic" <Ludovic.Beliveau@windriver.com>
+Date: Thu, 6 Aug 2015 11:18:41 -0400
+Subject: [PATCH] Support PCI devices with multiple provider network
+
+In upstream, a string compare is executed for each PCI request spec with the
+PCI pools.  If there is a match, the PCI pool is returned.  If not the
+guest can't be scheduled.
+
+This commit introduce a special case in the comparison of spec attributes for
+type "physical_network".  In this case we check if "physical_network"
+specified in the spec matches least one configured "physical_network" on the
+PCI device (seperated by a ',').
+---
+ nova/pci/utils.py | 13 ++++++++++++-
+ 1 file changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/nova/pci/utils.py b/nova/pci/utils.py
+index f6892a6..0307da3 100644
+--- a/nova/pci/utils.py
++++ b/nova/pci/utils.py
+@@ -56,7 +56,18 @@ def pci_device_prop_match(pci_dev, specs):
+         """
+         if isinstance(pci_dev.get('numa_node'), basestring):
+             pci_dev.update({'numa_node': int(pci_dev.get('numa_node'))})
+-        return all(pci_dev.get(k) == v for k, v in spec.iteritems())
++        for k, v in spec.iteritems():
++            # Allow a PCI device to be configured in multiple provider
++            # networks.  The spec need to match at least one of them.
++            if k == 'physical_network':
++                # SysInv does something similar, but let's not take chances.
++                if (not pci_dev.get(k) or
++                    v not in pci_dev.get(k).replace(" ", "").split(',')):
++                    return False
++            else:
++                if pci_dev.get(k) != v:
++                    return False
++        return True
+ 
+     return any(_matching_devices(spec) for spec in specs)
+ 
+-- 
+2.7.4
+

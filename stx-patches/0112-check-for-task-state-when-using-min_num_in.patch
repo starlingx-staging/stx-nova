@@ -1,0 +1,42 @@
+From 65fcda5c750ca2e1aa6bbab4cb80280f517659d1 Mon Sep 17 00:00:00 2001
+From: Francois Palin <francois.palin@windriver.com>
+Date: Wed, 28 Feb 2018 10:38:27 -0500
+Subject: [PATCH 112/143] check for task state when using
+ min_num_instances
+
+When booting up, scheduler_hints
+doesn't yet contain task_state, in filter_scheduler.
+
+Checking if task_state is set to None will be true when
+instances are booting up.
+
+This fix overrides change 40271d1.
+---
+ nova/scheduler/filter_scheduler.py | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/nova/scheduler/filter_scheduler.py b/nova/scheduler/filter_scheduler.py
+index 867b13d..b1bed01 100644
+--- a/nova/scheduler/filter_scheduler.py
++++ b/nova/scheduler/filter_scheduler.py
+@@ -35,7 +35,6 @@ from oslo_log import log as logging
+ from oslo_utils import strutils
+ from six.moves import range
+ 
+-from nova.compute import task_states
+ import nova.conf
+ from nova.i18n import _
+ from nova import rpc
+@@ -149,7 +148,8 @@ class FilterScheduler(driver.Scheduler):
+         #      otherwise default to num_instances
+         if hasattr(spec_obj, 'min_num_instances'):
+             task_state = spec_obj.scheduler_hints.get('task_state')
+-            if task_state and (task_state == task_states.SCHEDULING):
++            # task_state set to None indicates this is not for migration
++            if task_state is None:
+                 num_instances = spec_obj.min_num_instances
+ 
+         selected_hosts = self._schedule(context, spec_obj, instance_uuids,
+-- 
+2.7.4
+

@@ -44,6 +44,7 @@ MANIFEST
 nosetests.xml
 nova/tests/cover/*
 nova/vcsversion.py
+stx-patches
 tools/conf/nova.conf*
 doc/source/_static/nova.conf.sample
 doc/source/_static/nova.policy.yaml.sample

@@ -1,0 +1,80 @@
+From 0fb05ca7f67a93b65f066d0da5bfdf78fba856f5 Mon Sep 17 00:00:00 2001
+From: Ludovic Beliveau <ludovic.beliveau@windriver.com>
+Date: Wed, 30 Sep 2015 16:46:49 -0400
+Subject: [PATCH] VMs w/ multiple SR-IOV devices on the same tenant
+ network fail migration
+
+After a cold migration, the neutron ports corresponding to the PCI devices
+of an instance need to be updated with the PCI information of the new PCI
+devices claimed.  The port used to be correlated to a PCI device based on the
+physical network name.
+
+This commit fixes the issue by using the PCI Request ID to correlate the port
+with the PCI device.
+
+Limitation: There is one PCI device per PCI Request. It's possible to have
+more than one PCI devices per PCI request but we don't support it at the
+moment (via pci_alias in the flavor).  A jira was raised a while ago to
+address this issue.
+---
+ nova/network/neutronv2/api.py | 29 ++++++++++-------------------
+ 1 file changed, 10 insertions(+), 19 deletions(-)
+
+diff --git a/nova/network/neutronv2/api.py b/nova/network/neutronv2/api.py
+index b826464..2d64f7f 100644
+--- a/nova/network/neutronv2/api.py
++++ b/nova/network/neutronv2/api.py
+@@ -1777,30 +1777,20 @@ class API(base_api.NetworkAPI):
+             if p.get('binding:host_id') != host:
+                 updates.update({'binding:host_id': host})
+ 
++                # Update PCI information for SR-IOV devices, correlate
++                # based on PCI Request ID.
+                 vnic_type = p.get('binding:vnic_type')
+                 if vnic_type == network_model.VNIC_TYPE_DIRECT:
+-                    if ('binding:profile' not in p.keys() or
+-                        'physical_network' not in
+-                            p.get('binding:profile').keys()):
+-                        LOG.warning(_LW("Port %s doesn't contain "
+-                                    "binding:profile or physical_network") %
+-                                    p['id'])
+-                        physical_network = ""
+-                    else:
+-                        physical_network = p.get('binding:profile').get(
+-                            'physical_network')
+-
+-                    # Get the pci device that matches this port physical
+-                    # network
++                    binding_profile = p.get('binding:profile', {})
++                    pci_request_id = binding_profile.get('pci_request_id')
+                     pci_devs = pci_manager.get_instance_pci_devs(instance,
+                                                                  'all')
+                     devspec = None
+                     pci_dev = None
+                     for pci_dev in reversed(pci_devs):
+-                        spec = pci_whitelist.get_pci_device_devspec(pci_dev)
+-                        if (spec.get_tags().get('physical_network') ==
+-                            physical_network):
+-                            devspec = spec
++                        if pci_request_id == pci_dev.request_id:
++                            devspec = pci_whitelist.get_pci_device_devspec(
++                                pci_dev)
+                             break
+ 
+                     if devspec:
+@@ -1813,9 +1803,10 @@ class API(base_api.NetworkAPI):
+                             'pci_request_id': pci_dev.request_id}
+                         updates.update({'binding:profile': profile})
+                     else:
+-                        LOG.warning(_LW("PCI device not found for physical "
+-                                    "network %s") % physical_network)
++                        LOG.warning(_LW("PCI device not found for PCI "
++                                    "request %s") % pci_request_id)
+ 
++                # Update MAC address for PCI Passthrough devices
+                 if p.get(constants.PORT_VIF_MODEL) == 'pci-passthrough':
+                     inst = objects.Instance.get_by_uuid(context,
+                                                         instance['uuid'])
+-- 
+2.7.4
+

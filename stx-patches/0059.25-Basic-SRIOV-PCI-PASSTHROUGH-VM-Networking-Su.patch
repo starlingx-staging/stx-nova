@@ -1,0 +1,96 @@
+From 2b038f049ab2723e804d8d4bfdd033bd8b2b85fb Mon Sep 17 00:00:00 2001
+From: Ludovic Beliveau <ludovic.beliveau@windriver.com>
+Date: Tue, 7 Apr 2015 11:40:59 -0400
+Subject: [PATCH] Basic SRIOV (& PCI-PASSTHROUGH) VM Networking
+ Support: Implementation
+
+This update introduces PCI SR-IOV Passthrough.  The PCI SR-IOV Passthrough
+devices on the compute nodes are configured via the system inventory interface
+configuration.  Upon unlock, the interfaces that were specified to support
+SR-IOV will get configured with the right amount of VFs on the physical port.
+Also, nova.conf will get updated accordingly.
+
+PCI SR-IOV Passthrough devices are assigned to instances via the VIF model
+(pci-sriov) when configuring the networks of an instance.  The nova scheduler
+will then select an appropriate compute host that has available PCI devices
+with the required network attachments when scheduling the instance.
+
+Limitations:
+-   Cold migration for instances with SR-IOV devices is broken in Juno/Kilo.
+-   PCI (non-SRIOV) Passthrough is broken in this commit.  Need to be
+    re-aligned with Juno/Kilo.
+---
+ nova/compute/api.py           | 10 ++++++++--
+ nova/network/neutronv2/api.py |  2 ++
+ nova/pci/utils.py             |  5 +++--
+ nova/virt/libvirt/vif.py      |  3 ++-
+ 4 files changed, 15 insertions(+), 5 deletions(-)
+
+diff --git a/nova/compute/api.py b/nova/compute/api.py
+index 972a227..ab0437f 100644
+--- a/nova/compute/api.py
++++ b/nova/compute/api.py
+@@ -1160,8 +1160,14 @@ class API(base.Base):
+                     # PCI passthrough devices will be filtered
+                     # based on the PCI requests.
+                     if pci_utils.vif_model_pci_passthrough(vif_model):
+-                        pci_request.create_pci_request(system_metadata,
+-                            {'physical_network': physnet})
++                        request = objects.InstancePCIRequest(
++                            count=1,
++                            spec=[{pci_request.PCI_NET_TAG: physnet}],
++                            request_id=str(uuid.uuid4()))
++
++                        requests = base_options.get('pci_requests')
++                        requests.requests.append(request)
++                        ntwk.pci_request_id = request.request_id
+                     else:
+                         hint[physkey].update([physnet])
+                 except Exception as err:
+diff --git a/nova/network/neutronv2/api.py b/nova/network/neutronv2/api.py
+index e1f0f96..d1d417b 100644
+--- a/nova/network/neutronv2/api.py
++++ b/nova/network/neutronv2/api.py
+@@ -561,6 +561,8 @@ class API(base_api.NetworkAPI):
+             port_req_body = {'port': {'device_id': instance.uuid,
+                                       'device_owner': zone,
+                                       'binding:vif_model': request.vif_model}}
++            if request.vif_model == 'pci-sriov':
++                port_req_body['port'].update({'binding:vnic_type': 'direct'})
+             try:
+                 self._populate_neutron_extension_values(context,
+                                                         instance,
+diff --git a/nova/pci/utils.py b/nova/pci/utils.py
+index e4438e3..8d68ccd 100644
+--- a/nova/pci/utils.py
++++ b/nova/pci/utils.py
+@@ -142,9 +142,10 @@ def get_vf_num_by_pci_address(pci_addr):
+ 
+ 
+ def vif_model_pci_passthrough(vif_model):
+-    """Checks whether the supplied VIF model is a pci-passthrough device
++    """Checks whether the supplied VIF model is a pci-passthrough
++    device or pci-sriov
+     :param vif_model: The VIF model to check
+     :return: TRUE if pci-passthrough VIF model, otherwise FALSE
+     """
+     # TODO(mpeters): support other (more specific) PCI passthrough models
+-    return vif_model in ['pci-passthrough']
++    return vif_model in ['pci-passthrough', 'pci-sriov']
+diff --git a/nova/virt/libvirt/vif.py b/nova/virt/libvirt/vif.py
+index b4599fb..356ed10 100644
+--- a/nova/virt/libvirt/vif.py
++++ b/nova/virt/libvirt/vif.py
+@@ -63,7 +63,8 @@ def is_vif_model_valid_for_virt(virt_type, vif_model):
+                 network_model.VIF_MODEL_PCNET,
+                 network_model.VIF_MODEL_RTL8139,
+                 network_model.VIF_MODEL_E1000,
+-                network_model.VIF_MODEL_SPAPR_VLAN],
++                network_model.VIF_MODEL_SPAPR_VLAN,
++                'pci-sriov'],
+         'xen': [network_model.VIF_MODEL_NETFRONT,
+                 network_model.VIF_MODEL_NE2K_PCI,
+                 network_model.VIF_MODEL_PCNET,
+-- 
+2.7.4
+

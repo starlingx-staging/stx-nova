@@ -1,0 +1,56 @@
+From 5397c47a6a4fb4e5403acee5f32ec7b3eeccda22 Mon Sep 17 00:00:00 2001
+From: "Beliveau, Ludovic" <Ludovic.Beliveau@windriver.com>
+Date: Fri, 29 May 2015 12:29:39 -0400
+Subject: [PATCH] SR-IOV: Revert resize fails on cold migration
+
+This commit fixes the resetting of the networking information for the instance.
+Before this fix, libvirt was trying to use the PCI devices that were initially
+allocated during the initial cold migration.
+---
+ nova/compute/manager.py | 23 ++++++++++++-----------
+ 1 file changed, 12 insertions(+), 11 deletions(-)
+
+diff --git a/nova/compute/manager.py b/nova/compute/manager.py
+index b1e5d34..83ec90e 100644
+--- a/nova/compute/manager.py
++++ b/nova/compute/manager.py
+@@ -3951,17 +3951,6 @@ class ComputeManager(manager.Manager):
+             self.network_api.setup_networks_on_host(context, instance,
+                                                     migration.source_compute)
+ 
+-            block_device_info = self._get_instance_block_device_info(
+-                    context, instance, refresh_conn_info=True)
+-
+-            power_on = old_vm_state != vm_states.STOPPED
+-            self.driver.finish_revert_migration(context, instance,
+-                                       network_info,
+-                                       block_device_info, power_on)
+-
+-            instance.launched_at = timeutils.utcnow()
+-            instance.save(expected_task_state=task_states.RESIZE_REVERTING)
+-
+             # Update MAC addresses for PCI passthrough devices
+             macs = self.driver.macs_for_instance(
+                 instance, self._get_vif_models(network_info))
+@@ -3975,6 +3964,18 @@ class ComputeManager(manager.Manager):
+                                                      instance,
+                                                      migration_p)
+ 
++            network_info = self._get_instance_nw_info(context, instance)
++            block_device_info = self._get_instance_block_device_info(
++                    context, instance, refresh_conn_info=True)
++
++            power_on = old_vm_state != vm_states.STOPPED
++            self.driver.finish_revert_migration(context, instance,
++                                       network_info,
++                                       block_device_info, power_on)
++
++            instance.launched_at = timeutils.utcnow()
++            instance.save(expected_task_state=task_states.RESIZE_REVERTING)
++
+             # if the original vm state was STOPPED, set it back to STOPPED
+             LOG.info(_LI("Updating instance to original state: '%s'"),
+                      old_vm_state)
+-- 
+2.7.4
+

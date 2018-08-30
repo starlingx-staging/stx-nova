@@ -1,0 +1,110 @@
+From 862e75d7f88d9a05ae14fa0801a064f731c82c32 Mon Sep 17 00:00:00 2001
+From: Jim Gauld <james.gauld@windriver.com>
+Date: Sat, 27 Jan 2018 21:45:06 -0500
+Subject: [PATCH 087/143] nova: Bug 268: instance build error
+ feedback for volume creation failure
+
+This passes through the cinder volume creation error field so we see
+relevant nova-compute.log errors with that information. Some of this
+gets back to the user as fault information when an instance fails to
+build.
+
+Note see cinder-volume errors from cinder-scheduler.  Example:
+cinder.scheduler.filters.capacity_filter Insufficient free space for
+thin provisioning. The ratio of provisioned capacity over total
+capacity 1.16 has exceeded the maximum over subscription ratio 1.00
+on host controller@lvm#lvm.
+
+This shows up now in nova-compute.log, appended to the end of the
+VolumeNotCreated error. This also shows up in the fault message, so
+this is more obvious when we do 'nova show <server>'.
+The error also shows up on horizon GUI error details.
+
+__TYPE_single
+---
+ nova/compute/manager.py               |  8 +++++++-
+ nova/exception.py                     | 17 ++++++++++++++---
+ nova/tests/unit/volume/test_cinder.py |  1 +
+ nova/volume/cinder.py                 |  4 ++++
+ 4 files changed, 26 insertions(+), 4 deletions(-)
+
+diff --git a/nova/compute/manager.py b/nova/compute/manager.py
+index 85f4856..b4124ea 100644
+--- a/nova/compute/manager.py
++++ b/nova/compute/manager.py
+@@ -1338,10 +1338,16 @@ class ComputeManager(manager.Manager):
+                              'vol_status': volume_status})
+                 break
+             greenthread.sleep(CONF.block_device_allocate_retries_interval)
++        # - pass through volume creation errors
++        if 'error' in volume:
++            volume_error = volume['error']
++        else:
++            volume_error = ''
+         raise exception.VolumeNotCreated(volume_id=vol_id,
+                                          seconds=int(time.time() - start),
+                                          attempts=attempt,
+-                                         volume_status=volume_status)
++                                         volume_status=volume_status,
++                                         volume_error=volume_error)
+ 
+     def _await_volume_detached(self, context, vol_id):
+         start = time.time()
+diff --git a/nova/exception.py b/nova/exception.py
+index bb29deb..4691b98 100644
+--- a/nova/exception.py
++++ b/nova/exception.py
+@@ -266,9 +266,20 @@ class VolumeAttachFailed(Invalid):
+ 
+ 
+ class VolumeNotCreated(NovaException):
+-    msg_fmt = _("Volume %(volume_id)s did not finish being created"
+-                " even after we waited %(seconds)s seconds or %(attempts)s"
+-                " attempts. And its status is %(volume_status)s.")
++    msg_fmt = None
++
++    def __init__(self, message=None, **kwargs):
++        if 'volume_error' in kwargs:
++            self.msg_fmt = _(
++                "Volume %(volume_id)s creation did not finish after "
++                "%(seconds)s seconds or %(attempts)s attempts. "
++                "Status is %(volume_status)s. %(volume_error)s")
++        else:
++            self.msg_fmt = _(
++                "Volume %(volume_id)s creation did not finish after "
++                "%(seconds)s seconds or %(attempts)s attempts. "
++                "Status is %(volume_status)s.")
++        super(VolumeNotCreated, self).__init__(message=message, **kwargs)
+ 
+ 
+ class ExtendVolumeNotSupported(Invalid):
+diff --git a/nova/tests/unit/volume/test_cinder.py b/nova/tests/unit/volume/test_cinder.py
+index 506399c..3073dce 100644
+--- a/nova/tests/unit/volume/test_cinder.py
++++ b/nova/tests/unit/volume/test_cinder.py
+@@ -54,6 +54,7 @@ class FakeVolume(object):
+         self.snapshot_id = 'snap_id_1'
+         self.metadata = {}
+         self.multiattach = multiattach
++        self.error = ''
+ 
+     def get(self, volume_id):
+         return self.volume_id
+diff --git a/nova/volume/cinder.py b/nova/volume/cinder.py
+index 2afe15f..608440c 100644
+--- a/nova/volume/cinder.py
++++ b/nova/volume/cinder.py
+@@ -200,6 +200,10 @@ def _untranslate_volume_summary_view(context, vol):
+     if hasattr(vol, 'volume_image_metadata'):
+         d['volume_image_metadata'] = copy.deepcopy(vol.volume_image_metadata)
+ 
++    # - pass through volume creation errors
++    if hasattr(vol, 'error'):
++        d['error'] = vol.error
++
+     return d
+ 
+ 
+-- 
+2.7.4
+

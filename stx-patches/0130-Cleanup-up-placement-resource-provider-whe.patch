@@ -1,0 +1,73 @@
+From 43e6ff5b0bcebe7a9dfe92fef5d3b92cd184a229 Mon Sep 17 00:00:00 2001
+From: Gerry Kopec <Gerry.Kopec@windriver.com>
+Date: Thu, 15 Mar 2018 15:24:32 -0400
+Subject: [PATCH 130/143] Cleanup up placement resource provider
+ when deleting compute host
+
+If a compute host is deleted by sysinv, the service and compute_node in
+nova db are deleted but the placement service resource provider and
+inventory entries in nova_api db are not. This causes placement accounting
+problems if the compute host is re-added later as it will have the same
+name but different uuid.
+
+To fix, delete the resource provider entries when deleting the compute
+service.  When the compute node comes up again it will add a resource
+provider entry back into placement service with the correct uuid.  Also
+remove the cells host_mappings entry for the deleted host.
+
+This fix is upstreamable.
+---
+ nova/compute/api.py                      | 9 +++++++++
+ nova/tests/unit/compute/test_host_api.py | 6 +++++-
+ 2 files changed, 14 insertions(+), 1 deletion(-)
+
+diff --git a/nova/compute/api.py b/nova/compute/api.py
+index 5c3f493..0cfd838 100644
+--- a/nova/compute/api.py
++++ b/nova/compute/api.py
+@@ -4676,6 +4676,7 @@ class HostAPI(base.Base):
+     def __init__(self, rpcapi=None):
+         self.rpcapi = rpcapi or compute_rpcapi.ComputeAPI()
+         self.servicegroup_api = servicegroup.API()
++        self.scheduler_client = scheduler_client.SchedulerClient()
+         super(HostAPI, self).__init__()
+ 
+     def _assert_host_exists(self, context, host_name, must_be_up=False):
+@@ -4856,6 +4857,14 @@ class HostAPI(base.Base):
+             service = _find_service_in_cell(context, service_id=service_id)
+         except exception.NotFound:
+             raise exception.ServiceNotFound(service_id=service_id)
++        # if service is a compute, make sure resource provider and host
++        # mapping are deleted.
++        if hasattr(service, 'compute_node'):
++            self.scheduler_client.reportclient.delete_resource_provider(
++                              context, service.compute_node, cascade=True)
++            host_mapping = objects.HostMapping.get_by_host(context,
++                              service.compute_node.host)
++            host_mapping.destroy()
+         service.destroy()
+ 
+     def service_delete(self, context, service_id):
+diff --git a/nova/tests/unit/compute/test_host_api.py b/nova/tests/unit/compute/test_host_api.py
+index a0fe540..5aa0f64 100644
+--- a/nova/tests/unit/compute/test_host_api.py
++++ b/nova/tests/unit/compute/test_host_api.py
+@@ -363,10 +363,14 @@ class ComputeHostAPITestCase(test.TestCase):
+             [mock.call(ctxt, uuids.service_uuid)] * 2)
+         self.assertEqual('db://fake2', ctxt.db_connection)
+ 
++    @mock.patch('nova.objects.HostMapping.destroy')
++    @mock.patch('nova.scheduler.client.report.SchedulerReportClient.'
++                'delete_resource_provider')
+     @mock.patch('nova.context.set_target_cell')
+     @mock.patch('nova.compute.api.load_cells')
+     @mock.patch('nova.objects.Service.get_by_id')
+-    def test_service_delete(self, get_by_id, load_cells, set_target):
++    def test_service_delete(self, get_by_id, load_cells, set_target,
++                            delete_rp, destroy_hm):
+         compute_api.CELLS = [
+             objects.CellMapping(),
+             objects.CellMapping(),
+-- 
+2.7.4
+

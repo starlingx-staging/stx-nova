@@ -1,0 +1,148 @@
+From a50b6beaeccda6eb1a01fb90ce548903b24b6f0a Mon Sep 17 00:00:00 2001
+From: "Beliveau, Ludovic" <Ludovic.Beliveau@windriver.com>
+Date: Mon, 27 Apr 2015 13:17:36 -0400
+Subject: [PATCH] VM's with SRIOV ports fail to auto-evacuate
+
+PCI requests were never passed in the filter_properties, therefore the
+scheduler was ignoring whether or not the selected host could meet the PCI
+requests requirements.
+---
+ nova/compute/api.py                              | 16 +++++++++++
+ nova/pci/stats.py                                |  4 +++
+ nova/scheduler/filter_scheduler.py               | 35 ++++++++++++++++++++++++
+ nova/scheduler/filters/pci_passthrough_filter.py | 12 +++++---
+ 4 files changed, 63 insertions(+), 4 deletions(-)
+
+diff --git a/nova/compute/api.py b/nova/compute/api.py
+index b600e34..c6728fd 100644
+--- a/nova/compute/api.py
++++ b/nova/compute/api.py
+@@ -3421,6 +3421,22 @@ class API(base.Base):
+                           'expected to be down, but it was up.'), inst_host)
+             raise exception.ComputeServiceInUse(host=inst_host)
+ 
++        network_info = self.network_api.get_instance_nw_info(context, instance)
++        pci_requests = []
++        for vif in network_info:
++            if pci_utils.vif_model_pci_passthrough(vif['vif_model']):
++                meta = vif['network']['meta']
++                request = objects.InstancePCIRequest(
++                    count=1,
++                    is_new=True,
++                    spec=[{pci_request.PCI_NET_TAG: meta['physical_network']}],
++                    request_id=str(uuid.uuid4()))
++                pci_requests.append(request)
++
++        instance.pci_requests = objects.InstancePCIRequests(
++            requests=pci_requests,
++            instance_uuid=instance.uuid)
++
+         instance.task_state = task_states.REBUILDING
+         instance.save(expected_task_state=[None])
+         self._record_action_start(context, instance, instance_actions.EVACUATE)
+diff --git a/nova/pci/stats.py b/nova/pci/stats.py
+index 4a065ba..8eb5da0 100644
+--- a/nova/pci/stats.py
++++ b/nova/pci/stats.py
+@@ -192,11 +192,15 @@ class PciDeviceStats(object):
+                                               for cell in numa_cells)]
+ 
+     def _apply_request(self, pools, request, numa_cells=None):
++        LOG.info("request: %s" % request)
++
+         count = request.count
+         matching_pools = self._filter_pools_for_spec(pools, request.spec)
++        LOG.info("matching_pools: %s" % matching_pools)
+         if numa_cells:
+             matching_pools = self._filter_pools_for_numa_cells(matching_pools,
+                                                           numa_cells)
++        LOG.info("matching_pools with numa_cells: %s" % matching_pools)
+         if sum([pool['count'] for pool in matching_pools]) < count:
+             return False
+         else:
+diff --git a/nova/scheduler/filter_scheduler.py b/nova/scheduler/filter_scheduler.py
+index 4143d0e..e47dbe5 100644
+--- a/nova/scheduler/filter_scheduler.py
++++ b/nova/scheduler/filter_scheduler.py
+@@ -32,6 +32,7 @@ from oslo_config import cfg
+ from oslo_log import log as logging
+ 
+ from nova.i18n import _LI, _LW
++from nova import objects
+ from nova import rpc
+ from nova.scheduler import driver
+ from nova.scheduler import scheduler_options
+@@ -137,6 +138,7 @@ class FilterScheduler(driver.Scheduler):
+         elevated = context.elevated()
+         instance_properties = request_spec['instance_properties']
+         instance_type = request_spec.get("instance_type", None)
++        pci_requests = None
+ 
+         update_group_hosts = filter_properties.get('group_updated', False)
+ 
+@@ -185,6 +187,39 @@ class FilterScheduler(driver.Scheduler):
+                                  'err': err})
+             if len(hint[physkey]) > 0:
+                 scheduler_hints.update(hint)
++
++        # Put the pci_requests in the filter_properties so that it can
++        # be properly scheduled
++        instance_properties = request_spec.get('instance_properties')
++        if instance_properties:
++            instance_pci_requests = instance_properties.get('pci_requests')
++            # Only put pci_request in filter_properties if it's not
++            # there already
++            if (instance_pci_requests and
++                    not filter_properties.get('pci_requests')):
++                if isinstance(instance_pci_requests, dict):
++                    requests = []
++                    for request in instance_pci_requests.get('requests'):
++                        request = objects.InstancePCIRequest(
++                            count=request.get('count'),
++                            spec=request.get('spec'),
++                            alias_name=request.get('alias_name'),
++                            is_new=request.get('is_new'),
++                            request_id=request.get('request_id'))
++                        requests.append(request)
++
++                    if requests:
++                        pci_requests = objects.InstancePCIRequests(
++                            instance_uuid=instance_pci_requests.get(
++                                'instance_uuid'),
++                            requests=requests)
++                else:
++                    pci_requests = instance_properties.get('pci_requests')
++
++                if pci_requests:
++                    filter_properties.update(
++                        {'pci_requests': pci_requests})
++
+         filter_properties.update({'scheduler_hints': scheduler_hints})
+ 
+         # Find our local list of acceptable hosts by repeatedly
+diff --git a/nova/scheduler/filters/pci_passthrough_filter.py b/nova/scheduler/filters/pci_passthrough_filter.py
+index 67df34b..a785e4a 100644
+--- a/nova/scheduler/filters/pci_passthrough_filter.py
++++ b/nova/scheduler/filters/pci_passthrough_filter.py
+@@ -50,10 +50,14 @@ class PciPassthroughFilter(filters.BaseHostFilter):
+     def host_passes(self, host_state, filter_properties):
+         """Return true if the host has the required PCI devices."""
+         pci_requests = filter_properties.get('pci_requests')
+-        if not pci_requests:
+-            return True
+-        if not host_state.pci_stats.support_requests(pci_requests.requests):
+-            LOG.debug("%(host_state)s doesn't have the required PCI devices"
++        LOG.info("pci_requests: %s" % pci_requests)
++
++        # If pci_requests is None, bail out immediatialy.
++        # A node with no pci_stats is possible if PCI passthrought is not
++        # configured on that node.
++        if (pci_requests and (not host_state.pci_stats or
++            not host_state.pci_stats.support_requests(pci_requests.requests))):
++            LOG.info("%(host_state)s doesn't have the required PCI devices"
+                       " (%(requests)s)",
+                       {'host_state': host_state, 'requests': pci_requests})
+             msg = ("Required PCI device: '%(req)s' not available"
+-- 
+2.7.4
+

@@ -1,0 +1,171 @@
+From 48a1fc63c57018ba2e41e2efdfbc85f834704fd5 Mon Sep 17 00:00:00 2001
+From: Daniel Chavolla <daniel.chavolla@windriver.com>
+Date: Thu, 22 Feb 2018 13:24:36 -0500
+Subject: [PATCH 108/143] Added support for scaling real time vCPUs
+
+When a VM scales down a realtime vCPU (running as SCHED_FIFO) that gets then
+scheduled on the same pCPU as vCPU0 (running as SCHED_OTHER), there  is a
+sort of thread starvation problem which results in the SCHED_FIFO task
+busy-looping while the other task never gets to run.
+
+This fix consists in three parts:
+ 1) When creating the instance XML, scaled-down vCPUs should not be
+    counted as realtime.
+ 2) When scaling down a realtime vCPU, change it to run as SCHED_OTHER
+    before changing the affinity.
+ 3) When scaling up a realtime vCPU, change it to run as SCHED_FIFO
+    after changing the affinity.
+---
+ nova/virt/libvirt/driver.py | 30 ++++++++++++++++++++++
+ nova/virt/libvirt/utils.py  | 61 ++++++++++++++++++++++++++++++++-------------
+ 2 files changed, 74 insertions(+), 17 deletions(-)
+
+diff --git a/nova/virt/libvirt/driver.py b/nova/virt/libvirt/driver.py
+index 8450c1a..51d777a 100644
+--- a/nova/virt/libvirt/driver.py
++++ b/nova/virt/libvirt/driver.py
+@@ -4524,6 +4524,8 @@ class LibvirtDriver(driver.ComputeDriver):
+                     # Prepare realtime config for libvirt
+                     vcpus_rt = hardware.vcpus_realtime_topology(
+                         flavor, image_meta)
++                    offline_cpus = instance_numa_topology.offline_cpus
++                    vcpus_rt = vcpus_rt - offline_cpus
+                     vcpusched = vconfig.LibvirtConfigGuestCPUTuneVCPUSched()
+                     vcpusched.vcpus = vcpus_rt
+                     vcpusched.scheduler = "fifo"
+@@ -9407,6 +9409,21 @@ class LibvirtDriver(driver.ComputeDriver):
+             LOG.info('Freeing up phys cpu %d', phys_cpu,
+                      instance=instance)
+ 
++        # We modify the scheduling type of a real-time vCPU to SCHED_OTHER
++        # before it is pinned to vCPU-0. This is to avoid starvation of the
++        # emulator threads running on vCPU-0.
++        wants_realtime = hardware.is_realtime_enabled(instance.flavor)
++        if wants_realtime:
++            vcpus_rt = hardware.vcpus_realtime_topology(instance.flavor,
++                                                       instance.image_meta)
++            if virt_cpu in vcpus_rt:
++                rt = libvirt_utils.set_rt_vcpu_scheduler(dom, virt_cpu,
++                                                    libvirt_utils.SCHED_NORMAL)
++                if rt is None:
++                    LOG.error('Unable to set scheduler for realtime vcpu %d',
++                              virt_cpu, instance=instance)
++                    raise exception.CannotOfflineCpu(cpu=virt_cpu)
++
+         # For simplicity, pin it the same as vcpu0.
+         dom.pinVcpuFlags(virt_cpu, cpumap[0],
+                     libvirt.VIR_DOMAIN_AFFECT_LIVE |
+@@ -9438,6 +9455,19 @@ class LibvirtDriver(driver.ComputeDriver):
+         dom.pinVcpuFlags(vcpu, new_cpumap, libvirt.VIR_DOMAIN_AFFECT_LIVE |
+                     libvirt.VIR_DOMAIN_AFFECT_CONFIG)
+ 
++        # Restore this vCPU real-time scheduling priority, which was
++        # modified when scaled down.
++        wants_realtime = hardware.is_realtime_enabled(instance.flavor)
++        if wants_realtime:
++            vcpus_rt = hardware.vcpus_realtime_topology(instance.flavor,
++                                                        instance.image_meta)
++            if vcpu in vcpus_rt:
++                rt = libvirt_utils.set_rt_vcpu_scheduler(dom, vcpu,
++                                                        libvirt_utils.SCHED_RT)
++                if rt is None:
++                    LOG.warning('Unable to set scheduler for realtime vcpu %d',
++                                vcpu, instance=instance)
++
+         (cpuinfo, cpumap) = dom.vcpus()
+ 
+         # Pin the emulator to the same as vCPU0
+diff --git a/nova/virt/libvirt/utils.py b/nova/virt/libvirt/utils.py
+index 26c447c..665da35 100644
+--- a/nova/virt/libvirt/utils.py
++++ b/nova/virt/libvirt/utils.py
+@@ -53,6 +53,8 @@ CONF = nova.conf.CONF
+ LOG = logging.getLogger(__name__)
+ 
+ RESIZE_SNAPSHOT_NAME = 'nova-resize'
++SCHED_NORMAL = 0
++SCHED_RT = 1
+ 
+ 
+ def execute(*args, **kwargs):
+@@ -591,10 +593,6 @@ def assign_floating_cpusets(domain, instance):
+     # Do we need to do anything to make sure instance.numa_topology
+     # is available?
+ 
+-    global libvirt_qemu
+-    if libvirt_qemu is None:
+-        libvirt_qemu = importutils.import_module('libvirt_qemu')
+-
+     task_mapping = []
+     if instance.numa_topology is None:
+         # Guest has no NUMA restrictions, put it in the global set.
+@@ -606,20 +604,9 @@ def assign_floating_cpusets(domain, instance):
+                 return
+             task_mapping.append({'node': cell.id, 'vcpus': cell.cpuset})
+ 
+-    # Get CPU information from qemu.  This includes vCPU-to-thread mapping.
+-    # The result of this looks like:
+-    # {"return":[{"current":true,"CPU":0,"pc":-2130513274,"halted":true,
+-    # "thread_id":86064},{"current":false,"CPU":1,"pc":-2130513274,
+-    # "halted":true,"thread_id":86065},],"id":"libvirt-156"}
+-    try:
+-        cpuinfostr = libvirt_qemu.qemuMonitorCommand(
+-            domain, '{"execute":"query-cpus"}', 0)
+-    except Exception as e:
+-        LOG.error('Unable to query cpuset info, '
+-                  'qemuMonitorCommand failed: %s', e,
+-                  instance=instance)
++    cpuinfolist = get_cpu_info_qemu(domain)
++    if cpuinfolist is None:
+         return
+-    cpuinfolist = jsonutils.loads(cpuinfostr)['return']
+ 
+     # For each mapping, figure out the set of threads that correspond to
+     # the vCPUs in the mapping.
+@@ -646,3 +633,43 @@ def assign_floating_cpusets(domain, instance):
+     else:
+         node = None
+     hardware.set_cpuset_tasks(node, emulator_tasks)
++
++
++def get_cpu_info_qemu(domain):
++    global libvirt_qemu
++    if libvirt_qemu is None:
++        libvirt_qemu = importutils.import_module('libvirt_qemu')
++
++    # Get CPU information from qemu.  This includes vCPU-to-thread mapping.
++    # The result of this looks like:
++    # {"return":[{"current":true,"CPU":0,"pc":-2130513274,"halted":true,
++    # "thread_id":86064},{"current":false,"CPU":1,"pc":-2130513274,
++    # "halted":true,"thread_id":86065},],"id":"libvirt-156"}
++    try:
++        cpuinfostr = libvirt_qemu.qemuMonitorCommand(
++            domain, '{"execute":"query-cpus"}', 0)
++    except Exception as e:
++        LOG.error('Unable to query cpuset info, '
++                  'qemuMonitorCommand failed: %s', e)
++        return None
++    cpuinfolist = jsonutils.loads(cpuinfostr)['return']
++    return cpuinfolist
++
++
++def set_rt_vcpu_scheduler(domain, vcpu, scheduler):
++    cpuinfolist = get_cpu_info_qemu(domain)
++    if cpuinfolist is None:
++        return None
++
++    tid = None
++    for cpuinfo in cpuinfolist:
++        if cpuinfo['CPU'] == vcpu:
++            tid = cpuinfo['thread_id']
++    if tid:
++        if scheduler == SCHED_RT:
++            execute('chrt', '-f', '-p',
++                    CONF.libvirt.realtime_scheduler_priority, tid)
++        elif scheduler == SCHED_NORMAL:
++            execute('chrt', '-o', '-p', 0, tid)
++
++    return tid
+-- 
+2.7.4
+

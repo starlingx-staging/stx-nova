@@ -1,0 +1,132 @@
+From d23a2e7969f0ac7b72a3382079662769477ec158 Mon Sep 17 00:00:00 2001
+From: Ludovic Beliveau <ludovic.beliveau@windriver.com>
+Date: Thu, 9 Apr 2015 12:48:14 -0400
+Subject: [PATCH] Basic PCI Passthrought support (non-SRIOV)
+
+Required to bring back some changes from original patch and a few fixes
+to adapt to Juno/Kilo.
+---
+ nova/compute/api.py         | 18 ++++++++++++++----
+ nova/virt/libvirt/driver.py | 35 +++++++++++++++++++++++------------
+ nova/virt/libvirt/vif.py    |  3 ++-
+ 3 files changed, 39 insertions(+), 17 deletions(-)
+
+diff --git a/nova/compute/api.py b/nova/compute/api.py
+index ab0437f..acf851f 100644
+--- a/nova/compute/api.py
++++ b/nova/compute/api.py
+@@ -1160,10 +1160,20 @@ class API(base.Base):
+                     # PCI passthrough devices will be filtered
+                     # based on the PCI requests.
+                     if pci_utils.vif_model_pci_passthrough(vif_model):
+-                        request = objects.InstancePCIRequest(
+-                            count=1,
+-                            spec=[{pci_request.PCI_NET_TAG: physnet}],
+-                            request_id=str(uuid.uuid4()))
++                        if vif_model == 'pci-sriov':
++                            request = objects.InstancePCIRequest(
++                                count=1,
++                                spec=[{pci_request.PCI_NET_TAG: physnet}],
++                                alias_name=None,
++                                request_id=str(uuid.uuid4()))
++                        elif vif_model == 'pci-passthrough':
++                            request = objects.InstancePCIRequest(
++                                count=1,
++                                spec=[{pci_request.PCI_NET_TAG: physnet}],
++                                request_id=str(uuid.uuid4()))
++                        else:
++                            msg = _('Invalid vif-model %s.' % vif_model)
++                            raise exception.InvalidInput(reason=msg)
+ 
+                         requests = base_options.get('pci_requests')
+                         requests.requests.append(request)
+diff --git a/nova/virt/libvirt/driver.py b/nova/virt/libvirt/driver.py
+index 038c775..0b06f99 100644
+--- a/nova/virt/libvirt/driver.py
++++ b/nova/virt/libvirt/driver.py
+@@ -692,16 +692,18 @@ class LibvirtDriver(driver.ComputeDriver):
+     def plug_vifs(self, instance, network_info):
+         """Plug VIFs into networks."""
+         for vif in network_info:
+-            self.vif_driver.plug(instance, vif)
++            if vif['vif_model'] != 'pci-passthrough':
++                self.vif_driver.plug(instance, vif)
+ 
+     def _unplug_vifs(self, instance, network_info, ignore_errors):
+         """Unplug VIFs from networks."""
+         for vif in network_info:
+-            try:
+-                self.vif_driver.unplug(instance, vif)
+-            except exception.NovaException:
+-                if not ignore_errors:
+-                    raise
++            if vif['vif_model'] != 'pci-passthrough':
++                try:
++                    self.vif_driver.unplug(instance, vif)
++                except exception.NovaException:
++                    if not ignore_errors:
++                        raise
+ 
+     def unplug_vifs(self, instance, network_info):
+         self._unplug_vifs(instance, network_info, False)
+@@ -4223,11 +4225,15 @@ class LibvirtDriver(driver.ComputeDriver):
+         for config in storage_configs:
+             guest.add_device(config)
+ 
++        request_id = None
+         for vif in network_info:
+-            config = self.vif_driver.get_config(
+-                instance, vif, image_meta,
+-                flavor, virt_type)
+-            guest.add_device(config)
++            if vif['vif_model'] != 'pci-passthrough':
++                config = self.vif_driver.get_config(
++                    instance, vif, image_meta,
++                    flavor, virt_type)
++                guest.add_device(config)
++            else:
++                request_id = 'all'
+ 
+         consolepty = self._create_consoles(virt_type, guest, instance, flavor,
+                                            image_meta, caps)
+@@ -4318,7 +4324,8 @@ class LibvirtDriver(driver.ComputeDriver):
+             guest.add_device(wrs_msg)
+ 
+         if virt_type in ('xen', 'qemu', 'kvm'):
+-            for pci_dev in pci_manager.get_instance_pci_devs(instance):
++            for pci_dev in pci_manager.get_instance_pci_devs(instance, 
++                                                             request_id):
+                 guest.add_device(self._get_guest_pci_device(pci_dev))
+         else:
+             if len(pci_devs) > 0:
+@@ -4548,8 +4555,12 @@ class LibvirtDriver(driver.ComputeDriver):
+         # already up will not undergo that transition, and for
+         # anything that might be stale (cache-wise) assume it's
+         # already up so we don't block on it.
++
++        # PCI Passthrough ports are kept in state UNKOWN.  Therefore
++        # Do not expect them to become up.
+         return [('network-vif-plugged', vif['id'])
+-                for vif in network_info if vif.get('active', True) is False]
++                for vif in network_info if (vif.get('active', True) is False
++                    and vif.get('vif_model') != 'pci-passthrough')]
+ 
+     def _create_domain_and_network(self, context, xml, instance, network_info,
+                                    disk_info, block_device_info=None,
+diff --git a/nova/virt/libvirt/vif.py b/nova/virt/libvirt/vif.py
+index 356ed10..f6abed9 100644
+--- a/nova/virt/libvirt/vif.py
++++ b/nova/virt/libvirt/vif.py
+@@ -64,7 +64,8 @@ def is_vif_model_valid_for_virt(virt_type, vif_model):
+                 network_model.VIF_MODEL_RTL8139,
+                 network_model.VIF_MODEL_E1000,
+                 network_model.VIF_MODEL_SPAPR_VLAN,
+-                'pci-sriov'],
++                'pci-sriov',
++                'pci-passthrough'],
+         'xen': [network_model.VIF_MODEL_NETFRONT,
+                 network_model.VIF_MODEL_NE2K_PCI,
+                 network_model.VIF_MODEL_PCNET,
+-- 
+2.7.4
+

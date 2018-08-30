@@ -1,0 +1,32 @@
+From fa6fd2f34ed9c65c11fcfa82972d950d50613f6b Mon Sep 17 00:00:00 2001
+From: Chris Friesen <chris.friesen@windriver.com>
+Date: Tue, 21 Jul 2015 10:05:46 -0600
+Subject: [PATCH] Fix up unit tests for git commit 308684f
+
+The commit mentioned above added a call to instance._load_pci_requests()
+in scheduler.utils.build_request_spec().  Mocking it out fixes four
+conductor tests.
+---
+ nova/tests/unit/conductor/test_conductor.py | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/nova/tests/unit/conductor/test_conductor.py b/nova/tests/unit/conductor/test_conductor.py
+index b7f16f8..00af879 100644
+--- a/nova/tests/unit/conductor/test_conductor.py
++++ b/nova/tests/unit/conductor/test_conductor.py
+@@ -1275,9 +1275,11 @@ class _BaseTaskTestCase(object):
+     def test_cold_migrate_forced_shutdown(self):
+         self._test_cold_migrate(clean_shutdown=False)
+ 
++    @mock.patch('nova.objects.Instance._load_pci_requests')
+     @mock.patch('nova.objects.Instance.refresh')
+     @mock.patch('nova.utils.spawn_n')
+-    def test_build_instances(self, mock_spawn, mock_refresh):
++    def test_build_instances(self, mock_spawn, mock_refresh,
++                             mock_load_pci_requests):
+         mock_spawn.side_effect = lambda f, *a, **k: f(*a, **k)
+         instance_type = flavors.get_default_flavor()
+         instances = [objects.Instance(context=self.context,
+-- 
+2.7.4
+

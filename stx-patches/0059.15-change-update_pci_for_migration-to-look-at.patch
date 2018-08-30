@@ -1,0 +1,37 @@
+From 2da2d57bc88a97dbe3078094f12954eddef2e93e Mon Sep 17 00:00:00 2001
+From: "Beliveau, Ludovic" <Ludovic.Beliveau@windriver.com>
+Date: Fri, 12 Jun 2015 11:10:03 -0400
+Subject: [PATCH] change update_pci_for_migration to look at
+ allocations
+
+PCI-Passthrough: Evacuate fails (intermittent) when PCI resources are scarce
+
+It's possible that the audit periodic task runs when we are evacuating a vm.
+In this case, a PCI device has already been allocated but the audit calls
+update_pci_for_migration with the vm in state RESIZE_PREP and it was trying
+to allocate a new PCI devices (which obviously was failing).
+
+The problem was that the logic in RESIZE_PREP was trying to allocate a new
+PCI device only when the instance uuid is not found in the claims.  But in this
+case, the instance PCI device are in allocations table.
+---
+ nova/pci/manager.py | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/nova/pci/manager.py b/nova/pci/manager.py
+index facf271..7a43883 100644
+--- a/nova/pci/manager.py
++++ b/nova/pci/manager.py
+@@ -276,7 +276,8 @@ class PciDevTracker(object):
+         """
+         task_state = instance['task_state']
+         uuid = instance['uuid']
+-        if sign == 1 and uuid not in self.claims:
++        if (sign == 1 and uuid not in self.claims and
++                uuid not in self.allocations):
+             # Do not allocate a new PCI device if the migration is on
+             # the same node (like resize)
+             if task_state == task_states.RESIZE_PREP and not same_node:
+-- 
+2.7.4
+
