@@ -1,0 +1,1615 @@
+From 0073ceb6726407eee9ea0682387c8096203d0f22 Mon Sep 17 00:00:00 2001
+From: Gerry Kopec <Gerry.Kopec@windriver.com>
+Date: Wed, 8 Nov 2017 18:45:23 -0500
+Subject: [PATCH 072/143] Pike rebase: Enable placement service
+
+Update placement service vcpu accounting for customizations:
+- dedicated/floating instances on same compute host
+- shared vcpu
+- scaling
+
+As placement only supports integer accounting, we need to scale up the
+vcpu inventory of a compute by the cpu_allocation_ratio (16).  Instances
+with shared cpu_policy will allocate resources equal to number of vcpus,
+instances with dedicated cpu_policy will allocate 16*vcpus, and instances
+with isolate cpu_thread_policy will allocate 2*16*vcpus on HT hosts.
+
+Existing normalized_vcpus() function in virt/hardware.py will be used
+to adjust for cpu_policy, cpu_thread_policy and shared_vcpu per existing
+rules and then be scaled up by cpu allocation factor for placement
+allocation.  In the traditional case in resource tracker, instance data
+can be used to feed into the calculation, but as placement service
+allocates resources in the scheduler, additional checks are required
+in the case of downscaled instances.  Similar to existing resource
+tracking, downscaled instances will be scheduled based on the full vcpu
+allocation, but for the resource claim in the scheduler it has to be
+adjusted for the downscaled cpus.  To accomodate this, add the field
+offline_cpus to the request_spec object.  This will be set in nova
+conductor based on instance numa_topology and flavor (new if resize)
+for migrations/evacuation.
+
+Also to support scaling and handle corner cases, add in allocation
+correction during resource audit instances update.  This will cover
+cases where instance allocation has changed or instance is no longer on
+the given compute host.  This allocation correction will only run if the
+instance is not migrating.
+
+ccb3df9 fix spurious numa topology log during scheduling
+  During all scheduling operations, see "host_numa_topology not present"
+  warning log.  This log was coming out during vcpu normalization prior to
+  making request to placement service to determine allocation candidates.
+  As compute node topology isn't know at this time, we have to create a
+  dummy compute node/numa topology object.  However this was lacking numa
+  cells and siblings within the cell resulting in the warning log.
+
+__TYPE_primary
+---
+ nova/api/openstack/placement/wsgi.py               |   2 +
+ nova/compute/manager.py                            |  45 ++++---
+ nova/compute/resource_tracker.py                   | 132 +++++++++++++--------
+ nova/conductor/manager.py                          |   6 +
+ nova/conductor/tasks/live_migrate.py               |  22 +++-
+ nova/conductor/tasks/migrate.py                    |   6 +
+ nova/objects/request_spec.py                       |  11 +-
+ nova/scheduler/client/report.py                    |  36 ++++--
+ nova/scheduler/filter_scheduler.py                 |  16 +++
+ nova/scheduler/manager.py                          |  55 ++++++---
+ nova/scheduler/utils.py                            |  40 +++++++
+ nova/tests/unit/compute/test_compute.py            |   8 +-
+ nova/tests/unit/compute/test_compute_mgr.py        |  31 +++--
+ nova/tests/unit/compute/test_resource_tracker.py   |  19 ++-
+ .../unit/conductor/tasks/test_live_migrate.py      |  20 +++-
+ nova/tests/unit/objects/test_objects.py            |   2 +-
+ nova/tests/unit/objects/test_request_spec.py       |   6 +-
+ nova/tests/unit/scheduler/client/test_report.py    |  71 +++++++----
+ nova/tests/unit/scheduler/test_filter_scheduler.py | 107 ++++++++++++-----
+ nova/tests/unit/scheduler/test_scheduler.py        |  21 +++-
+ 20 files changed, 488 insertions(+), 168 deletions(-)
+
+diff --git a/nova/api/openstack/placement/wsgi.py b/nova/api/openstack/placement/wsgi.py
+index c982f90..a4db549 100644
+--- a/nova/api/openstack/placement/wsgi.py
++++ b/nova/api/openstack/placement/wsgi.py
+@@ -25,6 +25,7 @@ from nova import conf
+ from nova import config
+ 
+ CONFIG_FILE = 'nova.conf'
++LOG = logging.getLogger(__name__)
+ 
+ 
+ def setup_logging(config):
+@@ -61,5 +62,6 @@ def init_application():
+             logging.getLogger(__name__),
+             logging.DEBUG)
+ 
++    LOG.info("Starting placement api")
+     # build and return our WSGI app
+     return deploy.loadapp(conf.CONF)
+diff --git a/nova/compute/manager.py b/nova/compute/manager.py
+index 29b1aaa..d8f8f2a 100644
+--- a/nova/compute/manager.py
++++ b/nova/compute/manager.py
+@@ -680,6 +680,7 @@ class ComputeManager(manager.Manager):
+         # compute_nodes of the resource tracker has not been populated yet so
+         # we cannot rely on the resource tracker here.
+         compute_nodes = {}
++        compute_nodes_obj = {}
+ 
+         for instance in evacuated:
+             migration = evacuations[instance.uuid]
+@@ -707,9 +708,12 @@ class ComputeManager(manager.Manager):
+             # delete the allocation of the evacuated instance from this host
+             if migration.source_node not in compute_nodes:
+                 try:
+-                    cn_uuid = objects.ComputeNode.get_by_host_and_nodename(
+-                        context, self.host, migration.source_node).uuid
+-                    compute_nodes[migration.source_node] = cn_uuid
++                    cn = objects.ComputeNode.get_by_host_and_nodename(
++                        context, self.host, migration.source_node)
++                    compute_nodes[migration.source_node] = cn.uuid
++                    # we need to keep full compute node data to normalize
++                    # resource usage
++                    compute_nodes_obj[cn.uuid] = cn
+                 except exception.ComputeHostNotFound:
+                     LOG.error("Failed to clean allocation of evacuated "
+                               "instance as the source node %s is not found",
+@@ -719,9 +723,21 @@ class ComputeManager(manager.Manager):
+ 
+             my_resources = scheduler_utils.resources_from_flavor(
+                 instance, instance.flavor)
++
++            # Use instance fields as instance was not resized
++            cn = compute_nodes_obj[cn_uuid]
++            system_metadata = instance.system_metadata
++            image_meta = utils.get_image_from_system_metadata(system_metadata)
++            image_props = image_meta.get('properties', {})
++            normalized_resources = \
++                  scheduler_utils.normalized_resources_for_placement_claim(
++                      my_resources, cn, instance.vcpus,
++                      instance.flavor.extra_specs, image_props,
++                      instance.numa_topology)
++
+             res = self.reportclient.remove_provider_from_instance_allocation(
+                 instance.uuid, cn_uuid, instance.user_id,
+-                instance.project_id, my_resources)
++                instance.project_id, normalized_resources)
+             if not res:
+                 LOG.error("Failed to clean allocation of evacuated instance "
+                           "on the source node %s",
+@@ -778,8 +794,9 @@ class ComputeManager(manager.Manager):
+ 
+         self._update_resource_tracker(context, instance)
+ 
+-        rt = self._get_resource_tracker()
+-        rt.reportclient.delete_allocation_for_instance(instance.uuid)
++        # as we're keeping the hook in _update_usage_from_instance() in
++        # the resource tracker, we don't need to do a specific placement
++        # allocation delete here.
+ 
+         self._notify_about_instance_usage(context, instance, "delete.end",
+                 system_metadata=system_meta)
+@@ -3085,7 +3102,7 @@ class ComputeManager(manager.Manager):
+                 # get here when evacuating to a destination node. Rebuilding
+                 # on the same host (not evacuate) uses the NopClaim which will
+                 # not raise ComputeResourcesUnavailable.
+-                rt.delete_allocation_for_evacuated_instance(
++                rt.delete_allocation_for_evacuated_instance(context,
+                     instance, scheduled_node, node_type='destination')
+                 self._notify_instance_rebuild_error(context, instance, e)
+ 
+@@ -4176,9 +4193,11 @@ class ComputeManager(manager.Manager):
+                     # a resize to the same host, the scheduler will merge the
+                     # flavors, so here we'd be subtracting the new flavor from
+                     # the allocated resources on this node.
++                    # pass through image so we can access properties
++                    # to do proper resource normalization in resource tracker.
+                     rt = self._get_resource_tracker()
+                     rt.delete_allocation_for_failed_resize(
+-                        instance, node, instance_type)
++                        instance, node, instance_type, image)
+ 
+                 extra_usage_info = dict(
+                         new_instance_type=instance_type.name,
+@@ -6140,10 +6159,6 @@ class ComputeManager(manager.Manager):
+             # method
+             destroy_vifs = True
+ 
+-        # NOTE(danms): Save source node before calling post method on
+-        # destination, which will update it
+-        source_node = instance.node
+-
+         # Define domain at destination host, without doing it,
+         # pause/suspend/terminate do not work.
+         post_at_dest_success = True
+@@ -6202,6 +6217,8 @@ class ComputeManager(manager.Manager):
+         self.instance_events.clear_events_for_instance(instance)
+ 
+         # Drop live-migration instance tracking at source.
++        # This will also drop placement resource claim so we don't need to
++        # make a separate call.
+         try:
+             rt = self._get_resource_tracker()
+             rt.drop_move_claim(ctxt, instance,
+@@ -6213,10 +6230,6 @@ class ComputeManager(manager.Manager):
+                       {'err': e}, instance=instance)
+             self.update_available_resource(ctxt)
+ 
+-        rt = self._get_resource_tracker()
+-        rt.delete_allocation_for_migrated_instance(
+-            instance, source_node)
+-
+         self._delete_scheduler_instance_info(ctxt, instance.uuid)
+         self._notify_about_instance_usage(ctxt, instance,
+                                           "live_migration._post.end",
+diff --git a/nova/compute/resource_tracker.py b/nova/compute/resource_tracker.py
+index 406a1f9..3d8ca4e 100644
+--- a/nova/compute/resource_tracker.py
++++ b/nova/compute/resource_tracker.py
+@@ -118,7 +118,12 @@ def _normalize_inventory_from_cn_obj(inv_data, cn):
+     if fields.ResourceClass.VCPU in inv_data:
+         cpu_inv = inv_data[fields.ResourceClass.VCPU]
+         if 'allocation_ratio' not in cpu_inv:
+-            cpu_inv['allocation_ratio'] = cn.cpu_allocation_ratio
++            # for libvirt driver adjust vcpus by allocation ratio. Leave
++            # the rest (e.g. ironic) alone
++            cpu_inv['total'] = int(cpu_inv['total'] * cn.cpu_allocation_ratio)
++            cpu_inv['max_unit'] = int(cpu_inv['max_unit'] *
++                                                      cn.cpu_allocation_ratio)
++            cpu_inv['allocation_ratio'] = 1
+         if 'reserved' not in cpu_inv:
+             cpu_inv['reserved'] = CONF.reserved_host_cpus
+ 
+@@ -741,7 +746,23 @@ class ResourceTracker(object):
+         # the source host and shared providers for a revert_resize operation..
+         my_resources = scheduler_utils.resources_from_flavor(instance,
+             instance_type or instance.flavor)
+-        cn_uuid = self.compute_nodes[nodename].uuid
++
++        # need to make sure we're dropping resources based on the correct
++        # numa_topology either old or new
++        cn = self.compute_nodes[nodename]
++        flavor = instance_type or instance.flavor
++        num_offline_cpus = scheduler_utils.determine_offline_cpus(flavor,
++                                                             numa_topology)
++        vcpus = flavor.vcpus - num_offline_cpus
++        system_metadata = instance.system_metadata
++        image_meta = utils.get_image_from_system_metadata(system_metadata)
++        image_props = image_meta.get('properties', {})
++
++        normalized_resources = \
++              scheduler_utils.normalized_resources_for_placement_claim(
++                  my_resources, cn, vcpus, flavor.extra_specs, image_props,
++                  numa_topology)
++
+         operation = 'Confirming'
+         source_or_dest = 'source'
+         if prefix == 'new_':
+@@ -749,14 +770,14 @@ class ResourceTracker(object):
+             source_or_dest = 'destination'
+         LOG.debug("%s resize on %s host. Removing resources claimed on "
+                   "provider %s from allocation",
+-                  operation, source_or_dest, cn_uuid, instance=instance)
++                  operation, source_or_dest, cn.uuid, instance=instance)
+         res = self.reportclient.remove_provider_from_instance_allocation(
+-            instance.uuid, cn_uuid, instance.user_id,
+-            instance.project_id, my_resources)
++            instance.uuid, cn.uuid, instance.user_id,
++            instance.project_id, normalized_resources)
+         if not res:
+             LOG.error("Failed to save manipulated allocation when "
+                       "%s resize on %s host %s.",
+-                      operation.lower(), source_or_dest, cn_uuid,
++                      operation.lower(), source_or_dest, cn.uuid,
+                       instance=instance)
+ 
+     @utils.synchronized(COMPUTE_RESOURCE_SEMAPHORE)
+@@ -1901,39 +1922,13 @@ class ResourceTracker(object):
+                 self.pci_tracker.update_pci_for_instance(context,
+                                                          instance,
+                                                          sign=sign)
+-            if require_allocation_refresh:
+-                LOG.debug("Auto-correcting allocations to handle Ocata "
+-                          "assumptions.")
+-                self.reportclient.update_instance_allocation(cn, instance,
+-                                                             sign)
+-            else:
+-                # NOTE(jaypipes): We're on a Pike compute host or later in
+-                # a deployment with all compute hosts upgraded to Pike or
+-                # later
+-                #
+-                # If that is the case, then we know that the scheduler will
+-                # have properly created an allocation and that the compute
+-                # hosts have not attempted to overwrite allocations
+-                # **during the periodic update_available_resource() call**.
+-                # However, Pike compute hosts may still rework an
+-                # allocation for an instance in a move operation during
+-                # confirm_resize() on the source host which will remove the
+-                # source resource provider from any allocation for an
+-                # instance.
+-                #
+-                # In Queens and beyond, the scheduler will understand when
+-                # a move operation has been requested and instead of
+-                # creating a doubled-up allocation that contains both the
+-                # source and destination host, the scheduler will take the
+-                # original allocation (against the source host) and change
+-                # the consumer ID of that allocation to be the migration
+-                # UUID and not the instance UUID. The scheduler will
+-                # allocate the resources for the destination host to the
+-                # instance UUID.
+-                LOG.debug("We're on a Pike compute host in a deployment "
+-                          "with all Pike compute hosts. Skipping "
+-                          "auto-correction of allocations.")
+-
++            # This covers rare cases where scheduler allocation is
++            # incorrect and needs to be auto-corrected on the next resource
++            # audit. However if the instance is migrating, leave the
++            # allocations alone.
++            if not _instance_in_migration_or_resize_state(instance):
++                self.scheduler_client.reportclient.update_instance_allocation(
++                    cn, instance, sign)
+             # new instance, update compute node resource usage:
+             self._update_usage(self._get_usage_dict(instance), nodename,
+                                sign=sign, update_affinity=update_affinity,
+@@ -2156,32 +2151,56 @@ class ResourceTracker(object):
+                           "There are allocations remaining against the source "
+                           "host that might need to be removed: %s.",
+                           instance_uuid, instance.host, instance.node, alloc)
++                # remove allocations if instance is not in migrating state
++                if not _instance_in_migration_or_resize_state(instance):
++                    self.reportclient.remove_provider_from_instance_allocation(
++                             instance.uuid, cn.uuid, instance.user_id,
++                             instance.project_id, alloc['resources'])
++                continue
+ 
+-    def delete_allocation_for_evacuated_instance(self, instance, node,
++    def delete_allocation_for_evacuated_instance(self, context, instance, node,
+                                                  node_type='source'):
+-        self._delete_allocation_for_moved_instance(
++        self._delete_allocation_for_moved_instance(context,
+             instance, node, 'evacuated', node_type)
+ 
+-    def delete_allocation_for_migrated_instance(self, instance, node):
+-        self._delete_allocation_for_moved_instance(instance, node, 'migrated')
++    def delete_allocation_for_migrated_instance(self, context, instance, node):
++        self._delete_allocation_for_moved_instance(context, instance, node,
++                                                   'migrated')
+ 
+     def _delete_allocation_for_moved_instance(
+-            self, instance, node, move_type, node_type='source'):
++            self, context, instance, node, move_type, node_type='source'):
+         # Clean up the instance allocation from this node in placement
+         my_resources = scheduler_utils.resources_from_flavor(
+             instance, instance.flavor)
+ 
+-        cn_uuid = self.compute_nodes[node].uuid
++        if node not in self.compute_nodes:
++            # during evacuation, this is called before
++            # _init_compute_node() so compute_nodes may not be initialized
++            # TODO(GK) with fix in fb968e18 this may not be required anymore
++            self.compute_nodes[node] = \
++                self._get_compute_node(context, node)
++
++        # Use instance fields as instance was not resized
++        cn = self.compute_nodes[node]
++        system_metadata = instance.system_metadata
++        image_meta = utils.get_image_from_system_metadata(system_metadata)
++        image_props = image_meta.get('properties', {})
++        normalized_resources = \
++              scheduler_utils.normalized_resources_for_placement_claim(
++                  my_resources, cn, instance.vcpus,
++                  instance.flavor.extra_specs, image_props,
++                  instance.numa_topology)
+ 
+         res = self.reportclient.remove_provider_from_instance_allocation(
+-            instance.uuid, cn_uuid, instance.user_id,
+-            instance.project_id, my_resources)
++            instance.uuid, cn.uuid, instance.user_id,
++            instance.project_id, normalized_resources)
+         if not res:
+             LOG.error("Failed to clean allocation of %s "
+                       "instance on the %s node %s",
+-                      move_type, node_type, cn_uuid, instance=instance)
++                      move_type, node_type, cn.uuid, instance=instance)
+ 
+-    def delete_allocation_for_failed_resize(self, instance, node, flavor):
++    def delete_allocation_for_failed_resize(self, instance, node, flavor,
++                                            image):
+         """Delete instance allocations for the node during a failed resize
+ 
+         :param instance: The instance being resized/migrated.
+@@ -2192,9 +2211,22 @@ class ResourceTracker(object):
+         """
+         resources = scheduler_utils.resources_from_flavor(instance, flavor)
+         cn = self.compute_nodes[node]
++
++        # as resize failed prior to finishing undo the resource claim
++        # based on the new flavor to reverse what was done in the scheduler
++        offline_cpus = scheduler_utils.determine_offline_cpus(flavor,
++                                                     instance.numa_topology)
++        vcpus = flavor.vcpus - offline_cpus
++        image_meta_obj = objects.ImageMeta.from_dict(image)
++        numa_topology = hardware.numa_get_constraints(flavor, image_meta_obj)
++        normalized_resources = \
++              scheduler_utils.normalized_resources_for_placement_claim(
++                  resources, cn, vcpus, flavor.extra_specs,
++                  image['properties'], numa_topology)
++
+         res = self.reportclient.remove_provider_from_instance_allocation(
+             instance.uuid, cn.uuid, instance.user_id, instance.project_id,
+-            resources)
++            normalized_resources)
+         if not res:
+             if instance.instance_type_id == flavor.id:
+                 operation = 'migration'
+diff --git a/nova/conductor/manager.py b/nova/conductor/manager.py
+index 9c2602b..af00cf2 100644
+--- a/nova/conductor/manager.py
++++ b/nova/conductor/manager.py
+@@ -914,6 +914,12 @@ class ComputeTaskManager(base.Base):
+                     # if we want to make sure that the next destination
+                     # is not forced to be the original host
+                     request_spec.reset_forced_destinations()
++                    # determine offline cpus due to scaling to be used
++                    # to calculate placement service resource claim in
++                    # scheduler.
++                    request_spec.offline_cpus = \
++                        scheduler_utils.determine_offline_cpus(
++                                  instance.flavor, instance.numa_topology)
+ 
+                     # these hints are needed by the vcpu filter
+                     hints = dict()
+diff --git a/nova/conductor/tasks/live_migrate.py b/nova/conductor/tasks/live_migrate.py
+index 9db921c..d9d5061 100644
+--- a/nova/conductor/tasks/live_migrate.py
++++ b/nova/conductor/tasks/live_migrate.py
+@@ -372,6 +372,11 @@ class LiveMigrationTask(base.TaskBase):
+                 cell=cell_mapping)
+ 
+         request_spec.ensure_project_id(self.instance)
++
++        # determine offline cpus due to scaling to be used to calculate
++        # placement service resource claim in scheduler
++        request_spec.offline_cpus = scheduler_utils.determine_offline_cpus(
++                         self.instance.flavor, self.instance.numa_topology)
+         host = limits = None
+         migration_error = {}
+         while host is None:
+@@ -415,11 +420,12 @@ class LiveMigrationTask(base.TaskBase):
+                 # The scheduler would have created allocations against the
+                 # selected destination host in Placement, so we need to remove
+                 # those before moving on.
+-                self._remove_host_allocations(host, hoststate['nodename'])
++                self._remove_host_allocations(host, hoststate['nodename'],
++                                              request_spec)
+                 host = limits = None
+         return host, limits
+ 
+-    def _remove_host_allocations(self, host, node):
++    def _remove_host_allocations(self, host, node, request_spec):
+         """Removes instance allocations against the given host from Placement
+ 
+         :param host: The name of the host.
+@@ -444,6 +450,16 @@ class LiveMigrationTask(base.TaskBase):
+         resources = scheduler_utils.resources_from_flavor(
+             self.instance, self.instance.flavor)
+ 
++        # adjust resource allocations based on request_spec
++        vcpus = request_spec.flavor.vcpus - request_spec.offline_cpus
++        extra_specs = request_spec.flavor.extra_specs
++        image_props = request_spec.image.properties
++        instance_numa_topology = request_spec.numa_topology
++        normalized_resources = \
++                  scheduler_utils.normalized_resources_for_placement_claim(
++                             resources, compute_node, vcpus, extra_specs,
++                             image_props, instance_numa_topology)
++
+         # Now remove the allocations for our instance against that node.
+         # Note that this does not remove allocations against any other node
+         # or shared resource provider, it's just undoing what the scheduler
+@@ -451,7 +467,7 @@ class LiveMigrationTask(base.TaskBase):
+         self.scheduler_client.reportclient.\
+             remove_provider_from_instance_allocation(
+                 self.instance.uuid, compute_node.uuid, self.instance.user_id,
+-                self.instance.project_id, resources)
++                self.instance.project_id, normalized_resources)
+ 
+     def _check_not_over_max_retries(self, attempted_hosts):
+         if CONF.migrate_max_retries == -1:
+diff --git a/nova/conductor/tasks/migrate.py b/nova/conductor/tasks/migrate.py
+index a329e3d..dcde8fc 100644
+--- a/nova/conductor/tasks/migrate.py
++++ b/nova/conductor/tasks/migrate.py
+@@ -94,6 +94,12 @@ class MigrationTask(base.TaskBase):
+                 cell=instance_mapping.cell_mapping)
+ 
+         self.request_spec.ensure_project_id(self.instance)
++
++        # determine offline cpus due to scaling to be used to calculate
++        # placement service resource claim in scheduler
++        self.request_spec.offline_cpus = \
++                  scheduler_utils.determine_offline_cpus(
++                         self.flavor, self.instance.numa_topology)
+         hosts = self.scheduler_client.select_destinations(
+             self.context, self.request_spec, [self.instance.uuid])
+         host_state = hosts[0]
+diff --git a/nova/objects/request_spec.py b/nova/objects/request_spec.py
+index 5bf0eab..ee65285 100644
+--- a/nova/objects/request_spec.py
++++ b/nova/objects/request_spec.py
+@@ -34,7 +34,8 @@ from nova.scheduler import utils as scheduler_utils
+ from nova.virt import hardware
+ 
+ REQUEST_SPEC_OPTIONAL_ATTRS = ['requested_destination',
+-                               'security_groups']
++                               'security_groups',
++                               'offline_cpus']
+ 
+ 
+ @base.NovaObjectRegistry.register
+@@ -52,6 +53,7 @@ class RequestSpec(base.NovaObject):
+     #              add display_name
+     #              add name
+     #              add reject_map
++    #              add offline_cpus
+     VERSION = '1.8'
+ 
+     fields = {
+@@ -92,6 +94,7 @@ class RequestSpec(base.NovaObject):
+         'display_name': fields.StringField(nullable=True),
+         'name': fields.StringField(nullable=True),
+         'reject_map': fields.DictOfListOfStringsField(nullable=True),
++        'offline_cpus': fields.IntegerField(default=0),
+     }
+ 
+     def obj_make_compatible(self, primitive, target_version):
+@@ -290,6 +293,7 @@ class RequestSpec(base.NovaObject):
+         spec.min_num_instances = filter_properties.get('min_num_instances',
+                                                        num_instances)
+         spec.reject_map = filter_properties.get('reject_map', {})
++        spec.offline_cpus = request_spec.get('offline_cpus', 0)
+ 
+         # NOTE(sbauza): Default the other fields that are not part of the
+         # original contract
+@@ -375,6 +379,10 @@ class RequestSpec(base.NovaObject):
+             req_spec['instance_type'] = self.flavor
+         else:
+             req_spec['instance_type'] = {}
++        if self.obj_attr_is_set('offline_cpus'):
++            req_spec['offline_cpus'] = self.offline_cpus
++        else:
++            req_spec['offline_cpus'] = 0
+         if self.obj_attr_is_set('min_num_instances'):
+             req_spec['min_num_instances'] = self.min_num_instances
+         return req_spec
+@@ -465,6 +473,7 @@ class RequestSpec(base.NovaObject):
+         spec_obj.display_name = ''
+         spec_obj.name = ''
+         spec_obj.reject_map = filter_properties.get('reject_map', {})
++        spec_obj.offline_cpus = 0
+         # NOTE(sbauza): Default the other fields that are not part of the
+         # original contract
+         spec_obj.obj_set_defaults()
+diff --git a/nova/scheduler/client/report.py b/nova/scheduler/client/report.py
+index 2f4c3d2..8042d53 100644
+--- a/nova/scheduler/client/report.py
++++ b/nova/scheduler/client/report.py
+@@ -30,6 +30,7 @@ from nova.i18n import _LE, _LI, _LW
+ from nova import objects
+ from nova.objects import fields
+ from nova.scheduler import utils as scheduler_utils
++from nova import utils
+ 
+ CONF = nova.conf.CONF
+ LOG = logging.getLogger(__name__)
+@@ -97,14 +98,20 @@ def _compute_node_to_inventory_dict(compute_node):
+ 
+     # NOTE(jaypipes): Ironic virt driver will return 0 values for vcpus,
+     # memory_mb and disk_gb if the Ironic node is not available/operable
++    # allow max_unit to be number of vcpus * allocation ratio to allow
++    # for instances with dedicated cpu_policy to allocate correctly.  Given
++    # change to max unit have to set allocation ratio in resource inventory
++    # to 1 so capacity check is correct.
+     if compute_node.vcpus > 0:
+         result[VCPU] = {
+-            'total': compute_node.vcpus,
++            'total': int(compute_node.vcpus *
++                                    compute_node.cpu_allocation_ratio),
+             'reserved': CONF.reserved_host_cpus,
+             'min_unit': 1,
+-            'max_unit': compute_node.vcpus,
++            'max_unit': int(compute_node.vcpus *
++                                    compute_node.cpu_allocation_ratio),
+             'step_size': 1,
+-            'allocation_ratio': compute_node.cpu_allocation_ratio,
++            'allocation_ratio': 1,
+         }
+     if compute_node.memory_mb > 0:
+         result[MEMORY_MB] = {
+@@ -131,7 +138,7 @@ def _compute_node_to_inventory_dict(compute_node):
+     return result
+ 
+ 
+-def _instance_to_allocations_dict(instance):
++def _instance_to_allocations_dict(instance, rp):
+     """Given an `objects.Instance` object, return a dict, keyed by resource
+     class of the amount used by the instance.
+ 
+@@ -140,8 +147,17 @@ def _instance_to_allocations_dict(instance):
+     alloc_dict = scheduler_utils.resources_from_flavor(instance,
+         instance.flavor)
+ 
++    # adjust resource allocations for features
++    system_metadata = instance.system_metadata
++    image_meta = utils.get_image_from_system_metadata(system_metadata)
++    image_props = image_meta.get('properties', {})
++    normalized_alloc_dict = \
++          scheduler_utils.normalized_resources_for_placement_claim(
++              alloc_dict, rp, instance.vcpus, instance.flavor.extra_specs,
++              image_props, instance.numa_topology)
++
+     # Remove any zero allocations.
+-    return {key: val for key, val in alloc_dict.items() if val}
++    return {key: val for key, val in normalized_alloc_dict.items() if val}
+ 
+ 
+ def _move_operation_alloc_request(source_allocs, dest_alloc_req):
+@@ -1063,9 +1079,9 @@ class SchedulerReportClient(object):
+             return resp.json()['allocations'].get(
+                 rp_uuid, {}).get('resources', {})
+ 
+-    def _allocate_for_instance(self, rp_uuid, instance):
+-        my_allocations = _instance_to_allocations_dict(instance)
+-        current_allocations = self.get_allocations_for_instance(rp_uuid,
++    def _allocate_for_instance(self, rp, instance):
++        my_allocations = _instance_to_allocations_dict(instance, rp)
++        current_allocations = self.get_allocations_for_instance(rp.uuid,
+                                                                 instance)
+         if current_allocations == my_allocations:
+             allocstr = ','.join(['%s=%s' % (k, v)
+@@ -1077,7 +1093,7 @@ class SchedulerReportClient(object):
+         LOG.debug('Sending allocation for instance %s',
+                   my_allocations,
+                   instance=instance)
+-        res = self.put_allocations(rp_uuid, instance.uuid, my_allocations,
++        res = self.put_allocations(rp.uuid, instance.uuid, my_allocations,
+                                    instance.project_id, instance.user_id)
+         if res:
+             LOG.info(_LI('Submitted allocation for instance'),
+@@ -1326,7 +1342,7 @@ class SchedulerReportClient(object):
+ 
+     def update_instance_allocation(self, compute_node, instance, sign):
+         if sign > 0:
+-            self._allocate_for_instance(compute_node.uuid, instance)
++            self._allocate_for_instance(compute_node, instance)
+         else:
+             self.delete_allocation_for_instance(instance.uuid)
+ 
+diff --git a/nova/scheduler/filter_scheduler.py b/nova/scheduler/filter_scheduler.py
+index 275185b..0275f61 100644
+--- a/nova/scheduler/filter_scheduler.py
++++ b/nova/scheduler/filter_scheduler.py
+@@ -397,6 +397,22 @@ class FilterScheduler(driver.Scheduler):
+                         continue
+ 
+                     alloc_reqs = alloc_reqs_by_rp_uuid[cn_uuid]
++                    # Determine resources consumed and update placement
++                    # service
++                    for alloc in alloc_reqs[0]['allocations']:
++                        if alloc['resource_provider']['uuid'] == cn_uuid:
++                            vcpus = (spec_obj.flavor.vcpus -
++                                               spec_obj.offline_cpus)
++                            extra_specs = spec_obj.flavor.extra_specs
++                            image_props = spec_obj.image.properties
++                            instance_numa_topology = spec_obj.numa_topology
++                            resources = alloc['resources']
++                            normalized_resources = scheduler_utils. \
++                                normalized_resources_for_placement_claim(
++                                    resources, host, vcpus, extra_specs,
++                                    image_props, instance_numa_topology)
++                            alloc['resources'] = normalized_resources
++
+                     if self._claim_resources(elevated, spec_obj, instance_uuid,
+                             alloc_reqs):
+                         claimed_host = host
+diff --git a/nova/scheduler/manager.py b/nova/scheduler/manager.py
+index b8c1a8d..e1541ba 100644
+--- a/nova/scheduler/manager.py
++++ b/nova/scheduler/manager.py
+@@ -37,7 +37,6 @@ from nova import quota
+ from nova.scheduler import client as scheduler_client
+ from nova.scheduler import utils
+ from nova import utils as nova_utils
+-from nova.virt import hardware
+ 
+ 
+ LOG = logging.getLogger(__name__)
+@@ -122,21 +121,28 @@ class SchedulerManager(manager.Manager):
+                                                            filter_properties)
+         resources = utils.resources_from_request_spec(spec_obj)
+ 
+-        # The request_spec has stale numa_topology, so must be updated.
+-        # We can get stale numa_topology if we do an evacuation or
+-        # live-migration after a resize,
+-        instance_type = spec_obj.flavor
+-        image_meta = objects.ImageMeta(properties=image_props)
+-        try:
+-            spec_obj.numa_topology = \
+-                hardware.numa_get_constraints(instance_type, image_meta)
+-        except Exception as ex:
+-            LOG.error("Cannot get numa constraints, error=%(err)r",
+-                    {'err': ex})
++        # Determine resources consumed for placement candidate check,
++        vcpus = spec_obj.flavor.vcpus
++        extra_specs = spec_obj.flavor.extra_specs
++        image_props = spec_obj.image.properties
++
++        instance_numa_topology = spec_obj.numa_topology
++        # If cpu_thread_policy is ISOLATE and compute has hyperthreading
++        # enabled, vcpus claim will be double flavor.vcpus.  Since we don't
++        # know the compute node at this point, we'll just request flavor.vcpus
++        # and let the numa_topology filter sort this out.
++        numa_cell = objects.NUMACell(siblings=[])
++        numa_topology = objects.NUMATopology(cells=[numa_cell])._to_json()
++        computenode = objects.ComputeNode(numa_topology=numa_topology)
++        normalized_resources = \
++                  utils.normalized_resources_for_placement_claim(
++                             resources, computenode, vcpus, extra_specs,
++                             image_props, instance_numa_topology)
+ 
+         alloc_reqs_by_rp_uuid, provider_summaries = None, None
+         if self.driver.USES_ALLOCATION_CANDIDATES:
+-            res = self.placement_client.get_allocation_candidates(resources)
++            res = self.placement_client.get_allocation_candidates(
++                                                         normalized_resources)
+             if res is None:
+                 # We have to handle the case that we failed to connect to the
+                 # Placement service and the safe_connect decorator on
+@@ -149,7 +155,28 @@ class SchedulerManager(manager.Manager):
+                           "API. This may be a temporary occurrence as compute "
+                           "nodes start up and begin reporting inventory to "
+                           "the Placement service.")
+-                raise exception.NoValidHost(reason="")
++
++                # Determine the rejection reasons for all hosts based on
++                # placement vcpu, memory, and disk criteria. This is done
++                # after-the-fact since the placement query does not return
++                # any reasons.
++                reasons = self.placement_client.get_rejection_reasons(
++                    requested=normalized_resources)
++
++                # Populate per-host rejection map based on placement criteria.
++                host_states = self.driver.host_manager.get_all_host_states(
++                    ctxt)
++                for host_state in host_states:
++                    if host_state.uuid in reasons:
++                        msg = reasons[host_state.uuid]
++                        if msg:
++                            nova_utils.filter_reject('Placement',
++                                                     host_state, spec_obj, msg,
++                                                     append=False)
++
++                reason = 'Placement service found no hosts.'
++                filter_properties = spec_obj.to_legacy_filter_properties_dict()
++                utils.NoValidHost_extend(filter_properties, reason=reason)
+             else:
+                 # Build a dict of lists of allocation requests, keyed by
+                 # provider UUID, so that when we attempt to claim resources for
+diff --git a/nova/scheduler/utils.py b/nova/scheduler/utils.py
+index 3df486d..9429325 100644
+--- a/nova/scheduler/utils.py
++++ b/nova/scheduler/utils.py
+@@ -22,6 +22,7 @@
+ """Utility methods for scheduling."""
+ 
+ import collections
++import copy
+ import functools
+ import sys
+ 
+@@ -241,6 +242,45 @@ def resources_from_flavor(instance, flavor):
+     return resources
+ 
+ 
++# adjust vcpu resource claim for features: dedicated/shared cpu
++# accounting, shared vcpu and isolate cpu_thread_policy reserved cpus
++def normalized_resources_for_placement_claim(resources, compute_node, vcpus,
++                          extra_specs, image_props, instance_numa_topology):
++    normalized_resources = copy.deepcopy(resources)
++    # Get host numa topology
++    host_numa_topology, _fmt = hardware.host_topology_and_format_from_host(
++                                                compute_node)
++    # Get set of reserved thread sibling pcpus that cannot be allocated
++    # when using 'isolate' cpu_thread_policy.
++    reserved = hardware.get_reserved_thread_sibling_pcpus(
++                                  instance_numa_topology, host_numa_topology)
++    threads_per_core = hardware._get_threads_per_core(host_numa_topology)
++    # As placement service only supports integer allocation, multiply floating
++    # vcpus from normalized_vcpus by cpu_allocation_ratio.  This means one
++    # dedicated vcpu will be allocated 16 while 1 floating cpu would be
++    # allocated 1.
++    normalized_resources[fields.ResourceClass.VCPU] = \
++        int(CONF.cpu_allocation_ratio * hardware.normalized_vcpus(vcpus=vcpus,
++                                            reserved=reserved,
++                                            extra_specs=extra_specs,
++                                            image_props=image_props,
++                                            ratio=CONF.cpu_allocation_ratio,
++                                            threads_per_core=threads_per_core))
++    return normalized_resources
++
++
++# For downscaled instance determine offline_cpus that are in range of the
++# new flavor.
++def determine_offline_cpus(flavor, numa_topology):
++    if numa_topology is not None:
++        offline_cpus = [i for i in numa_topology.offline_cpus
++                        if i < flavor.vcpus]
++        num_offline_cpus = len(offline_cpus)
++    else:
++        num_offline_cpus = 0
++    return num_offline_cpus
++
++
+ def merge_resources(original_resources, new_resources, sign=1):
+     """Merge a list of new resources with existing resources.
+ 
+diff --git a/nova/tests/unit/compute/test_compute.py b/nova/tests/unit/compute/test_compute.py
+index 17b3139..cc4e978 100644
+--- a/nova/tests/unit/compute/test_compute.py
++++ b/nova/tests/unit/compute/test_compute.py
+@@ -5290,7 +5290,8 @@ class ComputeTestCase(BaseTestCase,
+ 
+         self.assertRaises(exception.MigrationError, self.compute.prep_resize,
+                           self.context, instance=instance,
+-                          instance_type=instance_type, image={},
++                          instance_type=instance_type,
++                          image={'properties': {}},
+                           reservations=[], request_spec={},
+                           filter_properties={}, node=None,
+                           clean_shutdown=True)
+@@ -12107,8 +12108,9 @@ class ComputeRescheduleResizeOrReraiseTestCase(BaseTestCase):
+         """
+         inst_obj = self._create_fake_instance_obj()
+         mock_mig.side_effect = test.TestingException("Original")
++        image = {'properties': {}}
+ 
+-        self.compute.prep_resize(self.context, image=None,
++        self.compute.prep_resize(self.context, image=image,
+                                  instance=inst_obj,
+                                  instance_type=self.instance_type,
+                                  reservations=[], request_spec={},
+@@ -12116,7 +12118,7 @@ class ComputeRescheduleResizeOrReraiseTestCase(BaseTestCase):
+                                  clean_shutdown=True)
+ 
+         mock_mig.assert_called_once_with(mock.ANY, mock.ANY)
+-        mock_res.assert_called_once_with(mock.ANY, None, inst_obj, mock.ANY,
++        mock_res.assert_called_once_with(mock.ANY, image, inst_obj, mock.ANY,
+                                          self.instance_type, {}, {})
+ 
+     @mock.patch.object(compute_manager.ComputeManager, "_reschedule")
+diff --git a/nova/tests/unit/compute/test_compute_mgr.py b/nova/tests/unit/compute/test_compute_mgr.py
+index 940a3eb..7952374 100644
+--- a/nova/tests/unit/compute/test_compute_mgr.py
++++ b/nova/tests/unit/compute/test_compute_mgr.py
+@@ -670,6 +670,8 @@ class ComputeManagerUnitTestCase(test.NoDBTestCase):
+             self.compute.init_virt_events()
+         self.assertFalse(mock_register.called)
+ 
++    @mock.patch(
++           'nova.scheduler.utils.normalized_resources_for_placement_claim')
+     @mock.patch('nova.objects.ComputeNode.get_by_host_and_nodename')
+     @mock.patch('nova.scheduler.utils.resources_from_flavor')
+     @mock.patch.object(manager.ComputeManager, '_get_instances_on_driver')
+@@ -684,12 +686,14 @@ class ComputeManagerUnitTestCase(test.NoDBTestCase):
+     def test_init_host_with_evacuated_instance(self, mock_save, mock_mig_get,
+             mock_temp_mut, mock_init_host, mock_destroy, mock_host_get,
+             mock_admin_ctxt, mock_init_virt, mock_get_inst, mock_resources,
+-            mock_get_node):
++            mock_get_node, mock_norm_res):
+         our_host = self.compute.host
+         not_our_host = 'not-' + our_host
+ 
+         deleted_instance = fake_instance.fake_instance_obj(
+                 self.context, host=not_our_host, uuid=uuids.deleted_instance)
++        deleted_instance.system_metadata = {}
++        deleted_instance.numa_topology = None
+         migration = objects.Migration(instance_uuid=deleted_instance.uuid)
+         migration.source_node = 'fake-node'
+         mock_mig_get.return_value = [migration]
+@@ -698,6 +702,7 @@ class ComputeManagerUnitTestCase(test.NoDBTestCase):
+         our_node = objects.ComputeNode(host=our_host, uuid=uuids.our_node_uuid)
+         mock_get_node.return_value = our_node
+         mock_resources.return_value = mock.sentinel.my_resources
++        mock_norm_res.return_value = mock.sentinel.my_resources
+ 
+         # simulate failed instance
+         mock_get_inst.return_value = [deleted_instance]
+@@ -3452,7 +3457,7 @@ class ComputeManagerUnitTestCase(test.NoDBTestCase):
+ 
+     def test_destroy_evacuated_instances(self):
+         our_host = self.compute.host
+-        flavor = objects.Flavor()
++        flavor = objects.Flavor(extra_specs={})
+         instance_1 = objects.Instance(self.context, flavor=flavor)
+         instance_1.uuid = uuids.instance_1
+         instance_1.task_state = None
+@@ -3467,6 +3472,9 @@ class ComputeManagerUnitTestCase(test.NoDBTestCase):
+         instance_2.host = 'not-' + our_host
+         instance_2.user_id = uuids.user_id
+         instance_2.project_id = uuids.project_id
++        instance_2.system_metadata = {}
++        instance_2.vcpus = 1
++        instance_2.numa_topology = None
+ 
+         # Only instance 2 has a migration record
+         migration = objects.Migration(instance_uuid=instance_2.uuid)
+@@ -3493,14 +3501,17 @@ class ComputeManagerUnitTestCase(test.NoDBTestCase):
+             mock.patch('nova.objects.ComputeNode.get_by_host_and_nodename'),
+             mock.patch('nova.scheduler.utils.resources_from_flavor'),
+             mock.patch.object(self.compute.reportclient,
+-                              'remove_provider_from_instance_allocation')
++                              'remove_provider_from_instance_allocation'),
++            mock.patch(
++              'nova.scheduler.utils.normalized_resources_for_placement_claim')
+         ) as (_get_instances_on_driver, get_instance_nw_info,
+               _get_instance_block_device_info, _is_instance_storage_shared,
+               destroy, migration_list, migration_save, get_node,
+-              get_resources, remove_allocation):
++              get_resources, remove_allocation, normalize_resource):
+             migration_list.return_value = [migration]
+             get_node.return_value = our_node
+             get_resources.return_value = mock.sentinel.resources
++            normalize_resource.return_value = mock.sentinel.resources
+ 
+             self.compute._destroy_evacuated_instances(self.context)
+             # Only instance 2 should be deleted. Instance 1 is still running
+@@ -3516,7 +3527,7 @@ class ComputeManagerUnitTestCase(test.NoDBTestCase):
+ 
+     def test_destroy_evacuated_instances_node_deleted(self):
+         our_host = self.compute.host
+-        flavor = objects.Flavor()
++        flavor = objects.Flavor(extra_specs={})
+         instance_1 = objects.Instance(self.context, flavor=flavor)
+         instance_1.uuid = uuids.instance_1
+         instance_1.task_state = None
+@@ -3531,6 +3542,9 @@ class ComputeManagerUnitTestCase(test.NoDBTestCase):
+         instance_2.host = 'not-' + our_host
+         instance_2.user_id = uuids.user_id
+         instance_2.project_id = uuids.project_id
++        instance_2.system_metadata = {}
++        instance_2.vcpus = 1
++        instance_2.numa_topology = None
+ 
+         migration_1 = objects.Migration(instance_uuid=instance_1.uuid)
+         # Consider the migration successful but the node was deleted while the
+@@ -3562,11 +3576,13 @@ class ComputeManagerUnitTestCase(test.NoDBTestCase):
+             mock.patch('nova.objects.ComputeNode.get_by_host_and_nodename'),
+             mock.patch('nova.scheduler.utils.resources_from_flavor'),
+             mock.patch.object(self.compute.reportclient,
+-                              'remove_provider_from_instance_allocation')
++                              'remove_provider_from_instance_allocation'),
++            mock.patch(
++              'nova.scheduler.utils.normalized_resources_for_placement_claim')
+         ) as (_get_instances_on_driver, get_instance_nw_info,
+               _get_instance_block_device_info, _is_instance_storage_shared,
+               destroy, migration_list, migration_save, get_node,
+-              get_resources, remove_allocation):
++              get_resources, remove_allocation, normalize_resource):
+             migration_list.return_value = [migration_1, migration_2]
+ 
+             def fake_get_node(context, host, node):
+@@ -3577,6 +3593,7 @@ class ComputeManagerUnitTestCase(test.NoDBTestCase):
+ 
+             get_node.side_effect = fake_get_node
+             get_resources.return_value = mock.sentinel.resources
++            normalize_resource.return_value = mock.sentinel.resources
+ 
+             self.compute._destroy_evacuated_instances(self.context)
+ 
+diff --git a/nova/tests/unit/compute/test_resource_tracker.py b/nova/tests/unit/compute/test_resource_tracker.py
+index d119c0c..453ea18 100644
+--- a/nova/tests/unit/compute/test_resource_tracker.py
++++ b/nova/tests/unit/compute/test_resource_tracker.py
+@@ -1276,12 +1276,12 @@ class TestNormalizatInventoryFromComputeNode(test.NoDBTestCase):
+         }
+         expected = {
+             obj_fields.ResourceClass.VCPU: {
+-                'total': vcpus,
++                'total': int(vcpus * 16),
+                 'reserved': 1,
+                 'min_unit': 1,
+-                'max_unit': vcpus,
++                'max_unit': int(vcpus * 16),
+                 'step_size': 1,
+-                'allocation_ratio': 16.0,
++                'allocation_ratio': 1,
+             },
+             obj_fields.ResourceClass.MEMORY_MB: {
+                 'total': memory_mb,
+@@ -1741,6 +1741,7 @@ class TestResize(BaseTestCase):
+         # fixture and indicates a source-and-dest resize.
+         mig_context_obj = _MIGRATION_CONTEXT_FIXTURES[instance.uuid]
+         instance.migration_context = mig_context_obj
++        instance.system_metadata = {}
+ 
+         self.rt.update_available_resource(mock.MagicMock(), _NODENAME)
+ 
+@@ -1852,6 +1853,7 @@ class TestResize(BaseTestCase):
+         instance = _INSTANCE_FIXTURES[0].obj_clone()
+         old_flavor = instance.flavor
+         instance.new_flavor = _INSTANCE_TYPE_OBJ_FIXTURES[2]
++        instance.system_metadata = {}
+ 
+         # Build instance
+         with mock.patch.object(instance, 'save'):
+@@ -2070,6 +2072,7 @@ class TestResize(BaseTestCase):
+         instance.migration_context = objects.MigrationContext()
+         instance.migration_context.new_pci_devices = objects.PciDeviceList(
+             objects=pci_devs)
++        instance.system_metadata = {}
+ 
+         self.rt.tracked_instances = {
+             instance.uuid: obj_base.obj_to_primitive(instance)
+@@ -2660,15 +2663,21 @@ class TestUpdateUsageFromInstance(BaseTestCase):
+ 
+         test()
+ 
++    @mock.patch(
++        'nova.scheduler.utils.normalized_resources_for_placement_claim')
+     @mock.patch('nova.scheduler.utils.resources_from_flavor')
+     def test_delete_allocation_for_evacuated_instance(
+-            self, mock_resource_from_flavor):
++            self, mock_resource_from_flavor, mock_norm_res_place):
+         mock_resource = mock.Mock()
+         mock_resource_from_flavor.return_value = mock_resource
++        mock_norm_res_place.return_value = mock_resource
+         instance = _INSTANCE_FIXTURES[0].obj_clone()
+         instance.uuid = uuids.inst0
++        instance.system_metadata = {}
++        ctx = mock.sentinel.ctx
+ 
+-        self.rt.delete_allocation_for_evacuated_instance(instance, _NODENAME)
++        self.rt.delete_allocation_for_evacuated_instance(ctx, instance,
++                                                         _NODENAME)
+ 
+         rc = self.rt.reportclient
+         mock_remove_allocation = rc.remove_provider_from_instance_allocation
+diff --git a/nova/tests/unit/conductor/tasks/test_live_migrate.py b/nova/tests/unit/conductor/tasks/test_live_migrate.py
+index 3df2ec3..46cae53 100644
+--- a/nova/tests/unit/conductor/tasks/test_live_migrate.py
++++ b/nova/tests/unit/conductor/tasks/test_live_migrate.py
+@@ -283,6 +283,7 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
+         self.assertIn('across cells', six.text_type(ex))
+ 
+     def test_find_destination_works(self):
++        self.instance.numa_topology = None
+         self.mox.StubOutWithMock(utils, 'get_image_from_system_metadata')
+         self.mox.StubOutWithMock(scheduler_utils, 'setup_instance_group')
+         self.mox.StubOutWithMock(objects.RequestSpec,
+@@ -319,6 +320,7 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
+     # add testcase for server groups to test that _find_destination()
+     # will update RequestSpec with latest instance_group details.
+     def test_find_destination_works_with_instance_group(self):
++        self.instance.numa_topology = None
+         self.fake_spec.instance_group = objects.InstanceGroup(members=["uuid"])
+         self.instance_uuid = self.instance.uuid = "uuid"
+         updated_instance_group = objects.InstanceGroup(members=["uuid",
+@@ -429,6 +431,7 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
+ 
+     def test_find_destination_no_image_works(self):
+         self.instance['image_ref'] = ''
++        self.instance.numa_topology = None
+ 
+         self.mox.StubOutWithMock(scheduler_utils, 'setup_instance_group')
+         self.mox.StubOutWithMock(self.task.scheduler_client,
+@@ -451,6 +454,7 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
+                          self.task._find_destination())
+ 
+     def _test_find_destination_retry_hypervisor_raises(self, error):
++        self.instance.numa_topology = None
+         self.mox.StubOutWithMock(utils, 'get_image_from_system_metadata')
+         self.mox.StubOutWithMock(scheduler_utils, 'setup_instance_group')
+         self.mox.StubOutWithMock(self.task.scheduler_client,
+@@ -483,7 +487,7 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
+             self.assertEqual(("host2", 'fake-limits'),
+                              self.task._find_destination())
+         # Should have removed allocations for the first host.
+-        remove_allocs.assert_called_once_with('host1', 'node1')
++        remove_allocs.assert_called_once_with('host1', 'node1', self.fake_spec)
+ 
+     def test_find_destination_retry_with_old_hypervisor(self):
+         self._test_find_destination_retry_hypervisor_raises(
+@@ -495,6 +499,7 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
+ 
+     def _test_find_destination_retry_livem_checks_fail(self, error):
+         self.flags(migrate_max_retries=1)
++        self.instance.numa_topology = None
+         self.mox.StubOutWithMock(utils, 'get_image_from_system_metadata')
+         self.mox.StubOutWithMock(scheduler_utils, 'setup_instance_group')
+         self.mox.StubOutWithMock(self.task.scheduler_client,
+@@ -529,10 +534,11 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
+             self.assertEqual(("host2", 'fake-limits'),
+                              self.task._find_destination())
+         # Should have removed allocations for the first host.
+-        remove_allocs.assert_called_once_with('host1', 'node1')
++        remove_allocs.assert_called_once_with('host1', 'node1', self.fake_spec)
+ 
+     def test_find_destination_retry_with_failed_migration_pre_checks(self):
+         self.flags(migrate_max_retries=1)
++        self.instance.numa_topology = None
+         self.mox.StubOutWithMock(utils, 'get_image_from_system_metadata')
+         self.mox.StubOutWithMock(scheduler_utils, 'setup_instance_group')
+         self.mox.StubOutWithMock(self.task.scheduler_client,
+@@ -567,7 +573,7 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
+             self.assertEqual(("host2", 'fake-limits'),
+                              self.task._find_destination())
+         # Should have removed allocations for the first host.
+-        remove_allocs.assert_called_once_with('host1', 'node1')
++        remove_allocs.assert_called_once_with('host1', 'node1', self.fake_spec)
+ 
+     def test_find_destination_retry_with_invalid_livem_checks(self):
+         self._test_find_destination_retry_livem_checks_fail(exception.Invalid)
+@@ -578,6 +584,7 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
+ 
+     def test_find_destination_retry_exceeds_max(self):
+         self.flags(migrate_max_retries=0)
++        self.instance.numa_topology = None
+         self.mox.StubOutWithMock(utils, 'get_image_from_system_metadata')
+         self.mox.StubOutWithMock(scheduler_utils, 'setup_instance_group')
+         self.mox.StubOutWithMock(self.task.scheduler_client,
+@@ -607,9 +614,11 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
+             self.assertEqual('failed', self.task.migration.status)
+             save_mock.assert_called_once_with()
+             # Should have removed allocations for the first host.
+-            remove_allocs.assert_called_once_with('host1', 'node1')
++            remove_allocs.assert_called_once_with('host1', 'node1',
++                                                  self.fake_spec)
+ 
+     def test_find_destination_when_runs_out_of_hosts(self):
++        self.instance.numa_topology = None
+         self.mox.StubOutWithMock(utils, 'get_image_from_system_metadata')
+         self.mox.StubOutWithMock(scheduler_utils, 'setup_instance_group')
+         self.mox.StubOutWithMock(self.task.scheduler_client,
+@@ -631,6 +640,7 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
+     def test_find_destination_with_remoteError(self,
+         m_from_primitives, m_setup_instance_group,
+         m_build_request_spec, m_get_image_from_system_metadata):
++        self.instance.numa_topology = None
+         m_get_image_from_system_metadata.return_value = {'properties': {}}
+         m_build_request_spec.return_value = {}
+         fake_spec = objects.RequestSpec()
+@@ -682,5 +692,5 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
+         with mock.patch.object(
+                 self.task.scheduler_client.reportclient,
+                 'remove_provider_from_instance_allocation') as remove_provider:
+-            self.task._remove_host_allocations('host', 'node')
++            self.task._remove_host_allocations('host', 'node', self.fake_spec)
+         remove_provider.assert_not_called()
+diff --git a/nova/tests/unit/objects/test_objects.py b/nova/tests/unit/objects/test_objects.py
+index dfa880e..8b48c98 100644
+--- a/nova/tests/unit/objects/test_objects.py
++++ b/nova/tests/unit/objects/test_objects.py
+@@ -1156,7 +1156,7 @@ object_data = {
+     'PowerVMLiveMigrateData': '1.1-ac0fdd26da685f12d7038782cabd393a',
+     'Quotas': '1.3-40fcefe522111dddd3e5e6155702cf4e',
+     'QuotasNoOp': '1.3-347a039fc7cfee7b225b68b5181e0733',
+-    'RequestSpec': '1.8-5929c2b85e8de1a0d7a2641408163acd',
++    'RequestSpec': '1.8-e76e9b8355b28772472aa2cca6aa9691',
+     'ResourceClass': '1.0-e6b367e2cf1733c5f3526f20a3286fe9',
+     'ResourceClassList': '1.1-15ecf022a68ddbb8c2a6739cfc9f8f5e',
+     'ResourceProvider': '1.4-35e8a41d2ece17a862fac5b07ca966af',
+diff --git a/nova/tests/unit/objects/test_request_spec.py b/nova/tests/unit/objects/test_request_spec.py
+index da70548..193cd14 100644
+--- a/nova/tests/unit/objects/test_request_spec.py
++++ b/nova/tests/unit/objects/test_request_spec.py
+@@ -447,7 +447,8 @@ class _TestRequestSpecObject(object):
+         expected = {'num_instances': 1,
+                     'image': fake_image_dict,
+                     'instance_properties': fake_instance,
+-                    'instance_type': fake_flavor}
++                    'instance_type': fake_flavor,
++                    'offline_cpus': 0}
+         self.assertEqual(expected, spec_dict)
+ 
+     def test_to_legacy_request_spec_dict_with_unset_values(self):
+@@ -455,7 +456,8 @@ class _TestRequestSpecObject(object):
+         self.assertEqual({'num_instances': 1,
+                           'image': {},
+                           'instance_properties': {},
+-                          'instance_type': {}},
++                          'instance_type': {},
++                          'offline_cpus': 0},
+                          spec.to_legacy_request_spec_dict())
+ 
+     def test_to_legacy_filter_properties_dict(self):
+diff --git a/nova/tests/unit/scheduler/client/test_report.py b/nova/tests/unit/scheduler/client/test_report.py
+index 211dd93..b43f791 100644
+--- a/nova/tests/unit/scheduler/client/test_report.py
++++ b/nova/tests/unit/scheduler/client/test_report.py
+@@ -1373,12 +1373,16 @@ class TestComputeNodeToInventoryDict(test.NoDBTestCase):
+ 
+         expected = {
+             'VCPU': {
+-                'total': compute_node.vcpus,
++                # dedicated instances will take 16 * vcpus so total and
++                # max_unit must be scaled up and allocation_ratio reduced to 1.
++                'total': compute_node.vcpus *
++                                   compute_node.cpu_allocation_ratio,
+                 'reserved': CONF.reserved_host_cpus,
+                 'min_unit': 1,
+-                'max_unit': compute_node.vcpus,
++                'max_unit': compute_node.vcpus *
++                                   compute_node.cpu_allocation_ratio,
+                 'step_size': 1,
+-                'allocation_ratio': compute_node.cpu_allocation_ratio,
++                'allocation_ratio': 1
+             },
+             'MEMORY_MB': {
+                 'total': compute_node.memory_mb,
+@@ -1427,12 +1431,14 @@ class TestInventory(SchedulerReportClientTestCase):
+         mock_erp.assert_called_once_with(cn.uuid, cn.hypervisor_hostname)
+         expected_inv_data = {
+             'VCPU': {
+-                'total': 8,
++                # dedicated instances will take 16 * vcpus so total and
++                # max_unit must be scaled up and allocation_ratio reduced to 1.
++                'total': 128,
+                 'reserved': CONF.reserved_host_cpus,
+                 'min_unit': 1,
+-                'max_unit': 8,
++                'max_unit': 128,
+                 'step_size': 1,
+-                'allocation_ratio': 16.0,
++                'allocation_ratio': 1,
+             },
+             'MEMORY_MB': {
+                 'total': 1024,
+@@ -1809,12 +1815,16 @@ There was a conflict when trying to complete your request.
+             'resource_provider_generation': 43,
+             'inventories': {
+                 'VCPU': {
+-                    'total': 8,
++                    # dedicated instances will take 16 * vcpus so total
++                    # and max_unit must be scaled up and allocation_ratio
++                    # reduced to 1.
++                    'total': 8 * compute_node.cpu_allocation_ratio,
+                     'reserved': CONF.reserved_host_cpus,
+                     'min_unit': 1,
+-                    'max_unit': compute_node.vcpus,
++                    'max_unit': compute_node.vcpus *
++                                          compute_node.cpu_allocation_ratio,
+                     'step_size': 1,
+-                    'allocation_ratio': compute_node.cpu_allocation_ratio,
++                    'allocation_ratio': 1,
+                 },
+                 'MEMORY_MB': {
+                     'total': 1024,
+@@ -1849,12 +1859,16 @@ There was a conflict when trying to complete your request.
+             'resource_provider_generation': 43,
+             'inventories': {
+                 'VCPU': {
+-                    'total': 8,
++                    # dedicated instances will take 16 * vcpus so total
++                    # and max_unit must be scaled up and allocation_ratio
++                    # reduced to 1.
++                    'total': 8 * compute_node.cpu_allocation_ratio,
+                     'reserved': CONF.reserved_host_cpus,
+                     'min_unit': 1,
+-                    'max_unit': compute_node.vcpus,
++                    'max_unit': compute_node.vcpus *
++                                          compute_node.cpu_allocation_ratio,
+                     'step_size': 1,
+-                    'allocation_ratio': compute_node.cpu_allocation_ratio,
++                    'allocation_ratio': 1,
+                 },
+                 'MEMORY_MB': {
+                     'total': 1024,
+@@ -2258,8 +2272,12 @@ class TestAllocations(SchedulerReportClientTestCase):
+                                   ephemeral_gb=100,
+                                   memory_mb=1024,
+                                   vcpus=2,
+-                                  extra_specs={}))
+-        result = report._instance_to_allocations_dict(inst)
++                                  extra_specs={}),
++            system_metadata={},
++            vcpus=2,
++            numa_topology=None)
++        self.compute_node.numa_topology = None
++        result = report._instance_to_allocations_dict(inst, self.compute_node)
+         expected = {
+             'MEMORY_MB': 1024,
+             'VCPU': 2,
+@@ -2290,8 +2308,13 @@ class TestAllocations(SchedulerReportClientTestCase):
+                                   ephemeral_gb=100,
+                                   memory_mb=1024,
+                                   vcpus=2,
+-                                  extra_specs=specs))
+-        result = report._instance_to_allocations_dict(inst)
++                                  extra_specs=specs),
++            # assume our normalization lines up with resources spec
++            vcpus=4,
++            system_metadata={},
++            numa_topology=None)
++        self.compute_node.numa_topology = None
++        result = report._instance_to_allocations_dict(inst, self.compute_node)
+         expected = {
+             'MEMORY_MB': 1024,
+             'VCPU': 4,
+@@ -2310,8 +2333,12 @@ class TestAllocations(SchedulerReportClientTestCase):
+                                   ephemeral_gb=100,
+                                   memory_mb=1024,
+                                   vcpus=2,
+-                                  extra_specs={}))
+-        result = report._instance_to_allocations_dict(inst)
++                                  extra_specs={}),
++            vcpus=2,
++            system_metadata={},
++            numa_topology=None)
++        self.compute_node.numa_topology = None
++        result = report._instance_to_allocations_dict(inst, self.compute_node)
+         expected = {
+             'MEMORY_MB': 1024,
+             'VCPU': 2,
+@@ -2329,8 +2356,12 @@ class TestAllocations(SchedulerReportClientTestCase):
+                                   ephemeral_gb=0,
+                                   memory_mb=1024,
+                                   vcpus=2,
+-                                  extra_specs={}))
+-        result = report._instance_to_allocations_dict(inst)
++                                  extra_specs={}),
++            vcpus=2,
++            system_metadata={},
++            numa_topology=None)
++        self.compute_node.numa_topology = None
++        result = report._instance_to_allocations_dict(inst, self.compute_node)
+         expected = {
+             'MEMORY_MB': 1024,
+             'VCPU': 2,
+diff --git a/nova/tests/unit/scheduler/test_filter_scheduler.py b/nova/tests/unit/scheduler/test_filter_scheduler.py
+index 76c9717..9f81387 100644
+--- a/nova/tests/unit/scheduler/test_filter_scheduler.py
++++ b/nova/tests/unit/scheduler/test_filter_scheduler.py
+@@ -184,21 +184,30 @@ class FilterSchedulerTestCase(test_scheduler.SchedulerTestCase):
+                                   root_gb=512,
+                                   ephemeral_gb=0,
+                                   swap=0,
+-                                  vcpus=1),
++                                  vcpus=1,
++                                  extra_specs={}),
+             project_id=uuids.project_id,
+             instance_group=None,
+-            instance_uuid='00000000-aaaa-bbbb-cccc-000000000000')
++            instance_uuid='00000000-aaaa-bbbb-cccc-000000000000',
++            image=objects.ImageMeta(properties=objects.ImageMetaProps()),
++            numa_topology=None)
+ 
+         host_state = mock.Mock(spec=host_manager.HostState,
+-            host=mock.sentinel.host, uuid=uuids.cn1)
++            host=mock.sentinel.host, uuid=uuids.cn1, numa_topology=None)
+         all_host_states = [host_state]
+         mock_get_all_states.return_value = all_host_states
+         mock_get_hosts.return_value = all_host_states
+         mock_claim.return_value = True
+ 
+         instance_uuids = [uuids.instance]
++        allocs = \
++           [{'allocations': [
++                {'resources': {'VCPU': 1, 'MEMORY_MB': 512, 'DISK_GB': 512},
++                 'resource_provider': {'uuid': uuids.cn1}}
++              ]
++            }]
+         alloc_reqs_by_rp_uuid = {
+-            uuids.cn1: [mock.sentinel.alloc_req],
++            uuids.cn1: allocs,
+         }
+         ctx = mock.Mock()
+         selected_hosts = self.driver._schedule(ctx, spec_obj,
+@@ -210,7 +219,7 @@ class FilterSchedulerTestCase(test_scheduler.SchedulerTestCase):
+             mock.sentinel.provider_summaries)
+         mock_get_hosts.assert_called_once_with(spec_obj, all_host_states, 0)
+         mock_claim.assert_called_once_with(ctx.elevated.return_value, spec_obj,
+-            uuids.instance, [mock.sentinel.alloc_req])
++            uuids.instance, allocs)
+ 
+         self.assertEqual(len(selected_hosts), 1)
+         self.assertEqual([host_state], selected_hosts)
+@@ -250,21 +259,30 @@ class FilterSchedulerTestCase(test_scheduler.SchedulerTestCase):
+                                   root_gb=512,
+                                   ephemeral_gb=0,
+                                   swap=0,
+-                                  vcpus=1),
++                                  vcpus=1,
++                                  extra_specs={}),
+             project_id=uuids.project_id,
+             instance_group=None,
+-            instance_uuid='00000000-aaaa-bbbb-cccc-000000000000')
++            instance_uuid='00000000-aaaa-bbbb-cccc-000000000000',
++            image=objects.ImageMeta(properties=objects.ImageMetaProps()),
++            numa_topology=None)
+ 
+         host_state = mock.Mock(spec=host_manager.HostState,
+-            host=mock.sentinel.host, uuid=uuids.cn1)
++            host=mock.sentinel.host, uuid=uuids.cn1, numa_topology=None)
+         all_host_states = [host_state]
+         mock_get_all_states.return_value = all_host_states
+         mock_get_hosts.return_value = all_host_states
+         mock_claim.return_value = False
+ 
+         instance_uuids = [uuids.instance]
++        allocs = \
++           [{'allocations': [
++                {'resources': {'VCPU': 1, 'MEMORY_MB': 512, 'DISK_GB': 512},
++                 'resource_provider': {'uuid': uuids.cn1}}
++              ]
++            }]
+         alloc_reqs_by_rp_uuid = {
+-            uuids.cn1: [mock.sentinel.alloc_req],
++            uuids.cn1: allocs,
+         }
+         ctx = mock.Mock()
+         selected_hosts = self.driver._schedule(ctx, spec_obj,
+@@ -276,7 +294,7 @@ class FilterSchedulerTestCase(test_scheduler.SchedulerTestCase):
+             mock.sentinel.provider_summaries)
+         mock_get_hosts.assert_called_once_with(spec_obj, all_host_states, 0)
+         mock_claim.assert_called_once_with(ctx.elevated.return_value, spec_obj,
+-            uuids.instance, [mock.sentinel.alloc_req])
++            uuids.instance, allocs)
+ 
+         self.assertEqual([], selected_hosts)
+ 
+@@ -307,13 +325,16 @@ class FilterSchedulerTestCase(test_scheduler.SchedulerTestCase):
+                                   root_gb=512,
+                                   ephemeral_gb=0,
+                                   swap=0,
+-                                  vcpus=1),
++                                  vcpus=1,
++                                  extra_specs={}),
+             project_id=uuids.project_id,
+             instance_group=None,
+-            instance_uuid='00000000-aaaa-bbbb-cccc-000000000000')
++            instance_uuid='00000000-aaaa-bbbb-cccc-000000000000',
++            image=objects.ImageMeta(properties=objects.ImageMetaProps()),
++            numa_topology=None)
+ 
+         host_state = mock.Mock(spec=host_manager.HostState,
+-            host=mock.sentinel.host, uuid=uuids.cn1)
++            host=mock.sentinel.host, uuid=uuids.cn1, numa_topology=None)
+         all_host_states = [host_state]
+         mock_get_all_states.return_value = all_host_states
+         mock_get_hosts.side_effect = [
+@@ -323,8 +344,14 @@ class FilterSchedulerTestCase(test_scheduler.SchedulerTestCase):
+         mock_claim.return_value = True
+ 
+         instance_uuids = [uuids.instance1, uuids.instance2]
++        allocs = \
++           [{'allocations': [
++                {'resources': {'VCPU': 1, 'MEMORY_MB': 512, 'DISK_GB': 512},
++                 'resource_provider': {'uuid': uuids.cn1}}
++              ]
++            }]
+         alloc_reqs_by_rp_uuid = {
+-            uuids.cn1: [mock.sentinel.alloc_req],
++            uuids.cn1: allocs,
+         }
+         ctx = mock.Mock()
+         self.driver._schedule(ctx, spec_obj, instance_uuids,
+@@ -356,22 +383,39 @@ class FilterSchedulerTestCase(test_scheduler.SchedulerTestCase):
+                                   root_gb=512,
+                                   ephemeral_gb=0,
+                                   swap=0,
+-                                  vcpus=1),
++                                  vcpus=1,
++                                  extra_specs={}),
+             project_id=uuids.project_id,
+             instance_group=ig,
+-            instance_uuid='00000000-aaaa-bbbb-cccc-000000000000')
++            instance_uuid='00000000-aaaa-bbbb-cccc-000000000000',
++            image=objects.ImageMeta(properties=objects.ImageMetaProps()),
++            numa_topology=None)
+ 
+         hs1 = mock.Mock(spec=host_manager.HostState, host='host1',
+-            uuid=uuids.cn1)
++            uuid=uuids.cn1, numa_topology=None)
+         hs2 = mock.Mock(spec=host_manager.HostState, host='host2',
+-            uuid=uuids.cn2)
++            uuid=uuids.cn2, numa_topology=None)
+         all_host_states = [hs1, hs2]
+         mock_get_all_states.return_value = all_host_states
+         mock_claim.return_value = True
+ 
++        resources = {'VCPU': 1, 'MEMORY_MB': 512, 'DISK_GB': 512}
++        allocs1 = \
++           [{'allocations': [
++                {'resources': resources,
++                 'resource_provider': {'uuid': uuids.cn1}}
++              ]
++            }]
++        allocs2 = \
++           [{'allocations': [
++                {'resources': resources,
++                 'resource_provider': {'uuid': uuids.cn2}}
++              ]
++            }]
++
+         alloc_reqs_by_rp_uuid = {
+-            uuids.cn1: [mock.sentinel.alloc_req_cn1],
+-            uuids.cn2: [mock.sentinel.alloc_req_cn2],
++            uuids.cn1: allocs1,
++            uuids.cn2: allocs2,
+         }
+ 
+         # Simulate host 1 and host 2 being randomly returned first by
+@@ -389,9 +433,9 @@ class FilterSchedulerTestCase(test_scheduler.SchedulerTestCase):
+         # host state
+         claim_calls = [
+             mock.call(ctx.elevated.return_value, spec_obj,
+-                uuids.instance0, [mock.sentinel.alloc_req_cn2]),
++                uuids.instance0, allocs2),
+             mock.call(ctx.elevated.return_value, spec_obj,
+-                uuids.instance1, [mock.sentinel.alloc_req_cn1]),
++                uuids.instance1, allocs1),
+         ]
+         mock_claim.assert_has_calls(claim_calls)
+ 
+@@ -739,7 +783,8 @@ class FilterSchedulerTestCase(test_scheduler.SchedulerTestCase):
+                              'display_name': 'fake-vm',
+                              'name': 'instance-00000001'},
+                         'instance_type': {},
+-                        'image': {}}
++                        'image': {},
++                        'offline_cpus': 0}
+             spec_obj = objects.RequestSpec(num_instances=1,
+                                            instance_uuid=uuids.instance,
+                                            # extension
+@@ -840,7 +885,8 @@ class FilterSchedulerTestCase(test_scheduler.SchedulerTestCase):
+             flavor=objects.Flavor(memory_mb=512,
+                                   root_gb=512,
+                                   ephemeral_gb=0,
+-                                  vcpus=1),
++                                  vcpus=1,
++                                  extra_specs={}),
+             project_id=1,
+             os_type='Linux',
+             instance_uuid='00000000-aaaa-bbbb-cccc-000000000000',
+@@ -850,16 +896,23 @@ class FilterSchedulerTestCase(test_scheduler.SchedulerTestCase):
+             scheduler_hints=scheduler_hints,
+             # extension
+             display_name = 'fake-vm',
+-            name = 'instance-00000001')
++            name = 'instance-00000001',
++            image=objects.ImageMeta(properties=objects.ImageMetaProps()))
+ 
+         host_state = mock.Mock(spec=host_manager.HostState,
+-            host=mock.sentinel.host, uuid=uuids.cn1)
++            host=mock.sentinel.host, uuid=uuids.cn1, numa_topology=None)
+         all_host_states = [host_state]
+         mock_get_all_states.return_value = all_host_states
+ 
+         instance_uuids = [uuids.instance]
++        allocs = \
++           [{'allocations': [
++                {'resources': {'VCPU': 1, 'MEMORY_MB': 512, 'DISK_GB': 512},
++                 'resource_provider': {'uuid': uuids.cn1}}
++              ]
++            }]
+         alloc_reqs_by_rp_uuid = {
+-            uuids.cn1: [mock.sentinel.alloc_req],
++            uuids.cn1: allocs,
+         }
+ 
+         with mock.patch.object(self.driver.host_manager,
+diff --git a/nova/tests/unit/scheduler/test_scheduler.py b/nova/tests/unit/scheduler/test_scheduler.py
+index 6e553e4..f368a5c 100644
+--- a/nova/tests/unit/scheduler/test_scheduler.py
++++ b/nova/tests/unit/scheduler/test_scheduler.py
+@@ -108,7 +108,11 @@ class SchedulerManagerTestCase(test.NoDBTestCase):
+     @mock.patch('nova.scheduler.client.report.SchedulerReportClient.'
+                 'get_allocation_candidates')
+     def test_select_destination(self, mock_get_ac, mock_rfrs):
+-        fake_spec = objects.RequestSpec()
++        fake_spec = objects.RequestSpec(
++                  flavor=objects.Flavor(vcpus=1, extra_specs={}),
++                  image=objects.ImageMeta(properties=objects.ImageMetaProps()),
++                  numa_topology=None)
++
+         fake_spec.instance_uuid = uuids.instance
+         place_res = (fakes.ALLOC_REQS, mock.sentinel.p_sums)
+         mock_get_ac.return_value = place_res
+@@ -134,7 +138,10 @@ class SchedulerManagerTestCase(test.NoDBTestCase):
+     def _test_select_destination(self, get_allocation_candidates_response,
+                                  mock_get_ac, mock_rfrs,
+                                  mock_get_res, mock_get_all):
+-        fake_spec = objects.RequestSpec()
++        fake_spec = objects.RequestSpec(
++                  flavor=objects.Flavor(vcpus=1, extra_specs={}),
++                  image=objects.ImageMeta(properties=objects.ImageMetaProps()),
++                  numa_topology=None)
+         fake_spec.instance_uuid = uuids.instance
+         place_res = get_allocation_candidates_response
+         mock_get_ac.return_value = place_res
+@@ -176,7 +183,10 @@ class SchedulerManagerTestCase(test.NoDBTestCase):
+     @mock.patch('nova.scheduler.client.report.SchedulerReportClient.'
+                 'get_allocation_candidates')
+     def test_select_destination_with_4_3_client(self, mock_get_ac, mock_rfrs):
+-        fake_spec = objects.RequestSpec()
++        fake_spec = objects.RequestSpec(
++                  flavor=objects.Flavor(vcpus=1, extra_specs={}),
++                  image=objects.ImageMeta(properties=objects.ImageMetaProps()),
++                  numa_topology=None)
+         place_res = (fakes.ALLOC_REQS, mock.sentinel.p_sums)
+         mock_get_ac.return_value = place_res
+         expected_alloc_reqs_by_rp_uuid = {
+@@ -197,7 +207,10 @@ class SchedulerManagerTestCase(test.NoDBTestCase):
+     @mock.patch.object(objects.RequestSpec, 'from_primitives')
+     def test_select_destination_with_old_client(self, from_primitives,
+             mock_get_ac, mock_rfrs):
+-        fake_spec = objects.RequestSpec()
++        fake_spec = objects.RequestSpec(
++                  flavor=objects.Flavor(vcpus=1, extra_specs={}),
++                  image=objects.ImageMeta(properties=objects.ImageMetaProps()),
++                  numa_topology=None)
+         fake_spec.instance_uuid = uuids.instance
+         from_primitives.return_value = fake_spec
+         place_res = (fakes.ALLOC_REQS, mock.sentinel.p_sums)
+-- 
+2.7.4
+

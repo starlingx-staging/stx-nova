@@ -1,0 +1,46 @@
+From 2e4f3f771979853d25e072d14e587b7d6d2d8f2d Mon Sep 17 00:00:00 2001
+From: Bart Wensley <barton.wensley@windriver.com>
+Date: Wed, 12 Jul 2017 10:26:13 -0400
+Subject: [PATCH 055/143] Add ability to recover VMs in priority order
+
+Adding that ability to recover VMs in priority order. Changes in
+nova include:
+- Addition of validation routine in nova to ensure new
+  sw:wrs:recovery_priority is an integer between 1 and 10.
+
+__TYPE_single
+__TAG_recovery
+__R4_commit_7683537
+---
+ nova/api/openstack/common.py | 15 +++++++++++++++
+ 1 file changed, 15 insertions(+)
+
+diff --git a/nova/api/openstack/common.py b/nova/api/openstack/common.py
+index 8833b33..8224b1d 100644
+--- a/nova/api/openstack/common.py
++++ b/nova/api/openstack/common.py
+@@ -338,6 +338,21 @@ def validate_metadata(metadata):
+     validate_live_migration_timeout(metadata)
+     validate_live_migration_max_downtime(metadata)
+     validate_boolean_options(metadata)
++    validate_recovery_priority(metadata)
++
++
++# validation for instance metadata
++def validate_recovery_priority(metadata):
++    key = 'sw:wrs:recovery_priority'
++    if key in metadata:
++        try:
++            recovery_priority = int(metadata[key])
++        except ValueError:
++            msg = "%s must be an integer." % key
++            raise webob.exc.HTTPBadRequest(explanation=msg)
++        if recovery_priority not in range(1, 11):
++            msg = "%s must be between 1 and 10" % key
++            raise webob.exc.HTTPBadRequest(explanation=msg)
+ 
+ 
+ def validate_boolean_options(metadata):
+-- 
+2.7.4
+

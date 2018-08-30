@@ -1,0 +1,140 @@
+From b4f04e19bc697d0cbf670950eb83dcb092e226fa Mon Sep 17 00:00:00 2001
+From: Francois Palin <francois.palin@windriver.com>
+Date: Fri, 9 Feb 2018 08:54:22 -0500
+Subject: [PATCH 097/143] Do not show deleted instances in server group list command
+
+An extra check is needed for nova command server-group-list
+to make sure deleted instances don't get displayed.
+
+The build requests and instance mappings are deleted for
+excess instances, as well as instance allocations.
+---
+ nova/api/openstack/compute/server_groups.py        | 16 ++++++++++++----
+ nova/conductor/manager.py                          | 22 ++++++++++++++++++++++
+ .../api/openstack/compute/test_server_groups.py    | 20 ++++++++++++++++++++
+ 3 files changed, 54 insertions(+), 4 deletions(-)
+
+diff --git a/nova/api/openstack/compute/server_groups.py b/nova/api/openstack/compute/server_groups.py
+index 17f9684..bdf3ab3 100644
+--- a/nova/api/openstack/compute/server_groups.py
++++ b/nova/api/openstack/compute/server_groups.py
+@@ -63,10 +63,18 @@ def _get_not_deleted(context, uuids):
+     # uuids organized by cell
+     for im in mappings:
+         if not im.cell_mapping:
+-            # Not scheduled yet, so just throw it in the final list
+-            # and move on
+-            found_inst_uuids.append(im.instance_uuid)
+-            continue
++            # let's see first if build request is still around:
++            try:
++                objects.BuildRequest.get_by_instance_uuid(
++                    context, im.instance_uuid)
++            except nova.exception.BuildRequestNotFound:
++                # the build request is gone so let's not add this instance
++                continue
++            else:
++                # Not scheduled yet, so just throw it in the final list
++                # and move on
++                found_inst_uuids.append(im.instance_uuid)
++                continue
+         if im.cell_mapping.uuid not in cell_mappings:
+             cell_mappings[im.cell_mapping.uuid] = im.cell_mapping
+         inst_by_cell[im.cell_mapping.uuid].append(im.instance_uuid)
+diff --git a/nova/conductor/manager.py b/nova/conductor/manager.py
+index 6018009..17e91da 100644
+--- a/nova/conductor/manager.py
++++ b/nova/conductor/manager.py
+@@ -1145,8 +1145,15 @@ class ComputeTaskManager(base.Base):
+         num_allowed -= max(group_exceed, 0)
+         num_destroyed = 0
+ 
++        # need to keep track of remaining build requests to delete them.
++        # Not using deep copy since source object does not allow member delete
++        remaining_build_requests = []
++        for build_request in build_requests:
++            remaining_build_requests.append(build_request)
++
+         for (build_request, request_spec, host) in six.moves.zip(
+                 build_requests, request_specs, hosts):
++            del remaining_build_requests[0]
+             instance = build_request.get_new_instance(context)
+             # Convert host from the scheduler into a cell record
+             if host['host'] not in host_mapping_cache:
+@@ -1193,6 +1200,18 @@ class ComputeTaskManager(base.Base):
+                     except exception.BuildRequestNotFound:
+                         pass
+                     num_destroyed += 1
++
++                    try:
++                        instance_mapping = objects.InstanceMapping\
++                                  .get_by_instance_uuid(context, instance.uuid)
++                    except exception.InstanceMappingNotFound:
++                        pass
++                    else:
++                        instance_mapping.destroy()
++
++                    instances.append(None)
++                    rc = self.scheduler_client.reportclient
++                    rc.delete_allocation_for_instance(instance.uuid)
+                     continue
+                 num_allowed -= 1
+                 instance.availability_zone = (
+@@ -1203,6 +1222,9 @@ class ComputeTaskManager(base.Base):
+                     instances.append(instance)
+                     cell_mapping_cache[instance.uuid] = cell
+ 
++        for build_request in remaining_build_requests:
++            build_request.destroy()
++
+         # NOTE(melwitt): We recheck the quota after creating the
+         # objects to prevent users from allocating more resources
+         # than their allowed quota in the event of a race. This is
+diff --git a/nova/tests/unit/api/openstack/compute/test_server_groups.py b/nova/tests/unit/api/openstack/compute/test_server_groups.py
+index 5fb1ef6..560a33d 100644
+--- a/nova/tests/unit/api/openstack/compute/test_server_groups.py
++++ b/nova/tests/unit/api/openstack/compute/test_server_groups.py
+@@ -33,6 +33,7 @@ from nova.policies import server_groups as sg_policies
+ from nova import test
+ from nova.tests import fixtures
+ from nova.tests.unit.api.openstack import fakes
++from nova.tests.unit import fake_build_request
+ from nova.tests.unit import policy_fixture
+ from nova.tests import uuidsentinel
+ 
+@@ -348,6 +349,15 @@ class ServerGroupTestV21(test.NoDBTestCase):
+ 
+     def test_display_members(self):
+         ctx = context.RequestContext('fake_user', 'fake')
++        fake_build_req = fake_build_request.fake_req_obj(ctx)
++
++        @staticmethod
++        def _fake_get_by_instance_uuid(context, instance_uuid):
++            return fake_build_req
++
++        self.stub_out('nova.objects.BuildRequest.get_by_instance_uuid',
++                      _fake_get_by_instance_uuid)
++
+         (ig_uuid, instances, members) = self._create_groups_and_instances(ctx)
+         res_dict = self.controller.show(self.req, ig_uuid)
+         result_members = res_dict['server_group']['members']
+@@ -402,6 +412,16 @@ class ServerGroupTestV21(test.NoDBTestCase):
+ 
+     def test_display_active_members_only(self):
+         ctx = context.RequestContext('fake_user', 'fake')
++
++        fake_build_req = fake_build_request.fake_req_obj(ctx)
++
++        @staticmethod
++        def _fake_get_by_instance_uuid(context, instance_uuid):
++            return fake_build_req
++
++        self.stub_out('nova.objects.BuildRequest.get_by_instance_uuid',
++                      _fake_get_by_instance_uuid)
++
+         (ig_uuid, instances, members) = self._create_groups_and_instances(ctx)
+ 
+         # delete an instance
+-- 
+2.7.4
+

@@ -1,0 +1,111 @@
+From 6b8dbdad8e989778d2ad0793dee75b55e16fa448 Mon Sep 17 00:00:00 2001
+From: Sivasathurappan Radhakrishnan <siva.radhakrishnan@intel.com>
+Date: Wed, 23 Nov 2016 00:17:47 +0000
+Subject: [PATCH 053/143] Instance remains in task "migrating" state
+ after unexpected exception in pre-live-migration check
+
+Fix includes upstream commits:
+
+1) Reset instance status on invalid host
+
+When live migrating instance to invalid host, live migration fails
+with host not found and sets instance task state to migrating
+This changes resets the instance state to 'Active' in the above
+scenario.
+
+Change-Id: I7c5e80298b9adf1bd53cc6c464a3744b5397b7e8
+Partial-bug:1643623
+https://review.openstack.org/#/c/401009/5
+
+2) Return 400 when compute host is not found
+
+Previously user was getting a 500 error code for ComputeHostNotFound
+if they are using latest microversion that does live migration in
+async. This patches changes return response to 400 as 500 internal
+server error should not be returned to the user for failures due to
+user error that can be fixed by changing to request on client side.
+
+Change-Id: I7a9de211ecfaa7f2816fbf8bcd73ebbdd990643c
+closes-bug:1643623
+https://review.openstack.org/#/c/447355/2
+
+__TYPE_upstream
+__R4_commit_32155c8
+---
+ nova/api/openstack/compute/migrate_server.py |  3 ++-
+ nova/compute/api.py                          |  8 +++++++-
+ nova/tests/unit/compute/test_compute_api.py  | 18 ++++++++++++++++++
+ 3 files changed, 27 insertions(+), 2 deletions(-)
+
+diff --git a/nova/api/openstack/compute/migrate_server.py b/nova/api/openstack/compute/migrate_server.py
+index ea4fff7..f4502c9 100644
+--- a/nova/api/openstack/compute/migrate_server.py
++++ b/nova/api/openstack/compute/migrate_server.py
+@@ -100,7 +100,6 @@ class MigrateServerController(wsgi.Controller):
+             raise exc.HTTPNotFound(explanation=e.format_message())
+         except (exception.NoValidHost,
+                 exception.ComputeServiceUnavailable,
+-                exception.ComputeHostNotFound,
+                 exception.InvalidHypervisorType,
+                 exception.InvalidCPUInfo,
+                 exception.UnableToMigrateToSelf,
+@@ -120,6 +119,8 @@ class MigrateServerController(wsgi.Controller):
+                 raise exc.HTTPBadRequest(explanation=ex.format_message())
+         except exception.InstanceIsLocked as e:
+             raise exc.HTTPConflict(explanation=e.format_message())
++        except exception.ComputeHostNotFound as e:
++            raise exc.HTTPBadRequest(explanation=e.format_message())
+         except exception.InstanceInvalidState as state_error:
+             common.raise_http_conflict_for_instance_invalid_state(state_error,
+                     'os-migrateLive', id)
+diff --git a/nova/compute/api.py b/nova/compute/api.py
+index b6a3c4a..5676561 100644
+--- a/nova/compute/api.py
++++ b/nova/compute/api.py
+@@ -4140,7 +4140,13 @@ class API(base.Base):
+ 
+         # NOTE(sbauza): Force is a boolean by the new related API version
+         if force is False and host_name:
+-            nodes = objects.ComputeNodeList.get_all_by_host(context, host_name)
++            try:
++                nodes = objects.ComputeNodeList.get_all_by_host(context,
++                                                                host_name)
++            except exception.ComputeHostNotFound:
++                with excutils.save_and_reraise_exception():
++                    instance.task_state = None
++                    instance.save()
+             # Unset the host to make sure we call the scheduler
+             # from the conductor LiveMigrationTask. Yes this is tightly-coupled
+             # to behavior in conductor and not great.
+diff --git a/nova/tests/unit/compute/test_compute_api.py b/nova/tests/unit/compute/test_compute_api.py
+index d276681..0abca38 100644
+--- a/nova/tests/unit/compute/test_compute_api.py
++++ b/nova/tests/unit/compute/test_compute_api.py
+@@ -2170,6 +2170,24 @@ class _ComputeAPIUnitTestMixIn(object):
+                 instance,
+                 mock.ANY)
+ 
++    @mock.patch.object(objects.RequestSpec, 'get_by_instance_uuid')
++    @mock.patch.object(objects.InstanceAction, 'action_start')
++    @mock.patch.object(objects.Instance, 'save')
++    @mock.patch.object(objects.ComputeNodeList, 'get_all_by_host')
++    def test_live_migrate_computehost_notfound(self, mock_nodelist, mock_save,
++                                               mock_action,
++                                               mock_get_spec):
++        instance = self._create_instance_obj()
++        mock_nodelist.side_effect = exception.ComputeHostNotFound('fake_host')
++        self.assertRaises(exception.ComputeHostNotFound,
++                          self.compute_api.live_migrate,
++                          self.context, instance,
++                          host_name='fake_host',
++                          block_migration=True, disk_over_commit=True,
++                          force=False)
++        self.assertEqual(instance.vm_state, vm_states.ACTIVE)
++        self.assertIsNone(instance.task_state)
++
+     @mock.patch.object(objects.ComputeNodeList, 'get_all_by_host')
+     @mock.patch.object(objects.RequestSpec, 'get_by_instance_uuid')
+     @mock.patch.object(objects.Instance, 'save')
+-- 
+2.7.4
+

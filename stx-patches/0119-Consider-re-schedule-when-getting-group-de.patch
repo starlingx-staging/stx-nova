@@ -1,0 +1,30 @@
+From 75d7c2a225bfee78be08048fcbee45a6861ff931 Mon Sep 17 00:00:00 2001
+From: Francois Palin <francois.palin@windriver.com>
+Date: Wed, 7 Mar 2018 09:19:15 -0500
+Subject: [PATCH 119/143] Consider re-schedule when getting group details
+
+In a re-schedule case, _get_group_details has to lower the total
+number of members_launched by 1, otherwise exception
+InstanceGroupSizeLimit will get raised.
+---
+ nova/scheduler/utils.py | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/nova/scheduler/utils.py b/nova/scheduler/utils.py
+index e794aca..5f5f8b9 100644
+--- a/nova/scheduler/utils.py
++++ b/nova/scheduler/utils.py
+@@ -674,6 +674,10 @@ def _get_group_details(context, instance_uuid, request_spec,
+         group_member_uuids = group.get_members_launched(context)
+         members_launched = len(group_member_uuids)
+ 
++        # substract 1 if this is a re-schedule
++        if instance_uuid in group_member_uuids:
++            members_launched -= 1
++
+         # total members if launch minimal num of requested instances
+         total_members_min = members_launched + request_spec.min_num_instances
+         # total members if launch all requested instances
+-- 
+2.7.4
+

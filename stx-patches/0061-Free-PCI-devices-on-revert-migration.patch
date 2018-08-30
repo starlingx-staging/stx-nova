@@ -1,0 +1,70 @@
+From 3da7e2cbdf8b47b89e7b1ff25f8cdfc76d065f1e Mon Sep 17 00:00:00 2001
+From: Ludovic Beliveau <ludovic.beliveau@windriver.com>
+Date: Wed, 7 Sep 2016 17:24:13 -0400
+Subject: [PATCH 061/143] Free PCI devices on revert migration
+
+Don't wait for next audit before freeing the PCI devices.  Only free the PCI
+devices that were allocated on the destination node when dropping the
+migration context.
+
+75fdbf7 Fix PCI resource tracking in Newton
+
+   This commit fixes PCI resource tracking to account for the new migration
+   context mechanism in Newton.
+
+   1. Because of the migration_context, we can remove the 'free_instance_on_revert'
+   functionality that used to be in the pci manager.
+
+   2. We need to account for an audit that runs while we wait for a confirm/revert,
+   which would change a pci device resource state from 'claimed' to 'allocated'.
+   We just compare the pci id from the migration with what we have in the stats view.
+
+   We might want to look at aligning this code with the upstream (after Newton)
+   drop_move_claim().
+
+Notes for Pike rebase:
+   - for 75fdbf7, only had to port changes to manager.py
+     Changes to resource_tracker.py are implemented by upstream change 3a4909a.
+
+__TYPE_upstreamable
+__TAG_sriov,pci,migration,resize,resource
+__R4_commit_f2bfbde
+__R3_commit_bad2431
+__TC2956
+---
+ nova/pci/manager.py | 12 ++++++++++--
+ 1 file changed, 10 insertions(+), 2 deletions(-)
+
+diff --git a/nova/pci/manager.py b/nova/pci/manager.py
+index 4049475..30211b4 100644
+--- a/nova/pci/manager.py
++++ b/nova/pci/manager.py
+@@ -362,7 +362,11 @@ class PciDevTracker(object):
+                          {'uuid': uuid,
+                           'addrs': [dev.address for dev in devs]})
+                 for dev in devs:
+-                    self._free_device(dev)
++                    # The PCI devices might have been cleaned up
++                    # on revert, which would cause an exception to be
++                    # raised.
++                    if dev.status != fields.PciDeviceStatus.AVAILABLE:
++                        self._free_device(dev)
+         # need to copy keys, because the dict is modified in the loop body
+         for uuid in list(self.allocations):
+             if uuid not in existed:
+@@ -372,7 +376,11 @@ class PciDevTracker(object):
+                          {'uuid': uuid,
+                           'addrs': [dev.address for dev in devs]})
+                 for dev in devs:
+-                    self._free_device(dev)
++                    # The PCI devices might have been cleaned up
++                    # on revert, which would cause an exception to be
++                    # raised.
++                    if dev.status != fields.PciDeviceStatus.AVAILABLE:
++                        self._free_device(dev)
+ 
+ 
+ def get_instance_pci_devs(inst, request_id=None):
+-- 
+2.7.4
+

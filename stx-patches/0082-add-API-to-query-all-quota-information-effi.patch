@@ -1,0 +1,273 @@
+From 29254dbcb35214dc7a921c0bfb1a6d6a021e8577 Mon Sep 17 00:00:00 2001
+From: Chris Friesen <chris.friesen@windriver.com>
+Date: Wed, 13 Dec 2017 16:57:03 -0600
+Subject: [PATCH 082/143] add API to query all quota information efficiently
+
+The distributed-cloud work wants to be able to efficiently query
+all the project and project/user quotas that have been explicitly
+specified.
+
+Accordingly, add the ability to index os-quota-sets as an admin-only
+operation.  This will return a dict which contains information on
+all the project quotas that have been set, as well as all the
+project/user quotas that have been set.
+
+__TYPE_single
+__TAG_distributed-cloud
+---
+ nova/api/openstack/compute/quota_sets.py | 22 ++++++++++++++
+ nova/api/openstack/compute/routes.py     |  3 ++
+ nova/db/api.py                           | 10 +++++++
+ nova/db/sqlalchemy/api.py                | 13 +++++++++
+ nova/objects/quotas.py                   | 26 +++++++++++++++++
+ nova/policies/quota_sets.py              | 10 +++++++
+ nova/quota.py                            | 49 ++++++++++++++++++++++++++++++++
+ nova/tests/unit/test_policy.py           |  1 +
+ 8 files changed, 134 insertions(+)
+
+diff --git a/nova/api/openstack/compute/quota_sets.py b/nova/api/openstack/compute/quota_sets.py
+index de19aba..3b38608 100644
+--- a/nova/api/openstack/compute/quota_sets.py
++++ b/nova/api/openstack/compute/quota_sets.py
+@@ -108,6 +108,28 @@ class QuotaSetsController(wsgi.Controller):
+             self._get_quotas(context, id, user_id=user_id),
+             filtered_quotas=filtered_quotas)
+ 
++    @extensions.expected_errors(())
++    def index(self, req):
++        """Returns a list of modified quotas."""
++        context = req.environ['nova.context']
++        context.can(qs_policies.POLICY_ROOT % 'list')
++        user_quotas = QUOTAS.get_all_project_user_quotas(context)
++        quotas = QUOTAS.get_all_project_quotas(context)
++
++        # "quotas" is a dict where the keys are project IDs and the values are
++        # dicts of individual quotas.
++        result = {'project_quotas': [
++            {'project_id': project, 'quotas': quotas[project]}
++            for project in quotas]}
++        # "user_quotas" is a dict where the keys are project IDs and the
++        # values are dicts where the keys are user IDs and the values are
++        # dicts of individual quotas.
++        result['project_user_quotas'] = [
++            {'project_id': project, 'user_quotas': [
++                {'user_id': user, 'quotas': user_quotas[project][user]}
++                for user in user_quotas[project]]} for project in user_quotas]
++        return result
++
+     @wsgi.Controller.api_version("2.1", MAX_PROXY_API_SUPPORT_VERSION)
+     @extensions.expected_errors(400)
+     def detail(self, req, id):
+diff --git a/nova/api/openstack/compute/routes.py b/nova/api/openstack/compute/routes.py
+index 9cb1928..d260d22 100644
+--- a/nova/api/openstack/compute/routes.py
++++ b/nova/api/openstack/compute/routes.py
+@@ -682,6 +682,9 @@ ROUTE_LIST = (
+         'GET': [quota_classes_controller, 'show'],
+         'PUT': [quota_classes_controller, 'update']
+     }),
++    ('/os-quota-sets', {
++        'GET': [quota_set_controller, 'index'],
++    }),
+     ('/os-quota-sets/{id}', {
+         'GET': [quota_set_controller, 'show'],
+         'PUT': [quota_set_controller, 'update'],
+diff --git a/nova/db/api.py b/nova/db/api.py
+index 488e80d..e931e7f 100644
+--- a/nova/db/api.py
++++ b/nova/db/api.py
+@@ -1178,6 +1178,16 @@ def quota_get_all(context, project_id):
+     return IMPL.quota_get_all(context, project_id)
+ 
+ 
++def quota_really_get_all(context):
++    """Retrieve all quotas."""
++    return IMPL.quota_really_get_all(context)
++
++
++def quota_user_really_get_all(context):
++    """Retrieve all user quotas."""
++    return IMPL.quota_user_really_get_all(context)
++
++
+ def quota_update(context, project_id, resource, limit, user_id=None):
+     """Update a quota or raise if it does not exist."""
+     return IMPL.quota_update(context, project_id, resource, limit,
+diff --git a/nova/db/sqlalchemy/api.py b/nova/db/sqlalchemy/api.py
+index be01921..ecad795 100644
+--- a/nova/db/sqlalchemy/api.py
++++ b/nova/db/sqlalchemy/api.py
+@@ -3747,6 +3747,19 @@ def quota_get_all_by_project(context, project_id):
+ 
+ @require_context
+ @pick_context_manager_reader
++def quota_really_get_all(context):
++    return model_query(context, models.Quota, read_deleted="no").all()
++
++
++@require_context
++@pick_context_manager_reader
++def quota_user_really_get_all(context):
++    return model_query(context, models.ProjectUserQuota,
++                       read_deleted="no").all()
++
++
++@require_context
++@pick_context_manager_reader
+ def quota_get_all(context, project_id):
+     result = model_query(context, models.ProjectUserQuota).\
+                    filter_by(project_id=project_id).\
+diff --git a/nova/objects/quotas.py b/nova/objects/quotas.py
+index 639db8c..11d8be0 100644
+--- a/nova/objects/quotas.py
++++ b/nova/objects/quotas.py
+@@ -130,6 +130,16 @@ class Quotas(base.NovaObject):
+         return result
+ 
+     @staticmethod
++    @db_api.api_context_manager.reader
++    def _get_all_project_quotas(context):
++        return context.session.query(api_models.Quota).all()
++
++    @staticmethod
++    @db_api.api_context_manager.reader
++    def _get_all_project_user_quotas(context):
++        return context.session.query(api_models.ProjectUserQuota).all()
++
++    @staticmethod
+     @db_api.api_context_manager.writer
+     def _destroy_all_in_db_by_project(context, project_id):
+         per_project = context.session.query(api_models.Quota).\
+@@ -459,6 +469,22 @@ class Quotas(base.NovaObject):
+         return main_db_quotas_dict
+ 
+     @classmethod
++    def get_all_project_quotas(cls, context):
++        api_db_quotas_dict = cls._get_all_project_quotas(context)
++        main_db_quotas_dict = db.quota_really_get_all(context)
++        # As of Pike we don't expect there to be any quota stuff
++        # in the main DB.
++        return main_db_quotas_dict + api_db_quotas_dict
++
++    @classmethod
++    def get_all_project_user_quotas(cls, context):
++        api_db_quotas_dict = cls._get_all_project_user_quotas(context)
++        main_db_quotas_dict = db.quota_user_really_get_all(context)
++        # As of Pike we don't expect there to be any quota stuff
++        # in the main DB.
++        return main_db_quotas_dict + api_db_quotas_dict
++
++    @classmethod
+     def destroy_all_by_project(cls, context, project_id):
+         try:
+             cls._destroy_all_in_db_by_project(context, project_id)
+diff --git a/nova/policies/quota_sets.py b/nova/policies/quota_sets.py
+index 5e208b2..af7ef9e 100644
+--- a/nova/policies/quota_sets.py
++++ b/nova/policies/quota_sets.py
+@@ -72,6 +72,16 @@ quota_sets_policies = [
+                 'path': '/os-quota-sets/{tenant_id}/detail'
+             }
+         ]),
++    policy.DocumentedRuleDefault(
++        POLICY_ROOT % 'list',
++        base.RULE_ADMIN_API,
++        "List all quota information",
++        [
++            {
++                'method': 'GET',
++                'path': '/os-quota-sets'
++            }
++        ]),
+ ]
+ 
+ 
+diff --git a/nova/quota.py b/nova/quota.py
+index 986c78f..7e95f2c 100644
+--- a/nova/quota.py
++++ b/nova/quota.py
+@@ -298,6 +298,43 @@ class DbQuotaDriver(object):
+                                     defaults=defaults, usages=project_usages,
+                                     remains=remains)
+ 
++    def get_all_project_quotas(self, context):
++        """Get all quota entries.
++
++        The result is a dict where the keys are project IDs and the values are
++        dicts of individual quotas.
++        """
++        quotas = objects.Quotas.get_all_project_quotas(context)
++        results = {}
++        for quota in quotas:
++            if quota.project_id in results:
++                results[quota.project_id][quota.resource] = quota.hard_limit
++            else:
++                results[quota.project_id] = {quota.resource: quota.hard_limit}
++        return results
++
++    def get_all_project_user_quotas(self, context):
++        """Get all project user quota entries.
++
++        The result is a dict where the keys are project IDs and the values
++        are dicts where the keys are user IDs and the values are dicts of
++        individual quotas.
++        """
++        user_quotas = objects.Quotas.get_all_project_user_quotas(context)
++        results = {}
++        for quota in user_quotas:
++            if quota.project_id in results:
++                if quota.user_id in results[quota.project_id]:
++                    results[quota.project_id][quota.user_id][quota.resource] =\
++                        quota.hard_limit
++                else:
++                    results[quota.project_id][quota.user_id] = {
++                        quota.resource: quota.hard_limit}
++            else:
++                results[quota.project_id] = {
++                    quota.user_id: {quota.resource: quota.hard_limit}}
++        return results
++
+     def _is_unlimited_value(self, v):
+         """A helper method to check for unlimited value.
+         """
+@@ -1026,6 +1063,12 @@ class NoopQuotaDriver(object):
+         """
+         return self._get_noop_quotas(resources, usages=usages, remains=remains)
+ 
++    def get_all_project_quotas(self, context):
++        return {}
++
++    def get_all_project_user_quotas(self, context):
++        return {}
++
+     def get_settable_quotas(self, context, resources, project_id,
+                             user_id=None):
+         """Given a list of resources, retrieve the range of settable quotas for
+@@ -1533,6 +1576,12 @@ class QuotaEngine(object):
+                                               usages=usages,
+                                               remains=remains)
+ 
++    def get_all_project_quotas(self, context):
++        return self._driver.get_all_project_quotas(context)
++
++    def get_all_project_user_quotas(self, context):
++        return self._driver.get_all_project_user_quotas(context)
++
+     def get_settable_quotas(self, context, project_id, user_id=None):
+         """Given a list of resources, retrieve the range of settable quotas for
+         the given user or project.
+diff --git a/nova/tests/unit/test_policy.py b/nova/tests/unit/test_policy.py
+index e21eaeb..9cc989a 100644
+--- a/nova/tests/unit/test_policy.py
++++ b/nova/tests/unit/test_policy.py
+@@ -337,6 +337,7 @@ class RealRolePolicyTestCase(test.NoDBTestCase):
+ "os_compute_api:os-networks-associate",
+ "os_compute_api:os-quota-sets:update",
+ "os_compute_api:os-quota-sets:delete",
++"os_compute_api:os-quota-sets:list",
+ "os_compute_api:os-security-group-default-rules",
+ "os_compute_api:os-server-diagnostics",
+ "os_compute_api:os-services",
+-- 
+2.7.4
+

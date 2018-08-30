@@ -1,0 +1,331 @@
+From d17806302fed6022bdd6f753b7ec38f46ba49990 Mon Sep 17 00:00:00 2001
+From: "Beliveau, Ludovic" <Ludovic.Beliveau@windriver.com>
+Date: Mon, 20 Apr 2015 19:46:48 -0400
+Subject: [PATCH] Cold Migration Support for SR-IOV & PCI Passthrough
+
+Cold migration for PCI SR-IOV devices got broken in Kilo.  In
+Kilo, the PCI SR-IOV from the incoming compute were reallocated
+(same PCI addresses) on the target compute even if the PCI
+device were not part of the pci_passthrough_whitelist.
+
+When an instance is cold migrated, a new PCI SR-IOV device has
+to be allocated on the target compute and the Neutron port has
+to be updated accordingly.
+
+Note: in our commit 0012047d there was originally some changes to
+nova/scheduler/host_manager.py.  I think the changes from upstream
+commit bf79742d2 are equivalent, so I'm not porting our changes.
+---
+ .../api/openstack/compute/contrib/admin_actions.py |  6 +++++
+ nova/compute/api.py                                | 15 +++++++++++
+ nova/compute/resource_tracker.py                   |  9 ++++++-
+ nova/network/neutronv2/api.py                      | 20 +++++++++++++++
+ nova/objects/instance.py                           |  6 +++--
+ nova/pci/device.py                                 | 30 ++++++++++++++++------
+ nova/pci/manager.py                                | 26 ++++++++++++++-----
+ nova/pci/request.py                                |  9 ++++---
+ 8 files changed, 100 insertions(+), 21 deletions(-)
+
+diff --git a/nova/api/openstack/compute/contrib/admin_actions.py b/nova/api/openstack/compute/contrib/admin_actions.py
+index c7a54be..1464858 100644
+--- a/nova/api/openstack/compute/contrib/admin_actions.py
++++ b/nova/api/openstack/compute/contrib/admin_actions.py
+@@ -329,6 +329,12 @@ class AdminActionsController(wsgi.Controller):
+             raise exc.HTTPBadRequest(explanation=six.text_type(err))
+ 
+         instance = common.get_instance(self.compute_api, context, id)
++
++        if instance.pci_devices:
++            msg = _("Live migration of instance %s is not supported "
++                    "with PCI passthrough devices attached.") % id
++            raise exc.HTTPBadRequest(explanation=msg)
++
+         try:
+             self.compute_api.live_migrate(context, instance, block_migration,
+                                           disk_over_commit, host)
+diff --git a/nova/compute/api.py b/nova/compute/api.py
+index fbae2a2..54b1a80 100644
+--- a/nova/compute/api.py
++++ b/nova/compute/api.py
+@@ -2740,6 +2740,21 @@ class API(base.Base):
+                                "scaled-down vCPUs.  Scale up and retry.")
+                     raise exception.ResizeError(reason=reason)
+ 
++        network_info = self.network_api.get_instance_nw_info(context, instance)
++        pci_requests = []
++        for vif in network_info:
++            if pci_utils.vif_model_pci_passthrough(vif['vif_model']):
++                meta = vif['network']['meta']
++                request = objects.InstancePCIRequest(
++                    count=1,
++                    is_new=True,
++                    spec=[{pci_request.PCI_NET_TAG: meta['physical_network']}],
++                    request_id=str(uuid.uuid4()))
++                pci_requests.append(request)
++
++        instance.pci_requests = objects.InstancePCIRequests(requests=pci_requests,
++            instance_uuid=instance.uuid)
++
+         instance.task_state = task_states.RESIZE_PREP
+         instance.progress = 0
+         instance.update(extra_instance_updates)
+diff --git a/nova/compute/resource_tracker.py b/nova/compute/resource_tracker.py
+index 1d38222..41e598c 100644
+--- a/nova/compute/resource_tracker.py
++++ b/nova/compute/resource_tracker.py
+@@ -266,6 +266,11 @@ class ResourceTracker(object):
+         # compute host:
+         self._update_usage_from_migration(context, instance_ref, image_meta,
+                                               self.compute_node, migration)
++
++        # Save pci_devices that were claimed for resize
++        if instance_ref['pci_devices']:
++            instance['pci_devices'] = instance_ref['pci_devices']
++
+         elevated = context.elevated()
+         self._update(elevated, self.compute_node)
+ 
+@@ -919,7 +924,9 @@ class ResourceTracker(object):
+             usage = self._get_usage_dict(
+                         itype, numa_topology=numa_topology)
+             if self.pci_tracker:
+-                self.pci_tracker.update_pci_for_migration(context, instance)
++                self.pci_tracker.update_pci_for_migration(context, instance,
++                                                          incoming=incoming)
++
+             self._update_usage(context, resources, usage)
+             if self.pci_tracker:
+                 resources['pci_device_pools'] = self.pci_tracker.stats
+diff --git a/nova/network/neutronv2/api.py b/nova/network/neutronv2/api.py
+index d1d417b..020f0f9 100644
+--- a/nova/network/neutronv2/api.py
++++ b/nova/network/neutronv2/api.py
+@@ -1723,6 +1723,26 @@ class API(base_api.NetworkAPI):
+                         LOG.exception(_LE("Unable to update host of port %s"),
+                                       p['id'])
+ 
++            if p.get('binding:vif_model') == 'pci-sriov':
++                profile = ''
++                pci_requests = instance.pci_requests
++                if pci_requests and pci_requests.requests:
++                    pci_dev = pci_manager.get_instance_pci_devs(
++                        instance, 'all').pop()
++                    devspec = pci_whitelist.get_pci_device_devspec(pci_dev)
++                    profile = {'pci_vendor_info': "%s:%s" %
++                                    (pci_dev.vendor_id, pci_dev.product_id),
++                               'pci_slot': pci_dev.address,
++                               'physical_network':
++                                    devspec.get_tags().get('physical_network')
++                              }
++                try:
++                    neutron.update_port(p['id'],
++                                        {'port': {'binding:profile': profile}})
++                except Exception:
++                    with excutils.save_and_reraise_exception():
++                        LOG.exception(_LE("Unable to update host of port %s"),
++                                      p['id'])
+ 
+ def _ensure_requested_network_ordering(accessor, unordered, preferred):
+     """Sort a list with respect to the preferred network ordering."""
+diff --git a/nova/objects/instance.py b/nova/objects/instance.py
+index fca9989..4576f0b 100644
+--- a/nova/objects/instance.py
++++ b/nova/objects/instance.py
+@@ -31,6 +31,7 @@ from nova import objects
+ from nova.objects import base
+ from nova.objects import fields
+ from nova import utils
++from nova.compute import task_states
+ 
+ 
+ CONF = cfg.CONF
+@@ -689,8 +690,9 @@ class Instance(base.NovaPersistentObject, base.NovaObject,
+                     context, self.uuid)
+ 
+     def _save_pci_requests(self, context):
+-        # NOTE(danms): No need for this yet.
+-        pass
++        if self.pci_requests and self.task_state == task_states.RESIZE_PREP:
++            with self.pci_requests.obj_alternate_context(context):
++                self.pci_requests.save()
+ 
+     def _save_pci_devices(self, context):
+         # NOTE(yjiang5): All devices held by PCI tracker, only PCI tracker
+diff --git a/nova/pci/device.py b/nova/pci/device.py
+index a7cb201..8963493 100644
+--- a/nova/pci/device.py
++++ b/nova/pci/device.py
+@@ -17,7 +17,10 @@ import copy
+ import functools
+ 
+ from nova import exception
++from nova.objects.pci_device import PciDeviceList
++from oslo_log import log as logging
+ 
++LOG = logging.getLogger(__name__)
+ 
+ def check_device_status(dev_status=None):
+     """Decorator to check device status before changing it."""
+@@ -46,6 +49,13 @@ def claim(devobj, instance):
+     devobj.status = 'claimed'
+     devobj.instance_uuid = instance['uuid']
+ 
++    if isinstance(instance, dict):
++        if 'pci_devices' not in instance:
++            instance['pci_devices'] = PciDeviceList()
++        instance['pci_devices'].objects.append(copy.copy(devobj))
++    else:
++        instance.pci_devices.objects.append(copy.copy(devobj))
++
+ 
+ @check_device_status(dev_status=['available', 'claimed'])
+ def allocate(devobj, instance):
+@@ -62,13 +72,13 @@ def allocate(devobj, instance):
+     # compute manager is finished
+     if isinstance(instance, dict):
+         if 'pci_devices' not in instance:
+-            instance['pci_devices'] = []
+-        instance['pci_devices'].append(copy.copy(devobj))
++            instance['pci_devices'] = PciDeviceList()
++        instance['pci_devices'].objects.append(copy.copy(devobj))
+     else:
+         instance.pci_devices.objects.append(copy.copy(devobj))
+ 
+ 
+-@check_device_status(dev_status=['available'])
++# @check_device_status(dev_status=['available'])
+ def remove(devobj):
+     devobj.status = 'removed'
+     devobj.instance_uuid = None
+@@ -86,12 +96,16 @@ def free(devobj, instance=None):
+     devobj.status = 'available'
+     devobj.instance_uuid = None
+     devobj.request_id = None
+-    if old_status == 'allocated' and instance:
++
++    if (old_status in ['allocated', 'claimed'] and instance is not None):
+         # Notes(yjiang5): remove this check when instance object for
+         # compute manager is finished
+-        existed = next((dev for dev in instance['pci_devices']
+-            if dev.id == devobj.id))
+         if isinstance(instance, dict):
+-            instance['pci_devices'].remove(existed)
++            pci_devices = instance.get('pci_devices', [])
+         else:
+-            instance.pci_devices.objects.remove(existed)
++            pci_devices = instance.pci_devices
++
++        if pci_devices:
++            existed = next((dev for dev in pci_devices
++                           if dev.id == devobj.id))
++            pci_devices.objects.remove(existed)
+diff --git a/nova/pci/manager.py b/nova/pci/manager.py
+index 04719f4..6f838ba 100644
+--- a/nova/pci/manager.py
++++ b/nova/pci/manager.py
+@@ -26,6 +26,7 @@ from nova import objects
+ from nova.pci import device
+ from nova.pci import stats
+ from nova.virt import hardware
++from nova.objects.pci_device import PciDeviceList
+ 
+ LOG = logging.getLogger(__name__)
+ 
+@@ -153,9 +154,15 @@ class PciDevTracker(object):
+             self.pci_devs.append(dev_obj)
+             self.stats.add_device(dev_obj)
+ 
+-    def _claim_instance(self, context, instance, prefix=''):
+-        pci_requests = objects.InstancePCIRequests.get_by_instance(
+-            context, instance)
++    def _claim_instance(self, context, instance, is_new=False):
++        PCIrequest = objects.InstancePCIRequests
++        if is_new:
++            pci_requests = PCIrequest.get_by_instance_uuid_and_newness(context,
++                instance['uuid'],
++                is_new=True)
++        else:
++            pci_requests = PCIrequest.get_by_instance(context, instance)
++
+         if not pci_requests.requests:
+             return None
+         instance_numa_topology = hardware.instance_topology_from_instance(
+@@ -204,6 +211,8 @@ class PciDevTracker(object):
+ 
+         The caller should hold the COMPUTE_RESOURCE_SEMAPHORE lock
+         """
++        if not self.pci_devs:
++            return
+ 
+         uuid = instance['uuid']
+         vm_state = instance['vm_state']
+@@ -230,7 +239,8 @@ class PciDevTracker(object):
+                 self._allocate_instance(instance, devs)
+                 self.allocations[uuid] = devs
+ 
+-    def update_pci_for_migration(self, context, instance, sign=1):
++    def update_pci_for_migration(self, context, instance,
++                                 sign=1, incoming=False):
+         """Update instance's pci usage information when it is migrated.
+ 
+         The caller should hold the COMPUTE_RESOURCE_SEMAPHORE lock.
+@@ -240,9 +250,12 @@ class PciDevTracker(object):
+         """
+         uuid = instance['uuid']
+         if sign == 1 and uuid not in self.claims:
++            instance['pci_devices'] = PciDeviceList()
+             devs = self._claim_instance(context, instance, 'new_')
+             if devs:
+-                self.claims[uuid] = devs
++                self._allocate_instance(instance, devs)
++                self.allocations[uuid] = devs
++
+         if sign == -1 and uuid in self.claims:
+             self._free_instance(instance)
+ 
+@@ -278,4 +291,5 @@ def get_instance_pci_devs(inst, request_id=None):
+     """
+     pci_devices = inst.pci_devices
+     return [device for device in pci_devices if
+-                   device.request_id == request_id or request_id == 'all']
++                   (device.request_id == request_id or request_id == 'all')
++            and device.status == 'allocated']
+diff --git a/nova/pci/request.py b/nova/pci/request.py
+index 3251033..d245a4e 100644
+--- a/nova/pci/request.py
++++ b/nova/pci/request.py
+@@ -132,7 +132,7 @@ def _get_alias_from_config():
+     return aliases
+ 
+ 
+-def _translate_alias_to_requests(alias_spec):
++def _translate_alias_to_requests(alias_spec, is_new=False):
+     """Generate complete pci requests from pci aliases in extra_spec."""
+ 
+     pci_aliases = _get_alias_from_config()
+@@ -146,12 +146,13 @@ def _translate_alias_to_requests(alias_spec):
+             request = objects.InstancePCIRequest(
+                 count=int(count),
+                 spec=copy.deepcopy(pci_aliases[name]),
+-                alias_name=name)
++                alias_name=name,
++                is_new=is_new)
+             pci_requests.append(request)
+     return pci_requests
+ 
+ 
+-def get_pci_requests_from_flavor(flavor):
++def get_pci_requests_from_flavor(flavor, is_new=False):
+     """Get flavor's pci request.
+ 
+     The pci_passthrough:alias scope in flavor extra_specs
+@@ -189,5 +190,5 @@ def get_pci_requests_from_flavor(flavor):
+     if ('extra_specs' in flavor and
+             'pci_passthrough:alias' in flavor['extra_specs']):
+         pci_requests = _translate_alias_to_requests(
+-            flavor['extra_specs']['pci_passthrough:alias'])
++            flavor['extra_specs']['pci_passthrough:alias'], is_new)
+     return objects.InstancePCIRequests(requests=pci_requests)
+-- 
+2.7.4
+

@@ -1,0 +1,57 @@
+From 44beb8dc74917ab79ec6d97c0da129d936b9f4a6 Mon Sep 17 00:00:00 2001
+From: "Beliveau, Ludovic" <Ludovic.Beliveau@windriver.com>
+Date: Wed, 6 May 2015 11:47:28 -0400
+Subject: [PATCH] Fixed some tox unit tests related to PCI.
+
+---
+ nova/objects/instance_pci_requests.py |  7 +++++++
+ nova/pci/stats.py                     | 13 +++++++------
+ 2 files changed, 14 insertions(+), 6 deletions(-)
+
+diff --git a/nova/objects/instance_pci_requests.py b/nova/objects/instance_pci_requests.py
+index d011586..2a07b14 100644
+--- a/nova/objects/instance_pci_requests.py
++++ b/nova/objects/instance_pci_requests.py
+@@ -101,6 +101,13 @@ class InstancePCIRequests(base.NovaObject,
+             db_pci_requests = db_pci_requests['pci_requests']
+         return cls.obj_from_db(context, instance_uuid, db_pci_requests)
+ 
++    @classmethod
++    def get_by_instance_uuid_and_newness(cls, context, instance_uuid, is_new):
++        requests = cls.get_by_instance_uuid(context, instance_uuid)
++        requests.requests = [x for x in requests.requests
++                             if x.new == is_new]
++        return requests
++
+     @staticmethod
+     def _load_legacy_requests(sysmeta_value, is_new=False):
+         if sysmeta_value is None:
+diff --git a/nova/pci/stats.py b/nova/pci/stats.py
+index 6388007..893bfb5 100644
+--- a/nova/pci/stats.py
++++ b/nova/pci/stats.py
+@@ -66,14 +66,15 @@ class PciDeviceStats(object):
+         for pool in pools:
+             devices = []
+             if 'devices' in pool.keys():
+-                devices = [str(device.address) for device in pool['devices']]
++                devices = [str(device.address) for device
++                                               in pool.get('devices')]
+             else:
+-                devices = pool['count']
++                devices = pool.get('count')
+ 
+-            _pools += '{}.{}.{}.{}:{}\n'.format(pool['vendor_id'],
+-                                                pool['product_id'],
+-                                                pool['numa_node'],
+-                                                pool['physical_network'],
++            _pools += '{}.{}.{}.{}:{}\n'.format(pool.get('vendor_id'),
++                                                pool.get('product_id'),
++                                                pool.get('numa_node'),
++                                                pool.get('physical_network'),
+                                                 devices)
+         return _pools
+ 
+-- 
+2.7.4
+

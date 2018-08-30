@@ -1,0 +1,742 @@
+From 36a27fd43b2362f8dc0ec24c4e79fc9348a1cbe9 Mon Sep 17 00:00:00 2001
+From: Dan Smith <dansmith@redhat.com>
+Date: Thu, 2 Feb 2017 15:05:34 -0800
+Subject: [PATCH 075/143] Request zero root disk for boot-from-volume instances
+
+We should not request any DISK_GB resource for boot-from-volume instances
+that will not use it on their compute node. This is slightly ugly because
+we're not communicating a very rich request to scheduler right now, and
+thus scheduler has lost sight of the fact that an instance has a volume
+as its root disk. Because we pass a copy of the flavor to scheduler
+purely as the resource request, we can hack in our root_gb=0 there, which
+will live only for that single RPC call.
+
+Later, we need to pass more detail anyway so that scheduler can request
+of placement resources available from the appropriate volume resource
+provider (for example).
+
+Co-Authored-By: melanie witt <melwittt@gmail.com>
+
+Partial-Bug: #1469179
+
+Change-Id: I4aec3700ff5bb9d50213e5827870ffcb13e44b7a
+
+Cherry piacked from upstream review:
+https://review.openstack.org/#/c/428481/16
+This is a partial fix to Pike rebase bug 271.
+
+__TYPE_upstream
+---
+ nova/conductor/manager.py                       |  34 ++++-
+ nova/conductor/tasks/migrate.py                 |  15 +-
+ nova/objects/block_device.py                    |   4 +
+ nova/objects/instance.py                        |   8 +
+ nova/tests/unit/conductor/tasks/test_migrate.py |  34 ++++-
+ nova/tests/unit/conductor/test_conductor.py     | 189 ++++++++++++++++++++----
+ nova/tests/unit/objects/test_block_device.py    |  17 +++
+ 7 files changed, 258 insertions(+), 43 deletions(-)
+
+diff --git a/nova/conductor/manager.py b/nova/conductor/manager.py
+index 4f3724b..6018009 100644
+--- a/nova/conductor/manager.py
++++ b/nova/conductor/manager.py
+@@ -568,6 +568,8 @@ class ComputeTaskManager(base.Base):
+             filter_properties = dict(filter_properties, instance_type=flavor)
+ 
+         request_spec = {}
++        is_bfv = (block_device_mapping.root_bdm_is_volume()
++                  if block_device_mapping else False)
+         try:
+             # check retry policy. Rather ugly use of instances[0]...
+             # but if we've exceeded max retries... then we really only
+@@ -583,7 +585,7 @@ class ComputeTaskManager(base.Base):
+             spec_obj = objects.RequestSpec.from_primitives(
+                     context, request_spec, filter_properties)
+             hosts = self._schedule_instances(
+-                    context, spec_obj, instance_uuids)
++                    context, spec_obj, is_bfv, instance_uuids)
+         except Exception as exc:
+             num_attempts = filter_properties.get(
+                 'retry', {}).get('num_attempts', 1)
+@@ -660,11 +662,23 @@ class ComputeTaskManager(base.Base):
+                     block_device_mapping=bdms, node=host['nodename'],
+                     limits=host['limits'])
+ 
+-    def _schedule_instances(self, context, request_spec,
++    def _schedule_instances(self, context, request_spec, is_bfv,
+                             instance_uuids=None):
+         scheduler_utils.setup_instance_group(context, request_spec)
++        # NOTE(danms): We don't pass enough information to the scheduler to
++        # know that we have a boot-from-volume request.
++        # TODO(danms): We need to pass more context to the scheduler here
++        # in order to (a) handle boot-from-volume instances, as well as
++        # (b) know which volume provider to request resource from.
++        request_spec_copy = request_spec
++        if is_bfv:
++            LOG.debug('Requesting zero root disk for '
++                      'boot-from-volume instance')
++            # Clone this so we don't mutate the RequestSpec that was passed in
++            request_spec_copy = request_spec.obj_clone()
++            request_spec_copy.flavor.root_gb = 0
+         hosts = self.scheduler_client.select_destinations(context,
+-            request_spec, instance_uuids)
++            request_spec_copy, instance_uuids)
+         return hosts
+ 
+     @targets_cell
+@@ -747,8 +761,9 @@ class ComputeTaskManager(base.Base):
+                                 cell=instance_mapping.cell_mapping))
+ 
+                     request_spec.ensure_project_id(instance)
+-                    hosts = self._schedule_instances(context, request_spec,
+-                                                     [instance.uuid])
++                    hosts = self._schedule_instances(
++                        context, request_spec, instance.is_volume_backed(),
++                        [instance.uuid])
+                     host_state = hosts[0]
+                     scheduler_utils.populate_filter_properties(
+                             filter_properties, host_state)
+@@ -936,8 +951,9 @@ class ComputeTaskManager(base.Base):
+ 
+                 try:
+                     request_spec.ensure_project_id(instance)
+-                    hosts = self._schedule_instances(context, request_spec,
+-                                                     [instance.uuid])
++                    hosts = self._schedule_instances(
++                        context, request_spec, instance.is_volume_backed(),
++                        [instance.uuid])
+                     host_dict = hosts.pop(0)
+                     host, node, limits = (host_dict['host'],
+                                           host_dict['nodename'],
+@@ -1101,10 +1117,12 @@ class ComputeTaskManager(base.Base):
+                                      admin_password, injected_files,
+                                      requested_networks, block_device_mapping,
+                                      tags=None):
++        is_bfv = (block_device_mapping.root_bdm_is_volume()
++                  if block_device_mapping else False)
+         # Add all the UUIDs for the instances
+         instance_uuids = [spec.instance_uuid for spec in request_specs]
+         try:
+-            hosts = self._schedule_instances(context, request_specs[0],
++            hosts = self._schedule_instances(context, request_specs[0], is_bfv,
+                                              instance_uuids)
+         except Exception as exc:
+             LOG.exception('Failed to schedule instances')
+diff --git a/nova/conductor/tasks/migrate.py b/nova/conductor/tasks/migrate.py
+index dcde8fc..a47fe53 100644
+--- a/nova/conductor/tasks/migrate.py
++++ b/nova/conductor/tasks/migrate.py
+@@ -100,8 +100,21 @@ class MigrationTask(base.TaskBase):
+         self.request_spec.offline_cpus = \
+                   scheduler_utils.determine_offline_cpus(
+                          self.flavor, self.instance.numa_topology)
++        # NOTE(danms): We don't pass enough information to the scheduler to
++        # know that we have a boot-from-volume request.
++        # TODO(danms): We need to pass more context to the scheduler here
++        # in order to (a) handle boot-from-volume instances, as well as
++        # (b) know which volume provider to request resource from.
++        request_spec_copy = self.request_spec
++        if self.instance.is_volume_backed():
++            LOG.debug('Requesting zero root disk for '
++                      'boot-from-volume instance')
++            # Clone this so we don't mutate the RequestSpec that was passed in
++            request_spec_copy = self.request_spec.obj_clone()
++            request_spec_copy.flavor.root_gb = 0
++
+         hosts = self.scheduler_client.select_destinations(
+-            self.context, self.request_spec, [self.instance.uuid])
++            self.context, request_spec_copy, [self.instance.uuid])
+         host_state = hosts[0]
+ 
+         scheduler_utils.populate_filter_properties(legacy_props,
+diff --git a/nova/objects/block_device.py b/nova/objects/block_device.py
+index e81b419..7daf8b5 100644
+--- a/nova/objects/block_device.py
++++ b/nova/objects/block_device.py
+@@ -381,6 +381,10 @@ class BlockDeviceMappingList(base.ObjectListBase, base.NovaObject):
+         except StopIteration:
+             return
+ 
++    def root_bdm_is_volume(self):
++        root_bdm = self.root_bdm()
++        return root_bdm.is_volume if root_bdm else False
++
+ 
+ def block_device_make_list(context, db_list, **extra_args):
+     return base.obj_make_list(context,
+diff --git a/nova/objects/instance.py b/nova/objects/instance.py
+index 0c11bdc..43b11cc 100644
+--- a/nova/objects/instance.py
++++ b/nova/objects/instance.py
+@@ -36,6 +36,7 @@ from nova.cells import opts as cells_opts
+ from nova.cells import rpcapi as cells_rpcapi
+ from nova.cells import utils as cells_utils
+ from nova.compute import task_states
++from nova.compute import utils as compute_utils
+ from nova.compute import vm_states
+ from nova import db
+ from nova.db.sqlalchemy import api as db_api
+@@ -242,6 +243,7 @@ class Instance(base.NovaPersistentObject, base.NovaObject,
+     def __init__(self, *args, **kwargs):
+         super(Instance, self).__init__(*args, **kwargs)
+         self._reset_metadata_tracking()
++        self._is_volume_backed = None
+ 
+     @property
+     def image_meta(self):
+@@ -1186,6 +1188,12 @@ class Instance(base.NovaPersistentObject, base.NovaObject,
+         return objects.BlockDeviceMappingList.get_by_instance_uuid(
+             self._context, self.uuid)
+ 
++    def is_volume_backed(self):
++        if self._is_volume_backed is None:
++            self._is_volume_backed = compute_utils.is_volume_backed_instance(
++                self._context, self)
++        return self._is_volume_backed
++
+ 
+ def _make_instance_list(context, inst_list, db_inst_list, expected_attrs):
+     get_fault = expected_attrs and 'fault' in expected_attrs
+diff --git a/nova/tests/unit/conductor/tasks/test_migrate.py b/nova/tests/unit/conductor/tasks/test_migrate.py
+index 4d5c50a..09931e5 100644
+--- a/nova/tests/unit/conductor/tasks/test_migrate.py
++++ b/nova/tests/unit/conductor/tasks/test_migrate.py
+@@ -11,6 +11,7 @@
+ #    under the License.
+ 
+ import mock
++from oslo_serialization import jsonutils
+ 
+ from nova import availability_zones
+ from nova.compute import rpcapi as compute_rpcapi
+@@ -42,7 +43,8 @@ class MigrationTaskTestCase(test.NoDBTestCase):
+         self.instance = objects.Instance._from_db_object(
+             self.context, inst_object, inst, [])
+         self.request_spec = objects.RequestSpec(image=objects.ImageMeta(
+-                                    properties=objects.ImageMetaProps()))
++                                    properties=objects.ImageMetaProps()),
++                                                flavor=self.flavor)
+         self.request_spec.instance_group = None
+         self.hosts = [dict(host='host1', nodename=None, limits={})]
+         self.filter_properties = {'limits': {}, 'retry': {'num_attempts': 1,
+@@ -88,34 +90,46 @@ class MigrationTaskTestCase(test.NoDBTestCase):
+                                      compute_rpcapi.ComputeAPI(),
+                                      scheduler_client.SchedulerClient())
+ 
++    @mock.patch('nova.objects.RequestSpec.obj_clone')
++    @mock.patch('nova.objects.Instance.is_volume_backed')
+     @mock.patch('nova.availability_zones.get_host_availability_zone')
+     @mock.patch.object(scheduler_utils, 'setup_instance_group')
+     @mock.patch.object(scheduler_client.SchedulerClient, 'select_destinations')
+     @mock.patch.object(compute_rpcapi.ComputeAPI, 'prep_resize')
+-    def test_execute(self, prep_resize_mock, sel_dest_mock, sig_mock, az_mock):
++    def test_execute(self, prep_resize_mock, sel_dest_mock, sig_mock, az_mock,
++                     is_bfv_mock, clone_mock):
+         sel_dest_mock.return_value = self.hosts
+         az_mock.return_value = 'myaz'
+         task = self._generate_task()
+         legacy_request_spec = self.request_spec.to_legacy_request_spec_dict()
++        # FIXME(sbauza): Serialize/Unserialize the legacy dict because of
++        # oslo.messaging #1529084 to transform datetime values into strings.
++        # tl;dr: datetimes in dicts are not accepted as correct values by the
++        # rpc fake driver.
++        legacy_request_spec_reloaded = jsonutils.loads(
++            jsonutils.dumps(legacy_request_spec))
+         task.execute()
+ 
+         sig_mock.assert_called_once_with(self.context, self.request_spec)
+         task.scheduler_client.select_destinations.assert_called_once_with(
+-            self.context, self.request_spec, [self.instance.uuid])
++            self.context, clone_mock.return_value, [self.instance.uuid])
+         prep_resize_mock.assert_called_once_with(
+             self.context, self.instance, legacy_request_spec['image'],
+             self.flavor, self.hosts[0]['host'], self.reservations,
+-            request_spec=legacy_request_spec,
++            request_spec=legacy_request_spec_reloaded,
+             filter_properties=self.filter_properties,
+             node=self.hosts[0]['nodename'], clean_shutdown=self.clean_shutdown)
+         az_mock.assert_called_once_with(self.context, 'host1')
+ 
++    @mock.patch('nova.objects.RequestSpec.obj_clone')
++    @mock.patch('nova.objects.Instance.is_volume_backed')
+     @mock.patch.object(availability_zones, 'get_host_availability_zone')
+     @mock.patch.object(scheduler_utils, 'setup_instance_group')
+     @mock.patch.object(scheduler_client.SchedulerClient, 'select_destinations')
+     @mock.patch.object(compute_rpcapi.ComputeAPI, 'prep_resize')
+     def test_execute_with_instance_group(self, prep_resize_mock,
+-                     sel_dest_mock, sig_mock, mock_get_avail_zone):
++                     sel_dest_mock, sig_mock, mock_get_avail_zone,
++                     is_bfv_mock, clone_mock):
+         sel_dest_mock.return_value = self.hosts
+         mock_get_avail_zone.return_value = 'nova'
+ 
+@@ -128,6 +142,12 @@ class MigrationTaskTestCase(test.NoDBTestCase):
+ 
+         task = self._generate_task()
+         legacy_request_spec = self.request_spec.to_legacy_request_spec_dict()
++        # FIXME(sbauza): Serialize/Unserialize the legacy dict because of
++        # oslo.messaging #1529084 to transform datetime values into strings.
++        # tl;dr: datetimes in dicts are not accepted as correct values by the
++        # rpc fake driver.
++        legacy_request_spec_reloaded = jsonutils.loads(
++            jsonutils.dumps(legacy_request_spec))
+ 
+         self.filter_properties = \
+             {
+@@ -145,10 +165,10 @@ class MigrationTaskTestCase(test.NoDBTestCase):
+ 
+         sig_mock.assert_called_once_with(self.context, self.request_spec)
+         task.scheduler_client.select_destinations.assert_called_once_with(
+-            self.context, self.request_spec, [self.instance.uuid])
++            self.context, clone_mock.return_value, [self.instance.uuid])
+         prep_resize_mock.assert_called_once_with(
+             self.context, self.instance, legacy_request_spec['image'],
+             self.flavor, self.hosts[0]['host'], self.reservations,
+-            request_spec=legacy_request_spec,
++            request_spec=legacy_request_spec_reloaded,
+             filter_properties=self.filter_properties,
+             node=self.hosts[0]['nodename'], clean_shutdown=self.clean_shutdown)
+diff --git a/nova/tests/unit/conductor/test_conductor.py b/nova/tests/unit/conductor/test_conductor.py
+index fa1486c..73bac08 100644
+--- a/nova/tests/unit/conductor/test_conductor.py
++++ b/nova/tests/unit/conductor/test_conductor.py
+@@ -424,7 +424,7 @@ class _BaseTaskTestCase(object):
+                 'num_instances': 2}
+         filter_properties = {'retry': {'num_attempts': 1, 'hosts': []}}
+         self.conductor_manager._schedule_instances(self.context,
+-                fake_spec, [uuids.fake, uuids.fake]).AndReturn(
++                fake_spec, False, [uuids.fake, uuids.fake]).AndReturn(
+                         [{'host': 'host1', 'nodename': 'node1', 'limits': []},
+                          {'host': 'host2', 'nodename': 'node2', 'limits': []}])
+         db.block_device_mapping_get_all_by_instance(self.context,
+@@ -484,13 +484,59 @@ class _BaseTaskTestCase(object):
+                 injected_files='injected_files',
+                 requested_networks=None,
+                 security_groups='security_groups',
+-                block_device_mapping='block_device_mapping',
++                block_device_mapping=None,
+                 legacy_bdm=False)
+         mock_getaz.assert_has_calls([
+             mock.call(self.context, 'host1'),
+             mock.call(self.context, 'host2')])
+         mock_fp.assert_called_once_with(self.context, spec, filter_properties)
+ 
++    @mock.patch('nova.compute.rpcapi.ComputeAPI.build_and_run_instance')
++    @mock.patch('nova.scheduler.rpcapi.SchedulerAPI.select_destinations')
++    @mock.patch('nova.conductor.manager.ComputeTaskManager.'
++                '_set_vm_state_and_notify')
++    @mock.patch('nova.conductor.manager.ComputeTaskManager.'
++                '_cleanup_allocated_networks')
++    def test_build_instances_bfv(self, cleanup_nets, set_vm_state,
++                                 select_destinations, build_and_run_instance):
++        flavor = flavors.get_default_flavor()
++        instances = [objects.Instance(context=self.context,
++                                      id=i,
++                                      uuid=uuids.fake,
++                                      flavor=flavor) for i in range(2)]
++        # Make this bdm a root volume
++        bdm = objects.BlockDeviceMapping(self.context, **dict(
++            source_type='blank', destination_type='volume',
++            guest_format='foo', device_type='disk', disk_bus='',
++            boot_index=0, device_name='xvda', delete_on_termination=False,
++            snapshot_id=None, volume_id=None, volume_size=1,
++            image_id='bar', no_device=False, connection_info=None,
++            tag=''))
++        bdms = objects.BlockDeviceMappingList(objects=[bdm])
++
++        def _select_destinations(context, spec_obj, *args, **kwargs):
++            self.assertEqual(0, spec_obj.root_gb)
++            # Skip the rest of build_instances since we only want to verify the
++            # request spec disk.
++            raise exc.NoValidHost(reason='no hosts')
++
++        select_destinations.side_effect = _select_destinations
++
++        # build_instances() is a cast, we need to wait for it to complete
++        self.useFixture(cast_as_call.CastAsCall(self))
++
++        self.conductor.build_instances(self.context,
++                instances=instances,
++                image={'fake_data': 'should_pass_silently'},
++                filter_properties={},
++                admin_password='admin_password',
++                injected_files='injected_files',
++                requested_networks=None,
++                security_groups='security_groups',
++                block_device_mapping=bdms,
++                legacy_bdm=False)
++        self.assertTrue(select_destinations.called)
++
+     @mock.patch.object(scheduler_utils, 'build_request_spec')
+     @mock.patch.object(scheduler_utils, 'setup_instance_group')
+     @mock.patch.object(scheduler_utils, 'set_vm_state_and_notify')
+@@ -529,7 +575,7 @@ class _BaseTaskTestCase(object):
+             injected_files='injected_files',
+             requested_networks=None,
+             security_groups='security_groups',
+-            block_device_mapping='block_device_mapping',
++            block_device_mapping=None,
+             legacy_bdm=False)
+ 
+         set_state_calls = []
+@@ -576,7 +622,7 @@ class _BaseTaskTestCase(object):
+                 injected_files='injected_files',
+                 requested_networks=None,
+                 security_groups='security_groups',
+-                block_device_mapping='block_device_mapping',
++                block_device_mapping=None,
+                 legacy_bdm=False)
+ 
+             populate_retry.assert_called_once_with(
+@@ -620,7 +666,7 @@ class _BaseTaskTestCase(object):
+                           injected_files='injected_files',
+                           requested_networks=None,
+                           security_groups='security_groups',
+-                          block_device_mapping='block_device_mapping',
++                          block_device_mapping=None,
+                           legacy_bdm=False)
+         set_state_calls = []
+         cleanup_network_calls = []
+@@ -668,7 +714,7 @@ class _BaseTaskTestCase(object):
+                               injected_files='injected_files',
+                               requested_networks=None,
+                               security_groups='security_groups',
+-                              block_device_mapping='block_device_mapping',
++                              block_device_mapping=None,
+                               legacy_bdm=False)
+         mock_get_inst_map_by_uuid.assert_has_calls([
+             mock.call(self.context, instances[0].uuid),
+@@ -713,7 +759,7 @@ class _BaseTaskTestCase(object):
+                               injected_files='injected_files',
+                               requested_networks=None,
+                               security_groups='security_groups',
+-                              block_device_mapping='block_device_mapping',
++                              block_device_mapping=None,
+                               legacy_bdm=False)
+         for instance in instances:
+             mock_get_inst_map_by_uuid.assert_any_call(self.context,
+@@ -765,7 +811,7 @@ class _BaseTaskTestCase(object):
+                               injected_files='injected_files',
+                               requested_networks=None,
+                               security_groups='security_groups',
+-                              block_device_mapping='block_device_mapping',
++                              block_device_mapping=None,
+                               legacy_bdm=False)
+         for instance in instances:
+             mock_get_inst_map_by_uuid.assert_any_call(self.context,
+@@ -816,7 +862,7 @@ class _BaseTaskTestCase(object):
+                               injected_files='injected_files',
+                               requested_networks=None,
+                               security_groups='security_groups',
+-                              block_device_mapping='block_device_mapping',
++                              block_device_mapping=None,
+                               legacy_bdm=False)
+ 
+         do_test()
+@@ -863,7 +909,7 @@ class _BaseTaskTestCase(object):
+                 injected_files='injected_files',
+                 requested_networks=None,
+                 security_groups='security_groups',
+-                block_device_mapping='block_device_mapping',
++                block_device_mapping=None,
+                 legacy_bdm=False)
+ 
+             mock_build_and_run.assert_called_once_with(
+@@ -908,6 +954,33 @@ class _BaseTaskTestCase(object):
+         system_metadata['shelved_host'] = 'fake-mini'
+         self.conductor_manager.unshelve_instance(self.context, instance)
+ 
++    @mock.patch.object(objects.Instance, 'save')
++    @mock.patch('nova.objects.InstanceMapping.get_by_instance_uuid')
++    @mock.patch('nova.compute.utils.is_volume_backed_instance',
++                return_value=True)
++    def test_unshelve_instance_bfv(self, mock_is_bfv, mock_get, mock_save):
++        inst_obj = self._create_fake_instance_obj()
++        inst_obj.vm_state = vm_states.SHELVED_OFFLOADED
++        cell_mapping = objects.CellMapping.get_by_uuid(self.context,
++                                                       uuids.cell1)
++        mock_get.return_value = objects.InstanceMapping(
++            cell_mapping=cell_mapping)
++
++        def _select_destinations(context, spec_obj, *args, **kwargs):
++            self.assertEqual(0, spec_obj.root_gb)
++            # Skip the rest of unshelve since we only want to verify the
++            # request spec disk.
++            raise exc.NoValidHost(reason='no hosts')
++
++        # unshelve_instance() is a cast, we need to wait for it to complete
++        self.useFixture(cast_as_call.CastAsCall(self))
++
++        with mock.patch.object(self.conductor_manager.scheduler_client,
++                               'select_destinations') as select_dest_mock:
++            select_dest_mock.side_effect = _select_destinations
++            self.conductor.unshelve_instance(self.context, inst_obj)
++            self.assertTrue(select_dest_mock.called)
++
+     def test_unshelve_offload_instance_on_host_with_request_spec(self):
+         instance = self._create_fake_instance_obj()
+         instance.vm_state = vm_states.SHELVED_OFFLOADED
+@@ -970,7 +1043,7 @@ class _BaseTaskTestCase(object):
+             from_primitives.assert_called_once_with(self.context, request_spec,
+                     filter_properties)
+             sched_instances.assert_called_once_with(self.context, fake_spec,
+-                    [instance.uuid])
++                    False, [instance.uuid])
+             self.assertEqual(cell_mapping,
+                              fake_spec.requested_destination.cell)
+             # NOTE(sbauza): Since the instance is dehydrated when passing
+@@ -1062,7 +1135,7 @@ class _BaseTaskTestCase(object):
+         scheduler_utils.build_request_spec(self.context, 'fake_image',
+                 mox.IgnoreArg()).AndReturn('req_spec')
+         self.conductor_manager._schedule_instances(self.context,
+-                fake_spec, [instance.uuid]).AndReturn(
++                fake_spec, False, [instance.uuid]).AndReturn(
+                         [{'host': 'fake_host',
+                           'nodename': 'fake_node',
+                           'limits': {}}])
+@@ -1162,7 +1235,7 @@ class _BaseTaskTestCase(object):
+         scheduler_utils.build_request_spec(self.context, None,
+                 mox.IgnoreArg()).AndReturn('req_spec')
+         self.conductor_manager._schedule_instances(self.context,
+-                fake_spec, [instance.uuid]).AndReturn(
++                fake_spec, False, [instance.uuid]).AndReturn(
+                         [{'host': 'fake_host',
+                           'nodename': 'fake_node',
+                           'limits': {}}])
+@@ -1199,6 +1272,32 @@ class _BaseTaskTestCase(object):
+                                instance=inst_obj,
+                                **compute_args)
+ 
++    @mock.patch('nova.compute.utils.is_volume_backed_instance',
++                return_value=True)
++    def test_rebuild_instance_bfv(self, mock_is_bfv):
++        inst_obj = self._create_fake_instance_obj()
++        rebuild_args, compute_args = self._prepare_rebuild_args(
++            {'host': None})
++
++        def _select_destinations(context, spec_obj, *args, **kwargs):
++            self.assertEqual(0, spec_obj.root_gb)
++            # Skip the rest of rebuild since we only want to verify the request
++            # spec disk.
++            raise exc.NoValidHost(reason='no hosts')
++
++        # rebuild_instance is a cast, we need to wait for it to complete
++        self.useFixture(cast_as_call.CastAsCall(self))
++
++        with mock.patch.object(self.conductor_manager.scheduler_client,
++                               'select_destinations') as select_dest_mock:
++            select_dest_mock.side_effect = _select_destinations
++            self.assertRaises(exc.NoValidHost,
++                              self.conductor.rebuild_instance,
++                              self.context,
++                              inst_obj,
++                              **rebuild_args)
++            self.assertTrue(select_dest_mock.called)
++
+     def test_rebuild_instance_with_scheduler(self):
+         inst_obj = self._create_fake_instance_obj()
+         inst_obj.host = 'noselect'
+@@ -1471,6 +1570,7 @@ class ConductorTaskTestCase(_BaseTaskTestCase, test_compute.BaseTestCase):
+         rs.instance_group = None
+         rs.retry = None
+         rs.limits = None
++        rs.flavor = build_request.instance.flavor
+         rs.create()
+         params['request_specs'] = [rs]
+         params['image'] = {'fake_data': 'should_pass_silently'}
+@@ -1587,6 +1687,28 @@ class ConductorTaskTestCase(_BaseTaskTestCase, test_compute.BaseTestCase):
+                 else:
+                     self.assertEqual(0, len(actions))
+ 
++    @mock.patch('nova.volume.cinder.API.unreserve_volume')
++    @mock.patch('nova.compute.rpcapi.ComputeAPI.build_and_run_instance')
++    @mock.patch('nova.scheduler.rpcapi.SchedulerAPI.select_destinations')
++    def test_schedule_and_build_instances_bfv(self, select_destinations,
++                                              build_and_run_instance,
++                                              mock_unreserve_vol):
++        params = self.params
++
++        # NOTE(danms): Make this BDM a root volume
++        params['block_device_mapping'][0].boot_index = 0
++        params['block_device_mapping'][0].destination_type = 'volume'
++
++        def _select_destinations(context, spec_obj, *args, **kwargs):
++            self.assertEqual(0, spec_obj.root_gb)
++            # Skip the rest of schedule_and_build_instances since we only want
++            # to verify the request spec disk.
++            raise exc.NoValidHost(reason='no hosts')
++
++        select_destinations.side_effect = _select_destinations
++        self.conductor.schedule_and_build_instances(**params)
++        self.assertTrue(select_destinations.called)
++
+     @mock.patch('nova.compute.rpcapi.ComputeAPI.build_and_run_instance')
+     @mock.patch('nova.scheduler.rpcapi.SchedulerAPI.select_destinations')
+     @mock.patch('nova.objects.HostMapping.get_by_host')
+@@ -2173,6 +2295,7 @@ class ConductorTaskTestCase(_BaseTaskTestCase, test_compute.BaseTestCase):
+         self.conductor._set_vm_state_and_notify(
+                 self.context, 1, 'method', 'updates', 'ex', 'request_spec')
+ 
++    @mock.patch('nova.objects.Instance.is_volume_backed')
+     @mock.patch.object(objects.InstanceMapping, 'get_by_instance_uuid')
+     @mock.patch.object(objects.RequestSpec, 'from_components')
+     @mock.patch.object(scheduler_utils, 'setup_instance_group')
+@@ -2182,8 +2305,8 @@ class ConductorTaskTestCase(_BaseTaskTestCase, test_compute.BaseTestCase):
+                        '_set_vm_state_and_notify')
+     @mock.patch.object(migrate.MigrationTask, 'rollback')
+     def test_cold_migrate_no_valid_host_back_in_active_state(
+-            self, rollback_mock, notify_mock, select_dest_mock,
+-            metadata_mock, sig_mock, spec_fc_mock, im_mock):
++            self, rollback_mock, notify_mock, select_dest_mock, metadata_mock,
++            sig_mock, spec_fc_mock, im_mock, is_bfv_mock):
+         flavor = flavors.get_flavor_by_name('m1.tiny')
+         inst_obj = objects.Instance(
+             image_ref='fake-image_ref',
+@@ -2203,7 +2326,8 @@ class ConductorTaskTestCase(_BaseTaskTestCase, test_compute.BaseTestCase):
+         resvs = 'fake-resvs'
+         image = 'fake-image'
+         fake_spec = objects.RequestSpec(image=objects.ImageMeta(
+-                                        properties=objects.ImageMetaProps()))
++                                        properties=objects.ImageMetaProps()),
++                                        flavor=flavor)
+         spec_fc_mock.return_value = fake_spec
+         legacy_request_spec = fake_spec.to_legacy_request_spec_dict()
+         metadata_mock.return_value = image
+@@ -2229,6 +2353,7 @@ class ConductorTaskTestCase(_BaseTaskTestCase, test_compute.BaseTestCase):
+                                               exc_info, legacy_request_spec)
+         rollback_mock.assert_called_once_with()
+ 
++    @mock.patch('nova.objects.Instance.is_volume_backed')
+     @mock.patch.object(objects.InstanceMapping, 'get_by_instance_uuid')
+     @mock.patch.object(scheduler_utils, 'setup_instance_group')
+     @mock.patch.object(objects.RequestSpec, 'from_components')
+@@ -2238,8 +2363,8 @@ class ConductorTaskTestCase(_BaseTaskTestCase, test_compute.BaseTestCase):
+                        '_set_vm_state_and_notify')
+     @mock.patch.object(migrate.MigrationTask, 'rollback')
+     def test_cold_migrate_no_valid_host_back_in_stopped_state(
+-            self, rollback_mock, notify_mock, select_dest_mock,
+-            metadata_mock, spec_fc_mock, sig_mock, im_mock):
++            self, rollback_mock, notify_mock, select_dest_mock, metadata_mock,
++            spec_fc_mock, sig_mock, im_mock, is_bfv_mock):
+         flavor = flavors.get_flavor_by_name('m1.tiny')
+         inst_obj = objects.Instance(
+             image_ref='fake-image_ref',
+@@ -2260,7 +2385,8 @@ class ConductorTaskTestCase(_BaseTaskTestCase, test_compute.BaseTestCase):
+         resvs = 'fake-resvs'
+ 
+         fake_spec = objects.RequestSpec(image=objects.ImageMeta(
+-                                        properties=objects.ImageMetaProps()))
++                                        properties=objects.ImageMetaProps()),
++                                        flavor=flavor)
+         spec_fc_mock.return_value = fake_spec
+         legacy_request_spec = fake_spec.to_legacy_request_spec_dict()
+ 
+@@ -2364,6 +2490,8 @@ class ConductorTaskTestCase(_BaseTaskTestCase, test_compute.BaseTestCase):
+                                             'migrate_server', updates,
+                                             exception, legacy_request_spec)
+ 
++    @mock.patch('nova.objects.RequestSpec.obj_clone')
++    @mock.patch('nova.objects.Instance.is_volume_backed')
+     @mock.patch.object(objects.InstanceMapping, 'get_by_instance_uuid')
+     @mock.patch.object(scheduler_utils, 'setup_instance_group')
+     @mock.patch.object(objects.RequestSpec, 'from_components')
+@@ -2375,8 +2503,8 @@ class ConductorTaskTestCase(_BaseTaskTestCase, test_compute.BaseTestCase):
+     @mock.patch.object(compute_rpcapi.ComputeAPI, 'prep_resize')
+     def test_cold_migrate_exception_host_in_error_state_and_raise(
+             self, prep_resize_mock, rollback_mock, notify_mock,
+-            select_dest_mock, metadata_mock, spec_fc_mock,
+-            sig_mock, im_mock):
++            select_dest_mock, metadata_mock, spec_fc_mock, sig_mock, im_mock,
++            is_bfv_mock, clone_mock):
+         flavor = flavors.get_flavor_by_name('m1.tiny')
+         inst_obj = objects.Instance(
+             image_ref='fake-image_ref',
+@@ -2396,8 +2524,15 @@ class ConductorTaskTestCase(_BaseTaskTestCase, test_compute.BaseTestCase):
+         image = 'fake-image'
+         resvs = 'fake-resvs'
+         fake_spec = objects.RequestSpec(image=objects.ImageMeta(
+-                                        properties=objects.ImageMetaProps()))
++                                        properties=objects.ImageMetaProps()),
++                                        flavor=flavor)
+         legacy_request_spec = fake_spec.to_legacy_request_spec_dict()
++        # FIXME(sbauza): Serialize/Unserialize the legacy dict because of
++        # oslo.messaging #1529084 to transform datetime values into strings.
++        # tl;dr: datetimes in dicts are not accepted as correct values by the
++        # rpc fake driver.
++        legacy_request_spec_reloaded = jsonutils.loads(
++            jsonutils.dumps(legacy_request_spec))
+         spec_fc_mock.return_value = fake_spec
+ 
+         im_mock.return_value = objects.InstanceMapping(
+@@ -2426,11 +2561,11 @@ class ConductorTaskTestCase(_BaseTaskTestCase, test_compute.BaseTestCase):
+         sig_mock.assert_called_once_with(self.context, fake_spec)
+         self.assertEqual(inst_obj.project_id, fake_spec.project_id)
+         select_dest_mock.assert_called_once_with(
+-            self.context, fake_spec, [inst_obj.uuid])
++            self.context, clone_mock.return_value, [inst_obj.uuid])
+         prep_resize_mock.assert_called_once_with(
+             self.context, inst_obj, legacy_request_spec['image'],
+             flavor, hosts[0]['host'], [resvs],
+-            request_spec=legacy_request_spec,
++            request_spec=legacy_request_spec_reloaded,
+             filter_properties=legacy_filter_props,
+             node=hosts[0]['nodename'], clean_shutdown=True)
+         notify_mock.assert_called_once_with(self.context, inst_obj.uuid,
+@@ -2538,7 +2673,7 @@ class ConductorTaskTestCase(_BaseTaskTestCase, test_compute.BaseTestCase):
+         filter_properties = {'retry': {'num_attempts': 1, 'hosts': []}}
+         inst_uuids = [inst.uuid for inst in instances]
+         self.conductor_manager._schedule_instances(self.context,
+-                fake_spec, inst_uuids).AndReturn(
++                fake_spec, False, inst_uuids).AndReturn(
+                         [{'host': 'host1', 'nodename': 'node1', 'limits': []},
+                          {'host': 'host2', 'nodename': 'node2', 'limits': []}])
+         instances[0].save().AndRaise(
+@@ -2570,7 +2705,7 @@ class ConductorTaskTestCase(_BaseTaskTestCase, test_compute.BaseTestCase):
+                 injected_files='injected_files',
+                 requested_networks=None,
+                 security_groups='security_groups',
+-                block_device_mapping='block_device_mapping',
++                block_device_mapping=None,
+                 legacy_bdm=False)
+         fp.assert_called_once_with(self.context, spec, filter_properties)
+ 
+@@ -2614,7 +2749,7 @@ class ConductorTaskTestCase(_BaseTaskTestCase, test_compute.BaseTestCase):
+                     injected_files='injected_files',
+                     requested_networks=None,
+                     security_groups='security_groups',
+-                    block_device_mapping='block_device_mapping',
++                    block_device_mapping=None,
+                     legacy_bdm=False)
+ 
+             setup_instance_group.assert_called_once_with(
+diff --git a/nova/tests/unit/objects/test_block_device.py b/nova/tests/unit/objects/test_block_device.py
+index d917df8..0481916 100644
+--- a/nova/tests/unit/objects/test_block_device.py
++++ b/nova/tests/unit/objects/test_block_device.py
+@@ -512,6 +512,23 @@ class _TestBlockDeviceMappingListObject(object):
+             self.context, uuids.bdm_instance)
+         self.assertRaises(exception.UndefinedRootBDM, bdm_list.root_bdm)
+ 
++    @mock.patch.object(db, 'block_device_mapping_get_all_by_instance')
++    def test_root_bdm_is_volume(self, get_all_by_inst):
++        fakes = [self.fake_bdm(123), self.fake_bdm(456, boot_index=0)]
++        get_all_by_inst.return_value = fakes
++        bdm_list = objects.BlockDeviceMappingList.get_by_instance_uuid(
++            self.context, uuids.instance)
++        self.assertTrue(bdm_list.root_bdm_is_volume())
++
++    @mock.patch.object(db, 'block_device_mapping_get_all_by_instance')
++    def test_root_bdm_is_not_volume(self, get_all_by_inst):
++        fakes = [self.fake_bdm(123), self.fake_bdm(456, boot_index=0)]
++        fakes[1]['destination_type'] = 'local'
++        get_all_by_inst.return_value = fakes
++        bdm_list = objects.BlockDeviceMappingList.get_by_instance_uuid(
++            self.context, uuids.instance)
++        self.assertFalse(bdm_list.root_bdm_is_volume())
++
+ 
+ class TestBlockDeviceMappingListObject(test_objects._LocalTest,
+                                        _TestBlockDeviceMappingListObject):
+-- 
+2.7.4
+

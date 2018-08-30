@@ -1,0 +1,63 @@
+From 47f2d3a7e6dc0d0565db357d8bcadd81c9b8b156 Mon Sep 17 00:00:00 2001
+From: Francois Palin <francois.palin@windriver.com>
+Date: Tue, 31 Oct 2017 08:32:24 -0400
+Subject: [PATCH 071/143] fix live migration scheduler instance info
+
+When migration completes, scheduler instance info needs to
+have the source host indicate that the instance was deleted from it
+and destination host needs to indicate that the instance was added
+to it.
+
+This applies to live and cold migrations.
+
+Otherwise, an issue occurs when executing parallel migrations
+in sequences, separated by less than
+CONF.scheduler_instance_sync_interval (default = 2 minutes).
+Instances using an anti-affinity server group with best_effort=false
+will eventually end up on the same host.
+Since the scheduler instance info is lagging by one migration, it
+will show that the host still has the instance. A host can then bypass
+the anti-affinity filter check at beginning of filter, where it verifies
+for the case of an instance resize to same host.
+
+This update is a candidate for upstreaming.
+
+__TYPE_upstreamable
+__R5_commit_159b4fc
+---
+ nova/compute/manager.py | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/nova/compute/manager.py b/nova/compute/manager.py
+index 77fc74a..29b1aaa 100644
+--- a/nova/compute/manager.py
++++ b/nova/compute/manager.py
+@@ -3935,6 +3935,7 @@ class ComputeManager(manager.Manager):
+             instance.task_state = None
+             instance.save(expected_task_state=[None, task_states.DELETING])
+ 
++            self._delete_scheduler_instance_info(context, instance.uuid)
+             self._notify_about_instance_usage(
+                 context, instance, "resize.confirm.end",
+                 network_info=network_info)
+@@ -6216,7 +6217,7 @@ class ComputeManager(manager.Manager):
+         rt.delete_allocation_for_migrated_instance(
+             instance, source_node)
+ 
+-        self._update_scheduler_instance_info(ctxt, instance)
++        self._delete_scheduler_instance_info(ctxt, instance.uuid)
+         self._notify_about_instance_usage(ctxt, instance,
+                                           "live_migration._post.end",
+                                           network_info=network_info)
+@@ -6336,6 +6337,8 @@ class ComputeManager(manager.Manager):
+                                                 prev_host, teardown=True)
+         # NOTE(vish): this is necessary to update dhcp
+         self.network_api.setup_networks_on_host(context, instance, self.host)
++
++        self._update_scheduler_instance_info(context, instance)
+         self._notify_about_instance_usage(
+                      context, instance, "live_migration.post.dest.end",
+                      network_info=network_info)
+-- 
+2.7.4
+

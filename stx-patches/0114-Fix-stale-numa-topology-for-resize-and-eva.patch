@@ -1,0 +1,52 @@
+From f1ffe743ff9fbfb6a0e4e0c5636daec737e83845 Mon Sep 17 00:00:00 2001
+From: Jim Gauld <james.gauld@windriver.com>
+Date: Fri, 2 Mar 2018 17:08:17 -0500
+Subject: [PATCH 114/143] Fix stale numa topology for resize and
+ evacuation
+
+This nova/scheduler/manager.py code from commit 75153fc was missing from
+commit 58e885e022727ce041d29412e24db76a1b3757f5 in last Pike rebase.
+
+This updates request_spec field numa_topology when we do
+scheduler/manager.py select_destinations(). The numa_topology can get
+stale if we do an evacuation or live-migration after a resize.
+
+This should be merged with 58e885e.
+---
+ nova/scheduler/manager.py | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/nova/scheduler/manager.py b/nova/scheduler/manager.py
+index e1541ba..b4aea4e 100644
+--- a/nova/scheduler/manager.py
++++ b/nova/scheduler/manager.py
+@@ -37,6 +37,7 @@ from nova import quota
+ from nova.scheduler import client as scheduler_client
+ from nova.scheduler import utils
+ from nova import utils as nova_utils
++from nova.virt import hardware
+ 
+ 
+ LOG = logging.getLogger(__name__)
+@@ -126,6 +127,18 @@ class SchedulerManager(manager.Manager):
+         extra_specs = spec_obj.flavor.extra_specs
+         image_props = spec_obj.image.properties
+ 
++        # The request_spec has stale numa_topology, so must be updated.
++        # We can get stale numa_topology if we do an evacuation or
++        # live-migration after a resize,
++        instance_type = spec_obj.flavor
++        image_meta = objects.ImageMeta(properties=image_props)
++        try:
++            spec_obj.numa_topology = \
++                hardware.numa_get_constraints(instance_type, image_meta)
++        except Exception as ex:
++            LOG.error("Cannot get numa constraints, error=%(err)r",
++                      {'err': ex})
++
+         instance_numa_topology = spec_obj.numa_topology
+         # If cpu_thread_policy is ISOLATE and compute has hyperthreading
+         # enabled, vcpus claim will be double flavor.vcpus.  Since we don't
+-- 
+2.7.4
+

@@ -1,0 +1,62 @@
+From d19a962de32cca6a5ab56a630dd588e6577fb078 Mon Sep 17 00:00:00 2001
+From: Francois Palin <francois.palin@windriver.com>
+Date: Thu, 15 Feb 2018 16:06:10 -0500
+Subject: [PATCH 104/143] Specify migration type in db filter for
+ anti-affinity migration
+
+Migration and live-migration anti-affinity code that adds member
+hosts to the server group by looking at database migrations table
+also needs to filter by migration_type to avoid picking up dangling
+evacuation records.
+---
+ nova/conductor/tasks/live_migrate.py                 | 1 +
+ nova/conductor/tasks/migrate.py                      | 1 +
+ nova/tests/unit/conductor/tasks/test_live_migrate.py | 2 ++
+ 3 files changed, 4 insertions(+)
+
+diff --git a/nova/conductor/tasks/live_migrate.py b/nova/conductor/tasks/live_migrate.py
+index 88aac7c..0d8e31e 100644
+--- a/nova/conductor/tasks/live_migrate.py
++++ b/nova/conductor/tasks/live_migrate.py
+@@ -337,6 +337,7 @@ class LiveMigrationTask(base.TaskBase):
+ 
+                     for member_uuid in group_members:
+                         filters = {
++                            'migration_type': 'live-migration',
+                             'instance_uuid': member_uuid,
+                             'status': ['queued', 'accepted', 'pre-migrating',
+                                        'preparing', 'running']
+diff --git a/nova/conductor/tasks/migrate.py b/nova/conductor/tasks/migrate.py
+index fbd1fe1..6274a18 100644
+--- a/nova/conductor/tasks/migrate.py
++++ b/nova/conductor/tasks/migrate.py
+@@ -55,6 +55,7 @@ class MigrationTask(base.TaskBase):
+ 
+                 for instance_uuid in group_members:
+                     filters = {
++                        'migration_type': 'migration',
+                         'instance_uuid': instance_uuid,
+                         'status': ['queued', 'pre-migrating', 'migrating',
+                                    'post-migrating', 'finished']
+diff --git a/nova/tests/unit/conductor/tasks/test_live_migrate.py b/nova/tests/unit/conductor/tasks/test_live_migrate.py
+index eb6d5fb..78efd7a 100644
+--- a/nova/tests/unit/conductor/tasks/test_live_migrate.py
++++ b/nova/tests/unit/conductor/tasks/test_live_migrate.py
+@@ -346,12 +346,14 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
+         self.mox.StubOutWithMock(objects.MigrationList,
+                                  'get_by_filters')
+         filters = {
++            'migration_type': 'live-migration',
+             'instance_uuid': 'uuid',
+             'status': ['queued', 'accepted', 'pre-migrating',
+                        'preparing', 'running']
+         }
+ 
+         empty_migrations_filters = {
++            'migration_type': 'live-migration',
+             'instance_uuid': 'uuid-2',
+             'status': ['queued', 'accepted', 'pre-migrating',
+                        'preparing', 'running']
+-- 
+2.7.4
+

@@ -1,0 +1,97 @@
+From ec9f87196df0146ac0b4bf8ac52b95357c8681ae Mon Sep 17 00:00:00 2001
+From: "Beliveau, Ludovic" <Ludovic.Beliveau@windriver.com>
+Date: Mon, 25 May 2015 07:57:33 -0400
+Subject: [PATCH] Unable to launch VM with sriov and pci-passthrough
+ NICs
+
+Two problems wre fixed in this commit:
+- There was a bug in libvirt driver which didn't allowed to have an
+  instance with mix of pci-sriov and pci-passthrough.  Libvirt was not
+  filtering on the type of pci interface and was re-using the pci-sriov
+  interfaces for generating the instance xml.  Which caused some pci
+  device to be configured twice.
+- There was a bug on migration/evacuate.  When updating the neutron port
+  information, the right pci device in the intance was not properly picked.
+  Now we iterate properly the list of pci devices and match it on the port
+  physical network.
+---
+ nova/network/neutronv2/api.py | 43 ++++++++++++++++++++++++++++++++++---------
+ nova/virt/libvirt/driver.py   |  8 ++++++--
+ 2 files changed, 40 insertions(+), 11 deletions(-)
+
+diff --git a/nova/network/neutronv2/api.py b/nova/network/neutronv2/api.py
+index b66e34c..08811a7 100644
+--- a/nova/network/neutronv2/api.py
++++ b/nova/network/neutronv2/api.py
+@@ -1749,15 +1749,40 @@ class API(base_api.NetworkAPI):
+                 updates.update({'binding:host_id': host})
+ 
+                 if p.get(constants.PORT_VIF_MODEL) == 'pci-sriov':
+-                    pci_dev = pci_manager.get_instance_pci_devs(
+-                        instance, 'all').pop()
+-                    devspec = pci_whitelist.get_pci_device_devspec(pci_dev)
+-                    profile = {'pci_vendor_info': "%s:%s" %
+-                                    (pci_dev.vendor_id, pci_dev.product_id),
+-                               'pci_slot': pci_dev.address,
+-                               'physical_network':
+-                                    devspec.get_tags().get('physical_network')}
+-                    updates.update({'binding:profile': profile})
++                    if ('binding:profile' not in p.keys() or
++                        'physical_network' not in
++                            p.get('binding:profile').keys()):
++                        LOG.warning("Port  %s doesn't contain binding:profile "
++                                    "or physical_network")
++                        physical_network = ""
++                    else:
++                        physical_network = p.get('binding:profile').get(
++                            'physical_network')
++
++                    # Get the pci device that matches this port physical
++                    # network
++                    pci_devs = pci_manager.get_instance_pci_devs(instance,
++                                                                 'all')
++                    devspec = None
++                    pci_dev = None
++                    for pci_dev in reversed(pci_devs):
++                        spec = pci_whitelist.get_pci_device_devspec(pci_dev)
++                        if (spec.get_tags().get('physical_network') ==
++                            physical_network):
++                            devspec = spec
++                            break
++
++                    if devspec:
++                        profile = {
++                            'pci_vendor_info': "%s:%s" %
++                                (pci_dev.vendor_id, pci_dev.product_id),
++                            'pci_slot': pci_dev.address,
++                            'physical_network':
++                                devspec.get_tags().get('physical_network')}
++                        updates.update({'binding:profile': profile})
++                    else:
++                        LOG.warning("PCI device not found for physical "
++                                    "network %s" % physical_network)
+ 
+                 if p.get(constants.PORT_VIF_MODEL) == 'pci-passthrough':
+                     inst = objects.Instance.get_by_uuid(context,
+diff --git a/nova/virt/libvirt/driver.py b/nova/virt/libvirt/driver.py
+index a0a8591..4821b5b 100644
+--- a/nova/virt/libvirt/driver.py
++++ b/nova/virt/libvirt/driver.py
+@@ -4368,8 +4368,12 @@ class LibvirtDriver(driver.ComputeDriver):
+             guest.add_device(wrs_msg)
+ 
+         if virt_type in ('xen', 'qemu', 'kvm'):
+-            for pci_dev in pci_manager.get_instance_pci_devs(instance,
+-                                                             request_id):
++            pci_devs = pci_manager.get_instance_pci_devs(instance,
++                                                         request_id)
++            # Only keep pci-passthrough devices
++            pci_devs = [d for d in pci_devs
++                        if d['dev_type'] == 'type-PCI']
++            for pci_dev in pci_devs:
+                 guest.add_device(self._get_guest_pci_device(pci_dev))
+         else:
+             if len(pci_devs) > 0:
+-- 
+2.7.4
+

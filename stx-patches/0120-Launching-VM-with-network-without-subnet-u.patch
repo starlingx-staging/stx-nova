@@ -1,0 +1,34 @@
+From 1deef118f53c029a72087deb8337cb99296b58b3 Mon Sep 17 00:00:00 2001
+From: Teresa Ho <teresa.ho@windriver.com>
+Date: Wed, 7 Mar 2018 12:11:53 -0500
+Subject: [PATCH 120/143] Launching VM with network without subnet
+ using port-id fails with error requesting fixed ip
+
+This update removes a check in nova that prevent launching an instance with
+port id on a network that does not have subnets.
+---
+ nova/network/neutronv2/api.py | 8 --------
+ 1 file changed, 8 deletions(-)
+
+diff --git a/nova/network/neutronv2/api.py b/nova/network/neutronv2/api.py
+index c18511b..f9b4657 100644
+--- a/nova/network/neutronv2/api.py
++++ b/nova/network/neutronv2/api.py
+@@ -1674,14 +1674,6 @@ class API(base_api.NetworkAPI):
+                                            neutron_client=neutron)
+                     if port.get('device_id', None):
+                         raise exception.PortInUse(port_id=request.port_id)
+-                    deferred_ip = port.get('ip_allocation') == 'deferred'
+-                    # NOTE(carl_baldwin) A deferred IP port doesn't have an
+-                    # address here. If it fails to get one later when nova
+-                    # updates it with host info, Neutron will error which
+-                    # raises an exception.
+-                    if not deferred_ip and not port.get('fixed_ips'):
+-                        raise exception.PortRequiresFixedIP(
+-                            port_id=request.port_id)
+                     request.network_id = port['network_id']
+                 else:
+                     ports_needed_per_instance += 1
+-- 
+2.7.4
+

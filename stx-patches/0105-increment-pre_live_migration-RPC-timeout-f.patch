@@ -1,0 +1,57 @@
+From 0f3548341b9291f14af4bd09f72a0867ab6e5abc Mon Sep 17 00:00:00 2001
+From: Chris Friesen <chris.friesen@windriver.com>
+Date: Fri, 16 Feb 2018 14:14:05 -0600
+Subject: [PATCH 105/143] increment pre_live_migration() RPC timeout for each vif
+
+There is an O(N) cost in pre_live_migration() to update all the network
+ports.  If there are a lot of vifs associated with an instance it's
+possible for them to push an otherwise-borderline RPC call over the
+timeout threshold.
+
+Accordingly, let's add 2 seconds to the RPC timeout for each vif
+associated with an instance.
+
+Some upstream folks do not want this change, they would rather see a
+generic solution in oslo.messaging that would implement some sort of
+heartbeat mechanism for all long-running RPC calls.
+---
+ nova/compute/rpcapi.py | 18 +++++++++++++++---
+ 1 file changed, 15 insertions(+), 3 deletions(-)
+
+diff --git a/nova/compute/rpcapi.py b/nova/compute/rpcapi.py
+index 6dccbb1..ddf10ad 100644
+--- a/nova/compute/rpcapi.py
++++ b/nova/compute/rpcapi.py
+@@ -768,14 +768,26 @@ class ComputeAPI(object):
+             if migrate_data:
+                 migrate_data = migrate_data.to_legacy_dict()
+ 
++        # Base RPC timeout is 60 sec.  This is normally set in oslo.messaging
++        # which makes this kind of gross.
++        timeout = 60
++
++        # Regarding the following changes...upstream nova would rather see
++        # generic heartbeating for long-running call() operations added to
++        # oslo.messaging.
++
+         #  increase RPC msg timeout from 1 minute to 5 minutes
+         # for block migration, in case glance image download takes too long at
+         # destination
+         if (migrate_data and 'block_migration' in migrate_data and
+                 migrate_data.block_migration):
+-            cctxt = client.prepare(server=host, version=version, timeout=300)
+-        else:
+-            cctxt = client.prepare(server=host, version=version)
++            timeout = 300
++
++        # add a bit of time for each vif.
++        num_vifs = len(instance.get_network_info())
++        timeout += num_vifs * 2
++
++        cctxt = client.prepare(server=host, version=version, timeout=timeout)
+         result = cctxt.call(ctxt, 'pre_live_migration',
+                             instance=instance,
+                             block_migration=block_migration,
+-- 
+2.7.4
+

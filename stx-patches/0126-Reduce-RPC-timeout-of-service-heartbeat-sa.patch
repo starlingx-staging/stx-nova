@@ -1,0 +1,129 @@
+From da05bc44f48d511924b417811a000cd14692330a Mon Sep 17 00:00:00 2001
+From: Jim Gauld <james.gauld@windriver.com>
+Date: Mon, 12 Mar 2018 19:54:44 -0400
+Subject: [PATCH 126/143] Reduce RPC timeout of service heartbeat save
+
+This improves our system recovery time after controller swact by setting
+a reasonable RPC timeout for service heartbeat save(). We no longer
+require a full minute wait after AMQP messaging reconnects to hit
+service save() MessagingTimeout. We are now able to schedule on computes
+immediately after the scheduler restarts instead of receiving a 'not
+heard in a while' message.
+
+This introduces a way to set RPC timeout for base.remotable functions
+via conductor object_action routine.
+
+This adds RPC timeout to nova/object/service.py save(). This is only
+configured for hearbeat function nova/servicegroup/drivers/db.py
+_report_state() to 5 seconds (i.e. half the configured report_inverval).
+Since this function fires every 10 seconds on a timer, it makes no sense
+to wait 60 seconds for default RPC timeout.
+
+This also eliminates the periodic_fuzzy_delay for non-compute binary
+services.
+---
+ nova/conductor/rpcapi.py                | 6 +++++-
+ nova/objects/service.py                 | 5 ++++-
+ nova/service.py                         | 5 +++++
+ nova/servicegroup/drivers/db.py         | 8 +++++++-
+ nova/tests/unit/objects/test_objects.py | 2 +-
+ 5 files changed, 22 insertions(+), 4 deletions(-)
+
+diff --git a/nova/conductor/rpcapi.py b/nova/conductor/rpcapi.py
+index 6aacfc9..0e7fd17 100644
+--- a/nova/conductor/rpcapi.py
++++ b/nova/conductor/rpcapi.py
+@@ -247,7 +247,11 @@ class ConductorAPI(object):
+                           args=args, kwargs=kwargs)
+ 
+     def object_action(self, context, objinst, objmethod, args, kwargs):
+-        cctxt = self.client.prepare()
++        # - Strip off RPC timeout argument used with base.remoteable
++        # functions, and set the timeout. This enables special handling of
++        # specific methods what don't desire long wait.
++        wrs_rpc_timeout = kwargs.pop('wrs_rpc_timeout', None)
++        cctxt = self.client.prepare(timeout=wrs_rpc_timeout)
+         return cctxt.call(context, 'object_action', objinst=objinst,
+                           objmethod=objmethod, args=args, kwargs=kwargs)
+ 
+diff --git a/nova/objects/service.py b/nova/objects/service.py
+index fbf2977..c2a4e40 100644
+--- a/nova/objects/service.py
++++ b/nova/objects/service.py
+@@ -375,7 +375,10 @@ class Service(base.NovaPersistentObject, base.NovaObject,
+         self._from_db_object(self._context, self, db_service)
+ 
+     @base.remotable
+-    def save(self):
++    # - Add conductor/rpcapi object_action specific RPC timeout. The
++    # parameter wrs_rpc_timeout is not actually used in this function,
++    # but is used in the "remotable" wrapper.
++    def save(self, wrs_rpc_timeout=None):
+         updates = self.obj_get_changes()
+         updates.pop('id', None)
+         self._check_minimum_version()
+diff --git a/nova/service.py b/nova/service.py
+index 200c295..2b4be12 100644
+--- a/nova/service.py
++++ b/nova/service.py
+@@ -205,6 +205,11 @@ class Service(service.Service):
+             else:
+                 initial_delay = None
+ 
++            # - Do not delay start of non-compute services. This improves
++            # responsiveness of no-reboot-patching of controllers by making
++            # the nova-scheduler weigher patch audit run immediately.
++            if 'compute' not in self.binary:
++                initial_delay = None
+             self.tg.add_dynamic_timer(self.periodic_tasks,
+                                      initial_delay=initial_delay,
+                                      periodic_interval_max=
+diff --git a/nova/servicegroup/drivers/db.py b/nova/servicegroup/drivers/db.py
+index 02cc2ee..4fde0af 100644
+--- a/nova/servicegroup/drivers/db.py
++++ b/nova/servicegroup/drivers/db.py
+@@ -33,6 +33,7 @@ class DbDriver(base.Driver):
+ 
+     def __init__(self, *args, **kwargs):
+         self.service_down_time = CONF.service_down_time
++        self.service_rpc_timeout = 30
+ 
+     def join(self, member, group, service=None):
+         """Add a new member to a service group.
+@@ -50,6 +51,10 @@ class DbDriver(base.Driver):
+                                  ' ServiceGroup driver'))
+         report_interval = service.report_interval
+         if report_interval:
++            # Set service RPC timeout less than report interval so we
++            # react faster to messaging outages due to swact. Setting timeout
++            # too large defeats using the report interval as a heartbeat.
++            self.service_rpc_timeout = max(1, int(CONF.report_interval / 2))
+             service.tg.add_timer(report_interval, self._report_state,
+                                  api.INITIAL_REPORTING_DELAY, service)
+ 
+@@ -88,7 +93,8 @@ class DbDriver(base.Driver):
+ 
+         try:
+             service.service_ref.report_count += 1
+-            service.service_ref.save()
++            # - Add conductor/rpcapi object_action specific RPC timeout
++            service.service_ref.save(wrs_rpc_timeout=self.service_rpc_timeout)
+ 
+             # TODO(termie): make this pattern be more elegant.
+             if getattr(service, 'model_disconnected', False):
+diff --git a/nova/tests/unit/objects/test_objects.py b/nova/tests/unit/objects/test_objects.py
+index a9824ae..517b443 100644
+--- a/nova/tests/unit/objects/test_objects.py
++++ b/nova/tests/unit/objects/test_objects.py
+@@ -1169,7 +1169,7 @@ object_data = {
+     'SecurityGroupList': '1.1-c655ed13298e630f4d398152f7d08d71',
+     'SecurityGroupRule': '1.1-ae1da17b79970012e8536f88cb3c6b29',
+     'SecurityGroupRuleList': '1.2-0005c47fcd0fb78dd6d7fd32a1409f5b',
+-    'Service': '1.22-8a740459ab9bf258a19c8fcb875c2d9a',
++    'Service': '1.22-c1eb298ef0b417a34d5ca692735f7205',
+     'ServiceList': '1.19-5325bce13eebcbf22edc9678285270cc',
+     'TaskLog': '1.0-78b0534366f29aa3eebb01860fbe18fe',
+     'TaskLogList': '1.0-cc8cce1af8a283b9d28b55fcd682e777',
+-- 
+2.7.4
+

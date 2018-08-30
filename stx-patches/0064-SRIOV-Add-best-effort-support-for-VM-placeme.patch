@@ -1,0 +1,873 @@
+From abd830d062a47cd52c4d115fe4b99930f8338899 Mon Sep 17 00:00:00 2001
+From: Steven Webster <steven.webster@windriver.com>
+Date: Tue, 30 Jun 2015 13:54:25 -0400
+Subject: [PATCH 064/143] SRIOV: Add best effort support for VM
+ placement
+
+This commit introduce a new feature to scheduling of guests with PCI device(s)
+(SR-IOV and PCI-Passthrough) based on NUMA node(s) best effort on which the
+PCI devices are located.
+
+A new flavor extra-spec ("hw:wrs:pci_numa_affinity") can now be specified for
+this behavior.  The default value is "strict", which specifies that a PCI
+device(s) should be matched on the same NUMA node(s) as the guest.  If
+"prefer" is specified, a "strict" allocation will be tried first, if
+unsuccessfull, a PCI device(s) on any NUMA node(s) will be selected for the
+guest.
+
+Includes following fixes:
+- Sanity: Live migration fails (commit e22473c7)
+- SRIOV-Add best effort support for VM placement -- rework
+  (commit 02ebdcd1)
+
+(cherry picked from R3 commits bdbcfe2)
+
+Notes on Newton rebase:
+
+- The newton claim_instance function no longer takes an instance parameter.
+  We need the instance parameter to support the pci_strict functionality,
+  which allows best effort placement in the case of no available computes
+  with a similar numa/pci topology.
+  We'd like to add the pci_strict parameter to the instance_pci_request
+  object, but in the interest of time this has not been done in this commit.
+  We should look at implementing this enhancement at a later time, so that
+  the (Newton) method signatures for claim_instance, consume_requests, etc.
+  do not have to be changed.
+
+f74cd61 Pike rebase bug 291: resize handling of extra-specs
+  Makes sure we use the destination side flavor extra-specs.
+  This fixes specific resize failures due to inconsistencies of extra-specs
+  between the scheduler and the compute.
+
+__TYPE_primary
+__TAG_sriov,sched,besteffort
+__R4_commit_4720b7d
+__R3_commit_bdbcfe2
+__TC2966
+---
+ nova/api/openstack/compute/flavors_extraspecs.py |  16 +++
+ nova/compute/claims.py                           |  25 ++--
+ nova/compute/resource_tracker.py                 |   5 +-
+ nova/objects/fields.py                           |  17 +++
+ nova/pci/manager.py                              |  30 ++++-
+ nova/pci/stats.py                                | 163 +++++++++++++++++------
+ nova/scheduler/filters/numa_topology_filter.py   |   9 +-
+ nova/scheduler/host_manager.py                   |  11 +-
+ nova/tests/unit/compute/test_resource_tracker.py |  17 ++-
+ nova/tests/unit/pci/test_manager.py              |  40 +++---
+ nova/tests/unit/pci/test_stats.py                |  36 +++--
+ nova/tests/unit/scheduler/test_host_manager.py   |   5 +-
+ nova/virt/hardware.py                            |   7 +-
+ 13 files changed, 277 insertions(+), 104 deletions(-)
+
+diff --git a/nova/api/openstack/compute/flavors_extraspecs.py b/nova/api/openstack/compute/flavors_extraspecs.py
+index 030fa95..6e9711a 100644
+--- a/nova/api/openstack/compute/flavors_extraspecs.py
++++ b/nova/api/openstack/compute/flavors_extraspecs.py
+@@ -170,6 +170,21 @@ class FlavorExtraSpecsController(wsgi.Controller):
+                         })
+                 raise webob.exc.HTTPBadRequest(explanation=msg)
+ 
++    # Validate pci numa affinity.
++    @staticmethod
++    def _validate_pci_numa_affinity(flavor):
++        key = 'hw:wrs:pci_numa_affinity'
++        if key in flavor.extra_specs:
++            value = flavor.extra_specs[key]
++            if value not in fields.PciAllocationPolicy.ALL:
++                msg = (_("Invalid %(K)s '%(V)s', must be one of: %(A)s.") %
++                       {'K': key,
++                        'V': value,
++                        'A': ', '.join(
++                            list(fields.PciAllocationPolicy.ALL))
++                        })
++                raise webob.exc.HTTPBadRequest(explanation=msg)
++
+     # Validate hw:cpu_realtime_mask and interaction with
+     # hw:wrs:shared_vcpu .
+     @staticmethod
+@@ -367,6 +382,7 @@ class FlavorExtraSpecsController(wsgi.Controller):
+         self._validate_cpu_policy(flavor)
+         self._validate_vswitch_numa_affinity(flavor)
+         self._validate_cpu_thread_policy(flavor)
++        self._validate_pci_numa_affinity(flavor)
+         self._validate_shared_vcpu(flavor)
+         self._validate_min_vcpus(flavor)
+         self._validate_numa_node(flavor)
+diff --git a/nova/compute/claims.py b/nova/compute/claims.py
+index 2ab8344..c22d8a4 100644
+--- a/nova/compute/claims.py
++++ b/nova/compute/claims.py
+@@ -229,7 +229,11 @@ class Claim(NopClaim):
+         requested_topology = self.numa_topology
+         if host_topology:
+             # - numa affinity requires extra_specs
+-            extra_specs = self._get_extra_specs()
++            # NOTE(jgauld): Require the old fix 32558ef to define self.flavor,
++            # based on 132eae7 Bug 181 fix: claim _test_numa_topology() to look
++            # into destination extra_spec.
++            extra_specs = self.flavor.get('extra_specs', {})
++
+             host_topology = objects.NUMATopology.obj_from_db_obj(
+                     host_topology)
+             pci_requests = self._pci_requests
+@@ -243,6 +247,12 @@ class Claim(NopClaim):
+             metrics_ = (resources.metrics if 'metrics' in resources else None)
+             metrics = objects.MonitorMetricList.from_json(metrics_)
+ 
++            # Support strict vs prefer allocation of PCI devices.
++            # If strict fails, fallback to prefer.
++            pci_numa_affinity = extra_specs.get('hw:wrs:pci_numa_affinity',
++                                                'strict')
++            pci_strict = False if pci_numa_affinity == 'prefer' else True
++
+             details = None
+             instance_topology = (
+                     hardware.numa_fit_instance_to_host(
+@@ -252,7 +262,8 @@ class Claim(NopClaim):
+                         pci_requests=pci_requests.requests,
+                         pci_stats=pci_stats,
+                         details=details,
+-                        vswitch_strict=vswitch_strict))
++                        vswitch_strict=vswitch_strict,
++                        pci_strict=pci_strict))
+ 
+             if requested_topology and not instance_topology:
+                 details = utils.details_initialize(details=details)
+@@ -315,16 +326,6 @@ class Claim(NopClaim):
+                       {'type': type_, 'free': free, 'unit': unit,
+                        'requested': requested})
+ 
+-    def _get_extra_specs(self):
+-        try:
+-            flavor = self.instance.get_flavor()
+-            return flavor.get('extra_specs', {})
+-        except exception.OrphanedObjectError:
+-            # WRS(LBeliveau): This is a hack to get around the fact that some
+-            # unit tests have orphaned instances where we can't lazy-load the
+-            # flavor. There should be a better way to do this.
+-            return {}
+-
+ 
+ class MoveClaim(Claim):
+     """Claim used for holding resources for an incoming move operation.
+diff --git a/nova/compute/resource_tracker.py b/nova/compute/resource_tracker.py
+index 94986a6..4721f82 100644
+--- a/nova/compute/resource_tracker.py
++++ b/nova/compute/resource_tracker.py
+@@ -368,7 +368,7 @@ class ResourceTracker(object):
+         if self.pci_tracker:
+             # NOTE(jaypipes): ComputeNode.pci_device_pools is set below
+             # in _update_usage_from_instance().
+-            self.pci_tracker.claim_instance(context, pci_requests,
++            self.pci_tracker.claim_instance(context, instance, pci_requests,
+                                             instance_numa_topology)
+ 
+         # add claim to tracker's list
+@@ -498,7 +498,8 @@ class ResourceTracker(object):
+             # NOTE(jaypipes): ComputeNode.pci_device_pools is set below
+             # in _update_usage_from_instance().
+             claimed_pci_devices_objs = self.pci_tracker.claim_instance(
+-                    context, new_pci_requests, claim.claimed_numa_topology)
++                    context, instance, new_pci_requests,
++                    claim.claimed_numa_topology)
+         claimed_pci_devices = objects.PciDeviceList(
+                 objects=claimed_pci_devices_objs)
+ 
+diff --git a/nova/objects/fields.py b/nova/objects/fields.py
+index 0f05e7e..2df62bf 100644
+--- a/nova/objects/fields.py
++++ b/nova/objects/fields.py
+@@ -278,6 +278,23 @@ class VswitchAllocationPolicy(BaseNovaEnum):
+     ALL = (STRICT, PREFER)
+ 
+ 
++class PciAllocationPolicy(BaseNovaEnum):
++    """Represents the possible values for pci_numa_affinity."""
++
++    # strict:  (default) Select from host NUMA nodes that have pci on the same
++    # node.
++    STRICT = "strict"
++    # prefer:  Select from host all host NUMA nodes, preferring nodes with pci
++    # on same node.
++    PREFER = "prefer"
++
++    ALL = (STRICT, PREFER)
++
++    def __init__(self):
++        super(PciAllocationPolicy, self).__init__(
++            valid_values=PciAllocationPolicy.ALL)
++
++
+ class CPUThreadAllocationPolicy(BaseNovaEnum):
+ 
+     # prefer (default): The host may or may not have hyperthreads. This
+diff --git a/nova/pci/manager.py b/nova/pci/manager.py
+index 30211b4..fc7c0c8 100644
+--- a/nova/pci/manager.py
++++ b/nova/pci/manager.py
+@@ -20,6 +20,7 @@ from oslo_config import cfg
+ from oslo_log import log as logging
+ from oslo_serialization import jsonutils
+ 
++from nova.compute import task_states
+ from nova import exception
+ from nova import objects
+ from nova.objects import fields
+@@ -222,13 +223,33 @@ class PciDevTracker(object):
+ 
+         self._build_device_tree(self.pci_devs)
+ 
+-    def _claim_instance(self, context, pci_requests, instance_numa_topology):
++    # extension
++    def _instance_get_flavor_extra_specs(self, context, instance):
++        flavor = instance.flavor
++        if (instance.task_state == task_states.RESIZE_PREP and
++                instance.new_flavor):
++            flavor = instance.new_flavor
++
++        return flavor.get('extra_specs', {})
++
++    def _claim_instance(self, context, instance, pci_requests,
++                        instance_numa_topology):
+         instance_cells = None
+         if instance_numa_topology:
+             instance_cells = instance_numa_topology.cells
+ 
++        # Support strict vs prefer allocation of PCI devices.
++        extra_specs = self._instance_get_flavor_extra_specs(
++            context, instance)
++        pci_numa_affinity = extra_specs.get('hw:wrs:pci_numa_affinity',
++            'strict')
++        pci_strict = False if pci_numa_affinity == 'prefer' else True
++
++        # For next rebase, track prefer/strict in the pci requests so
++        # that we avoid changing the method signatures.
+         devs = self.stats.consume_requests(pci_requests.requests,
+-                                           instance_cells)
++                                           instance_cells,
++                                           pci_strict=pci_strict)
+         if not devs:
+             return None
+ 
+@@ -252,11 +273,12 @@ class PciDevTracker(object):
+         if devs:
+             self.allocations[instance['uuid']] += devs
+ 
+-    def claim_instance(self, context, pci_requests, instance_numa_topology):
++    def claim_instance(self, context, instance, pci_requests,
++                       instance_numa_topology):
+         devs = []
+         if self.pci_devs and pci_requests.requests:
+             instance_uuid = pci_requests.instance_uuid
+-            devs = self._claim_instance(context, pci_requests,
++            devs = self._claim_instance(context, instance, pci_requests,
+                                         instance_numa_topology)
+             if devs:
+                 self.claims[instance_uuid] = devs
+diff --git a/nova/pci/stats.py b/nova/pci/stats.py
+index 26fceca..db4177e 100644
+--- a/nova/pci/stats.py
++++ b/nova/pci/stats.py
+@@ -62,7 +62,8 @@ class PciDeviceStats(object):
+         # NOTE(sbauza): Stats are a PCIDevicePoolList object
+         self.pools = [pci_pool.to_dict()
+                       for pci_pool in stats] if stats else []
+-        self.pools.sort(key=lambda item: len(item))
++        # self.pools.sort(key=lambda item: len(item))
++        self.pools.sort(key=self.get_key)
+         self.dev_filter = dev_filter or whitelist.Whitelist(
+             CONF.pci.passthrough_whitelist)
+ 
+@@ -153,7 +154,8 @@ class PciDeviceStats(object):
+                 dev_pool['configured'] = 0
+                 dev_pool['devices'] = []
+                 self.pools.append(dev_pool)
+-                self.pools.sort(key=lambda item: len(item))
++                # self.pools.sort(key=lambda item: len(item))
++                self.pools.sort(key=self.get_key)
+                 pool = dev_pool
+ 
+             # Do not add allocated PCI devices to the pool.  These are
+@@ -204,46 +206,97 @@ class PciDeviceStats(object):
+             free_devs.extend(pool['devices'])
+         return free_devs
+ 
+-    def consume_requests(self, pci_requests, numa_cells=None):
++    # Originally (upstream) _consume_requests is consume_requests.  This
++    # was broken down in two pieces to more easily implement best-effort.
++    # Also, for tracking down allocation of PCI devices per PCI request, this
++    # function was reduced to handling only one PCI request at a time (for
++    # loop over PCI requests is now done in consume_requests).
++    def _consume_requests(self, request, numa_cells=None,
++                          log_error=True):
++        numa = None
++        if numa_cells:
++            numa = [n.id for n in numa_cells]
++        LOG.info("Consuming PCI requests on numa %s", numa)
+         alloc_devices = []
+-        for request in pci_requests:
+-            count = request.count
+-            spec = request.spec
+-            # For now, keep the same algorithm as during scheduling:
+-            # a spec may be able to match multiple pools.
+-            pools = self._filter_pools_for_spec(self.pools, spec)
+-            if numa_cells:
+-                pools = self._filter_pools_for_numa_cells(pools, numa_cells)
+-            pools = self._filter_non_requested_pfs(request, pools)
+-            # Failed to allocate the required number of devices
+-            # Return the devices already allocated back to their pools
+-            if sum([pool['count'] for pool in pools]) < count:
++        count = request.count
++        spec = request.spec
++        # For now, keep the same algorithm as during scheduling:
++        # a spec may be able to match multiple pools.
++        pools = self._filter_pools_for_spec(self.pools, spec)
++        if numa_cells:
++            pools = self._filter_pools_for_numa_cells(pools, numa_cells)
++        pools = self._filter_non_requested_pfs(request, pools)
++        # Failed to allocate the required number of devices
++        # Return the devices already allocated back to their pools
++        if sum([pool['count'] for pool in pools]) < count:
++            # This routine called multiple times. Only log errors
++            # last time through.
++            if log_error:
+                 LOG.error("Failed to allocate PCI devices for instance."
+                           " Unassigning devices back to pools."
+                           " This should not happen, since the scheduler"
+-                          " should have accurate information, and allocation"
+-                          " during claims is controlled via a hold"
+-                          " on the compute node semaphore")
+-                for d in range(len(alloc_devices)):
+-                    self.add_device(alloc_devices.pop())
+-                return None
+-            for pool in pools:
+-                if pool['count'] >= count:
+-                    num_alloc = count
+-                else:
+-                    num_alloc = pool['count']
+-                count -= num_alloc
+-                pool['count'] -= num_alloc
+-                for d in range(num_alloc):
+-                    pci_dev = pool['devices'].pop()
+-                    self._handle_device_dependents(pci_dev)
+-                    pci_dev.request_id = request.request_id
+-                    alloc_devices.append(pci_dev)
+-                if count == 0:
+-                    break
++                          " should have accurate information, and"
++                          " allocation during claims is controlled via a"
++                          " hold on the compute node semaphore")
++            for d in range(len(alloc_devices)):
++                self.add_device(alloc_devices.pop())
++            return None
++
++        for pool in pools:
++            if pool['count'] >= count:
++                num_alloc = count
++            else:
++                num_alloc = pool['count']
++            count -= num_alloc
++            pool['count'] -= num_alloc
++            for d in range(num_alloc):
++                pci_dev = pool['devices'].pop()
++                self._handle_device_dependents(pci_dev)
++                pci_dev.request_id = request.request_id
++                alloc_devices.append(pci_dev)
++            if count == 0:
++                break
+         LOG.info("Allocated devices %(devs)s, pool is now: %(p)s",
+                  {'devs': [str(dev.address) for dev in alloc_devices],
+                   'p': self._pools_prettyprint(self.pools)})
++
++        return alloc_devices
++
++    # Add back PCI devices on the pools.
++    def _cleanup(self, alloc_devices):
++        for d in range(len(alloc_devices)):
++            self.add_device(alloc_devices.pop())
++
++    # Redesigned to keep track of devices so they could be properly
++    # cleaned up.  If an individual PCI requests fails, then cleanup the
++    # accumulated PCI devices.  In theory this should not happen since
++    # the scheduler should have valid view on the pools status (but lets not
++    # take any chances ...).
++    def consume_requests(self, pci_requests, numa_cells=None, pci_strict=True):
++        alloc_devices = []
++        for r in pci_requests:
++            # PCI request strict match on same NUMA node.
++            _alloc_devices = self._consume_requests(r,
++                                                    numa_cells,
++                                                    log_error=pci_strict)
++            if not _alloc_devices:
++                if pci_strict:
++                    self._cleanup(alloc_devices)
++                    raise exception.PciDeviceRequestFailed(
++                        requests=pci_requests)
++                else:
++                    # PCI request matching any NUMA node.
++                    _alloc_devices = self._consume_requests(r, None)
++                    if not _alloc_devices:
++                        self._cleanup(alloc_devices)
++                        raise exception.PciDeviceRequestFailed(
++                            requests=pci_requests)
++
++            # Accumulate all the PCI devices from individual PCI
++            # requests so that if there is an error we can put them back
++            # in the pools.
++            alloc_devices.extend(_alloc_devices)
++
+         return alloc_devices
+ 
+     def _handle_device_dependents(self, pci_dev):
+@@ -305,6 +358,11 @@ class PciDeviceStats(object):
+         # Two concurrent requests may succeed when called support_requests
+         # because this method does not remove related devices from the pools
+         LOG.info("request: %s", request)
++        numa = None
++        if numa_cells:
++            numa = [n.id for n in numa_cells]
++        LOG.info("Applying PCI request on numa %(numa)s: %(request)s",
++                 {'numa': numa, 'request': request})
+ 
+         count = request.count
+         matching_pools = self._filter_pools_for_spec(pools, request.spec)
+@@ -313,10 +371,10 @@ class PciDeviceStats(object):
+         if numa_cells:
+             matching_pools = self._filter_pools_for_numa_cells(matching_pools,
+                                                           numa_cells)
++            LOG.info("matching_pools with numa_cells: %s",
++                     self._pools_prettyprint(matching_pools))
+         matching_pools = self._filter_non_requested_pfs(request,
+                                                         matching_pools)
+-        LOG.info("matching_pools with numa_cells: %s",
+-                 self._pools_prettyprint(matching_pools))
+         if sum([pool['count'] for pool in matching_pools]) < count:
+             return False
+         else:
+@@ -324,9 +382,10 @@ class PciDeviceStats(object):
+                 count = self._decrease_pool_count(pools, pool, count)
+                 if not count:
+                     break
++
+         return True
+ 
+-    def support_requests(self, requests, numa_cells=None):
++    def support_requests(self, requests, numa_cells=None, pci_strict=True):
+         """Check if the pci requests can be met.
+ 
+         Scheduler checks compute node's PCI stats to decide if an
+@@ -338,10 +397,16 @@ class PciDeviceStats(object):
+         # note (yjiang5): this function has high possibility to fail,
+         # so no exception should be triggered for performance reason.
+         pools = copy.deepcopy(self.pools)
+-        return all([self._apply_request(pools, r, numa_cells)
+-                        for r in requests])
++        for r in requests:
++            # PCI request strict match on same NUMA node.
++            if not self._apply_request(pools, r, numa_cells):
++                # PCI request matching any NUMA node.
++                if pci_strict or not self._apply_request(pools, r, None):
++                    return False
++
++        return True
+ 
+-    def apply_requests(self, requests, numa_cells=None):
++    def apply_requests(self, requests, numa_cells=None, pci_strict=True):
+         """Apply PCI requests to the PCI stats.
+ 
+         This is used in multiple instance creation, when the scheduler has to
+@@ -349,9 +414,19 @@ class PciDeviceStats(object):
+         If numa_cells is provided then only devices contained in
+         those nodes are considered.
+         """
+-        if not all([self._apply_request(self.pools, r, numa_cells)
+-                                            for r in requests]):
+-            raise exception.PciDeviceRequestFailed(requests=requests)
++        for r in requests:
++            # PCI request strict match on same NUMA node.
++            if not self._apply_request(self.pools, r, numa_cells):
++                # PCI request matching any NUMA node.
++                if pci_strict or not self._apply_request(self.pools, r, None):
++                    raise exception.PciDeviceRequestFailed(requests=requests)
++
++    @staticmethod
++    def get_key(pool):
++        # Make sort comparator more deterministic using specific keys.
++        # depending on the device type.
++        return (pool['product_id'], pool['vendor_id'], pool['numa_node'],
++            pool.get('dev_type'), pool.get('physical_network'))
+ 
+     def __iter__(self):
+         # 'devices' shouldn't be part of stats
+diff --git a/nova/scheduler/filters/numa_topology_filter.py b/nova/scheduler/filters/numa_topology_filter.py
+index ad72635..1e44ff9 100644
+--- a/nova/scheduler/filters/numa_topology_filter.py
++++ b/nova/scheduler/filters/numa_topology_filter.py
+@@ -114,6 +114,12 @@ class NUMATopologyFilter(filters.BaseHostFilter):
+             # - pass through metrics, vswitch numa affinity
+             vswitch_strict = hardware.\
+                 is_vswitch_strict_from_extra_specs(extra_specs)
++
++            # Support strict vs prefer allocation of PCI devices.
++            pci_numa_affinity = extra_specs.get('hw:wrs:pci_numa_affinity',
++                'strict')
++            pci_strict = False if pci_numa_affinity == 'prefer' else True
++
+             instance_topology = (hardware.numa_fit_instance_to_host(
+                         host_topology, requested_topology,
+                         limits=limits,
+@@ -121,7 +127,8 @@ class NUMATopologyFilter(filters.BaseHostFilter):
+                         pci_requests=pci_requests,
+                         pci_stats=host_state.pci_stats,
+                         details=details,
+-                        vswitch_strict=vswitch_strict))
++                        vswitch_strict=vswitch_strict,
++                        pci_strict=pci_strict))
+             if not instance_topology:
+                 LOG.debug("%(host)s, %(node)s fails NUMA topology "
+                           "requirements. The instance does not fit on this "
+diff --git a/nova/scheduler/host_manager.py b/nova/scheduler/host_manager.py
+index 94fb08f..a4f1e42 100644
+--- a/nova/scheduler/host_manager.py
++++ b/nova/scheduler/host_manager.py
+@@ -324,6 +324,11 @@ class HostState(object):
+         else:
+             pci_requests = None
+ 
++        # Support strict vs prefer allocation of PCI devices.
++        pci_numa_affinity = extra_specs.get('hw:wrs:pci_numa_affinity',
++            'strict')
++        pci_strict = False if pci_numa_affinity == 'prefer' else True
++
+         # Calculate the numa usage
+         host_numa_topology, _fmt = hardware.host_topology_and_format_from_host(
+                                 self)
+@@ -337,12 +342,14 @@ class HostState(object):
+             limits=self.limits.get('numa_topology'),
+             metrics=self.metrics,
+             pci_requests=pci_requests, pci_stats=self.pci_stats,
+-            vswitch_strict=vswitch_strict)
++            vswitch_strict=vswitch_strict, pci_strict=pci_strict)
+         if pci_requests:
+             instance_cells = None
+             if spec_obj.numa_topology:
+                 instance_cells = spec_obj.numa_topology.cells
+-            self.pci_stats.apply_requests(pci_requests, instance_cells)
++            self.pci_stats.apply_requests(pci_requests,
++                                          instance_cells,
++                                          pci_strict=pci_strict)
+ 
+         # NOTE(sbauza): Yeah, that's crap. We should get rid of all of those
+         # NUMA helpers because now we're 100% sure that spec_obj.numa_topology
+diff --git a/nova/tests/unit/compute/test_resource_tracker.py b/nova/tests/unit/compute/test_resource_tracker.py
+index a408d3e..f78a4d7 100644
+--- a/nova/tests/unit/compute/test_resource_tracker.py
++++ b/nova/tests/unit/compute/test_resource_tracker.py
+@@ -1515,9 +1515,11 @@ class TestInstanceClaim(BaseTestCase):
+ 
+     @mock.patch('nova.pci.stats.PciDeviceStats.support_requests',
+                 return_value=True)
++    @mock.patch('nova.pci.manager.PciDevTracker.claim_instance')
+     @mock.patch('nova.objects.InstancePCIRequests.get_by_instance_uuid')
+     @mock.patch('nova.objects.MigrationList.get_in_progress_by_host_and_node')
+-    def test_claim_with_pci(self, migr_mock, pci_mock, pci_stats_mock):
++    def test_claim_with_pci(self, migr_mock, pci_mock,
++                            pci_claim_mock, pci_stats_mock):
+         # Test that a claim involving PCI requests correctly claims
+         # PCI devices on the host and sends an updated pci_device_pools
+         # attribute of the ComputeNode object.
+@@ -1526,6 +1528,9 @@ class TestInstanceClaim(BaseTestCase):
+         # upon the resource tracker being initialized...
+         self.rt.pci_tracker = pci_manager.PciDevTracker(mock.sentinel.ctx)
+ 
++        pci_pools = objects.PciDevicePoolList()
++        pci_claim_mock.return_value = pci_pools
++
+         pci_dev = pci_device.PciDevice.create(
+             None, fake_pci_device.dev_dict)
+         pci_devs = [pci_dev]
+@@ -1549,7 +1554,7 @@ class TestInstanceClaim(BaseTestCase):
+             "free_ram_mb": expected.memory_mb - self.instance.memory_mb,
+             'running_vms': 1,
+             'vcpus_used': 1 / self.rt.cpu_allocation_ratio,
+-            'pci_device_pools': objects.PciDevicePoolList(),
++            'pci_device_pools': pci_pools,
+         }
+         _update_compute_node(expected, **vals)
+         with mock.patch.object(self.rt, '_update') as update_mock:
+@@ -1558,6 +1563,10 @@ class TestInstanceClaim(BaseTestCase):
+                                        None)
+             cn = self.rt.compute_nodes[_NODENAME]
+             update_mock.assert_called_once_with(self.elevated, cn)
++            pci_claim_mock.assert_called_once_with(self.ctx,
++                                                   self.instance,
++                                                   pci_requests,
++                                                   None)
+             pci_stats_mock.assert_called_once_with([request])
+             self.assertTrue(obj_base.obj_equal_prims(expected, cn))
+ 
+@@ -2027,8 +2036,8 @@ class TestResize(BaseTestCase):
+         ) as (alloc_mock, create_mig_mock, ctxt_mock, inst_save_mock):
+             self.rt.resize_claim(ctx, instance, new_flavor, _NODENAME)
+ 
+-        pci_claim_mock.assert_called_once_with(ctx, pci_req_mock.return_value,
+-                                               None)
++        pci_claim_mock.assert_called_once_with(ctx, instance,
++                                               pci_req_mock.return_value, None)
+         # Validate that the pci.request.get_pci_request_from_flavor() return
+         # value was merged with the instance PCI requests from the Instance
+         # itself that represent the SR-IOV devices from the original host.
+diff --git a/nova/tests/unit/pci/test_manager.py b/nova/tests/unit/pci/test_manager.py
+index b9dd550..d5ecdd8 100644
+--- a/nova/tests/unit/pci/test_manager.py
++++ b/nova/tests/unit/pci/test_manager.py
+@@ -173,6 +173,8 @@ class PciDevTrackerTestCase(test.NoDBTestCase):
+         self.inst.numa_topology = None
+         self.inst.host = "fakehost"
+         self.inst.node = "fakenode"
++        self.inst.flavor = objects.Flavor()
++        self.inst.new_flavor = objects.Flavor()
+ 
+     def _fake_get_pci_devices(self, ctxt, node_id):
+         return self.fake_devs
+@@ -382,6 +384,7 @@ class PciDevTrackerTestCase(test.NoDBTestCase):
+         pci_requests_obj = self._create_pci_requests_object(
+             [{'count': 1, 'spec': [{'vendor_id': 'v1'}]}])
+         self.tracker.claim_instance(mock.sentinel.context,
++                                    self.inst,
+                                     pci_requests_obj, None)
+         fake_pci_3 = dict(fake_pci, address='0000:00:00.2', vendor_id='v2')
+         fake_pci_devs = [copy.deepcopy(fake_pci), copy.deepcopy(fake_pci_2),
+@@ -393,6 +396,7 @@ class PciDevTrackerTestCase(test.NoDBTestCase):
+     def test_update_pci_for_instance_active(self):
+         pci_requests_obj = self._create_pci_requests_object(fake_pci_requests)
+         self.tracker.claim_instance(mock.sentinel.context,
++                                    self.inst,
+                                     pci_requests_obj, None)
+         self.assertEqual(len(self.tracker.claims[self.inst['uuid']]), 2)
+         self.tracker.update_pci_for_instance(None, self.inst, sign=1)
+@@ -405,14 +409,11 @@ class PciDevTrackerTestCase(test.NoDBTestCase):
+         pci_requests = copy.deepcopy(fake_pci_requests)
+         pci_requests[0]['count'] = 4
+         pci_requests_obj = self._create_pci_requests_object(pci_requests)
+-        self.tracker.claim_instance(mock.sentinel.context,
+-                                    pci_requests_obj, None)
+-        self.assertEqual(len(self.tracker.claims[self.inst['uuid']]), 0)
+-        devs = self.tracker.update_pci_for_instance(None,
+-                                                    self.inst,
+-                                                    sign=1)
+-        self.assertEqual(len(self.tracker.allocations[self.inst['uuid']]), 0)
+-        self.assertIsNone(devs)
++        self.assertRaises(exception.PciDeviceRequestFailed,
++                          self.tracker.claim_instance,
++                          mock.sentinel.context,
++                          self.inst,
++                          pci_requests_obj, None)
+ 
+     def test_pci_claim_instance_with_numa(self):
+         fake_db_dev_3 = dict(fake_db_dev_1, id=4, address='0000:00:00.4')
+@@ -427,6 +428,7 @@ class PciDevTrackerTestCase(test.NoDBTestCase):
+                     cells=[objects.InstanceNUMACell(
+                         id=1, cpuset=set([1, 2]), memory=512)])
+         self.tracker.claim_instance(mock.sentinel.context,
++                                    self.inst,
+                                     pci_requests_obj,
+                                     self.inst.numa_topology)
+         free_devs = self.tracker.pci_stats.get_free_devs()
+@@ -439,14 +441,17 @@ class PciDevTrackerTestCase(test.NoDBTestCase):
+         self.inst.numa_topology = objects.InstanceNUMATopology(
+                     cells=[objects.InstanceNUMACell(
+                         id=1, cpuset=set([1, 2]), memory=512)])
+-        self.assertIsNone(self.tracker.claim_instance(
+-                            mock.sentinel.context,
+-                            pci_requests_obj,
+-                            self.inst.numa_topology))
++        self.assertRaises(exception.PciDeviceRequestFailed,
++                          self.tracker.claim_instance,
++                          mock.sentinel.context,
++                          self.inst,
++                          pci_requests_obj,
++                          self.inst.numa_topology)
+ 
+     def test_update_pci_for_instance_deleted(self):
+         pci_requests_obj = self._create_pci_requests_object(fake_pci_requests)
+         self.tracker.claim_instance(mock.sentinel.context,
++                                    self.inst,
+                                     pci_requests_obj, None)
+         free_devs = self.tracker.pci_stats.get_free_devs()
+         self.assertEqual(len(free_devs), 1)
+@@ -499,12 +504,14 @@ class PciDevTrackerTestCase(test.NoDBTestCase):
+         pci_requests_obj = self._create_pci_requests_object(
+             [{'count': 1, 'spec': [{'vendor_id': 'v'}]}])
+         self.tracker.claim_instance(mock.sentinel.context,
++                                    self.inst,
+                                     pci_requests_obj, None)
+         self.tracker.update_pci_for_instance(None, self.inst, sign=1)
+         pci_requests_obj = self._create_pci_requests_object(
+             [{'count': 1, 'spec': [{'vendor_id': 'v1'}]}],
+             instance_uuid=inst_2.uuid)
+         self.tracker.claim_instance(mock.sentinel.context,
++                                    inst_2,
+                                     pci_requests_obj, None)
+         self.tracker.update_pci_for_instance(None, inst_2, sign=1)
+         free_devs = self.tracker.pci_stats.get_free_devs()
+@@ -538,6 +545,7 @@ class PciDevTrackerTestCase(test.NoDBTestCase):
+         pci_requests_obj = self._create_pci_requests_object(
+             [{'count': 1, 'spec': [{'vendor_id': 'v'}]}])
+         self.tracker.claim_instance(mock.sentinel.context,
++                                    self.inst,
+                                     pci_requests_obj, None)
+         self.tracker.update_pci_for_instance(None, self.inst, sign=1)
+ 
+@@ -552,7 +560,7 @@ class PciDevTrackerTestCase(test.NoDBTestCase):
+         pci_requests_obj = self._create_pci_requests_object(
+             [{'count': 1, 'spec': [{'vendor_id': 'v'}]}])
+         self.tracker.claim_instance(mock.sentinel.context,
+-                                    pci_requests_obj, None)
++                                    self.inst, pci_requests_obj, None)
+         self.tracker.update_pci_for_instance(None, self.inst, sign=1)
+         free_pci_device_ids = (
+             [dev.id for dev in self.tracker.pci_stats.get_free_devs()])
+@@ -583,12 +591,14 @@ class PciDevTrackerTestCase(test.NoDBTestCase):
+ 
+         pci_requests_obj = self._create_pci_requests_object(
+             [{'count': 1, 'spec': [{'vendor_id': 'v'}]}], self.inst.uuid)
+-        self.tracker.claim_instance(mock.sentinel.context, pci_requests_obj,
++        self.tracker.claim_instance(mock.sentinel.context,
++                                    self.inst, pci_requests_obj,
+                                     None)
+         self.tracker.update_pci_for_instance(None, self.inst, sign=1)
+         pci_requests_obj = self._create_pci_requests_object(
+             [{'count': 1, 'spec': [{'vendor_id': 'v1'}]}], inst_2.uuid)
+-        self.tracker.claim_instance(mock.sentinel.context, pci_requests_obj,
++        self.tracker.claim_instance(mock.sentinel.context,
++                                    inst_2, pci_requests_obj,
+                                     None)
+         self.tracker.update_pci_for_instance(None, inst_2, sign=1)
+         free_devs = self.tracker.pci_stats.get_free_devs()
+diff --git a/nova/tests/unit/pci/test_stats.py b/nova/tests/unit/pci/test_stats.py
+index 31795d9..ba4fc02 100644
+--- a/nova/tests/unit/pci/test_stats.py
++++ b/nova/tests/unit/pci/test_stats.py
+@@ -164,8 +164,9 @@ class PciDeviceStatsTestCase(test.NoDBTestCase):
+         self.assertEqual(0, len(devs))
+ 
+     def test_consume_requests_failed(self):
+-        self.assertIsNone(self.pci_stats.consume_requests(
+-                          pci_requests_multiple))
++        self.assertRaises(exception.PciDeviceRequestFailed,
++                          self.pci_stats.consume_requests,
++                          pci_requests_multiple)
+ 
+     def test_support_requests_numa(self):
+         cells = [objects.InstanceNUMACell(id=0, cpuset=set(), memory=0),
+@@ -192,7 +193,10 @@ class PciDeviceStatsTestCase(test.NoDBTestCase):
+ 
+     def test_consume_requests_numa_failed(self):
+         cells = [objects.InstanceNUMACell(id=0, cpuset=set(), memory=0)]
+-        self.assertIsNone(self.pci_stats.consume_requests(pci_requests, cells))
++        self.assertRaises(exception.PciDeviceRequestFailed,
++                          self.pci_stats.consume_requests,
++                          pci_requests,
++                          cells)
+ 
+     def test_consume_requests_no_numa_info(self):
+         cells = [objects.InstanceNUMACell(id=0, cpuset=set(), memory=0)]
+@@ -274,16 +278,17 @@ class PciDeviceStatsWithTagsTestCase(test.NoDBTestCase):
+         # they are also part of the keys. In this test class, we have
+         # two pools with the second one having the tag 'physical_network'
+         # and the value 'physnet1'
++        # Sort function is different than upstream.
+         self.assertEqual(2, len(self.pci_stats.pools))
+-        self._assertPoolContent(self.pci_stats.pools[0], '1137', '0072',
+-                                len(self.pci_untagged_devices))
+-        self.assertEqual(self.pci_untagged_devices,
+-                         self.pci_stats.pools[0]['devices'])
+-        self._assertPoolContent(self.pci_stats.pools[1], '1137', '0071',
++        self._assertPoolContent(self.pci_stats.pools[0], '1137', '0071',
+                                 len(self.pci_tagged_devices),
+                                 physical_network='physnet1')
+         self.assertEqual(self.pci_tagged_devices,
+-                         self.pci_stats.pools[1]['devices'])
++        self.pci_stats.pools[0]['devices'])
++        self._assertPoolContent(self.pci_stats.pools[1], '1137', '0072',
++                                len(self.pci_untagged_devices))
++        self.assertEqual(self.pci_untagged_devices,
++        self.pci_stats.pools[1]['devices'])
+ 
+     def test_add_devices(self):
+         self._create_pci_devices()
+@@ -300,9 +305,10 @@ class PciDeviceStatsWithTagsTestCase(test.NoDBTestCase):
+         self.assertEqual(2, len(devs))
+         self.assertEqual(set(['0071', '0072']),
+                          set([dev.product_id for dev in devs]))
+-        self._assertPoolContent(self.pci_stats.pools[0], '1137', '0072', 2)
+-        self._assertPoolContent(self.pci_stats.pools[1], '1137', '0071', 3,
++        # Sort function is different than upstream.
++        self._assertPoolContent(self.pci_stats.pools[0], '1137', '0071', 3,
+                                 physical_network='physnet1')
++        self._assertPoolContent(self.pci_stats.pools[1], '1137', '0072', 2)
+ 
+     def test_add_device_no_devspec(self):
+         self._create_pci_devices()
+@@ -437,10 +443,14 @@ class PciDeviceVFPFStatsTestCase(test.NoDBTestCase):
+                         objects.InstancePCIRequest(count=1,
+                             spec=[{'product_id': '1528',
+                                     'dev_type': 'type-PF'}])]
+-        self.assertIsNone(self.pci_stats.consume_requests(pci_requests))
++        self.assertRaises(exception.PciDeviceRequestFailed,
++                          self.pci_stats.consume_requests,
++                          pci_requests)
+ 
+     def test_consume_VF_and_PF_same_prodict_id_failed(self):
+         self._create_pci_devices(pf_product_id=1515)
+         pci_requests = [objects.InstancePCIRequest(count=9,
+                             spec=[{'product_id': '1515'}])]
+-        self.assertIsNone(self.pci_stats.consume_requests(pci_requests))
++        self.assertRaises(exception.PciDeviceRequestFailed,
++                          self.pci_stats.consume_requests,
++                          pci_requests)
+diff --git a/nova/tests/unit/scheduler/test_host_manager.py b/nova/tests/unit/scheduler/test_host_manager.py
+index 037b20e..d8335ba 100644
+--- a/nova/tests/unit/scheduler/test_host_manager.py
++++ b/nova/tests/unit/scheduler/test_host_manager.py
+@@ -1229,14 +1229,15 @@ class HostStateTestCase(test.NoDBTestCase):
+ 
+         self.assertIsNone(host.updated)
+         host.consume_from_request(spec_obj)
+-        # - pass through metrics, strict vswitch
++        # - pass through metrics, strict vswitch, strict avs/pci
+         numa_fit_mock.assert_called_once_with(fake_host_numa_topology,
+                                               fake_numa_topology,
+                                               limits=None,
+                                               metrics=None,
+                                               pci_requests=None,
+                                               pci_stats=None,
+-                                              vswitch_strict=False)
++                                              vswitch_strict=False,
++                                              pci_strict=True)
+         numa_usage_mock.assert_called_once_with(host, fake_instance,
+                                                 strict=True)
+         sync_mock.assert_called_once_with(("fakehost", "fakenode"))
+diff --git a/nova/virt/hardware.py b/nova/virt/hardware.py
+index 414723a..ec2d167 100644
+--- a/nova/virt/hardware.py
++++ b/nova/virt/hardware.py
+@@ -2003,11 +2003,8 @@ def _numa_fit_instance_to_host(host_topology, instance_topology, limits,
+                     cells=cells,
+                     emulator_threads_policy=emulator_threads_policy)
+             elif pci_stats is not None:
+-                # TO DO: put back if statement in place when
+-                #        adding pci_strict feature
+-                # if pci_stats.support_requests(pci_requests, cells,
+-                #                              pci_strict=pci_strict):
+-                if pci_stats.support_requests(pci_requests, cells):
++                if pci_stats.support_requests(pci_requests, cells,
++                                              pci_strict=pci_strict):
+                     return objects.InstanceNUMATopology(
+                         cells=cells,
+                         emulator_threads_policy=emulator_threads_policy)
+-- 
+2.7.4
+

@@ -1,0 +1,544 @@
+From d80928ca94c95db726511908d54daf0865bbc473 Mon Sep 17 00:00:00 2001
+From: "Beliveau, Ludovic" <Ludovic.Beliveau@windriver.com>
+Date: Tue, 12 May 2015 11:30:47 -0400
+Subject: [PATCH] PCI passthrough with DHCP support
+
+This commit enables support for DHCP request on PCI passthrough interface.
+Without this commit, an fa:16 MAC address is allocated to the neutron port
+for the PCI passthrough interface.  From the host it's not possible to
+change the MAC address of the guest interface.  In the guest, when the
+interface is brought up it takes the MAC address of the NIC.  For this reason,
+when building (or rebuilding) and instance with PCI passthrough, we force the
+MAC address to be the same than the NIC.
+
+This commit is a port of commit 706f3f
+
+Conflicts:
+	nova/network/neutronv2/api.py
+---
+ nova/compute/manager.py       | 59 +++++++++++++++++++++++++++-
+ nova/conductor/api.py         |  5 +++
+ nova/conductor/manager.py     |  3 ++
+ nova/conductor/rpcapi.py      |  6 +++
+ nova/network/neutronv2/api.py | 90 +++++++++++++++++++++++++++++--------------
+ nova/pci/manager.py           |  8 +++-
+ nova/virt/driver.py           | 12 +++---
+ nova/virt/libvirt/config.py   |  3 ++
+ nova/virt/libvirt/driver.py   | 48 +++++++++++++++++++++++
+ 9 files changed, 198 insertions(+), 36 deletions(-)
+
+diff --git a/nova/compute/manager.py b/nova/compute/manager.py
+index 4c3bd0e..82875f7 100644
+--- a/nova/compute/manager.py
++++ b/nova/compute/manager.py
+@@ -1538,6 +1538,18 @@ class ComputeManager(manager.Manager):
+ 
+         _do_validation(context, instance, group_hint)
+ 
++    def _get_vif_models_from_requested_networks(self, requested_networks=[]):
++        vif_models = []
++        for net in requested_networks:
++            vif_models.append(net.vif_model)
++        return vif_models
++
++    def _get_vif_models(self, network_info=[]):
++        vif_models = []
++        for vif in network_info:
++            vif_models.append(vif.get('vif_model'))
++        return vif_models
++
+     def _build_instance(self, context, request_spec, filter_properties,
+             requested_networks, injected_files, admin_password, is_first_time,
+             node, instance, image_meta, legacy_bdm_in_spec):
+@@ -1581,7 +1593,10 @@ class ComputeManager(manager.Manager):
+                 # the host is set on the instance.
+                 self._validate_instance_group_policy(context, instance,
+                         filter_properties)
+-                macs = self.driver.macs_for_instance(instance)
++                macs = self.driver.macs_for_instance(
++                    instance, self._get_vif_models_from_requested_networks(
++                        requested_networks))
++                LOG.debug("_build_instance macs={}".format(macs))
+                 dhcp_options = self.driver.dhcp_options_for_instance(instance)
+ 
+                 network_info = self._allocate_network(original_context,
+@@ -1868,7 +1883,12 @@ class ComputeManager(manager.Manager):
+         if not self.is_neutron_security_groups:
+             security_groups = []
+ 
+-        macs = self.driver.macs_for_instance(instance)
++        # Get an updated set of MAC address in case this instance has PCI
++        # passthrough devices attached.
++        macs = self.driver.macs_for_instance(
++            instance, self._get_vif_models_from_requested_networks(
++                requested_networks))
++        LOG.debug("_build_networks_for_instance macs={}".format(macs))
+         dhcp_options = self.driver.dhcp_options_for_instance(instance)
+         network_info = self._allocate_network(context, instance,
+                 requested_networks, macs, security_groups, dhcp_options)
+@@ -3107,6 +3127,16 @@ class ComputeManager(manager.Manager):
+             instance.task_state = task_states.REBUILDING
+             instance.save(expected_task_state=[task_states.REBUILDING])
+ 
++            # Get an updated set of MAC address in case this instance has PCI
++            # passthrough devices attached.
++            network_info = self._get_instance_nw_info(context, instance)
++            macs = self.driver.macs_for_instance(
++                instance, self._get_vif_models(network_info))
++            LOG.debug("rebuild_instance macs={}".format(macs))
++            network_info = self.network_api.update_instance_nw_info(context,
++                                                                    instance,
++                                                                    macs)
++
+             if recreate:
+                 # Needed for nova-network, does nothing for neutron
+                 self.network_api.setup_networks_on_host(
+@@ -3933,6 +3963,14 @@ class ComputeManager(manager.Manager):
+             instance.launched_at = timeutils.utcnow()
+             instance.save(expected_task_state=task_states.RESIZE_REVERTING)
+ 
++            # Update MAC addresses for PCI passthrough devices
++            macs = self.driver.macs_for_instance(
++                instance, self._get_vif_models(network_info))
++            network_info = self.network_api.update_instance_nw_info(context,
++                                                                    instance,
++                                                                    macs)
++            LOG.debug("finish_revert_resize macs={}".format(macs))
++
+             migration_p = obj_base.obj_to_primitive(migration)
+             self.network_api.migrate_instance_finish(context,
+                                                      instance,
+@@ -4209,6 +4247,15 @@ class ComputeManager(manager.Manager):
+             self._set_instance_info(instance, instance_type)
+             resize_instance = True
+ 
++        # Update MAC addresses for PCI passthrough devices
++        network_info = self._get_instance_nw_info(context, instance)
++        macs = self.driver.macs_for_instance(
++            instance, self._get_vif_models(network_info))
++        network_info = self.network_api.update_instance_nw_info(context,
++                                                                instance,
++                                                                macs)
++        LOG.debug("_finish_resize macs={}".format(macs))
++
+         # NOTE(tr3buchet): setup networks on destination host
+         self.network_api.setup_networks_on_host(context, instance,
+                                                 migration['dest_compute'])
+@@ -5645,7 +5692,15 @@ class ComputeManager(manager.Manager):
+                                                  instance,
+                                                  net_migration)
+ 
++        # Update MAC addresses for PCI passthrough devices
+         network_info = self._get_instance_nw_info(context, instance)
++        macs = self.driver.macs_for_instance(
++            instance, self._get_vif_models(network_info))
++        network_info = self.network_api.update_instance_nw_info(context,
++                                                                instance,
++                                                                macs)
++        LOG.debug("post_live_migration_at_destination macs={}".format(macs))
++
+         self._notify_about_instance_usage(
+                      context, instance, "live_migration.post.dest.start",
+                      network_info=network_info)
+diff --git a/nova/conductor/api.py b/nova/conductor/api.py
+index de002f4..087840b 100644
+--- a/nova/conductor/api.py
++++ b/nova/conductor/api.py
+@@ -193,6 +193,11 @@ class LocalAPI(object):
+     def object_backport(self, context, objinst, target_version):
+         return self._manager.object_backport(context, objinst, target_version)
+ 
++    def network_update_instance_nw_info(self, context, instance, macs):
++        return self._manager.network_update_instance_nw_info(context,
++                                                             instance,
++                                                             macs)
++
+ 
+ class LocalComputeTaskAPI(object):
+     def __init__(self):
+diff --git a/nova/conductor/manager.py b/nova/conductor/manager.py
+index 0f20e66..e61a207 100644
+--- a/nova/conductor/manager.py
++++ b/nova/conductor/manager.py
+@@ -463,6 +463,9 @@ class ConductorManager(manager.Manager):
+     def object_backport(self, context, objinst, target_version):
+         return objinst.obj_to_primitive(target_version=target_version)
+ 
++    def network_update_instance_nw_info(self, context, instance, macs):
++        self.network_api.update_instance_nw_info(context, instance, macs)
++
+ 
+ class ComputeTaskManager(base.Base):
+     """Namespace for compute methods.
+diff --git a/nova/conductor/rpcapi.py b/nova/conductor/rpcapi.py
+index 91a06f8..31f8213 100644
+--- a/nova/conductor/rpcapi.py
++++ b/nova/conductor/rpcapi.py
+@@ -344,6 +344,12 @@ class ConductorAPI(object):
+         return cctxt.call(context, 'object_backport', objinst=objinst,
+                           target_version=target_version)
+ 
++    def network_update_instance_nw_info(self, context, instance, macs):
++        instance_p = jsonutils.to_primitive(instance)
++        cctxt = self.client.prepare()
++        return cctxt.call(context, 'network_update_instance_nw_info',
++                          instance=instance_p, macs=macs)
++
+ 
+ class ComputeTaskAPI(object):
+     """Client side of the conductor 'compute' namespaced RPC API
+diff --git a/nova/network/neutronv2/api.py b/nova/network/neutronv2/api.py
+index 84bc915..b66e34c 100644
+--- a/nova/network/neutronv2/api.py
++++ b/nova/network/neutronv2/api.py
+@@ -141,6 +141,8 @@ LOG = logging.getLogger(__name__)
+ soft_external_network_attach_authorize = extensions.soft_core_authorizer(
+     'network', 'attach_external_network')
+ 
++update_instance_info_cache = base_api.update_instance_cache_with_nw_info
++
+ _SESSION = None
+ _ADMIN_AUTH = None
+ 
+@@ -271,7 +273,7 @@ class API(base_api.NetworkAPI):
+ 
+     def _create_port(self, port_client, instance, network_id, port_req_body,
+                      fixed_ip=None, security_group_ids=None,
+-                     available_macs=None, dhcp_opts=None):
++                     dhcp_opts=None):
+         """Attempts to create a port for the instance on the given network.
+ 
+         :param port_client: The client to use to create the port.
+@@ -282,8 +284,6 @@ class API(base_api.NetworkAPI):
+         :param fixed_ip: Optional fixed IP to use from the given network.
+         :param security_group_ids: Optional list of security group IDs to
+             apply to the port.
+-        :param available_macs: Optional set of available MAC addresses,
+-            from which one will be used at random.
+         :param dhcp_opts: Optional DHCP options.
+         :returns: ID of the created port.
+         :raises PortLimitExceeded: If neutron fails with an OverQuota error.
+@@ -299,12 +299,6 @@ class API(base_api.NetworkAPI):
+             port_req_body['port']['tenant_id'] = instance.project_id
+             if security_group_ids:
+                 port_req_body['port']['security_groups'] = security_group_ids
+-            if available_macs is not None:
+-                if not available_macs:
+-                    raise exception.PortNotFree(
+-                        instance=instance.uuid)
+-                mac_address = available_macs.pop()
+-                port_req_body['port']['mac_address'] = mac_address
+             if dhcp_opts is not None:
+                 port_req_body['port']['extra_dhcp_opts'] = dhcp_opts
+             port_id = port_client.create_port(port_req_body)['port']['id']
+@@ -325,12 +319,6 @@ class API(base_api.NetworkAPI):
+             LOG.warning(_LW('Neutron error: No more fixed IPs in network: %s'),
+                         network_id, instance=instance)
+             raise exception.NoMoreFixedIps(net=network_id)
+-        except neutron_client_exc.MacAddressInUseClient:
+-            LOG.warning(_LW('Neutron error: MAC address %(mac)s is already '
+-                            'in use on network %(network)s.') %
+-                        {'mac': mac_address, 'network': network_id},
+-                        instance=instance)
+-            raise exception.PortInUse(port_id=mac_address)
+         except neutron_client_exc.NeutronClientException:
+             with excutils.save_and_reraise_exception():
+                 LOG.exception(_LE('Neutron error creating port on network %s'),
+@@ -374,6 +362,20 @@ class API(base_api.NetworkAPI):
+                 LOG.exception(_LE("Unable to clear device ID "
+                                   "for port '%s'"), port_id)
+ 
++    def _get_next_mac_address(self, instance, available_macs=None):
++        if available_macs is not None:
++            # A list of MAC addresses was provided.  The list is an ordered
++            # list of MAC addresses to be used on the corresponding requested
++            # network
++            if not available_macs:
++                # No remaining addresses
++                raise exception.PortNotFree(instance=instance['display_name'])
++            mac_address = available_macs.pop(0)
++            if not mac_address.startswith('auto'):
++                # Specific MAC address must be used
++                return mac_address
++        return None
++
+     def allocate_for_instance(self, context, instance, **kwargs):
+         """Allocate network resources for the instance.
+ 
+@@ -402,7 +404,8 @@ class API(base_api.NetworkAPI):
+             # Make a copy we can mutate: records macs that have not been used
+             # to create a port on a network. If we find a mac with a
+             # pre-allocated port we also remove it from this set.
+-            available_macs = set(hypervisor_macs)
++            # available_macs = set(hypervisor_macs)
++            available_macs = hypervisor_macs
+ 
+         # The neutron client and port_client (either the admin context or
+         # tenant context) are read here. The reason for this is that there are
+@@ -441,16 +444,13 @@ class API(base_api.NetworkAPI):
+                     if port.get('device_id'):
+                         raise exception.PortInUse(port_id=request.port_id)
+                     if hypervisor_macs is not None:
+-                        if port['mac_address'] not in hypervisor_macs:
++                        if ((hypervisor_macs[request.index] != "auto") and
++                            (port['mac_address'] !=
++                                hypervisor_macs[request.index])):
+                             raise exception.PortNotUsable(
+                                 port_id=request.port_id,
+                                 instance=instance.uuid)
+-                        else:
+-                            # Don't try to use this MAC if we need to create a
+-                            # port on the fly later. Identical MACs may be
+-                            # configured by users into multiple ports so we
+-                            # discard rather than popping.
+-                            available_macs.discard(port['mac_address'])
++
+                     request.network_id = port['network_id']
+                     ports[request.port_id] = port
+                 if request.network_id:
+@@ -565,10 +565,12 @@ class API(base_api.NetworkAPI):
+             if request.vif_model == 'pci-sriov':
+                 port_req_body['port'].update({'binding:vnic_type': 'direct'})
+             try:
++                mac = self._get_next_mac_address(instance, available_macs)
+                 self._populate_neutron_extension_values(context,
+                                                         instance,
+                                                         request.pci_request_id,
+                                                         port_req_body,
++                                                        mac,
+                                                         neutron=neutron)
+                 if request.port_id:
+                     port = ports[request.port_id]
+@@ -579,7 +581,7 @@ class API(base_api.NetworkAPI):
+                     created_port = self._create_port(
+                             port_client, instance, request.network_id,
+                             port_req_body, request.address,
+-                            security_group_ids, available_macs, dhcp_opts)
++                            security_group_ids, dhcp_opts)
+                     created_port_ids.append(created_port)
+                     ports_in_requested_order.append(created_port)
+             except Exception:
+@@ -641,7 +643,7 @@ class API(base_api.NetworkAPI):
+ 
+     def _populate_neutron_extension_values(self, context, instance,
+                                            pci_request_id, port_req_body,
+-                                           neutron=None):
++                                           mac, neutron=None):
+         """Populate neutron extension values for the instance.
+ 
+         If the extensions loaded contain QOS_QUEUE then pass the rxtx_factor.
+@@ -656,6 +658,8 @@ class API(base_api.NetworkAPI):
+             self._populate_neutron_binding_profile(instance,
+                                                    pci_request_id,
+                                                    port_req_body)
++        if mac:
++            port_req_body['port']['mac_address'] = mac
+ 
+     def _delete_ports(self, neutron, instance, ports, raise_if_fail=False):
+         exceptions = []
+@@ -747,6 +751,29 @@ class API(base_api.NetworkAPI):
+         except neutron_client_exc.Unauthorized:
+             raise exception.Forbidden()
+ 
++    def update_instance_nw_info(self, context, instance, macs=None):
++        """Update attributes of the instance network info cache.
++        """
++        # Get the current cache contents
++        network_cache = self._get_instance_nw_info(context, instance)
++        if not macs:
++            # For now, mac_address is the only supported attribute
++            return network_cache
++
++        updated = True
++        for index, iface in enumerate(network_cache):
++            if iface['vif_model'] in ['pci-passthrough']:
++                LOG.debug("updating {} cached MAC for nic{} "
++                          "from {} to {}".format(
++                        instance['uuid'], index,
++                        iface['address'], macs[index]))
++                network_cache[index].update({'address': macs[index]})
++                updated = True
++        if updated:
++            update_instance_info_cache(self, context, instance, network_cache,
++                                       update_cells=False)
++        return network_cache
++
+     def get_instance_nw_info(self, context, instance, networks=None,
+                              port_ids=None, use_slave=False,
+                              admin_client=None,
+@@ -1730,12 +1757,19 @@ class API(base_api.NetworkAPI):
+                                'pci_slot': pci_dev.address,
+                                'physical_network':
+                                     devspec.get_tags().get('physical_network')}
+-
+-                    LOG.info("Updating PCI binding %s for port %s" %
+-                             (profile, p['id']))
+                     updates.update({'binding:profile': profile})
+ 
++                if p.get(constants.PORT_VIF_MODEL) == 'pci-passthrough':
++                    inst = objects.Instance.get_by_uuid(context,
++                                                        instance['uuid'])
++                    for vif in inst.info_cache.network_info:
++                        if vif.get('id') == p.get('id'):
++                            updates.update({'mac_address': vif.get('address')})
++                            break;
++
+             if updates:
++                LOG.info("Updating port %s with attributes %s" % (p['id'],
++                                                                  updates))
+                 try:
+                     neutron.update_port(p['id'], {'port': updates})
+                 except Exception:
+diff --git a/nova/pci/manager.py b/nova/pci/manager.py
+index 172d088..fe5287d 100644
+--- a/nova/pci/manager.py
++++ b/nova/pci/manager.py
+@@ -20,6 +20,7 @@ from oslo_log import log as logging
+ 
+ from nova.compute import task_states
+ from nova.compute import vm_states
++from nova import context
+ from nova import exception
+ from nova.i18n import _LW
+ from nova import objects
+@@ -288,7 +289,12 @@ def get_instance_pci_devs(inst, request_id=None):
+       instance need to be returned. Refer to libvirt driver that handles
+       soft_reboot and hard_boot of 'xen' instances.
+     """
++    ctxt = context.get_admin_context()
++    node = objects.ComputeNode.get_by_host_and_nodename(ctxt,
++                                                        inst.host,
++                                                        inst.node)
+     pci_devices = inst.pci_devices
+     return [device for device in pci_devices if
+                    (device.request_id == request_id or request_id == 'all')
+-            and device.status == 'allocated']
++            and device.status == 'allocated'
++            and device.compute_node_id == node.id]
+diff --git a/nova/virt/driver.py b/nova/virt/driver.py
+index 92533ed..3caa8d3 100644
+--- a/nova/virt/driver.py
++++ b/nova/virt/driver.py
+@@ -1106,7 +1106,7 @@ class ComputeDriver(object):
+         """Does the driver want networks deallocated on reschedule?"""
+         return False
+ 
+-    def macs_for_instance(self, instance):
++    def macs_for_instance(self, instance, vif_models=[]):
+         """What MAC addresses must this instance have?
+ 
+         Some hypervisors (such as bare metal) cannot do freeform virtualisation
+@@ -1125,13 +1125,15 @@ class ComputeDriver(object):
+         Hypervisors with MAC limits should return a set of MAC addresses, which
+         will be supplied to the allocate_for_instance call by the compute
+         manager, and it is up to that call to ensure that all assigned network
+-        details are compatible with the set of MAC addresses.
++        details are compatible with the list of MAC addresses.
+ 
+         This is called during spawn_instance by the compute manager.
+ 
+-        :return: None, or a set of MAC ids (e.g. set(['12:34:56:78:90:ab'])).
+-            None means 'no constraints', a set means 'these and only these
+-            MAC addresses'.
++        :return: None, or a list of MAC ids (e.g. ['12:34:56:78:90:ab']).
++            None means 'no constraints', a list means 'these and only these
++            MAC addresses'.  If any entry in the list starts with 'auto' then
++            the hypervisor may automatically assign a MAC address for the
++            corresponding requested_network
+         """
+         return None
+ 
+diff --git a/nova/virt/libvirt/config.py b/nova/virt/libvirt/config.py
+index 04fca64..bb3deae 100644
+--- a/nova/virt/libvirt/config.py
++++ b/nova/virt/libvirt/config.py
+@@ -2006,6 +2006,7 @@ class LibvirtConfigNodeDevice(LibvirtConfigObject):
+         self.name = None
+         self.parent = None
+         self.driver = None
++        self.path = None
+         self.pci_capability = None
+ 
+     def parse_dom(self, xmldoc):
+@@ -2014,6 +2015,8 @@ class LibvirtConfigNodeDevice(LibvirtConfigObject):
+         for c in xmldoc.getchildren():
+             if c.tag == "name":
+                 self.name = c.text
++            elif c.tag == "path":
++                self.path = c.text
+             elif c.tag == "parent":
+                 self.parent = c.text
+             elif c.tag == "capability" and c.get("type") == 'pci':
+diff --git a/nova/virt/libvirt/driver.py b/nova/virt/libvirt/driver.py
+index bc89fc4..a0a8591 100644
+--- a/nova/virt/libvirt/driver.py
++++ b/nova/virt/libvirt/driver.py
+@@ -4975,6 +4975,27 @@ class LibvirtDriver(driver.ComputeDriver):
+     def _get_pcidev_info(self, devname):
+         """Returns a dict of PCI device."""
+ 
++        def _get_net_device(cfgdev):
++            """Find the linux netdevice name if applicable"""
++            results = glob.glob(cfgdev.path + "/net/*")
++            if results:
++                return os.path.basename(results[0])
++            return None
++
++        def _is_net_device(cfgdev):
++            """Determine if the device is a networking device"""
++            return bool(_get_net_device(cfgdev))
++
++        def _get_mac_address(cfgdev):
++            """Retrieve the MAC address of the device"""
++            path = (cfgdev.path + "/net/" + str(_get_net_device(cfgdev)) +
++                "/address")
++            if os.path.exists(path):
++                with open(path, 'r') as f:
++                    data = f.readline()
++                    return data.strip()
++            return None
++
+         def _get_device_type(cfgdev):
+             """Get a PCI device's device type.
+ 
+@@ -5024,6 +5045,11 @@ class LibvirtDriver(driver.ComputeDriver):
+         # requirement by DataBase Model
+         device['label'] = 'label_%(vendor_id)s_%(product_id)s' % device
+         device.update(_get_device_type(cfgdev))
++
++        # VFs doesn't have MAC addresses
++        if device['dev_type'] == 'type-PCI' and _is_net_device(cfgdev):
++            device['mac_address'] = _get_mac_address(cfgdev)
++
+         return device
+ 
+     def _get_pci_passthrough_devices(self):
+@@ -7449,3 +7475,25 @@ class LibvirtDriver(driver.ComputeDriver):
+         except exception.InstanceNotFound:
+             # If the instance is already gone, we're happy.
+             pass
++
++    def macs_for_instance(self, instance, vif_models=[]):
++        """build a list of mac addresses for each of the requested networks
++        for the specified instance.  Networks that are attached to
++        pci-passthrough devices get the MAC address of the PCI device.  All
++        other devices are set to the "auto" keyword so that Neutron allocates
++        a MAC address.
++        """
++        macs = []
++        pci_devices = pci_manager.get_instance_pci_devs(instance, 'all')
++
++        # Prune the list down to only NIC devices
++        nic_devices = [d for d in pci_devices
++                       if 'mac_address' in d['extra_info']]
++
++        for vif_model in vif_models:
++            if vif_model in ['pci-passthrough']:
++                nic_device = nic_devices.pop()
++                macs.append(nic_device['extra_info']['mac_address'])
++            else:
++                macs.append("auto")
++        return macs
+-- 
+2.7.4
+

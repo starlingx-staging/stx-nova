@@ -1,0 +1,52 @@
+From 0ba75fc399b1c55770303b73589b728448d09602 Mon Sep 17 00:00:00 2001
+From: Teresa Ho <teresa.ho@windriver.com>
+Date: Tue, 6 Feb 2018 08:47:39 -0500
+Subject: [PATCH 099/143] Support for Neutron Port Security Extension
+
+This update enables the Neutron port security extension for ML2 plugin
+by default, overridding the existing mac filtering functionality.
+The port security can disabled on a per port or network basis.
+---
+ nova/network/neutronv2/api.py | 19 ++++++++++++++++++-
+ 1 file changed, 18 insertions(+), 1 deletion(-)
+
+diff --git a/nova/network/neutronv2/api.py b/nova/network/neutronv2/api.py
+index 702f9ee..8bbf8aa 100644
+--- a/nova/network/neutronv2/api.py
++++ b/nova/network/neutronv2/api.py
+@@ -780,7 +780,16 @@ class API(base_api.NetworkAPI):
+             try:
+                 port_security_enabled = network.get(
+                     'port_security_enabled', True)
+-                if not port_security_enabled:
++                if port_security_enabled:
++                    if not network.get('subnets'):
++                        # Neutron can't apply security groups to a port
++                        # for a network without L3 assignments.
++                        LOG.debug('Network with port security enabled does '
++                                  'not have subnets so security groups '
++                                  'cannot be applied: %s',
++                                  network, instance=instance)
++                        raise exception.SecurityGroupCannotBeApplied()
++                else:
+                     if security_group_ids:
+                         # We don't want to apply security groups on port
+                         # for a network defined with
+@@ -1665,6 +1674,14 @@ class API(base_api.NetworkAPI):
+                                            neutron_client=neutron)
+                     if port.get('device_id', None):
+                         raise exception.PortInUse(port_id=request.port_id)
++                    deferred_ip = port.get('ip_allocation') == 'deferred'
++                    # NOTE(carl_baldwin) A deferred IP port doesn't have an
++                    # address here. If it fails to get one later when nova
++                    # updates it with host info, Neutron will error which
++                    # raises an exception.
++                    if not deferred_ip and not port.get('fixed_ips'):
++                        raise exception.PortRequiresFixedIP(
++                            port_id=request.port_id)
+                     request.network_id = port['network_id']
+                 else:
+                     ports_needed_per_instance += 1
+-- 
+2.7.4
+

@@ -1,0 +1,1498 @@
+From bf5593bb752f59edcec7ea9c0569e1952eb6155d Mon Sep 17 00:00:00 2001
+From: Steven Webster <steven.webster@windriver.com>
+Date: Thu, 26 Jan 2017 09:48:37 -0500
+Subject: [PATCH 050/143] primary: support for configurable pci bus slots for
+ guest vnics
+
+Support for configurable pci bus slots for guest vnics
+
+This feature introduces the capability to specify the guest PCI addresses
+for network interfaces.
+
+The REST API has been extended to support the new parameter
+wrs-if:vif_pci_address when requesting a nic for a particular network.
+The format of the PCI address is: <domain>:<bus>:<slot>.<function>.  However
+in this release it's not possible to specify a domain value other than 0
+(because of limitation in kvm/qemu) and a function value other than 0
+(this add complexity in the management of PCI devices for the libvirt
+XML specification).
+
+The possibility to specify the bus and the slot allows the user to address a
+wide range of devices within it's guest (bus is a 16 bits value and slot is a
+
+The possibility to specify the bus and the slot allows the user to address a
+wide range of devices within it's guest (bus is a 16 bits value and slot is a
+5 bits value). If a bus number greater than 0 is specified, the corresponding
+pci-bridges will be configured in the libvirt XML.
+
+The virtual PCI address is persisted in the associated Neutron port in the
+profile field.
+
+The export of interfaces in the libvirt XML has also been changed.  Prior
+to this commit, those interfaces were specified as "qemu:commandline".  They
+are now specified as "interface" of "hostdev".  Doing so enabled us to
+leverage the libvirt code to reserve PCI addresses.
+
+Limitations:
+- This feature only support PCI devices of type NIC. Other PCI devices that
+  can be specified with a flavor is not supported.
+- It's not possible to specify a bus value other than 0 for the NICs.
+  There is an issue when doing so with harware, kvm starts and reports
+  running but the guest is not accessible.
+
+Additional changes for port to Newton:
+- Small change to virt/libvirt/driver.py _get_guest_config logic
+  This also gets rid of
+  a pep8 issue with the original logic.
+- Change in virt/wrs/libvirt/vif.py to align with new get_base_config
+  parameters.
+
+For port to Pike,
+- add vif_pci_address to networks properties for v2.37
+
+fa01d0b Set pci controller pcihole64 attribute to 64 GiB
+   This looks at the os_type of an instance, and if it is windows, then
+   the pcihole64 attribute is set to 64 GiB.
+
+   In the case of windows guests however, if we allocate this space, then the
+   guest will fail to boot.  As such, we discriminate based on os_type, and
+   do not allocate this in the case of windows guests.
+
+__TYPE_primary
+__TAG_pci-sriov
+__R4_commit_8545f78
+__R3_commit_337b621
+__TC8539
+---
+ nova/api/openstack/common.py                       |   4 +
+ nova/api/openstack/compute/schemas/servers.py      |  12 +-
+ nova/api/openstack/compute/servers.py              |  70 ++++++++++-
+ nova/network/neutronv2/api.py                      | 137 +++++++++++----------
+ nova/objects/network_request.py                    |  13 +-
+ .../unit/api/openstack/compute/test_serversV21.py  |  18 +--
+ .../api/openstack/compute/test_wrs_server_if.py    |   1 +
+ nova/tests/unit/network/test_neutronv2.py          |  13 +-
+ nova/tests/unit/objects/test_network_request.py    |   5 +-
+ nova/tests/unit/objects/test_objects.py            |   2 +-
+ nova/tests/unit/virt/libvirt/test_driver.py        |  58 ++++-----
+ nova/tests/unit/virt/wrs/test_config.py            |  47 +++----
+ nova/tests/unit/virt/wrs/test_vif.py               |  11 +-
+ nova/virt/libvirt/config.py                        |  65 +++++++++-
+ nova/virt/libvirt/driver.py                        | 106 +++++++++++++++-
+ nova/virt/libvirt/vif.py                           |  13 +-
+ nova/virt/wrs/libvirt/config.py                    |  10 ++
+ nova/virt/wrs/libvirt/designer.py                  |   7 +-
+ nova/virt/wrs/libvirt/vif.py                       |  29 +++--
+ 19 files changed, 455 insertions(+), 166 deletions(-)
+
+diff --git a/nova/api/openstack/common.py b/nova/api/openstack/common.py
+index 4993fd6..8833b33 100644
+--- a/nova/api/openstack/common.py
++++ b/nova/api/openstack/common.py
+@@ -358,9 +358,13 @@ def get_nics_for_instance_from_nw_info(nw_info):
+     nics = []
+     for index, vif in enumerate(nw_info):
+         name = "nic" + str(index + 1)
++        vif_pci_address = ""
++        if vif.get('profile') is not None:
++            vif_pci_address = vif.get('profile', {}).get('vif_pci_address', "")
+         nics.append({name: {'port_id': vif['id'],
+                             'mac_address': vif['address'],
+                             'vif_model': vif['vif_model'],
++                            'vif_pci_address': vif_pci_address,
+                             'mtu': vif['mtu'],
+                             'network': vif['network']['label']}})
+     return nics
+diff --git a/nova/api/openstack/compute/schemas/servers.py b/nova/api/openstack/compute/schemas/servers.py
+index 44170e5..7e4f57f 100644
+--- a/nova/api/openstack/compute/schemas/servers.py
++++ b/nova/api/openstack/compute/schemas/servers.py
+@@ -79,9 +79,11 @@ base_create_v20['properties']['server'][
+ base_create_v219 = copy.deepcopy(base_create)
+ base_create_v219['properties']['server'][
+     'properties']['description'] = parameter_types.description
+-# add vif_model to networks properties for v2.19
++# add vif_model and vif_pci_address to networks properties for v2.19
+ base_create_v219['properties']['server']['properties']['networks'][
+     'items']['properties']['wrs-if:vif_model'] = {'enum': model.VIF_MODEL_ALL}
++base_create_v219['properties']['server']['properties']['networks'][
++    'items']['properties']['wrs-if:vif_pci_address'] = {'type': 'string'}
+ 
+ 
+ base_create_v232 = copy.deepcopy(base_create_v219)
+@@ -108,8 +110,10 @@ base_create_v237['properties']['server']['properties']['networks'] = {
+                                {'type': 'null'}]
+                  },
+                  'uuid': {'type': 'string', 'format': 'uuid'},
+-                 # add vif_model to networks properties for v2.37
++                 # add vif_model and vif_pci_address to networks
++                 # properties for v2.37
+                  'wrs-if:vif_model': {'enum': model.VIF_MODEL_ALL},
++                 'wrs-if:vif_pci_address': {'type': 'string'},
+              },
+              'additionalProperties': False,
+          },
+@@ -134,6 +138,10 @@ base_create_v242['properties']['server']['properties']['networks'] = {
+                  },
+                  'uuid': {'type': 'string', 'format': 'uuid'},
+                  'tag': parameter_types.tag,
++                 # add vif_model and vif_pci_address
++                 'wrs-if:vif_model': {'type': 'string',
++                                      'enum': model.VIF_MODEL_ALL},
++                 'wrs-if:vif_pci_address': {'type': 'string'},
+              },
+              'additionalProperties': False,
+          },
+diff --git a/nova/api/openstack/compute/servers.py b/nova/api/openstack/compute/servers.py
+index 526da6c..d6714d4 100644
+--- a/nova/api/openstack/compute/servers.py
++++ b/nova/api/openstack/compute/servers.py
+@@ -58,8 +58,11 @@ from nova import context as nova_context
+ from nova import exception
+ from nova.i18n import _
+ from nova.image import glance
++from nova.network import model
+ from nova import objects
+ from nova.objects import service as service_obj
++from nova.pci import devspec
++from nova.pci import utils as pci_utils
+ from nova.policies import servers as server_policies
+ from nova import utils
+ 
+@@ -355,6 +358,40 @@ class ServersController(wsgi.Controller):
+         req.cache_db_instance(instance)
+         return instance
+ 
++    # extension
++    def _validate_vif_pci_address(self, vif_model, pci_address):
++        domain, bus, slot, func = pci_utils.get_pci_address_fields(pci_address)
++
++        if domain != '0000':
++            msg = _("Only domain 0000 is supported")
++            raise exc.HTTPBadRequest(explanation=msg)
++
++        if bus == '00' and slot in ('00', '01'):
++            msg = _("Slots 0,1 are reserved for PCI bus 0")
++            raise exc.HTTPBadRequest(explanation=msg)
++
++        if bus != '00' and slot == '00':
++            msg = _("Slots 0 is reserved for any PCI bus")
++            raise exc.HTTPBadRequest(explanation=msg)
++
++        if func != '0':
++            msg = _("Only function 0 is supported")
++            raise exc.HTTPBadRequest(explanation=msg)
++
++        # Max bus is 8, possibly kvm/qemu limitation.
++        if int(bus, 16) > 8:
++            msg = _("PCI bus maximum value is 8")
++            raise exc.HTTPBadRequest(explanation=msg)
++
++        if int(slot, 16) > devspec.MAX_SLOT:
++            msg = _("PCI slot maximum value is %s") % devspec.MAX_SLOT
++            raise exc.HTTPBadRequest(explanation=msg)
++
+     @staticmethod
+     def _validate_network_id(net_id, network_uuids):
+         """Validates that a requested network id.
+@@ -398,6 +435,7 @@ class ServersController(wsgi.Controller):
+ 
+         networks = []
+         network_uuids = []
++        vif_pci_addresses = []
+ 
+         try:
+             if utils.is_neutron():
+@@ -436,12 +474,32 @@ class ServersController(wsgi.Controller):
+                     request.network_id = network['uuid']
+                     self._validate_network_id(
+                         request.network_id, network_uuids)
+-                    network_uuids.append(request.network_id)
+ 
+-                # vif_model is optional
++                # vif_model and vif_pci_address are optional
+                 if utils.is_neutron():
+                     request.vif_model = network.get('wrs-if:vif_model', None)
+ 
++                    request.vif_pci_address = network.get(
++                        'wrs-if:vif_pci_address', None)
++                    if request.vif_pci_address is not None:
++                        try:
++                            pci_utils.parse_address(request.vif_pci_address)
++                        except exception.PciDeviceWrongAddressFormat:
++                            msg = _("Bad PCI address format")
++                            raise exc.HTTPBadRequest(explanation=msg)
++
++                        self._validate_vif_pci_address(request.vif_model,
++                                                       request.vif_pci_address)
++                        vif_pci_addresses.append(request.vif_pci_address)
++
++                # duplicate networks are allowed only for neutron v2.0
++                if (not utils.is_neutron() and request.network_id and
++                        request.network_id in network_uuids):
++                    expl = (_("Duplicate networks"
++                              " (%s) are not allowed") %
++                            request.network_id)
++                    raise exc.HTTPBadRequest(explanation=expl)
++                network_uuids.append(request.network_id)
+                 networks.append(request)
+             except KeyError as key:
+                 expl = _('Bad network format: missing %s') % key
+@@ -450,6 +508,14 @@ class ServersController(wsgi.Controller):
+                 expl = _('Bad networks format')
+                 raise exc.HTTPBadRequest(explanation=expl)
+ 
++        # Verify that all virtual PCI addresses for network devices
++        # are unique.
++        duplicates = [x for x in vif_pci_addresses
++                      if vif_pci_addresses.count(x) > 1]
++        if duplicates:
++            expl = _('PCI addresses must be unique')
++            raise exc.HTTPBadRequest(explanation=expl)
++
+         return objects.NetworkRequestList(objects=networks)
+ 
+     @extensions.expected_errors(404)
+diff --git a/nova/network/neutronv2/api.py b/nova/network/neutronv2/api.py
+index 492e7ff..951efb1 100644
+--- a/nova/network/neutronv2/api.py
++++ b/nova/network/neutronv2/api.py
+@@ -34,7 +34,7 @@ import six
+ from nova.compute import utils as compute_utils
+ import nova.conf
+ from nova import exception
+-from nova.i18n import _, _LE, _LI, _LW
++from nova.i18n import _
+ from nova.network import base_api
+ from nova.network import model as network_model
+ from nova.network.neutronv2 import constants
+@@ -129,9 +129,9 @@ class ClientWrapper(clientv20.Client):
+                 # should be able to regenerate a valid by using the
+                 # Neutron admin credential configuration located in
+                 # nova.conf.
+-                LOG.error(_LE("Neutron client was not able to generate a "
++                LOG.error("Neutron client was not able to generate a "
+                               "valid admin token, please verify Neutron "
+-                              "admin credential located in nova.conf"))
++                              "admin credential located in nova.conf")
+                 raise exception.NeutronAdminCredentialConfigurationInvalid()
+             except neutron_client_exc.Forbidden as e:
+                 raise exception.Forbidden(e)
+@@ -182,8 +182,8 @@ def _is_not_duplicate(item, items, items_list_name, instance):
+     # item is not part of the items list so if it is part of it
+     # we should at least log it as a warning
+     if present:
+-        LOG.warning(_LW("%(item)s already exists in list: %(list_name)s "
+-                        "containing: %(items)s. ignoring it"),
++        LOG.warning("%(item)s already exists in list: %(list_name)s "
++                    "containing: %(items)s. ignoring it",
+                     {'item': item,
+                      'list_name': items_list_name,
+                      'items': items},
+@@ -266,8 +266,8 @@ class API(base_api.NetworkAPI):
+             return updated_port
+         except Exception as ex:
+             with excutils.save_and_reraise_exception():
+-                LOG.error(_LE("Unable to update binding profile "
+-                              "for port: %(port)s due to failure: %(error)s"),
++                LOG.error("Unable to update binding profile "
++                          "for port: %(port)s due to failure: %(error)s",
+                           {'port': port_id, 'error': ex},
+                           instance=instance)
+ 
+@@ -418,8 +418,8 @@ class API(base_api.NetworkAPI):
+                       instance=instance)
+             return port
+         except neutron_client_exc.InvalidIpForNetworkClient:
+-            LOG.warning(_LW('Neutron error: %(ip)s is not a valid IP address '
+-                            'for network %(network_id)s.'),
++            LOG.warning('Neutron error: %(ip)s is not a valid IP address '
++                        'for network %(network_id)s.',
+                         {'ip': fixed_ip, 'network_id': network_id},
+                         instance=instance)
+             msg = (_('Fixed IP %(ip)s is not a valid ip address for '
+@@ -427,22 +427,22 @@ class API(base_api.NetworkAPI):
+                    {'ip': fixed_ip, 'network_id': network_id})
+             raise exception.InvalidInput(reason=msg)
+         except neutron_client_exc.IpAddressInUseClient:
+-            LOG.warning(_LW('Neutron error: Fixed IP %s is '
+-                            'already in use.'), fixed_ip, instance=instance)
++            LOG.warning('Neutron error: Fixed IP %s is '
++                            'already in use.', fixed_ip, instance=instance)
+             msg = _("Fixed IP %s is already in use.") % fixed_ip
+             raise exception.FixedIpAlreadyInUse(message=msg)
+         except neutron_client_exc.OverQuotaClient:
+-            LOG.warning(_LW(
+-                'Neutron error: Port quota exceeded in tenant: %s'),
++            LOG.warning(
++                'Neutron error: Port quota exceeded in tenant: %s',
+                 port_req_body['port']['tenant_id'], instance=instance)
+             raise exception.PortLimitExceeded()
+         except neutron_client_exc.IpAddressGenerationFailureClient:
+-            LOG.warning(_LW('Neutron error: No more fixed IPs in network: %s'),
++            LOG.warning('Neutron error: No more fixed IPs in network: %s',
+                         network_id, instance=instance)
+             raise exception.NoMoreFixedIps(net=network_id)
+         except neutron_client_exc.NeutronClientException:
+             with excutils.save_and_reraise_exception():
+-                LOG.exception(_LE('Neutron error creating port on network %s'),
++                LOG.exception('Neutron error creating port on network %s',
+                               network_id, instance=instance)
+ 
+     def _update_port(self, port_client, instance, port_id,
+@@ -457,16 +457,16 @@ class API(base_api.NetworkAPI):
+         except neutron_client_exc.MacAddressInUseClient:
+             mac_address = port_req_body['port'].get('mac_address')
+             network_id = port_req_body['port'].get('network_id')
+-            LOG.warning(_LW('Neutron error: MAC address %(mac)s is already '
+-                            'in use on network %(network)s.'),
++            LOG.warning('Neutron error: MAC address %(mac)s is already '
++                        'in use on network %(network)s.',
+                         {'mac': mac_address, 'network': network_id},
+                         instance=instance)
+             raise exception.PortInUse(port_id=mac_address)
+         except neutron_client_exc.HostNotCompatibleWithFixedIpsClient:
+             network_id = port_req_body['port'].get('network_id')
+-            LOG.warning(_LW('Neutron error: Tried to bind a port with '
+-                            'fixed_ips to a host in the wrong segment on '
+-                            'network %(network)s.'),
++            LOG.warning('Neutron error: Tried to bind a port with '
++                        'fixed_ips to a host in the wrong segment on '
++                        'network %(network)s.',
+                         {'network': network_id}, instance=instance)
+             raise exception.FixedIpInvalidOnHost(port_id=port_id)
+ 
+@@ -528,8 +528,8 @@ class API(base_api.NetworkAPI):
+                 LOG.debug('Unable to unbind port %s as it no longer exists.',
+                           port_id)
+             except Exception:
+-                LOG.exception(_LE("Unable to clear device ID "
+-                                  "for port '%s'"), port_id)
++                LOG.exception("Unable to clear device ID for port '%s'",
++                               port_id)
+ 
+     def _validate_requested_port_ids(self, context, instance, neutron,
+                                      requested_networks):
+@@ -970,7 +970,8 @@ class API(base_api.NetworkAPI):
+                 self._populate_neutron_extension_values(
+                     context, instance, request.pci_request_id, port_req_body,
+                     network=network, neutron=neutron,
+-                    bind_host_id=bind_host_id)
++                    bind_host_id=bind_host_id,
++                    vif_pci_address=request.vif_pci_address)
+                 self._populate_pci_mac_address(instance,
+                     request.pci_request_id, port_req_body)
+                 self._populate_mac_address(
+@@ -1070,16 +1071,24 @@ class API(base_api.NetworkAPI):
+         raise exception.PciDeviceNotFound(node_id=pci_dev.compute_node_id,
+                                           address=pci_dev.address)
+ 
++    # add vif_pci_address
+     def _populate_neutron_binding_profile(self, instance, pci_request_id,
+-                                          port_req_body):
++                                          port_req_body,
++                                          vif_pci_address=None):
+         """Populate neutron binding:profile.
+ 
+         Populate it with SR-IOV related information
+         """
++        profile = {}
+         if pci_request_id:
+             pci_dev = pci_manager.get_instance_pci_devs(
+                 instance, pci_request_id).pop()
+             profile = self._get_pci_device_profile(pci_dev)
++            profile.update({'pci_request_id': pci_request_id})
++        if vif_pci_address is not None:
++            profile.update({'vif_pci_address': vif_pci_address})
++
++        if profile:
+             port_req_body['port'][BINDING_PROFILE] = profile
+ 
+     @staticmethod
+@@ -1097,9 +1106,9 @@ class API(base_api.NetworkAPI):
+                 # only ever index a single device, which needs to be
+                 # successfully claimed for this to be called as part of
+                 # allocate_networks method
+-                LOG.error(_LE("PCI request %s does not have a "
+-                              "unique device associated with it. Unable to "
+-                              "determine MAC address"),
++                LOG.error("PCI request %s does not have a "
++                          "unique device associated with it. Unable to "
++                          "determine MAC address",
+                           pci_request, instance=instance)
+                 return
+             pci_dev = pci_devs[0]
+@@ -1108,16 +1117,18 @@ class API(base_api.NetworkAPI):
+                     mac = pci_utils.get_mac_by_pci_address(pci_dev.address)
+                 except exception.PciDeviceNotFoundById as e:
+                     LOG.error(
+-                        _LE("Could not determine MAC address for %(addr)s, "
+-                            "error: %(e)s"),
++                        "Could not determine MAC address for %(addr)s, "
++                        "error: %(e)s",
+                         {"addr": pci_dev.address, "e": e}, instance=instance)
+                 else:
+                     port_req_body['port']['mac_address'] = mac
+ 
++    # add vif_pci_address
+     def _populate_neutron_extension_values(self, context, instance,
+                                            pci_request_id, port_req_body,
+                                            network=None, neutron=None,
+-                                           bind_host_id=None):
++                                           bind_host_id=None,
++                                           vif_pci_address=None):
+         """Populate neutron extension values for the instance.
+ 
+         If the extensions loaded contain QOS_QUEUE then pass the rxtx_factor.
+@@ -1132,8 +1143,10 @@ class API(base_api.NetworkAPI):
+         if has_port_binding_extension:
+             port_req_body['port'][BINDING_HOST_ID] = bind_host_id
+             self._populate_neutron_binding_profile(instance,
+-                                                   pci_request_id,
+-                                                   port_req_body)
++                                               pci_request_id,
++                                               port_req_body,
++                                               vif_pci_address=vif_pci_address)
++
+         if constants.DNS_INTEGRATION in self.extensions:
+             # If the DNS integration extension is enabled in Neutron, most
+             # ports will get their dns_name attribute set in the port create or
+@@ -1168,8 +1181,8 @@ class API(base_api.NetworkAPI):
+                 port_req_body = {'port': {'dns_name': instance.hostname}}
+                 neutron.update_port(port_id, port_req_body)
+             except neutron_client_exc.BadRequest:
+-                LOG.warning(_LW('Neutron error: Instance hostname '
+-                                '%(hostname)s is not a valid DNS name'),
++                LOG.warning('Neutron error: Instance hostname '
++                            '%(hostname)s is not a valid DNS name',
+                             {'hostname': instance.hostname}, instance=instance)
+                 msg = (_('Instance hostname %(hostname)s is not a valid DNS '
+                          'name') % {'hostname': instance.hostname})
+@@ -1182,12 +1195,12 @@ class API(base_api.NetworkAPI):
+                 neutron.delete_port(port)
+             except neutron_client_exc.NeutronClientException as e:
+                 if e.status_code == 404:
+-                    LOG.warning(_LW("Port %s does not exist"), port,
++                    LOG.warning("Port %s does not exist", port,
+                                 instance=instance)
+                 else:
+                     exceptions.append(e)
+                     LOG.warning(
+-                        _LW("Failed to delete port %s for instance."),
++                        "Failed to delete port %s for instance.",
+                         port, instance=instance, exc_info=True)
+         if len(exceptions) > 0 and raise_if_fail:
+             raise exceptions[0]
+@@ -1204,9 +1217,9 @@ class API(base_api.NetworkAPI):
+         # NOTE(danms): Temporary and transitional
+         if isinstance(requested_networks, objects.NetworkRequestList):
+             requested_networks = requested_networks.as_tuples()
+-        # extension: add vif_model
++        # extension: add vif_model & vif_pci_address
+         ports_to_skip = set([port_id for nets, fips, port_id,
+-                             pci_request_id, vif_model
++                             pci_request_id, vif_model, vif_pci_address
+                              in requested_networks])
+         # NOTE(boden): requested_networks only passed in when deallocating
+         # from a failed build / spawn call. Therefore we need to include
+@@ -1597,8 +1610,8 @@ class API(base_api.NetworkAPI):
+         except neutron_client_exc.NetworkNotFoundClient:
+             # This shouldn't happen since we just created the network, but
+             # handle it anyway.
+-            LOG.error(_LE('Automatically allocated network %(network_id)s '
+-                          'was not found.'), {'network_id': topology['id']},
++            LOG.error('Automatically allocated network %(network_id)s '
++                      'was not found.', {'network_id': topology['id']},
+                       instance=instance)
+             raise exception.UnableToAutoAllocateNetwork(project_id=project_id)
+ 
+@@ -1789,8 +1802,8 @@ class API(base_api.NetworkAPI):
+ 
+             msg_dict = dict(address=floating_address,
+                             instance_id=orig_instance_uuid)
+-            LOG.info(_LI('re-assign floating IP %(address)s from '
+-                         'instance %(instance_id)s'), msg_dict,
++            LOG.info('re-assign floating IP %(address)s from '
++                     'instance %(instance_id)s', msg_dict,
+                      instance=instance)
+             orig_instance = objects.Instance.get_by_uuid(context,
+                                                          orig_instance_uuid)
+@@ -1893,7 +1906,7 @@ class API(base_api.NetworkAPI):
+                 raise exception.FloatingIpNotFound(id=id)
+             else:
+                 with excutils.save_and_reraise_exception():
+-                    LOG.exception(_LE('Unable to access floating IP %s'), id)
++                    LOG.exception('Unable to access floating IP %s', id)
+         pool_dict = self._setup_net_dict(client,
+                                          fip['floating_network_id'])
+         port_dict = self._setup_port_dict(context, client, fip['port_id'])
+@@ -2013,12 +2026,12 @@ class API(base_api.NetworkAPI):
+         use the [neutron] option only.
+         """
+         if CONF.default_floating_pool != 'nova':
+-            LOG.warning(_LW("Config option 'default_floating_pool' is set to "
+-                            "a non-default value. Falling back to this value "
+-                            "for now but this behavior will change in a "
+-                            "future release. You should unset this value "
+-                            "and set the '[neutron] default_floating_pool' "
+-                            "option instead."))
++            LOG.warning("Config option 'default_floating_pool' is set to "
++                        "a non-default value. Falling back to this value "
++                        "for now but this behavior will change in a "
++                        "future release. You should unset this value "
++                        "and set the '[neutron] default_floating_pool' "
++                        "option instead.")
+             return CONF.default_floating_pool
+ 
+         return CONF.neutron.default_floating_pool
+@@ -2056,7 +2069,7 @@ class API(base_api.NetworkAPI):
+             if e.status_code == 404:
+                 return []
+             with excutils.save_and_reraise_exception():
+-                LOG.exception(_LE('Unable to access floating IP for %s'),
++                LOG.exception('Unable to access floating IP for %s',
+                         ', '.join(['%s %s' % (k, v)
+                                    for k, v in kwargs.items()]))
+ 
+@@ -2185,9 +2198,9 @@ class API(base_api.NetworkAPI):
+                 break
+         else:
+             tenant_id = port['tenant_id']
+-            LOG.warning(_LW("Network %(id)s not matched with the tenants "
+-                            "network! The ports tenant %(tenant_id)s will be "
+-                            "used."),
++            LOG.warning("Network %(id)s not matched with the tenants "
++                        "network! The ports tenant %(tenant_id)s will be "
++                        "used.",
+                         {'id': port['network_id'], 'tenant_id': tenant_id})
+ 
+         bridge = None
+@@ -2397,9 +2410,9 @@ class API(base_api.NetworkAPI):
+                     preexisting_port_ids)
+                 nw_info.append(vif)
+             elif nw_info_refresh:
+-                LOG.info(_LI('Port %s from network info_cache is no '
+-                             'longer associated with instance in Neutron. '
+-                             'Removing from network info_cache.'), port_id,
++                LOG.info('Port %s from network info_cache is no '
++                         'longer associated with instance in Neutron. '
++                         'Removing from network info_cache.', port_id,
+                          instance=instance)
+ 
+         return nw_info
+@@ -2599,16 +2612,16 @@ class API(base_api.NetworkAPI):
+         # TODO(lbeliveau): Batch up the port updates in one neutron call.
+         for port_id, updates in port_updates:
+             if updates:
+-                LOG.info(_LI("Updating port %(port)s with "
+-                             "attributes %(attributes)s"),
++                LOG.info("Updating port %(port)s with "
++                         "attributes %(attributes)s",
+                          {"port": port_id, "attributes": updates},
+                          instance=instance)
+                 try:
+                     neutron.update_port(port_id, {'port': updates})
+                 except Exception:
+                     with excutils.save_and_reraise_exception():
+-                        LOG.exception(_LE("Unable to update binding details "
+-                                          "for port %s"),
++                        LOG.exception("Unable to update binding details "
++                                      "for port %s",
+                                       port_id, instance=instance)
+ 
+     def update_instance_vnic_index(self, context, instance, vif, index):
+@@ -2625,8 +2638,8 @@ class API(base_api.NetworkAPI):
+                 neutron.update_port(vif['id'], port_req_body)
+             except Exception:
+                 with excutils.save_and_reraise_exception():
+-                    LOG.exception(_LE('Unable to update instance VNIC index '
+-                                      'for port %s.'),
++                    LOG.exception('Unable to update instance VNIC index '
++                                  'for port %s.',
+                                   vif['id'], instance=instance)
+ 
+ 
+diff --git a/nova/objects/network_request.py b/nova/objects/network_request.py
+index eacb3c5..73d7d44 100644
+--- a/nova/objects/network_request.py
++++ b/nova/objects/network_request.py
+@@ -38,9 +38,9 @@ NETWORK_ID_AUTO = 'auto'
+ class NetworkRequest(obj_base.NovaObject):
+     # Version 1.0: Initial version
+     # Version 1.1: Added pci_request_id
++    #              Added vif_model & vif_pci_address
+     # Version 1.2: Added tag field
+     VERSION = '1.2'
+-    #              Added vif_model
+     fields = {
+         'network_id': fields.StringField(nullable=True),
+         'address': fields.IPAddressField(nullable=True),
+@@ -48,6 +48,7 @@ class NetworkRequest(obj_base.NovaObject):
+         'pci_request_id': fields.UUIDField(nullable=True),
+         'tag': fields.StringField(nullable=True),
+         'vif_model': fields.StringField(nullable=True),
++        'vif_pci_address': fields.StringField(nullable=True),
+     }
+ 
+     def obj_make_compatible(self, primitive, target_version):
+@@ -62,13 +63,19 @@ class NetworkRequest(obj_base.NovaObject):
+         address = str(self.address) if self.address is not None else None
+         if utils.is_neutron():
+             return (self.network_id, address, self.port_id,
+-                    self.pci_request_id, self.vif_model)
++                    self.pci_request_id, self.vif_model, self.vif_pci_address)
+         else:
+             return self.network_id, address
+ 
+     @classmethod
+     def from_tuple(cls, net_tuple):
+-        if len(net_tuple) == 5:
++        if len(net_tuple) == 6:
++            network_id, address, port_id, pci_request_id, vif_model, \
++                vif_pci_address = net_tuple
++            return cls(network_id=network_id, address=address,
++                       port_id=port_id, pci_request_id=pci_request_id,
++                       vif_model=vif_model, vif_pci_address=vif_pci_address)
++        elif len(net_tuple) == 5:
+             network_id, address, port_id, pci_request_id, vif_model = net_tuple
+             return cls(network_id=network_id, address=address,
+                        port_id=port_id, pci_request_id=pci_request_id,
+diff --git a/nova/tests/unit/api/openstack/compute/test_serversV21.py b/nova/tests/unit/api/openstack/compute/test_serversV21.py
+index a46f015..5355e81 100644
+--- a/nova/tests/unit/api/openstack/compute/test_serversV21.py
++++ b/nova/tests/unit/api/openstack/compute/test_serversV21.py
+@@ -222,14 +222,14 @@ class ServersControllerTest(ControllerTest):
+         uuid = 'br-00000000-0000-0000-0000-000000000000'
+         requested_networks = [{'uuid': uuid}]
+         res = self.controller._get_requested_networks(requested_networks)
+-        self.assertIn((uuid, None, None, None, None), res.as_tuples())
++        self.assertIn((uuid, None, None, None, None, None), res.as_tuples())
+ 
+     def test_requested_networks_neutronv2_enabled_with_port(self):
+         self.flags(use_neutron=True)
+         port = 'eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee'
+         requested_networks = [{'port': port}]
+         res = self.controller._get_requested_networks(requested_networks)
+-        self.assertEqual([(None, None, port, None, None)],
++        self.assertEqual([(None, None, port, None, None, None)],
+                          res.as_tuples())
+ 
+     def test_requested_networks_neutronv2_enabled_with_network(self):
+@@ -237,7 +237,7 @@ class ServersControllerTest(ControllerTest):
+         network = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
+         requested_networks = [{'uuid': network}]
+         res = self.controller._get_requested_networks(requested_networks)
+-        self.assertEqual([(network, None, None, None, None)],
++        self.assertEqual([(network, None, None, None, None, None)],
+                          res.as_tuples())
+ 
+     # add testcase for wrs-if:vif_model
+@@ -255,7 +255,7 @@ class ServersControllerTest(ControllerTest):
+         port = 'eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee'
+         requested_networks = [{'uuid': network, 'port': port}]
+         res = self.controller._get_requested_networks(requested_networks)
+-        self.assertEqual([(None, None, port, None, None)],
++        self.assertEqual([(None, None, port, None, None, None)],
+                          res.as_tuples())
+ 
+     def test_requested_networks_with_duplicate_networks_nova_net(self):
+@@ -274,8 +274,8 @@ class ServersControllerTest(ControllerTest):
+         network = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
+         requested_networks = [{'uuid': network}, {'uuid': network}]
+         res = self.controller._get_requested_networks(requested_networks)
+-        self.assertEqual([(network, None, None, None, None),
+-                          (network, None, None, None, None)],
++        self.assertEqual([(network, None, None, None, None, None),
++                          (network, None, None, None, None, None)],
+                          res.as_tuples())
+ 
+     def test_requested_networks_neutronv2_enabled_conflict_on_fixed_ip(self):
+@@ -306,7 +306,7 @@ class ServersControllerTest(ControllerTest):
+         port = 'eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee'
+         requested_networks = [{'uuid': network, 'port': port}]
+         res = self.controller._get_requested_networks(requested_networks)
+-        self.assertEqual([(None, None, port, None, None)],
++        self.assertEqual([(None, None, port, None, None, None)],
+                          res.as_tuples())
+ 
+     def test_get_server_by_uuid(self):
+@@ -3001,7 +3001,7 @@ class ServersControllerCreateTest(test.TestCase):
+ 
+         def create(*args, **kwargs):
+             result = [('76fa36fc-c930-4bf3-8c8a-ea2a2420deb6', None,
+-                       None, None, None)]
++                       None, None, None, None)]
+             self.assertEqual(result, kwargs['requested_networks'].as_tuples())
+             return old_create(*args, **kwargs)
+ 
+diff --git a/nova/tests/unit/api/openstack/compute/test_wrs_server_if.py b/nova/tests/unit/api/openstack/compute/test_wrs_server_if.py
+index 2e67bea..6b4dfa6 100644
+--- a/nova/tests/unit/api/openstack/compute/test_wrs_server_if.py
++++ b/nova/tests/unit/api/openstack/compute/test_wrs_server_if.py
+@@ -83,6 +83,7 @@ for index, cache in enumerate(NW_CACHE):
+     nic = {name: {'port_id': cache['id'],
+                   'mac_address': cache['address'],
+                   'vif_model': cache['vif_model'],
++                  'vif_pci_address': '',
+                   'mtu': None,  # only available from neutron in real env
+                   'network': cache['network']['label']}}
+     ALL_NICS.append(nic)
+diff --git a/nova/tests/unit/network/test_neutronv2.py b/nova/tests/unit/network/test_neutronv2.py
+index 2370ba9..213d339 100644
+--- a/nova/tests/unit/network/test_neutronv2.py
++++ b/nova/tests/unit/network/test_neutronv2.py
+@@ -549,7 +549,7 @@ class TestNeutronv2Base(test.TestCase):
+                     self.instance, mox.IgnoreArg(),
+                     mox.IgnoreArg(), network=network,
+                     neutron=self.moxed_client,
+-                    bind_host_id=None).AndReturn(None)
++                    bind_host_id=None, vif_pci_address=None).AndReturn(None)
+             elif has_portbinding:
+                 # since _populate_neutron_extension_values() will call
+                 # _has_port_binding_extension()
+@@ -1382,6 +1382,10 @@ class TestNeutronv2(TestNeutronv2Base):
+             port_id = getattr(uuids, 'portid_%s' % network['id'])
+             port = {'id': port_id, 'mac_address': 'foo'}
+ 
++            api._populate_neutron_extension_values(self.context,
++                self.instance, None, binding_port_req_body, network=network,
++                neutron=self.moxed_client, bind_host_id=None,
++                vif_pci_address=None).AndReturn(None)
+             if index == 0:
+                 self.moxed_client.update_port(port_id,
+                     MyComparator(binding_port_req_body)).AndReturn(
+@@ -1579,7 +1583,8 @@ class TestNeutronv2(TestNeutronv2Base):
+                 # NOTE(danms): Temporary and transitional
+                 with mock.patch('nova.utils.is_neutron', return_value=True):
+                     requested_networks = requested_networks.as_tuples()
+-            for net, fip, port, request_id, vif_model in requested_networks:
++            for net, fip, port, request_id, vif_model, vif_pci_address \
++                    in requested_networks:
+                 ret_data.append({'network_id': net,
+                                  'device_id': self.instance.uuid,
+                                  'device_owner': 'compute:nova',
+@@ -1594,7 +1599,8 @@ class TestNeutronv2(TestNeutronv2Base):
+                 {'ports': ret_data})
+         self.moxed_client.list_extensions().AndReturn({'extensions': []})
+         if requested_networks:
+-            for net, fip, port, request_id, vif_model in requested_networks:
++            for net, fip, port, request_id, vif_model, vif_pci_address \
++                    in requested_networks:
+                 self.moxed_client.update_port(port)
+         for port in ports:
+             self.moxed_client.delete_port(port).InAnyOrder("delete_port_group")
+@@ -5000,6 +5006,7 @@ class TestNeutronv2Portbinding(TestNeutronv2Base):
+         profile = {'pci_vendor_info': '1377:0047',
+                    'pci_slot': '0000:0a:00.1',
+                    'physical_network': 'phynet1',
++                   'pci_request_id': 'my_req_id',
+                   }
+ 
+         mock_get_instance_pci_devs.return_value = [mydev]
+diff --git a/nova/tests/unit/objects/test_network_request.py b/nova/tests/unit/objects/test_network_request.py
+index 1dd4f61..6edc25b 100644
+--- a/nova/tests/unit/objects/test_network_request.py
++++ b/nova/tests/unit/objects/test_network_request.py
+@@ -50,7 +50,7 @@ class _TestNetworkRequestObject(object):
+                                          port_id=FAKE_UUID,
+                                      )
+         with mock.patch('nova.utils.is_neutron', return_value=True):
+-            self.assertEqual(('123', '1.2.3.4', FAKE_UUID, None, None),
++            self.assertEqual(('123', '1.2.3.4', FAKE_UUID, None, None, None),
+                              request.to_tuple())
+ 
+     def test_to_tuple_nova(self):
+@@ -84,7 +84,8 @@ class _TestNetworkRequestObject(object):
+             objects=[objects.NetworkRequest(network_id='123'),
+                      objects.NetworkRequest(network_id='456')])
+         self.assertEqual(
+-            [('123', None, None, None, None), ('456', None, None, None, None)],
++            [('123', None, None, None, None, None),
++             ('456', None, None, None, None, None)],
+              requests.as_tuples())
+ 
+     def test_is_single_unspecified(self):
+diff --git a/nova/tests/unit/objects/test_objects.py b/nova/tests/unit/objects/test_objects.py
+index 7224d07..55a00ca 100644
+--- a/nova/tests/unit/objects/test_objects.py
++++ b/nova/tests/unit/objects/test_objects.py
+@@ -1146,7 +1146,7 @@ object_data = {
+     'Network': '1.2-a977ab383aa462a479b2fae8211a5dde',
+     'NetworkInterfaceMetadata': '1.1-3269ce11b30531eb1febfa5173b78b81',
+     'NetworkList': '1.2-69eca910d8fa035dfecd8ba10877ee59',
+-    'NetworkRequest': '1.2-3eeb5369745665f03fe792cf5d25eda4',
++    'NetworkRequest': '1.2-a765c8f0c0800ef704b83e4242ea50d2',
+     'NetworkRequestList': '1.1-15ecf022a68ddbb8c2a6739cfc9f8f5e',
+     'PciDevice': '1.6-2a2612baaa1786679e52084e82ca7e66',
+     'PCIDeviceBus': '1.0-2b891cb77e42961044689f3dc2718995',
+diff --git a/nova/tests/unit/virt/libvirt/test_driver.py b/nova/tests/unit/virt/libvirt/test_driver.py
+index ccfce5f..3fc528b 100755
+--- a/nova/tests/unit/virt/libvirt/test_driver.py
++++ b/nova/tests/unit/virt/libvirt/test_driver.py
+@@ -1984,7 +1984,7 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+         self.assertEqual(cfg.os_type, fields.VMMode.HVM)
+         self.assertEqual(cfg.os_boot_dev, ["hd"])
+         self.assertIsNone(cfg.os_root)
+-        self.assertEqual(len(cfg.devices), 10)
++        self.assertEqual(len(cfg.devices), 11)
+         self.assertIsInstance(cfg.devices[0],
+                               vconfig.LibvirtConfigGuestDisk)
+         self.assertIsInstance(cfg.devices[1],
+@@ -2095,7 +2095,7 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+         self.assertEqual("console=tty0 console=ttyS0 console=hvc0",
+                          cfg.os_cmdline)
+         self.assertIsNone(cfg.os_root)
+-        self.assertEqual(3, len(cfg.devices))
++        self.assertEqual(4, len(cfg.devices))
+         self.assertIsInstance(cfg.devices[0],
+                               vconfig.LibvirtConfigGuestFilesys)
+         self.assertIsInstance(cfg.devices[1],
+@@ -2121,7 +2121,7 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+         self.assertEqual("console=tty0 console=ttyS0 console=hvc0",
+                          cfg.os_cmdline)
+         self.assertIsNone(cfg.os_root)
+-        self.assertEqual(3, len(cfg.devices))
++        self.assertEqual(4, len(cfg.devices))
+         self.assertIsInstance(cfg.devices[0],
+                               vconfig.LibvirtConfigGuestFilesys)
+         self.assertIsInstance(cfg.devices[1],
+@@ -3327,7 +3327,7 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+         self.assertEqual(cfg.os_type, fields.VMMode.HVM)
+         self.assertEqual(cfg.os_boot_dev, ["hd"])
+         self.assertIsNone(cfg.os_root)
+-        self.assertEqual(len(cfg.devices), 10)
++        self.assertEqual(len(cfg.devices), 11)
+         self.assertIsInstance(cfg.devices[0],
+                               vconfig.LibvirtConfigGuestDisk)
+         self.assertIsInstance(cfg.devices[1],
+@@ -3392,7 +3392,7 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+         self.assertEqual(cfg.os_type, "uml")
+         self.assertEqual(cfg.os_boot_dev, [])
+         self.assertEqual(cfg.os_root, '/dev/vdb')
+-        self.assertEqual(len(cfg.devices), 3)
++        self.assertEqual(len(cfg.devices), 4)
+         self.assertIsInstance(cfg.devices[0],
+                               vconfig.LibvirtConfigGuestDisk)
+         self.assertIsInstance(cfg.devices[1],
+@@ -3663,7 +3663,7 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+                                             image_meta)
+         cfg = drvr._get_guest_config(instance_ref, [],
+                                      image_meta, disk_info)
+-        self.assertEqual(len(cfg.devices), 7)
++        self.assertEqual(len(cfg.devices), 8)
+         self.assertIsInstance(cfg.devices[0],
+                               vconfig.LibvirtConfigGuestDisk)
+         self.assertIsInstance(cfg.devices[1],
+@@ -3699,7 +3699,7 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+                                             image_meta)
+         cfg = drvr._get_guest_config(instance_ref, [],
+                                      image_meta, disk_info)
+-        self.assertEqual(len(cfg.devices), 8)
++        self.assertEqual(len(cfg.devices), 9)
+         self.assertIsInstance(cfg.devices[0],
+                               vconfig.LibvirtConfigGuestDisk)
+         self.assertIsInstance(cfg.devices[1],
+@@ -3740,7 +3740,7 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+                                             image_meta)
+         cfg = drvr._get_guest_config(instance_ref, [],
+                                      image_meta, disk_info)
+-        self.assertEqual(len(cfg.devices), 8)
++        self.assertEqual(len(cfg.devices), 9)
+         self.assertIsInstance(cfg.devices[0],
+                               vconfig.LibvirtConfigGuestDisk)
+         self.assertIsInstance(cfg.devices[1],
+@@ -3781,7 +3781,7 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+                                             image_meta)
+         cfg = drvr._get_guest_config(instance_ref, [],
+                                      image_meta, disk_info)
+-        self.assertEqual(len(cfg.devices), 8)
++        self.assertEqual(len(cfg.devices), 9)
+         self.assertIsInstance(cfg.devices[0],
+                               vconfig.LibvirtConfigGuestDisk)
+         self.assertIsInstance(cfg.devices[1],
+@@ -3924,7 +3924,7 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+ 
+         cfg = drvr._get_guest_config(instance_ref, [],
+                                      image_meta, disk_info)
+-        self.assertEqual(8, len(cfg.devices))
++        self.assertEqual(9, len(cfg.devices))
+         self.assertIsInstance(cfg.devices[0],
+                               vconfig.LibvirtConfigGuestDisk)
+         self.assertIsInstance(cfg.devices[1],
+@@ -3960,7 +3960,7 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+ 
+         cfg = drvr._get_guest_config(instance_ref, [],
+                                      image_meta, disk_info)
+-        self.assertEqual(10, len(cfg.devices))
++        self.assertEqual(11, len(cfg.devices))
+         self.assertIsInstance(cfg.devices[0],
+                               vconfig.LibvirtConfigGuestDisk)
+         self.assertIsInstance(cfg.devices[1],
+@@ -4020,7 +4020,7 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+                                             image_meta)
+         cfg = drvr._get_guest_config(instance_ref, [], image_meta,
+                                      disk_info)
+-        self.assertEqual(10, len(cfg.devices), cfg.devices)
++        self.assertEqual(11, len(cfg.devices), cfg.devices)
+         self.assertIsInstance(cfg.devices[0],
+                               vconfig.LibvirtConfigGuestDisk)
+         self.assertIsInstance(cfg.devices[1],
+@@ -4262,7 +4262,7 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+                                             image_meta)
+         cfg = drvr._get_guest_config(instance_ref, [],
+                                      image_meta, disk_info)
+-        self.assertEqual(len(cfg.devices), 6)
++        self.assertEqual(len(cfg.devices), 7)
+         self.assertIsInstance(cfg.devices[0],
+                               vconfig.LibvirtConfigGuestDisk)
+         self.assertIsInstance(cfg.devices[1],
+@@ -4403,7 +4403,7 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+                                             image_meta)
+         cfg = drvr._get_guest_config(instance_ref, [],
+                                      image_meta, disk_info)
+-        self.assertEqual(len(cfg.devices), 10)
++        self.assertEqual(len(cfg.devices), 11)
+         self.assertIsInstance(cfg.devices[0],
+                               vconfig.LibvirtConfigGuestDisk)
+         self.assertIsInstance(cfg.devices[1],
+@@ -4445,7 +4445,7 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+                                             image_meta)
+ 
+         cfg = drvr._get_guest_config(instance_ref, [], image_meta, disk_info)
+-        self.assertEqual(len(cfg.devices), 9)
++        self.assertEqual(len(cfg.devices), 10)
+         self.assertIsInstance(cfg.devices[0],
+                               vconfig.LibvirtConfigGuestDisk)
+         self.assertIsInstance(cfg.devices[1],
+@@ -4599,7 +4599,7 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+         cfg = drvr._get_guest_config(instance_ref, [],
+                                      image_meta, disk_info)
+ 
+-        self.assertEqual(9, len(cfg.devices))
++        self.assertEqual(10, len(cfg.devices))
+         self.assertIsInstance(cfg.devices[0],
+                               vconfig.LibvirtConfigGuestDisk)
+         self.assertIsInstance(cfg.devices[1],
+@@ -4639,7 +4639,7 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+         cfg = drvr._get_guest_config(instance_ref, [],
+                                      image_meta, disk_info)
+ 
+-        self.assertEqual(9, len(cfg.devices))
++        self.assertEqual(10, len(cfg.devices))
+         self.assertIsInstance(cfg.devices[0],
+                               vconfig.LibvirtConfigGuestDisk)
+         self.assertIsInstance(cfg.devices[1],
+@@ -4674,7 +4674,7 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+                                             instance_ref,
+                                             image_meta)
+         cfg = drvr._get_guest_config(instance_ref, [], image_meta, disk_info)
+-        self.assertEqual(len(cfg.devices), 8)
++        self.assertEqual(len(cfg.devices), 9)
+         self.assertIsInstance(cfg.devices[0],
+                               vconfig.LibvirtConfigGuestDisk)
+         self.assertIsInstance(cfg.devices[1],
+@@ -4708,7 +4708,7 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+                                             instance_ref,
+                                             image_meta)
+         cfg = drvr._get_guest_config(instance_ref, [], image_meta, disk_info)
+-        self.assertEqual(len(cfg.devices), 9)
++        self.assertEqual(len(cfg.devices), 10)
+         self.assertIsInstance(cfg.devices[0],
+                               vconfig.LibvirtConfigGuestDisk)
+         self.assertIsInstance(cfg.devices[1],
+@@ -4754,7 +4754,7 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+ 
+         cfg = drvr._get_guest_config(instance_ref, [],
+                                      image_meta, disk_info)
+-        self.assertEqual(len(cfg.devices), 8)
++        self.assertEqual(len(cfg.devices), 9)
+         self.assertIsInstance(cfg.devices[0],
+                               vconfig.LibvirtConfigGuestDisk)
+         self.assertIsInstance(cfg.devices[1],
+@@ -4880,7 +4880,7 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+                                             instance_ref,
+                                             image_meta)
+         cfg = drvr._get_guest_config(instance_ref, [], image_meta, disk_info)
+-        self.assertEqual(len(cfg.devices), 8)
++        self.assertEqual(len(cfg.devices), 9)
+         self.assertIsInstance(cfg.devices[0],
+                               vconfig.LibvirtConfigGuestDisk)
+         self.assertIsInstance(cfg.devices[1],
+@@ -4918,7 +4918,7 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+ 
+         cfg = drvr._get_guest_config(instance_ref, [],
+                                      image_meta, disk_info)
+-        self.assertEqual(len(cfg.devices), 8)
++        self.assertEqual(len(cfg.devices), 9)
+         self.assertIsInstance(cfg.devices[0],
+                               vconfig.LibvirtConfigGuestDisk)
+         self.assertIsInstance(cfg.devices[1],
+@@ -4957,7 +4957,7 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+ 
+         cfg = drvr._get_guest_config(instance_ref, [],
+                                      image_meta, disk_info)
+-        self.assertEqual(len(cfg.devices), 7)
++        self.assertEqual(len(cfg.devices), 8)
+         self.assertIsInstance(cfg.devices[0],
+                               vconfig.LibvirtConfigGuestDisk)
+         self.assertIsInstance(cfg.devices[1],
+@@ -4992,7 +4992,7 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+ 
+         cfg = drvr._get_guest_config(instance_ref, [],
+                                      image_meta, disk_info)
+-        self.assertEqual(len(cfg.devices), 8)
++        self.assertEqual(len(cfg.devices), 9)
+         self.assertIsInstance(cfg.devices[0],
+                               vconfig.LibvirtConfigGuestDisk)
+         self.assertIsInstance(cfg.devices[1],
+@@ -5036,7 +5036,7 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+ 
+         cfg = drvr._get_guest_config(instance_ref, [],
+                                      image_meta, disk_info)
+-        self.assertEqual(len(cfg.devices), 8)
++        self.assertEqual(len(cfg.devices), 9)
+         self.assertIsInstance(cfg.devices[0],
+                               vconfig.LibvirtConfigGuestDisk)
+         self.assertIsInstance(cfg.devices[1],
+@@ -16133,7 +16133,7 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+         self.assertEqual(instance_ref.flavor.vcpus, cfg.vcpus)
+         self.assertEqual(fields.VMMode.HVM, cfg.os_type)
+         self.assertIsNone(cfg.os_root)
+-        self.assertEqual(6, len(cfg.devices))
++        self.assertEqual(7, len(cfg.devices))
+         self.assertIsInstance(cfg.devices[0],
+                               vconfig.LibvirtConfigGuestDisk)
+         self.assertEqual(cfg.devices[0].driver_format, "ploop")
+@@ -16179,9 +16179,9 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+         self.assertEqual("/sbin/init", cfg.os_init_path)
+         self.assertIsNone(cfg.os_root)
+         if rescue:
+-            self.assertEqual(5, len(cfg.devices))
++            self.assertEqual(6, len(cfg.devices))
+         else:
+-            self.assertEqual(4, len(cfg.devices))
++            self.assertEqual(5, len(cfg.devices))
+         self.assertIsInstance(cfg.devices[0],
+                               vconfig.LibvirtConfigGuestFilesys)
+ 
+@@ -16243,7 +16243,7 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+         self.assertEqual(instance_ref.flavor.vcpus, cfg.vcpus)
+         self.assertEqual(vmmode, cfg.os_type)
+         self.assertIsNone(cfg.os_root)
+-        self.assertEqual(devices, len(cfg.devices))
++        self.assertEqual(devices + 1, len(cfg.devices))
+ 
+         disk_found = False
+ 
+diff --git a/nova/tests/unit/virt/wrs/test_config.py b/nova/tests/unit/virt/wrs/test_config.py
+index 35f2994..60f7fa4 100644
+--- a/nova/tests/unit/virt/wrs/test_config.py
++++ b/nova/tests/unit/virt/wrs/test_config.py
+@@ -13,7 +13,8 @@ sys.modules['neutron.agent'] = mock.Mock()
+ sys.modules['neutron.agent.vswitch'] = mock.Mock()
+ from nova import test
+ from nova.tests.unit import matchers
+-from nova.virt.wrs.libvirt import config
++from nova.virt.libvirt import config as vconfig
++from nova.virt.wrs.libvirt import config as wrs_config
+ 
+ 
+ class LibvirtConfigBaseTest(test.NoDBTestCase):
+@@ -21,37 +22,29 @@ class LibvirtConfigBaseTest(test.NoDBTestCase):
+         self.assertThat(actualXmlstr, matchers.XMLMatches(expectedXmlstr))
+ 
+ 
+-class LibvirtConfigGuestQemuRawDevice(LibvirtConfigBaseTest):
+-
+-    def test_config_qemu_raw_device(self):
+-        obj = config.LibvirtConfigGuestQemuRawDevice()
+-        obj.add_argument("testarg")
+-        obj.add_variable("testvar")
+-
+-        xml = obj.to_xml()
+-        expected_xml = """
+-        <qemu:commandline
+-            xmlns:qemu="http://libvirt.org/schemas/domain/qemu/1.0">
+-          <qemu:arg value="testarg"/>
+-          <qemu:env value="testvar"/>
+-        </qemu:commandline>"""
+-
+-        self.assertXmlEqual(expected_xml, xml)
+-
+-
+ 
+@@ -59,7 +52,7 @@ 
+ class LibvirtConfigGuestDpdkOptions(LibvirtConfigBaseTest):
+ 
+     def test_config_dpdk_options(self):
+-        obj = config.LibvirtConfigGuestDpdkOptions()
++        obj = wrs_config.LibvirtConfigGuestDpdkOptions()
+         obj.process_type = 'secondary'
+         obj.prefix = 'vs'
+         obj.channels = '4'
+diff --git a/nova/tests/unit/virt/wrs/test_vif.py b/nova/tests/unit/virt/wrs/test_vif.py
+index 66b2c25..d107778 100644
+--- a/nova/tests/unit/virt/wrs/test_vif.py
++++ b/nova/tests/unit/virt/wrs/test_vif.py
+@@ -165,11 +165,12 @@ class LibvirtWRSVifTestCase(test.NoDBTestCase):
+             <bios rebootTimeout="5000"/>
+         </os>
+         <devices>
+         </devices>
+         </domain>"""
+         self._assertXmlEqual(expected_xml, xml)
+diff --git a/nova/virt/libvirt/config.py b/nova/virt/libvirt/config.py
+index 9ed772a..1d5539c 100644
+--- a/nova/virt/libvirt/config.py
++++ b/nova/virt/libvirt/config.py
+@@ -11,6 +11,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2015-2016 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ """
+ Configuration for libvirt objects.
+@@ -1280,6 +1287,8 @@ class LibvirtConfigGuestInterface(LibvirtConfigGuestDevice):
+         self.vif_outbound_average = None
+         self.vlan = None
+         self.device_addr = None
++        self.guest_pci_address = None
++        self.target_dev_uuid = None
+ 
+     def format_dom(self):
+         dev = super(LibvirtConfigGuestInterface, self).format_dom()
+@@ -1336,7 +1345,10 @@ class LibvirtConfigGuestInterface(LibvirtConfigGuestDevice):
+             dev.append(vlan_elem)
+ 
+         if self.target_dev is not None:
+-            dev.append(etree.Element("target", dev=self.target_dev))
++            target_dev_elem = etree.Element("target", dev=self.target_dev)
++            if self.target_dev_uuid:
++                target_dev_elem.set("uuid", self.target_dev_uuid)
++            dev.append(target_dev_elem)
+ 
+         if self.vporttype is not None:
+             vport = etree.Element("virtualport", type=self.vporttype)
+@@ -1375,6 +1387,18 @@ class LibvirtConfigGuestInterface(LibvirtConfigGuestDevice):
+                 bandwidth.append(vif_outbound)
+             dev.append(bandwidth)
+ 
++        # Put NIC at specific guest PCI address.
++        if self.guest_pci_address:
++            domain, bus, slot, func = \
++                pci_utils.get_pci_address_fields(self.guest_pci_address)
++            guest_address = etree.Element(
++                "address", type='pci',
++                domain='0x{:s}'.format(domain),
++                bus='0x{:s}'.format(bus),
++                slot='0x{:s}'.format(slot),
++                function='0x{:s}'.format(func))
++            dev.append(guest_address)
++
+         return dev
+ 
+     def parse_dom(self, xmldoc):
+@@ -1628,6 +1652,7 @@ class LibvirtConfigGuestHostdevPCI(LibvirtConfigGuestHostdev):
+         self.bus = None
+         self.slot = None
+         self.function = None
++        self.guest_pci_address = None
+ 
+     def format_dom(self):
+         dev = super(LibvirtConfigGuestHostdevPCI, self).format_dom()
+@@ -1640,6 +1665,19 @@ class LibvirtConfigGuestHostdevPCI(LibvirtConfigGuestHostdev):
+         source = etree.Element("source")
+         source.append(address)
+         dev.append(source)
++
++        # Put NIC at specific guest PCI address.
++        if self.guest_pci_address:
++            domain, bus, slot, func = \
++                pci_utils.get_pci_address_fields(self.guest_pci_address)
++            guest_address = etree.Element(
++                "address", type='pci',
++                domain='0x{:s}'.format(domain),
++                bus='0x{:s}'.format(bus),
++                slot='0x{:s}'.format(slot),
++                function='0x{:s}'.format(func))
++            dev.append(guest_address)
++
+         return dev
+ 
+     def parse_dom(self, xmldoc):
+@@ -2649,3 +2687,28 @@ class LibvirtConfigSecret(LibvirtConfigObject):
+             usage.append(self._text_node('volume', str(self.usage_id)))
+         root.append(usage)
+         return root
++
++
++class LibvirtConfigPciController(LibvirtConfigGuestDevice):
++    def __init__(self, **kwargs):
++        super(LibvirtConfigGuestDevice, self).__init__(
++            root_name='controller',
++            **kwargs)
++        self.type = "pci"
++        self.index = None
++        self.model = None
++        self.pcihole64 = None
++
++    def format_dom(self):
++        dev = super(LibvirtConfigGuestDevice, self).format_dom()
++
++        dev.set("type", self.type)
++        dev.set("index", str(self.index))
++        dev.set("model", self.model)
++        if self.pcihole64:
++            pcihole64 = etree.Element("pcihole64")
++            pcihole64.set('unit', 'GiB')
++            pcihole64.text = str(self.pcihole64)
++            dev.append(pcihole64)
++
++        return dev
+diff --git a/nova/virt/libvirt/driver.py b/nova/virt/libvirt/driver.py
+index 4aaaca9..ead7947 100644
+--- a/nova/virt/libvirt/driver.py
++++ b/nova/virt/libvirt/driver.py
+@@ -5061,6 +5061,37 @@ class LibvirtDriver(driver.ComputeDriver):
+                 cpu_config.features.add(xf)
+         return cpu_config
+ 
++    def _get_guest_vif_pci_address(self, vif):
++        if vif:
++            profile = vif.get('profile')
++            if profile is not None:
++                return profile.get('vif_pci_address')
++            else:
++                return None
++
++    def _get_pcihole64(self, os_type):
++        """Determines whether to set pcihole64 based on OS of guest.
++
++        :param:os_type Operating system type of the guest
++
++        :return: pcihole64 size if it is to be set, else None.
++
++        """
++        if os_type == 'windows':
++            return None
++        else:
++            # This returns 64GiB, which libvirt converts to 67108864 KiB
++            # This is neccesary to allow hotplugging 16 NICs, which
++            # can each use up to 4GiB of address space.
++            return 64
++
+     def _get_guest_config(self, instance, network_info, image_meta,
+                           disk_info, rescue=None, block_device_info=None,
+                           context=None):
+@@ -5113,6 +5144,10 @@ class LibvirtDriver(driver.ComputeDriver):
+         instance.vcpu_model = self._cpu_config_to_vcpu_model(
+             guest.cpu, instance.vcpu_model)
+ 
++        # We need to get the maximum value of the bus number so that we
++        # can configure the PCI controller.
++        max_pci_bus = 0
++
+         if 'root' in disk_mapping:
+             root_device_name = block_device.prepend_dev(
+                 disk_mapping['root']['dev'])
+@@ -5148,7 +5183,17 @@ class LibvirtDriver(driver.ComputeDriver):
+         for vif in network_info:
+             config = self.vif_driver.get_config(
+                 instance, vif, image_meta,
+-                flavor, virt_type, self._host)
++                    flavor, virt_type, self._host)
++
++            # override guest PCI address
++            vif_pci_address = self._get_guest_vif_pci_address(vif)
++            if vif_pci_address is not None:
++                config.guest_pci_address = vif_pci_address
++
++                domain, bus, slot, func = \
++                    pci_utils.get_pci_address_fields(vif_pci_address)
++                max_pci_bus = max(int(bus, 16), max_pci_bus)
++
+             guest.add_device(config)
+ 
+         self._create_consoles(virt_type, guest, instance, flavor, image_meta)
+@@ -5169,14 +5214,39 @@ class LibvirtDriver(driver.ComputeDriver):
+ 
+         self._set_cgcs_msg(guest, flavor, instance)
+ 
+-        self._guest_add_pci_devices(guest, instance)
++        self._guest_add_pci_devices(guest, instance, network_info, max_pci_bus)
+ 
+         self._guest_add_watchdog_action(guest, flavor, image_meta)
+ 
+         self._guest_add_memory_balloon(guest)
+ 
++        self._set_pci_controller(guest, instance, max_pci_bus)
++
+         return guest
+ 
+     @staticmethod
+     def _guest_add_spice_channel(guest):
+         if (CONF.spice.enabled and CONF.spice.agent_enabled
+@@ -5217,12 +5287,38 @@ class LibvirtDriver(driver.ComputeDriver):
+             else:
+                 raise exception.InvalidWatchdogAction(action=watchdog_action)
+ 
+-    def _guest_add_pci_devices(self, guest, instance):
++    def _guest_add_pci_devices(self, guest, instance, network_info,
++                               max_pci_bus):
+         virt_type = guest.virt_type
+         if virt_type in ('xen', 'qemu', 'kvm'):
+             # Get all generic PCI devices (non-SR-IOV).
+-            for pci_dev in pci_manager.get_instance_pci_devs(instance):
+-                guest.add_device(self._get_guest_pci_device(pci_dev))
++            def get_from_network_info(pci_dev, network_info):
++                for vif in network_info:
++                    if (vif.get('profile', {}).get('pci_slot')
++                            == pci_dev.get('address')):
++                        return vif
++                return None
++
++            for pci_dev in pci_manager.get_instance_pci_devs(instance, 'all'):
++                config = self._get_guest_pci_device(pci_dev)
++
++                # Don't include PCI devices that were included in the
++                # loop over network_info above (SR-IOV PCI devices for vNIC).
++                # Else libvirt will complain that a given PCI device is
++                # already allocated.
++                vif = get_from_network_info(pci_dev, network_info)
++                if (vif is None or vif.get('vnic_type')
++                        != network_model.VNIC_TYPE_DIRECT):
++                    # override guest PCI address
++                    vif_pci_address = self._get_guest_vif_pci_address(vif)
++                    if vif_pci_address is not None:
++                        config.guest_pci_address = vif_pci_address
++
++                        domain, bus, slot, func = \
++                            pci_utils.get_pci_address_fields(vif_pci_address)
++                        max_pci_bus = max(int(bus, 16), max_pci_bus)
++
++                    guest.add_device(config)
+         else:
+             # PCI devices is only supported for hypervisors
+             #  'xen', 'qemu' and 'kvm'.
+diff --git a/nova/virt/libvirt/vif.py b/nova/virt/libvirt/vif.py
+index 9a42c71..6a5bd4e 100644
+--- a/nova/virt/libvirt/vif.py
++++ b/nova/virt/libvirt/vif.py
+@@ -15,6 +15,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2015-2016 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ """VIF drivers for libvirt."""
+ 
+@@ -58,13 +65,15 @@ def is_vif_model_valid_for_virt(virt_type, vif_model):
+
+diff --git a/nova/virt/wrs/libvirt/config.py b/nova/virt/wrs/libvirt/config.py
+index be51690..4702b48 100644
+--- a/nova/virt/wrs/libvirt/config.py
++++ b/nova/virt/wrs/libvirt/config.py
+@@ -167,7 +167,17 @@ class LibvirtConfigWrapper(object):
+ 
+ class LibvirtConfigGuestInterface(LibvirtConfigWrapper):
+ 
++    def __init__(self, obj):
++        super(LibvirtConfigGuestInterface, self).__init__(obj)
++
++        self.guest_pci_address = None
++
+     def format_dom(self):
++        # Not pretty, but needed since we don't have __setattr__ in
++        # LibvirtConfigWrapper.  Putting all of the handling for guest_slot
++        # in this class misses the SRIOV case (and likely others).
++        self.obj.guest_pci_address = self.guest_pci_address
++
+         conf = super(LibvirtConfigGuestInterface, self).format_dom()
+         return conf
+ 
+diff --git a/nova/virt/wrs/libvirt/designer.py b/nova/virt/wrs/libvirt/designer.py
+index c6722ba..ba9d7a5 100644
+--- a/nova/virt/wrs/libvirt/designer.py
++++ b/nova/virt/wrs/libvirt/designer.py
+@@ -17,9 +17,12 @@ def set_vif_host_backend_vswitch_config(conf, network_id, port_id):
+     conf.target_dev = port_id
+ 
+ 
+diff --git a/nova/virt/wrs/libvirt/vif.py b/nova/virt/wrs/libvirt/vif.py
+index 8ff2046..b7a1d0b 100644
+--- a/nova/virt/wrs/libvirt/vif.py
++++ b/nova/virt/wrs/libvirt/vif.py
+@@ -6,7 +6,7 @@
+ #
+ 
+ from nova import exception
+-from nova.i18n import _, _LE, _LW
++from nova.i18n import _
+ 
+ from oslo_log import log as logging
+ 
+@@ -29,13 +29,20 @@ class LibvirtGenericVIFDriver(vif.LibvirtGenericVIFDriver):
+     def __init__(self):
+         self.vswitch_api = vswitch_api.VSwitchManagementAPI()
+ 
+         return conf
+ 
+     def _get_vhost_settings(self, instance, vif):
+@@ -57,7 +64,7 @@ class LibvirtGenericVIFDriver(vif.LibvirtGenericVIFDriver):
+ 
+         # Disable vhost-user for guest with 4K pages backed memory.
+         if pgsize == MEMPAGES_4K:
+-            LOG.warning(_LW("Disabling vhost-user"))
++            LOG.warning("Disabling vhost-user")
+             vhost_mode = None
+             vhost_sock_path = None
+ 
+@@ -83,8 +90,8 @@ class LibvirtGenericVIFDriver(vif.LibvirtGenericVIFDriver):
+             # can handle.
+             VSWITCH_MAX_QUEUES = 8
+             if conf.vhost_queues > VSWITCH_MAX_QUEUES:
+-                LOG.warning(_LW(
+-                    "Limitting vhost queues to max {}, requested {}").format(
++                LOG.warning(
++                    "Limitting vhost queues to max {}, requested {}".format(
+                     VSWITCH_MAX_QUEUES, conf.vhost_queues))
+                 conf.vhost_queues = VSWITCH_MAX_QUEUES
+ 
+@@ -105,7 +112,8 @@ class LibvirtGenericVIFDriver(vif.LibvirtGenericVIFDriver):
+         # compute.api.API._create_instance()
+         model = vif.get('vif_model')
+
+@@ -143,15 +151,14 @@ class LibvirtGenericVIFDriver(vif.LibvirtGenericVIFDriver):
+             LOG.debug("port {} on socket-id {}".format(port['uuid'],
+                                                        port['socket-id']))
+         else:
+-            LOG.debug(_LW("No NUMA node list on port {}").format(vif['id']))
+-
++            LOG.debug("No NUMA node list on port {}".format(vif['id']))
+         try:
+             self.vswitch_api.add_port(port)
+             LOG.info("Port %s has been created on vswitch", port['uuid'])
+             # The port will be attached to its network when the Agent
+             # recognizes that this port has been added.
+         except vswitch_exceptions.VSwitchError as e:
+-            LOG.error(_LE("Failed to create port {}, {}").format(port['uuid'],
++            LOG.error("Failed to create port {}, {}".format(port['uuid'],
+                                                                e))
+             raise exception.NovaException(
+                 _("Failed to create port %s on vswitch") % port['uuid'])
+-- 
+2.7.4
+

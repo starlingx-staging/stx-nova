@@ -1,0 +1,148 @@
+From 39915010ecad24cfc9e84c6382baee19cd0b3db3 Mon Sep 17 00:00:00 2001
+From: Steven Webster <steven.webster@windriver.com>
+Date: Mon, 7 Aug 2017 21:20:51 -0400
+Subject: [PATCH 067/143] US100223: GPU passthrough
+
+For GPU passthough, PCI aliases were added for gpu, gpu-pf, and gpu-vf.
+Another alias 'user' enables a user to passthrough any PCI device, such
+as a USB mouse, keyboard, etc.
+
+Initially, we add all devices with a PCI class id of 'GPU' to the Nova
+PCI devices table, as well as fill out (with packstack) the nova.conf
+pci_passthrough_whitelist.
+
+This commit adds a tag to the Nova PCI request spec to represent the
+class id of the device.  A tag was chosen so as not to modify the PCI
+devices database, which only tracks device/vendor id.  In this way, we
+stay as close as possible to the upstream codebase.
+
+This commit also makes the pci_alias configuration parameter mutable.
+As of Newton, configuration can be re-read by a service by sending
+a HUP signal, rather than having to restart the service (as long
+as the parameter is mutable).
+
+__TYPE_single
+__TAG_pci,gpu_passthrough
+__R5_commit_0576ddd
+---
+ nova/api/openstack/compute/wrs_pci.py | 11 ++++++++---
+ nova/conf/pci.py                      |  2 ++
+ nova/pci/request.py                   |  4 ++++
+ nova/pci/stats.py                     |  6 ++++--
+ nova/pci/utils.py                     |  1 +
+ 5 files changed, 19 insertions(+), 5 deletions(-)
+
+diff --git a/nova/api/openstack/compute/wrs_pci.py b/nova/api/openstack/compute/wrs_pci.py
+index 35c556e..9a7e22b 100644
+--- a/nova/api/openstack/compute/wrs_pci.py
++++ b/nova/api/openstack/compute/wrs_pci.py
+@@ -23,10 +23,11 @@ LOG = logging.getLogger(__name__)
+ 
+ 
+ class WrsPciUsage(object):
+-    def __init__(self, product_id, vendor_id):
++    def __init__(self, product_id, vendor_id, class_id):
+         '''Construct a WrsPciUsage object with the given values.'''
+         self.product_id = product_id
+         self.vendor_id = vendor_id
++        self.class_id = class_id
+         self.pci_pfs_configured = 0
+         self.pci_pfs_count = 0
+         self.pci_vfs_configured = 0
+@@ -38,12 +39,16 @@ class WrsPciUsage(object):
+                 if (self.product_id != devspec.ANY and
+                     self.product_id != pool.product_id):
+                     continue
++                if (self.class_id and
++                    self.class_id != pool.tags.get("class_id")):
++                    continue
+                 tags = pool.tags
+                 dev_type = tags.get('dev_type', {})
+                 configured = int(tags.get('configured', '0'))
+ 
+-                if (self.product_id == pool.product_id and
+-                    self.vendor_id == pool.vendor_id):
++                if ((self.product_id == pool.product_id and
++                     self.vendor_id == pool.vendor_id) or
++                     self.class_id == pool.tags.get("class_id")):
+                     if 'type-PCI' in dev_type:
+                         self.pci_pfs_configured += configured
+                         self.pci_pfs_count += pool.count
+diff --git a/nova/conf/pci.py b/nova/conf/pci.py
+index cc41781..99842df 100644
+--- a/nova/conf/pci.py
++++ b/nova/conf/pci.py
+@@ -22,6 +22,7 @@ pci_group = cfg.OptGroup(
+ 
+ pci_opts = [
+     cfg.MultiStrOpt('alias',
++        mutable=True,
+         default=[],
+         deprecated_name='pci_alias',
+         deprecated_group='DEFAULT',
+@@ -81,6 +82,7 @@ Possible values:
+     PCI devices have a name.
+   * "<tag>": Additional <tag> and <tag_value> used for matching PCI devices.
+     Supported <tag>: "physical_network".
++                     "class_id"
+ 
+   The address key supports traditional glob style and regular expression
+   syntax. Valid examples are:
+diff --git a/nova/pci/request.py b/nova/pci/request.py
+index 9f38313..5d68445 100644
+--- a/nova/pci/request.py
++++ b/nova/pci/request.py
+@@ -88,6 +88,10 @@ _ALIAS_SCHEMA = {
+             "type": "string",
+             "pattern": utils.PCI_VENDOR_PATTERN,
+         },
++        "class_id": {
++            "type": "string",
++            "pattern": utils.PCI_CLASS_PATTERN,
++        },
+         "device_type": {
+             "type": "string",
+             "enum": _ALIAS_DEV_TYPE,
+diff --git a/nova/pci/stats.py b/nova/pci/stats.py
+index db4177e..02a1049 100644
+--- a/nova/pci/stats.py
++++ b/nova/pci/stats.py
+@@ -80,11 +80,12 @@ class PciDeviceStats(object):
+                 devices = pool.get('count')
+ 
+             fmt = ('[vendor:{}, product:{}, numa:{}, physnet:{}, ' +
+-                   'dev_type:{}]: {}\n')
++                   'class:{}, dev_type:{}]: {}\n')
+             _pools += fmt.format(pool.get('vendor_id'),
+                                  pool.get('product_id'),
+                                  pool.get('numa_node'),
+                                  pool.get('physical_network'),
++                                 pool.get('class_id'),
+                                  pool.get('dev_type'),
+                                  devices)
+         return _pools
+@@ -426,7 +427,8 @@ class PciDeviceStats(object):
+         # Make sort comparator more deterministic using specific keys.
+         # depending on the device type.
+         return (pool['product_id'], pool['vendor_id'], pool['numa_node'],
+-            pool.get('dev_type'), pool.get('physical_network'))
++            pool.get('dev_type'), pool.get('physical_network'),
++            pool.get('class_id'))
+ 
+     def __iter__(self):
+         # 'devices' shouldn't be part of stats
+diff --git a/nova/pci/utils.py b/nova/pci/utils.py
+index d909864..afd40fc 100644
+--- a/nova/pci/utils.py
++++ b/nova/pci/utils.py
+@@ -38,6 +38,7 @@ from nova.virt import hardware
+ LOG = logging.getLogger(__name__)
+ 
+ PCI_VENDOR_PATTERN = "^(hex{4})$".replace("hex", "[\da-fA-F]")
++PCI_CLASS_PATTERN = "^(hex{6})$".replace("hex", "[\da-fA-F]")
+ _PCI_ADDRESS_PATTERN = ("^(hex{4}):(hex{2}):(hex{2}).(oct{1})$".
+                                              replace("hex", "[\da-fA-F]").
+                                              replace("oct", "[0-7]"))
+-- 
+2.7.4
+

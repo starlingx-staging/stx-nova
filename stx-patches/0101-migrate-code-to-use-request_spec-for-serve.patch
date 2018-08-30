@@ -1,0 +1,76 @@
+From 248ca724a248da510832c769bd32eb5d5d14bf7d Mon Sep 17 00:00:00 2001
+From: Francois Palin <francois.palin@windriver.com>
+Date: Tue, 13 Feb 2018 16:41:49 -0500
+Subject: [PATCH 101/143] migrate code to use request_spec for server groups
+
+Migrate code needs to use and update request_spec info
+for server group retrieval and update, similar to what
+is done in live migration code.
+
+This way we have the augmented member hosts list in the
+request_spec, which is passed further down to scheduler
+select_destinations. Added hosts will then be taken
+into account by the scheduler affinity code.
+
+To be merged with d9f6f1ca8d6 on the next re-base.
+---
+ nova/conductor/tasks/migrate.py | 32 +++++++++++++++++++++-----------
+ 1 file changed, 21 insertions(+), 11 deletions(-)
+
+diff --git a/nova/conductor/tasks/migrate.py b/nova/conductor/tasks/migrate.py
+index a47fe53..fbd1fe1 100644
+--- a/nova/conductor/tasks/migrate.py
++++ b/nova/conductor/tasks/migrate.py
+@@ -45,13 +45,13 @@ class MigrationTask(base.TaskBase):
+         # add hosts to Server group host list for group members
+         # that are migrating in progress
+         if 'group_members' in legacy_props:
+-            metadetails = legacy_props['group_metadetails']
++            metadetails = self.request_spec.instance_group['metadetails']
+             is_best_effort = strutils.bool_from_string(
+-                                metadetails.get('wrs-sg:best_effort', 'False'))
++                metadetails.get('wrs-sg:best_effort', 'False'))
+ 
+-            if ('anti-affinity' in legacy_props['group_policies'] and
+-                    not is_best_effort):
+-                group_members = legacy_props['group_members']
++            if ('anti-affinity' in self.request_spec.instance_group['policies']
++                    and not is_best_effort):
++                group_members = self.request_spec.instance_group['members']
+ 
+                 for instance_uuid in group_members:
+                     filters = {
+@@ -60,14 +60,24 @@ class MigrationTask(base.TaskBase):
+                                    'post-migrating', 'finished']
+                     }
+ 
+-                    migrations = objects.MigrationList.\
+-                        get_by_filters(self.context, filters)
++                    migrations = objects.MigrationList.get_by_filters(
++                                                         self.context, filters)
+ 
+                     for migration in migrations:
+-                        legacy_props['group_hosts'].\
+-                            add(migration['source_compute'])
+-                        legacy_props['group_hosts'].\
+-                            add(migration['dest_compute'])
++                        if migration['source_compute'] not in \
++                                self.request_spec.instance_group['hosts']:
++                            self.request_spec.instance_group['hosts'].append(
++                                                   migration['source_compute'])
++                        if (migration['dest_compute'] and (
++                                migration['dest_compute'] not in
++                                   self.request_spec.instance_group['hosts'])):
++                            self.request_spec.instance_group['hosts'].append(
++                                                     migration['dest_compute'])
++
++                # refresh legacy_spec and legacy_props with latest request_spec
++                legacy_spec = self.request_spec.to_legacy_request_spec_dict()
++                legacy_props = self.\
++                    request_spec.to_legacy_filter_properties_dict()
+ 
+         scheduler_utils.populate_retry(legacy_props,
+                                        self.instance.uuid)
+-- 
+2.7.4
+

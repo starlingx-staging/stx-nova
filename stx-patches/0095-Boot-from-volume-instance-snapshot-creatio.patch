@@ -1,0 +1,45 @@
+From d0df0fb47181371102952a997b6c2ba654cc4419 Mon Sep 17 00:00:00 2001
+From: Wei Zhou <wei.zhou@windriver.com>
+Date: Wed, 7 Feb 2018 07:29:50 -0600
+Subject: [PATCH 095/143] Boot from volume instance snapshot
+ creation failed due to image format
+
+Solution: If image cache_raw is enabled, the snapshot will be a raw image. So we
+          remove all cache_raw related attributes and set disk_format to raw.
+---
+ nova/image/glance.py | 19 ++++++++++---------
+ 1 file changed, 10 insertions(+), 9 deletions(-)
+
+diff --git a/nova/image/glance.py b/nova/image/glance.py
+index 8bc8171..5822da9 100644
+--- a/nova/image/glance.py
++++ b/nova/image/glance.py
+@@ -480,15 +480,16 @@ class GlanceImageServiceV2(object):
+ 
+         location = sent_service_image_meta.pop('location', None)
+ 
+-        # Remove all raw caching attributes except the one that
+-        # enables it. We don't want to pass on invalid url, size
+-        # and status as they should be generated again for the
+-        # new snapshot image
+-        cache_raw_attrs_to_remove = [
+-            key for key in sent_service_image_meta.keys()
+-                if key.startswith('cache_raw_')]
+-        for key in cache_raw_attrs_to_remove:
+-            del sent_service_image_meta[key]
++        # If image cache_raw is enabled, the snapshot will be
++        # a raw image. So we remove all cache_raw related attributes
++        # and set disk_format to raw.
++        if sent_service_image_meta.get('cache_raw', False):
++            cache_raw_attrs_to_remove = [
++                key for key in sent_service_image_meta.keys()
++                    if key.startswith('cache_raw')]
++            for key in cache_raw_attrs_to_remove:
++                del sent_service_image_meta[key]
++            sent_service_image_meta['disk_format'] = 'raw'
+ 
+         image = self._client.call(
+             context, 2, 'create', **sent_service_image_meta)
+-- 
+2.7.4
+

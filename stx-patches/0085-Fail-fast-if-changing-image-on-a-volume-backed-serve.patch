@@ -1,0 +1,191 @@
+From 591b2a0332b2478ccc55364ff40586f441eae379 Mon Sep 17 00:00:00 2001
+From: Matt Riedemann <mriedem.os@gmail.com>
+Date: Thu, 16 Nov 2017 12:18:34 -0500
+Subject: [PATCH 085/143] Fail fast if changing image on a volume-backed server
+ rebuild
+
+We don't support changing the image in the root disk of a volume-backed
+server during a rebuild. The API will change the instance.image_ref
+attribute to the newly supplied image_href to the rebuild API but the
+actual image used by the server after the rebuild will be the original
+image, which is wrong.
+
+We need to just fail fast in this case in the API since the compute
+service doesn't support it. We also need to ensure that instance.image_ref
+doesn't get modified since a missing value here is used by novaclient and
+probably other HTTP API users as an indication of a volume-backed server.
+
+See the related mailing list discussion for more details:
+http://lists.openstack.org/pipermail/openstack-dev/2017-October/123255.html
+
+Co-Authored-By: Chris Friesen <chris.friesen@windriver.com>
+Change-Id: If4c5fb782bb7e7714fb44f8ca9875121e066bc10
+Closes-Bug: #1482040
+
+Cherry-picked from Queens 17.0.0.0b2 commit 132636d.
+fix up volume-backed server rebuild
+
+__TYPE_upstream
+---
+ nova/api/openstack/compute/servers.py              |  1 +
+ nova/compute/api.py                                | 19 ++++++++-
+ .../functional/regressions/test_bug_1732947.py     |  6 +--
+ nova/tests/functional/test_servers.py              | 46 ++++++++++++++++++++++
+ ...d-volume-backed-new-image-1b8e130c06e05b86.yaml | 11 ++++++
+ 5 files changed, 78 insertions(+), 5 deletions(-)
+ create mode 100644 releasenotes/notes/bug-1482040-rebuild-volume-backed-new-image-1b8e130c06e05b86.yaml
+
+diff --git a/nova/api/openstack/compute/servers.py b/nova/api/openstack/compute/servers.py
+index d6714d4..bfa9c10 100644
+--- a/nova/api/openstack/compute/servers.py
++++ b/nova/api/openstack/compute/servers.py
+@@ -1041,6 +1041,7 @@ class ServersController(wsgi.Controller):
+         except exception.QuotaError as error:
+             raise exc.HTTPForbidden(explanation=error.format_message())
+         except (exception.ImageNotActive,
++                exception.ImageUnacceptable,
+                 exception.FlavorDiskTooSmall,
+                 exception.FlavorMemoryTooSmall,
+                 exception.InvalidMetadata,
+diff --git a/nova/compute/api.py b/nova/compute/api.py
+index 542d9a7..6990c64 100644
+--- a/nova/compute/api.py
++++ b/nova/compute/api.py
+@@ -3105,7 +3105,8 @@ class API(base.Base):
+         root_bdm = compute_utils.get_root_bdm(context, instance, bdms)
+ 
+         # Check to see if the image is changing and we have a volume-backed
+-        # server.
++        # server. The compute doesn't support changing the image in the
++        # root disk of a volume-backed server, so we need to just fail fast.
+         is_volume_backed = compute_utils.is_volume_backed_instance(
+             context, instance, bdms)
+         if is_volume_backed:
+@@ -3123,6 +3124,17 @@ class API(base.Base):
+             volume = self.volume_api.get(context, root_bdm.volume_id)
+             volume_image_metadata = volume.get('volume_image_metadata', {})
+             orig_image_ref = volume_image_metadata.get('image_id')
++
++            if orig_image_ref != image_href:
++                # Leave a breadcrumb.
++                LOG.debug('Requested to rebuild instance with a new image %s '
++                          'for a volume-backed server with image %s in its '
++                          'root volume which is not supported.', image_href,
++                          orig_image_ref, instance=instance)
++                msg = _('Unable to rebuild with a different image for a '
++                        'volume-backed server.')
++                raise exception.ImageUnacceptable(
++                    image_id=image_href, reason=msg)
+         else:
+             orig_image_ref = instance.image_ref
+ 
+@@ -3165,7 +3177,10 @@ class API(base.Base):
+         instance.update(options_from_image)
+ 
+         instance.task_state = task_states.REBUILDING
+-        instance.image_ref = image_href
++        # An empty instance.image_ref is currently used as an indication
++        # of BFV.  Preserve that over a rebuild to not break users.
++        if not is_volume_backed:
++            instance.image_ref = image_href
+         instance.kernel_id = kernel_id or ""
+         instance.ramdisk_id = ramdisk_id or ""
+         instance.progress = 0
+diff --git a/nova/tests/functional/regressions/test_bug_1732947.py b/nova/tests/functional/regressions/test_bug_1732947.py
+index fa22a7f..5dcdf6e 100644
+--- a/nova/tests/functional/regressions/test_bug_1732947.py
++++ b/nova/tests/functional/regressions/test_bug_1732947.py
+@@ -83,6 +83,6 @@ class RebuildVolumeBackedSameImage(integrated_helpers._IntegratedTestBase,
+         }
+         server = self.api.api_post('/servers/%s/action' % server['id'],
+                                    rebuild_req_body).body['server']
+-        # FIXME(mriedem): Once bug 1482040 is fixed, the server image ref
+-        # should still be blank for a volume-backed server after the rebuild.
+-        self.assertNotEqual('', server['image'])
++        # The server image ref should still be blank for a volume-backed server
++        # after the rebuild.
++        self.assertEqual('', server['image'])
+diff --git a/nova/tests/functional/test_servers.py b/nova/tests/functional/test_servers.py
+index ad9e5ab..d2f9a04 100644
+--- a/nova/tests/functional/test_servers.py
++++ b/nova/tests/functional/test_servers.py
+@@ -21,6 +21,7 @@ import mock
+ from oslo_log import log as logging
+ from oslo_serialization import base64
+ from oslo_utils import timeutils
++import six
+ 
+ from nova.compute import api as compute_api
+ from nova.compute import instance_actions
+@@ -1226,6 +1227,51 @@ class ServerRebuildTestCase(integrated_helpers._IntegratedTestBase,
+         allocs = allocs[rp_uuid]['resources']
+         assertFlavorMatchesAllocation(flavor, allocs)
+ 
++    def test_volume_backed_rebuild_different_image(self):
++        """Tests that trying to rebuild a volume-backed instance with a
++        different image than what is in the root disk of the root volume
++        will result in a 400 BadRequest error.
++        """
++        self.useFixture(nova_fixtures.CinderFixture(self))
++        # First create our server as normal.
++        server_req_body = {
++            # There is no imageRef because this is boot from volume.
++            'server': {
++                'flavorRef': '1',  # m1.tiny from DefaultFlavorsFixture,
++                'name': 'test_volume_backed_rebuild_different_image',
++                # We don't care about networking for this test. This requires
++                # microversion >= 2.37.
++                'networks': 'none',
++                'block_device_mapping_v2': [{
++                    'boot_index': 0,
++                    'uuid': nova_fixtures.CinderFixture.IMAGE_BACKED_VOL,
++                    'source_type': 'volume',
++                    'destination_type': 'volume'
++                }]
++            }
++        }
++        server = self.api.post_server(server_req_body)
++        server = self._wait_for_state_change(self.api, server, 'ACTIVE')
++        # For a volume-backed server, the image ref will be an empty string
++        # in the server response.
++        self.assertEqual('', server['image'])
++
++        # Now rebuild the server with a different image than was used to create
++        # our fake volume.
++        rebuild_image_ref = (
++            nova.tests.unit.image.fake.AUTO_DISK_CONFIG_ENABLED_IMAGE_UUID)
++        rebuild_req_body = {
++            'rebuild': {
++                'imageRef': rebuild_image_ref
++            }
++        }
++        resp = self.api.api_post('/servers/%s/action' % server['id'],
++                                 rebuild_req_body, check_response_status=[400])
++        # Assert that we failed because of the image change and not something
++        # else.
++        self.assertIn('Unable to rebuild with a different image for a '
++                      'volume-backed server', six.text_type(resp))
++
+ 
+ class ProviderUsageBaseTestCase(test.TestCase,
+                                 integrated_helpers.InstanceHelperMixin):
+diff --git a/releasenotes/notes/bug-1482040-rebuild-volume-backed-new-image-1b8e130c06e05b86.yaml b/releasenotes/notes/bug-1482040-rebuild-volume-backed-new-image-1b8e130c06e05b86.yaml
+new file mode 100644
+index 0000000..f23e153
+--- /dev/null
++++ b/releasenotes/notes/bug-1482040-rebuild-volume-backed-new-image-1b8e130c06e05b86.yaml
+@@ -0,0 +1,11 @@
++---
++fixes:
++  - |
++    A fix is made for `bug 1482040`_ where a request to rebuild a volume-backed
++    server with a new image which is different than what is in the root volume
++    will now fail with a `400 Bad Request` response. The compute API would
++    previously return a `202 Accepted` response but the backend compute service
++    does not replace the image in the root disk so the API behavior was always
++    wrong and is now explicit about the failure.
++
++    .. _bug 1482040: https://bugs.launchpad.net/nova/+bug/1482040
+-- 
+2.7.4
+

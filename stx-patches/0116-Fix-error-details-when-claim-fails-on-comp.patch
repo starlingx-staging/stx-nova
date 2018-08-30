@@ -1,0 +1,40 @@
+From 37a64ac57964f905f0fdf23247a8130381d42870 Mon Sep 17 00:00:00 2001
+From: Gerry Kopec <Gerry.Kopec@windriver.com>
+Date: Fri, 2 Mar 2018 18:50:25 -0500
+Subject: [PATCH 116/143] Fix error details when claim fails on
+ compute
+
+If a claim fails on compute on numa_topology test, the details of why it
+failed should be logged, but instead we only get "REJECT: Uninitialized".
+Fix initialization of details dictionary.
+
+On next rebase this should be merged with:
+d653c5f4 primary: scheduler success or failure and metrics logs
+---
+ nova/compute/claims.py | 3 +--
+ 1 file changed, 1 insertion(+), 2 deletions(-)
+
+diff --git a/nova/compute/claims.py b/nova/compute/claims.py
+index 23c48ed..d4cd3d8 100644
+--- a/nova/compute/claims.py
++++ b/nova/compute/claims.py
+@@ -283,7 +283,7 @@ class Claim(NopClaim):
+                                                 'strict')
+             pci_strict = False if pci_numa_affinity == 'prefer' else True
+ 
+-            details = None
++            details = utils.details_initialize(details=None)
+             instance_topology = (
+                     hardware.numa_fit_instance_to_host(
+                         host_topology, requested_topology,
+@@ -296,7 +296,6 @@ class Claim(NopClaim):
+                         pci_strict=pci_strict))
+ 
+             if requested_topology and not instance_topology:
+-                details = utils.details_initialize(details=details)
+                 msg = details.get('reason', [])
+                 LOG.info('%(class)s: (%(node)s) REJECT: %(desc)s',
+                          {'class': self.__class__.__name__,
+-- 
+2.7.4
+

@@ -1,0 +1,45 @@
+From 2641ca2166c09cfd277c06485e05ea8c45289a01 Mon Sep 17 00:00:00 2001
+From: Daniel Chavolla <daniel.chavolla@windriver.com>
+Date: Wed, 14 Mar 2018 13:48:29 -0400
+Subject: [PATCH 128/143] added a check for reasons dictionary being None
+
+When nova is restarted in the middle of rescheduling there is the possibility
+of the variable "reasons", used for error reporting purposes, being None.
+If this is the case, a TypeError exception occurs when iterating over this
+variable, which is supposed to be a dictionary.
+
+This commit adds a check for this condition, initializing this variable.
+---
+ nova/scheduler/filter_scheduler.py | 2 ++
+ nova/scheduler/manager.py          | 2 ++
+ 2 files changed, 4 insertions(+)
+
+diff --git a/nova/scheduler/filter_scheduler.py b/nova/scheduler/filter_scheduler.py
+index b1bed01..7ce774b 100644
+--- a/nova/scheduler/filter_scheduler.py
++++ b/nova/scheduler/filter_scheduler.py
+@@ -193,6 +193,8 @@ class FilterScheduler(driver.Scheduler):
+             # any reasons.
+             reasons = self.placement_client.get_rejection_reasons(
+                 requested=normalized_resources)
++            if reasons is None:
++                reasons = {}
+ 
+             # Populate per-host rejection map based on placement criteria.
+             host_states = self.host_manager.get_all_host_states(context)
+diff --git a/nova/scheduler/manager.py b/nova/scheduler/manager.py
+index b4aea4e..d031e60 100644
+--- a/nova/scheduler/manager.py
++++ b/nova/scheduler/manager.py
+@@ -175,6 +175,8 @@ class SchedulerManager(manager.Manager):
+                 # any reasons.
+                 reasons = self.placement_client.get_rejection_reasons(
+                     requested=normalized_resources)
++                if reasons is None:
++                    reasons = {}
+ 
+                 # Populate per-host rejection map based on placement criteria.
+                 host_states = self.driver.host_manager.get_all_host_states(
+-- 
+2.7.4
+

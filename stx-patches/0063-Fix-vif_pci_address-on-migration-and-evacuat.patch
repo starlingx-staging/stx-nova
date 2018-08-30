@@ -1,0 +1,39 @@
+From d6f9959ca20e84d18144661ebc88b45df8368aff Mon Sep 17 00:00:00 2001
+From: Ludovic Beliveau <ludovic.beliveau@windriver.com>
+Date: Tue, 23 Aug 2016 16:51:33 -0400
+Subject: [PATCH 063/143] Fix vif_pci_address on migration and
+ evacuation
+
+The vif_pci_address was getting removed from the neutron port binding profile.
+Explicitely set 'vif_pci_address' in the neutron port binding progile
+whenever the port is updated.
+
+__TYPE_single
+__TAG_pci,neutron,vif
+__R4_commit_8b17b7e
+__R3_commit_3ec338f
+__TC8539
+---
+ nova/network/neutronv2/api.py | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/nova/network/neutronv2/api.py b/nova/network/neutronv2/api.py
+index c920b6f..702f9ee 100644
+--- a/nova/network/neutronv2/api.py
++++ b/nova/network/neutronv2/api.py
+@@ -2616,6 +2616,12 @@ class API(base_api.NetworkAPI):
+ 
+                     binding_profile.update(
+                         self._get_pci_device_profile(new_dev))
++                    # Keep original vif pci address.  Else it's going to
++                    # be removed in the neutron port.
++                    vif_pci_address = binding_profile.get("vif_pci_address")
++                    if vif_pci_address is not None:
++                        binding_profile.update(
++                            {'vif_pci_address': vif_pci_address})
+                     updates[BINDING_PROFILE] = binding_profile
+                     if vnic_type == network_model.VNIC_TYPE_DIRECT_PHYSICAL:
+                         try:
+-- 
+2.7.4
+

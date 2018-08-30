@@ -1,0 +1,36 @@
+From 38172ff1626b33ca38cbb70670820f1c5871c375 Mon Sep 17 00:00:00 2001
+From: Jim Gauld <james.gauld@windriver.com>
+Date: Wed, 7 Mar 2018 16:00:31 -0500
+Subject: [PATCH 122/143] Enhance memory available tracking based on
+ actual free pages
+
+This corrects a log format error, and should be merged with commit
+b98ae425441585b562c572932005844254ac29c8.
+---
+ nova/compute/resource_tracker.py | 7 +++----
+ 1 file changed, 3 insertions(+), 4 deletions(-)
+
+diff --git a/nova/compute/resource_tracker.py b/nova/compute/resource_tracker.py
+index 88f4404..755bbec 100644
+--- a/nova/compute/resource_tracker.py
++++ b/nova/compute/resource_tracker.py
+@@ -2458,13 +2458,12 @@ class ResourceTracker(object):
+                 try:
+                     actual_free = \
+                         actual_free_mempages[cell.id][mempage.size_kb]
+-                except Exception as e:
++                except KeyError:
+                     actual_free = None
+                     LOG.error('Could not get actual_free_mempages: '
+-                              'cellid=%(id)s, pgsize=%(size)s, error=%(err)s',
++                              'cellid=%(node)s, pgsize=%(size)s',
+                               {'node': cell.id,
+-                               'size': mempage.size_kb,
+-                               'err': e})
++                               'size': mempage.size_kb})
+                 if actual_free is not None:
+                     used_old, used_adjusted = mempage.adjust_used(actual_free)
+                     if used_old != used_adjusted:
+-- 
+2.7.4
+

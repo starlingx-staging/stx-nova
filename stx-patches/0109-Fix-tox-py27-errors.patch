@@ -1,0 +1,40 @@
+From 35ffd10e12e27348e73f2d19b395877056f61656 Mon Sep 17 00:00:00 2001
+From: Teresa Ho <teresa.ho@windriver.com>
+Date: Mon, 26 Feb 2018 14:41:05 -0500
+Subject: [PATCH 109/143] Fix tox py27 errors.
+
+---
+ nova/tests/unit/api/openstack/compute/test_neutron_security_groups.py | 2 +-
+ nova/tests/unit/network/test_neutronv2.py                             | 3 ++-
+ 2 files changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/nova/tests/unit/api/openstack/compute/test_neutron_security_groups.py b/nova/tests/unit/api/openstack/compute/test_neutron_security_groups.py
+index 39db3df..cfb642e 100644
+--- a/nova/tests/unit/api/openstack/compute/test_neutron_security_groups.py
++++ b/nova/tests/unit/api/openstack/compute/test_neutron_security_groups.py
+@@ -71,7 +71,7 @@ class TestNeutronSecurityGroupsV21(
+         return self.controller.create(self.req, body={'security_group': sg})
+ 
+     def _create_network(self):
+-        body = {'network': {'name': 'net1'}}
++        body = {'network': {'name': 'net1', 'port_security_enabled': True}}
+         neutron = get_client()
+         net = neutron.create_network(body)
+         body = {'subnet': {'network_id': net['network']['id'],
+diff --git a/nova/tests/unit/network/test_neutronv2.py b/nova/tests/unit/network/test_neutronv2.py
+index d944228..86196ef 100644
+--- a/nova/tests/unit/network/test_neutronv2.py
++++ b/nova/tests/unit/network/test_neutronv2.py
+@@ -5636,7 +5636,8 @@ class TestAllocateForInstance(test.NoDBTestCase):
+     def test_create_ports_for_instance_with_security_groups(self):
+         api = neutronapi.API()
+         ordered_networks = [objects.NetworkRequest(network_id=uuids.net)]
+-        nets = {uuids.net: {"id": uuids.net, "subnets": [uuids.subnet]}}
++        nets = {uuids.net: {"id": uuids.net, "subnets": [uuids.subnet],
++                            'port_security_enabled': True}}
+         mock_client = mock.Mock()
+         mock_client.create_port.return_value = {"port": {"id": uuids.port}}
+         security_groups = [uuids.sg]
+-- 
+2.7.4
+

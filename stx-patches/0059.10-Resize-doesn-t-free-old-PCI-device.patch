@@ -1,0 +1,117 @@
+From 89e67a3126d50a735d847a9ad8772375005894a3 Mon Sep 17 00:00:00 2001
+From: "Beliveau, Ludovic" <Ludovic.Beliveau@windriver.com>
+Date: Tue, 5 May 2015 12:12:46 -0400
+Subject: [PATCH] Resize doesn't free old PCI device
+
+With this patch, a PCI device won't be allocated if the resize is done on the
+same node.
+
+Also fixed in this commit:
+- Neutron port update on migration/resize/evacuation was not done properly
+  and the port was only updated with the binding:profile.  The port should
+  had been also updated with binding:host_id.
+- Only update binding:profile if the host of the instance has changed.
+---
+ nova/compute/resource_tracker.py |  6 ++++--
+ nova/network/neutronv2/api.py    | 32 ++++++++++++++++----------------
+ nova/pci/manager.py              |  7 +++++--
+ 3 files changed, 25 insertions(+), 20 deletions(-)
+
+diff --git a/nova/compute/resource_tracker.py b/nova/compute/resource_tracker.py
+index 19cfc80..8704c26 100644
+--- a/nova/compute/resource_tracker.py
++++ b/nova/compute/resource_tracker.py
+@@ -268,7 +268,7 @@ class ResourceTracker(object):
+                                               self.compute_node, migration)
+ 
+         # Save pci_devices that were claimed for resize
+-        if instance_ref['pci_devices']:
++        if 'pci_devices' in instance_ref.keys():
+             instance['pci_devices'] = instance_ref['pci_devices']
+ 
+         elevated = context.elevated()
+@@ -924,7 +924,9 @@ class ResourceTracker(object):
+             usage = self._get_usage_dict(
+                         itype, numa_topology=numa_topology)
+             if self.pci_tracker:
+-                self.pci_tracker.update_pci_for_migration(context, instance)
++                self.pci_tracker.update_pci_for_migration(context,
++                                                          instance,
++                                                          same_node=same_node)
+ 
+             self._update_usage(context, resources, usage)
+             if self.pci_tracker:
+diff --git a/nova/network/neutronv2/api.py b/nova/network/neutronv2/api.py
+index cba6682..84bc915 100644
+--- a/nova/network/neutronv2/api.py
++++ b/nova/network/neutronv2/api.py
+@@ -1719,25 +1719,25 @@ class API(base_api.NetworkAPI):
+             # If the host hasn't changed, like in the case of resizing to the
+             # same host, there is nothing to do.
+             if p.get('binding:host_id') != host:
+-                updates.update({'port': {'binding:host_id': host}})
+-
+-            if p.get(constants.PORT_VIF_MODEL) == 'pci-sriov':
+-                pci_dev = pci_manager.get_instance_pci_devs(
+-                    instance, 'all').pop()
+-                devspec = pci_whitelist.get_pci_device_devspec(pci_dev)
+-                profile = {'pci_vendor_info': "%s:%s" %
+-                                (pci_dev.vendor_id, pci_dev.product_id),
+-                           'pci_slot': pci_dev.address,
+-                           'physical_network':
+-                                devspec.get_tags().get('physical_network')}
+-
+-                LOG.info("Updating PCI binding %s for port %s" %
+-                         (profile, p['id']))
+-                updates.update({'port': {'binding:profile': profile}})
++                updates.update({'binding:host_id': host})
++
++                if p.get(constants.PORT_VIF_MODEL) == 'pci-sriov':
++                    pci_dev = pci_manager.get_instance_pci_devs(
++                        instance, 'all').pop()
++                    devspec = pci_whitelist.get_pci_device_devspec(pci_dev)
++                    profile = {'pci_vendor_info': "%s:%s" %
++                                    (pci_dev.vendor_id, pci_dev.product_id),
++                               'pci_slot': pci_dev.address,
++                               'physical_network':
++                                    devspec.get_tags().get('physical_network')}
++
++                    LOG.info("Updating PCI binding %s for port %s" %
++                             (profile, p['id']))
++                    updates.update({'binding:profile': profile})
+ 
+             if updates:
+                 try:
+-                    neutron.update_port(p['id'], updates)
++                    neutron.update_port(p['id'], {'port': updates})
+                 except Exception:
+                     with excutils.save_and_reraise_exception():
+                         LOG.exception(_LE("Unable to update host of port %s"),
+diff --git a/nova/pci/manager.py b/nova/pci/manager.py
+index 2e5402d..172d088 100644
+--- a/nova/pci/manager.py
++++ b/nova/pci/manager.py
+@@ -234,7 +234,8 @@ class PciDevTracker(object):
+                 self._allocate_instance(instance, devs)
+                 self.allocations[uuid] = devs
+ 
+-    def update_pci_for_migration(self, context, instance, sign=1):
++    def update_pci_for_migration(self, context, instance, sign=1,
++                                 same_node=False):
+         """Update instance's pci usage information when it is migrated.
+ 
+         The caller should hold the COMPUTE_RESOURCE_SEMAPHORE lock.
+@@ -245,7 +246,9 @@ class PciDevTracker(object):
+         task_state = instance['task_state']
+         uuid = instance['uuid']
+         if sign == 1 and uuid not in self.claims:
+-            if task_state == task_states.RESIZE_PREP:
++            # Do not allocate a new PCI device if the migration is on
++            # the same node (like resize)
++            if task_state == task_states.RESIZE_PREP and not same_node:
+                 instance['pci_devices'] = PciDeviceList()
+                 devs = self._claim_instance(context, instance)
+                 if devs:
+-- 
+2.7.4
+

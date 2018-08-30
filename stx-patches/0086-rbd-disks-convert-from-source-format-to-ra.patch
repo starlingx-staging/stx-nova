@@ -1,0 +1,85 @@
+From 493ae2053b61a4088c1470c7a3971de154721106 Mon Sep 17 00:00:00 2001
+From: Daniel Badea <daniel.badea@windriver.com>
+Date: Fri, 19 Jan 2018 18:48:36 +0000
+Subject: [PATCH 086/143] rbd disks: convert from source format to
+ raw
+
+On a ceph setup nova-compute uses "rbd import" to import images.
+
+When using a qcow2 as root disk the instance is spawned but fails
+to boot because data is accessed as raw. Using "qemu-img convert"
+instead of "rbd import" fixes this issue.
+
+__TYPE_upstreamable
+---
+ nova/tests/unit/virt/libvirt/test_imagebackend.py | 12 ++++++------
+ nova/virt/libvirt/storage/rbd_utils.py            | 19 ++++++++++---------
+ 2 files changed, 16 insertions(+), 15 deletions(-)
+
+diff --git a/nova/tests/unit/virt/libvirt/test_imagebackend.py b/nova/tests/unit/virt/libvirt/test_imagebackend.py
+index 0b9c647..2ed8af8 100644
+--- a/nova/tests/unit/virt/libvirt/test_imagebackend.py
++++ b/nova/tests/unit/virt/libvirt/test_imagebackend.py
+@@ -1383,9 +1383,9 @@ class RbdTestCase(_ImageTestCase, test.NoDBTestCase):
+         image.create_image(fn, self.TEMPLATE_PATH, None)
+ 
+         rbd_name = "%s_%s" % (self.INSTANCE['uuid'], self.NAME)
+-        cmd = ('rbd', 'import', '--pool', self.POOL, self.TEMPLATE_PATH,
+-               rbd_name, '--image-format=2', '--id', self.USER,
+-               '--conf', self.CONF)
++        cmd = ('qemu-img', 'convert', '-O', 'raw', self.TEMPLATE_PATH,
++               'rbd:{}/{}:id={}:conf={}'.format(
++                   self.POOL, rbd_name, self.USER, self.CONF))
+         self.assertEqual(fake_processutils.fake_execute_get_log(),
+                          [' '.join(cmd)])
+         mock_exists.assert_has_calls([mock.call(), mock.call()])
+@@ -1409,9 +1409,9 @@ class RbdTestCase(_ImageTestCase, test.NoDBTestCase):
+         mock_exists.return_value = False
+         mock_get.return_value = self.SIZE
+         rbd_name = "%s_%s" % (self.INSTANCE['uuid'], self.NAME)
+-        cmd = ('rbd', 'import', '--pool', self.POOL, self.TEMPLATE_PATH,
+-               rbd_name, '--image-format=2', '--id', self.USER,
+-               '--conf', self.CONF)
++        cmd = ('qemu-img', 'convert', '-O', 'raw', self.TEMPLATE_PATH,
++               'rbd:{}/{}:id={}:conf={}'.format(
++                   self.POOL, rbd_name, self.USER, self.CONF))
+ 
+         image.create_image(fn, self.TEMPLATE_PATH, full_size)
+ 
+diff --git a/nova/virt/libvirt/storage/rbd_utils.py b/nova/virt/libvirt/storage/rbd_utils.py
+index 974b5a9..290b855 100644
+--- a/nova/virt/libvirt/storage/rbd_utils.py
++++ b/nova/virt/libvirt/storage/rbd_utils.py
+@@ -315,19 +315,20 @@ class RBDDriver(object):
+     def import_image(self, base, name):
+         """Import RBD volume from image file.
+ 
+-        Uses the command line import instead of librbd since rbd import
+-        command detects zeroes to preserve sparseness in the image.
++        Uses the qemu-img convert to import image into rbd and convert
++        it to raw if necessary.
+ 
+         :base: Path to image file
+         :name: Name of RBD volume
+         """
+-        args = ['--pool', self.pool, base, name]
+-        # Image format 2 supports cloning,
+-        # in stable ceph rbd release default is not 2,
+-        # we need to use it explicitly.
+-        args += ['--image-format=2']
+-        args += self.ceph_args()
+-        utils.execute('rbd', 'import', *args)
++        args = ['-O', 'raw', base]
++        target = 'rbd:{}/{}'.format(self.pool, name)
++        if self.rbd_user:
++            target = '{}:id={}'.format(target, self.rbd_user)
++        if self.ceph_conf:
++            target = '{}:conf={}'.format(target, self.ceph_conf)
++        args.append(target)
++        utils.execute('qemu-img', 'convert', *args)
+ 
+     def _destroy_volume(self, client, volume, pool=None):
+         """Destroy an RBD volume, retrying as needed.
+-- 
+2.7.4
+

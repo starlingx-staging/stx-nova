@@ -1,0 +1,49 @@
+From 7862ec8f50afe0ebb1961f470953e815ec564094 Mon Sep 17 00:00:00 2001
+From: Angie Wang <Angie.Wang@windriver.com>
+Date: Mon, 12 Feb 2018 15:42:50 -0500
+Subject: [PATCH 098/143] add the ability for admin to create server
+ group for other tenants from nova CLI
+
+---
+ nova/api/openstack/compute/server_groups.py | 14 +++++++++-----
+ 1 file changed, 9 insertions(+), 5 deletions(-)
+
+diff --git a/nova/api/openstack/compute/server_groups.py b/nova/api/openstack/compute/server_groups.py
+index bdf3ab3..30f0847 100644
+--- a/nova/api/openstack/compute/server_groups.py
++++ b/nova/api/openstack/compute/server_groups.py
+@@ -46,9 +46,13 @@ LOG = logging.getLogger(__name__)
+ CONF = nova.conf.CONF
+ 
+ 
+-def _authorize_context(req, action):
++def _authorize_context(req, action, project_id=None):
+     context = req.environ['nova.context']
+-    context.can(sg_policies.POLICY_ROOT % action)
++    if project_id:
++        context.can(sg_policies.POLICY_ROOT % action,
++            {'project_id': project_id})
++    else:
++        context.can(sg_policies.POLICY_ROOT % action)
+     return context
+ 
+ 
+@@ -183,12 +187,12 @@ class ServerGroupController(wsgi.Controller):
+     @validation.schema(schema.create_v215, "2.15")
+     def create(self, req, body):
+         """Creates a new server group."""
+-        context = _authorize_context(req, 'create')
+-
+         # WRS:extension -- admin can create server-groups for other tenants,
+         # so make sure we charge quota using project_id as specified in body
+         vals = body['server_group']
+-        project_id = vals.get('project_id', context.project_id)
++        project_id = vals.get('project_id')
++
++        context = _authorize_context(req, 'create', project_id)
+ 
+         try:
+             objects.Quotas.check_deltas(context, {'server_groups': 1},
+-- 
+2.7.4
+

@@ -1,0 +1,129 @@
+From c900520e40bc80fcb28049a3d8555905c877fa01 Mon Sep 17 00:00:00 2001
+From: Joseph Richard <Joseph.Richard@windriver.com>
+Date: Wed, 7 Jun 2017 15:10:26 -0400
+Subject: [PATCH] Update pci mapping on evacuation
+
+This commit introduces nova doing a migration upon an evacuation.  This is
+necessary so that pcipt devices are remapped in nova with their new MACs.
+---
+ nova/network/neutronv2/api.py             |  8 ++-
+ nova/tests/unit/network/test_neutronv2.py | 84 +++++++++++++++++++++++++++++++
+ 2 files changed, 91 insertions(+), 1 deletion(-)
+
+diff --git a/nova/network/neutronv2/api.py b/nova/network/neutronv2/api.py
+index 9167f08..00d80c8 100644
+--- a/nova/network/neutronv2/api.py
++++ b/nova/network/neutronv2/api.py
+@@ -2408,7 +2408,13 @@ class API(base_api.NetworkAPI):
+ 
+     def setup_instance_network_on_host(self, context, instance, host):
+         """Setup network for specified instance on host."""
+-        self._update_port_binding_for_instance(context, instance, host)
++        migration = None
++        if instance.migration_context:
++            migration = objects.Migration.get_by_id_and_instance(
++                context, instance.migration_context.migration_id, instance.uuid
++            )
++        self._update_port_binding_for_instance(context, instance, host,
++                                               migration)
+ 
+     def cleanup_instance_network_on_host(self, context, instance, host):
+         """Cleanup network for specified instance on host."""
+diff --git a/nova/tests/unit/network/test_neutronv2.py b/nova/tests/unit/network/test_neutronv2.py
+index dce50f1..7c1081c 100644
+--- a/nova/tests/unit/network/test_neutronv2.py
++++ b/nova/tests/unit/network/test_neutronv2.py
+@@ -3886,6 +3886,90 @@ class TestNeutronv2WithMock(test.TestCase):
+         # No ports should be updated if the port's pci binding did not change.
+         update_port_mock.assert_not_called()
+ 
++    @mock.patch.object(pci_whitelist.Whitelist, 'get_devspec')
++    @mock.patch.object(neutronapi, 'get_client', return_value=mock.Mock())
++    def test_setup_instance_network_on_host_with_pci_evacuation_migration(self,
++                                            get_client_mock,
++                                            get_pci_device_devspec_mock):
++        self.api._has_port_binding_extension = mock.Mock(return_value=True)
++
++        devspec = mock.Mock()
++        devspec.get_tags.return_value = {'physical_network': 'physnet1'}
++        get_pci_device_devspec_mock.return_value = devspec
++
++        instance = fake_instance.fake_instance_obj(self.context)
++        migration = objects.Migration(context=self.context.elevated())
++        migration.instance_uuid = instance.uuid
++        migration.migration_type = 'evacuation'
++        migration.create()
++        instance.migration_context = objects.MigrationContext()
++        instance.migration_context.migration_id = migration.id
++        instance.migration_context.old_pci_devices = objects.PciDeviceList(
++            objects=[objects.PciDevice(vendor_id='1377',
++                                       product_id='0047',
++                                       address='0000:0a:00.1',
++                                       compute_node_id=1,
++                                       request_id='1234567890')])
++        instance.migration_context.new_pci_devices = objects.PciDeviceList(
++            objects=[objects.PciDevice(vendor_id='1377',
++                                       product_id='0047',
++                                       address='0000:0b:00.1',
++                                       compute_node_id=2,
++                                       request_id='1234567890')])
++        instance.pci_devices = instance.migration_context.old_pci_devices
++
++        fake_ports = {'ports': [
++                        {'id': 'fake-port-1',
++                         'binding:vnic_type': 'direct',
++                         neutronapi.BINDING_HOST_ID: instance.host,
++                         neutronapi.BINDING_PROFILE:
++                            {'pci_slot': '0000:0a:00.1',
++                             'physical_network': 'phys_net',
++                             'pci_vendor_info': 'pci_vendor_info'}}]}
++        list_ports_mock = mock.Mock(return_value=fake_ports)
++        get_client_mock.return_value.list_ports = list_ports_mock
++
++        update_port_mock = mock.Mock()
++        get_client_mock.return_value.update_port = update_port_mock
++
++        # Try to update the port binding with migration.
++        self.api.setup_instance_network_on_host(self.context, instance,
++                                                   instance.host)
++        # Port should be updated if the port's pci binding changed.
++        update_port_mock.assert_called_once()
++
++    def test_setup_instance_network_on_host_with_migration_context(self):
++        self.api._has_port_binding_extension = mock.Mock(return_value=False)
++        self.api._update_port_binding_for_instance = mock.Mock()
++
++        instance = fake_instance.fake_instance_obj(self.context)
++        migration = objects.Migration(context=self.context.elevated())
++        migration.instance_uuid = instance.uuid
++        migration.migration_type = 'evacuation'
++        migration.create()
++        migration_context = objects.MigrationContext()
++        instance.migration_context = migration_context
++        migration_context.migration_id = migration.id
++        # Try to update the port binding with no migration object.
++        self.api.setup_instance_network_on_host(self.context, instance,
++                                                instance.host)
++        self.assertEqual(
++            self.api._update_port_binding_for_instance.call_args[0][3].id,
++            migration.id
++        )
++
++    def test_setup_instance_network_on_host_without_migration_context(self):
++        self.api._has_port_binding_extension = mock.Mock(return_value=False)
++        self.api._update_port_binding_for_instance = mock.Mock()
++
++        instance = fake_instance.fake_instance_obj(self.context)
++        # Try to update the port binding with no migration object.
++        self.api.setup_instance_network_on_host(self.context, instance,
++                                                instance.host)
++        self.api._update_port_binding_for_instance.assert_called_once_with(
++            self.context, instance, instance.host, None
++        )
++
+     def test_get_pci_mapping_for_migration(self):
+         instance = fake_instance.fake_instance_obj(self.context)
+         instance.migration_context = objects.MigrationContext()
+-- 
+2.7.4
+

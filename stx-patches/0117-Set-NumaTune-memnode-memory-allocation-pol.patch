@@ -1,0 +1,71 @@
+From 03e305667e642a122b55609724b6417300161ace Mon Sep 17 00:00:00 2001
+From: Jim Gauld <james.gauld@windriver.com>
+Date: Mon, 5 Mar 2018 16:19:04 -0500
+Subject: [PATCH 117/143] Set NumaTune memnode memory allocation
+ policy to 'preferred' for 4K
+
+This changes NumaTune memnode memory allocation policy to 'preferred'
+from 'strict' only for 4K 'small' memory page size. This prevents
+out-of-memory conditions that cause instance crashes after launch, and
+continuous hard reboots due to VIM recovery.
+
+Normal 4K memory is shared between linux platform, VM overhead, and VMs
+that use 'small' memory page size. Specifying NumaTune memnode mode =
+'strict' will bind memory to a specific numa node, but we do not
+currently control other users of 4K.
+---
+ nova/tests/unit/virt/libvirt/test_driver.py | 6 +++---
+ nova/virt/libvirt/driver.py                 | 6 ++++++
+ 2 files changed, 9 insertions(+), 3 deletions(-)
+
+diff --git a/nova/tests/unit/virt/libvirt/test_driver.py b/nova/tests/unit/virt/libvirt/test_driver.py
+index cb33641..7567a08 100755
+--- a/nova/tests/unit/virt/libvirt/test_driver.py
++++ b/nova/tests/unit/virt/libvirt/test_driver.py
+@@ -2715,7 +2715,7 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+                     range(len(instance_topology.cells))):
+                 self.assertEqual(index, memnode.cellid)
+                 self.assertEqual([instance_cell.id], memnode.nodeset)
+-                self.assertEqual("strict", memnode.mode)
++                self.assertEqual("preferred", memnode.mode)
+ 
+     def test_get_guest_config_numa_host_instance_topo_reordered(self):
+         instance_topology = objects.InstanceNUMATopology(
+@@ -2790,7 +2790,7 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+                     cfg.numatune.memnodes)):
+                 self.assertEqual(index, memnode.cellid)
+                 self.assertEqual([instance_cell.id], memnode.nodeset)
+-                self.assertEqual("strict", memnode.mode)
++                self.assertEqual("preferred", memnode.mode)
+ 
+     def test_get_guest_config_numa_host_instance_topo_cpu_pinning(self):
+         instance_topology = objects.InstanceNUMATopology(
+@@ -2868,7 +2868,7 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+                     instance_topology.cells, cfg.numatune.memnodes)):
+                 self.assertEqual(i, memnode.cellid)
+                 self.assertEqual([instance_cell.id], memnode.nodeset)
+-                self.assertEqual("strict", memnode.mode)
++                self.assertEqual("preferred", memnode.mode)
+ 
+     def test_get_guest_config_numa_host_mempages_shared(self):
+         instance_topology = objects.InstanceNUMATopology(
+diff --git a/nova/virt/libvirt/driver.py b/nova/virt/libvirt/driver.py
+index 850701c..1be7289 100644
+--- a/nova/virt/libvirt/driver.py
++++ b/nova/virt/libvirt/driver.py
+@@ -4556,6 +4556,12 @@ class LibvirtDriver(driver.ComputeDriver):
+                                     instance_numa_topology.cells[guest_node_id]
+                                 )
+ 
++                            # Set NumaTune memnode mode to 'preferred' for
++                            # 4K memory so we prefer local node allocations.
++                            if ((object_numa_cell.pagesize is None) or
++                                    (object_numa_cell.pagesize == 4)):
++                                node.mode = "preferred"
++
+                             # L3 CAT Support
+                             numa_map = host_cell.id
+                             vcpu_map = set()
+-- 
+2.7.4
+

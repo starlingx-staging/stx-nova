@@ -1,0 +1,29 @@
+From 1a7c3e4df1cbedbd69b8d74a3a6c84c4585b1091 Mon Sep 17 00:00:00 2001
+From: "Beliveau, Ludovic" <Ludovic.Beliveau@windriver.com>
+Date: Thu, 14 May 2015 08:47:00 -0400
+Subject: [PATCH] use claimed numa topology to claim PCI
+
+The claimed numa topology is now being passed to update_pci_for_migration
+so that it can allocate a new device on this numa node.
+---
+ nova/compute/resource_tracker.py | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/nova/compute/resource_tracker.py b/nova/compute/resource_tracker.py
+index a02ebcd..bfd163d 100644
+--- a/nova/compute/resource_tracker.py
++++ b/nova/compute/resource_tracker.py
+@@ -925,6 +925,10 @@ class ResourceTracker(object):
+             usage = self._get_usage_dict(
+                         itype, numa_topology=numa_topology)
+             if self.pci_tracker:
++                # Use claimed numa toplopgy for claiming pci device
++                if numa_topology:
++                    instance['numa_topology'] = numa_topology
++
+                 self.pci_tracker.update_pci_for_migration(context,
+                                                           instance,
+                                                           same_node=same_node)
+-- 
+2.7.4
+

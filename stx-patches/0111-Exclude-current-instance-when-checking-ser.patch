@@ -1,0 +1,97 @@
+From 3143ca8ef4843a928571f99b01c2aa50bf22aec2 Mon Sep 17 00:00:00 2001
+From: Gerry Kopec <Gerry.Kopec@windriver.com>
+Date: Tue, 27 Feb 2018 21:21:36 -0500
+Subject: [PATCH 111/143] Exclude current instance when checking
+ server group live migrations
+
+Prior to scheduling live-migration, if an instance is in a strict
+anti-affinity server group, we check for any in-progress live migrations
+for all the instances in the server group and add the source and dest
+computes to the hosts list for the server group in the request spec.
+
+This check implicitly assumes that the dest compute host is not set for
+the current migration.  This is true if no destination host is specified
+by the live-migration command.  However if a host is specified, there
+are some scenarios where the dest compute will be preset causing that
+host to be included in the list of server group hosts thereby preventing
+the current live-migration from scheduling.
+
+- R3 live-migration with host fails
+- R4 live-migration with host fails if run
+  from openstack client cli or horizon gui but passes if run from nova
+  client cli.  In this case, nova client is using nova api version >= 2.30
+  which sets the force option to false and stores the destination host
+  elsewhere.  As openstack client and horizon gui use api version 2.1,
+  the force code is not triggered.
+- R5 works in all cases as we always run with force as false
+
+To fix, don't include migrations for the current instance when checking
+for in-progress migrations.
+
+On next rebase this commit should be merged with main server group commit:
+b4b099c5 primary: server-groups best-effort and group size
+---
+ nova/conductor/tasks/live_migrate.py                 |  2 ++
+ nova/tests/unit/conductor/tasks/test_live_migrate.py | 12 +-----------
+ 2 files changed, 3 insertions(+), 11 deletions(-)
+
+diff --git a/nova/conductor/tasks/live_migrate.py b/nova/conductor/tasks/live_migrate.py
+index 0d8e31e..9117e5b 100644
+--- a/nova/conductor/tasks/live_migrate.py
++++ b/nova/conductor/tasks/live_migrate.py
+@@ -336,6 +336,8 @@ class LiveMigrationTask(base.TaskBase):
+                     group_members = request_spec.instance_group['members']
+ 
+                     for member_uuid in group_members:
++                        if member_uuid == self.instance.uuid:
++                            continue
+                         filters = {
+                             'migration_type': 'live-migration',
+                             'instance_uuid': member_uuid,
+diff --git a/nova/tests/unit/conductor/tasks/test_live_migrate.py b/nova/tests/unit/conductor/tasks/test_live_migrate.py
+index 78efd7a..2c77542 100644
+--- a/nova/tests/unit/conductor/tasks/test_live_migrate.py
++++ b/nova/tests/unit/conductor/tasks/test_live_migrate.py
+@@ -324,7 +324,7 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
+     def test_find_destination_works_with_instance_group(self):
+         self.instance.numa_topology = None
+         self.fake_spec.instance_group = objects.InstanceGroup(members=["uuid"])
+-        self.instance_uuid = self.instance.uuid = "uuid"
++        self.instance_uuid = self.instance.uuid = "uuid-2"
+         updated_instance_group = objects.InstanceGroup(members=["uuid",
+                                                                 "uuid-2"],
+                                    hosts=['host1', 'host2'],
+@@ -335,7 +335,6 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
+         migration = objects.Migration(source_compute='host1',
+                                       dest_compute='host3')
+         migrations = objects.MigrationList(objects=[migration])
+-        empty_migrations = objects.MigrationList(objects=[])
+ 
+         self.mox.StubOutWithMock(utils, 'get_image_from_system_metadata')
+         self.mox.StubOutWithMock(scheduler_utils, 'setup_instance_group')
+@@ -352,13 +351,6 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
+                        'preparing', 'running']
+         }
+ 
+-        empty_migrations_filters = {
+-            'migration_type': 'live-migration',
+-            'instance_uuid': 'uuid-2',
+-            'status': ['queued', 'accepted', 'pre-migrating',
+-                       'preparing', 'running']
+-        }
+-
+         self.mox.StubOutWithMock(self.task,
+                                  '_check_compatible_with_source_hypervisor')
+         self.mox.StubOutWithMock(self.task, '_call_livem_checks_on_host')
+@@ -384,8 +376,6 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
+             self.context, self.instance_uuid).AndReturn(updated_instance_group)
+         objects.MigrationList.get_by_filters(
+             self.context, filters).AndReturn(migrations)
+-        objects.MigrationList.get_by_filters(
+-            self.context, empty_migrations_filters).AndReturn(empty_migrations)
+ 
+         self.task._check_compatible_with_source_hypervisor("host1")
+         self.task._call_livem_checks_on_host("host1", limits='fake-limits')
+-- 
+2.7.4
+

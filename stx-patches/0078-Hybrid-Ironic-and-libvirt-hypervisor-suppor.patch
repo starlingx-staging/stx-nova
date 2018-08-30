@@ -1,0 +1,544 @@
+From a521f61f5753395900c9efc2c4c7afd7f6aea6c1 Mon Sep 17 00:00:00 2001
+From: Jim Gauld <james.gauld@windriver.com>
+Date: Thu, 14 Dec 2017 17:32:56 -0500
+Subject: [PATCH 078/143] Hybrid Ironic and libvirt hypervisor support
+
+This enables hybrid support of Ironic and libvirt hypervisors so we
+may launch both baremetal and libvirt instances on the same system.
+Baremetal VMs are specified using extra-spec baremetal=true.
+
+- default scheduler host_manager now tracks both ironic and libvirt
+  hypervisors - we do not bind the Ironic host manager
+- scheduler filters that depend on libvirt now check the hypervisor type
+- scheduler filters that depend on host-aggregates are modified to skip
+  'baremetal=true' extra-spec property so that baremetal nodes do not
+  require isolation via host-aggregate
+- BaremetalFilter scheduler filter is introduced to allow regular VMs to
+  non-ironic hypervisors without additional host-aggregate configuration
+- compute claim tests specific to libvirt hypervisors are isolated
+  and we now check hypervisor type
+- resource tracking logs are modified to check hypervisor type so that
+  we do not print redundant information on Ironic nodes
+- default scheduler logs are modified to print (host, nodename,
+  hypervisor type) to make identifying hosts more obvious
+
+__TYPE_primary
+---
+ nova/compute/claims.py                             | 19 +++++---
+ nova/compute/resource_tracker.py                   |  4 ++
+ nova/objects/fields.py                             |  1 +
+ .../filters/aggregate_instance_extra_specs.py      | 13 +++++
+ .../filters/aggregate_provider_network_filter.py   |  5 ++
+ nova/scheduler/filters/baremetal_filter.py         | 57 ++++++++++++++++++++++
+ nova/scheduler/filters/numa_topology_filter.py     |  4 ++
+ nova/scheduler/filters/platform_filter.py          |  5 ++
+ nova/scheduler/host_manager.py                     | 49 ++++++++++++-------
+ nova/tests/unit/compute/test_claims.py             |  1 +
+ nova/tests/unit/compute/test_shelve.py             |  1 +
+ nova/tests/unit/scheduler/fakes.py                 |  2 +
+ .../filters/test_numa_topology_filters.py          | 17 ++++++-
+ nova/utils.py                                      | 17 +++++++
+ 14 files changed, 170 insertions(+), 25 deletions(-)
+ create mode 100644 nova/scheduler/filters/baremetal_filter.py
+
+diff --git a/nova/compute/claims.py b/nova/compute/claims.py
+index 51f08b0..23c48ed 100644
+--- a/nova/compute/claims.py
++++ b/nova/compute/claims.py
+@@ -181,9 +181,10 @@ class Claim(NopClaim):
+         closids_limit = limits.get('closids')
+         numa_topology_limit = limits.get('numa_topology')
+ 
++        # Ensure print formats display even with None value.
+         LOG.info("Attempting claim on node %(node)s: "
+-                 "memory %(memory_mb)d MB, "
+-                 "disk %(disk_gb)d GB, vcpus %(vcpus)s CPU, "
++                 "memory %(memory_mb)s MB, "
++                 "disk %(disk_gb)s GB, vcpus %(vcpus)s CPU, "
+                  "closids %(closids)s",
+                  {'node': self.nodename, 'memory_mb': self.memory_mb,
+                   'disk_gb': self.disk_gb, 'vcpus': self.vcpus,
+@@ -192,10 +193,12 @@ class Claim(NopClaim):
+ 
+         reasons = [self._test_memory(resources, memory_mb_limit),
+                    self._test_disk(resources, disk_gb_limit),
+-                   self._test_vcpus(resources, vcpus_limit),
+-                   self._test_closids(resources, closids_limit),
+-                   self._test_numa_topology(resources, numa_topology_limit),
+-                   self._test_pci()]
++                   self._test_vcpus(resources, vcpus_limit)]
++        if utils.is_libvirt_compute(resources):
++            reasons.extend(
++                [self._test_closids(resources, closids_limit),
++                 self._test_numa_topology(resources, numa_topology_limit),
++                 self._test_pci()])
+         reasons = [r for r in reasons if r is not None]
+         if len(reasons) > 0:
+             LOG.error('Claim unsuccessful on node %s: %s', self.nodename,
+@@ -328,6 +331,10 @@ class Claim(NopClaim):
+         """Test if the given type of resource needed for a claim can be safely
+         allocated.
+         """
++        # Ignore tests that are not configured, eg, Ironic.
++        if total is None or used is None:
++            return
++
+         LOG.info('Total %(type)s: %(total)d %(unit)s, used: %(used).02f '
+                  '%(unit)s',
+                   {'type': type_, 'total': total, 'unit': unit, 'used': used},
+diff --git a/nova/compute/resource_tracker.py b/nova/compute/resource_tracker.py
+index 3d8ca4e..ce74168 100644
+--- a/nova/compute/resource_tracker.py
++++ b/nova/compute/resource_tracker.py
+@@ -1232,6 +1232,10 @@ class ResourceTracker(object):
+                   'used_vcpus': ucpu,
+                   'pci_stats': pci_stats})
+ 
++        # - Ignore printing extended resources
++        if not utils.is_libvirt_compute(cn):
++            return
++
+         # - display per-numa resources
+         host_numa_topology, jsonify_result = \
+             hardware.host_topology_and_format_from_host(cn)
+diff --git a/nova/objects/fields.py b/nova/objects/fields.py
+index 3280b25..d81cefd 100644
+--- a/nova/objects/fields.py
++++ b/nova/objects/fields.py
+@@ -465,6 +465,7 @@ class HVType(BaseNovaEnum):
+     ALL = (BAREMETAL, BHYVE, DOCKER, FAKE, HYPERV, IRONIC, KQEMU, KVM, LXC,
+            LXD, OPENVZ, PARALLELS, PHYP, QEMU, TEST, UML, VBOX, VIRTUOZZO,
+            VMWARE, XEN, ZVM, PRSM)
++    LIBVIRT = (QEMU, FAKE)
+ 
+     def coerce(self, obj, attr, value):
+         try:
+diff --git a/nova/scheduler/filters/aggregate_instance_extra_specs.py b/nova/scheduler/filters/aggregate_instance_extra_specs.py
+index 70ca5fa..e813200 100644
+--- a/nova/scheduler/filters/aggregate_instance_extra_specs.py
++++ b/nova/scheduler/filters/aggregate_instance_extra_specs.py
+@@ -27,12 +27,19 @@ from oslo_log import log as logging
+ from nova.scheduler import filters
+ from nova.scheduler.filters import extra_specs_ops
+ from nova.scheduler.filters import utils
++from nova import utils as nova_utils
+ 
+ 
+ LOG = logging.getLogger(__name__)
+ 
+ _SCOPE = 'aggregate_instance_extra_specs'
+ 
++# - Hybrid baremetal support
++BAREMETAL_IGNORE_KEYS = [
++    'baremetal',
++    'storage',
++]
++
+ 
+ class AggregateInstanceExtraSpecsFilter(filters.BaseHostFilter):
+     """AggregateInstanceExtraSpecsFilter works with InstanceType records."""
+@@ -56,6 +63,7 @@ class AggregateInstanceExtraSpecsFilter(filters.BaseHostFilter):
+             return True
+ 
+         metadata = utils.aggregate_metadata_get_by_host(host_state)
++        is_ironic = nova_utils.is_ironic_compute(host_state)
+ 
+         for key, req in instance_type.extra_specs.items():
+             # Either not scope format, or aggregate_instance_extra_specs scope
+@@ -66,6 +74,11 @@ class AggregateInstanceExtraSpecsFilter(filters.BaseHostFilter):
+                 else:
+                     del scope[0]
+             key = scope[0]
++
++            # - Hybrid baremetal support
++            if is_ironic and key in BAREMETAL_IGNORE_KEYS:
++                continue
++
+             aggregate_vals = metadata.get(key, None)
+             if not aggregate_vals:
+                 LOG.debug("%(host_state)s fails instance_type extra_specs "
+diff --git a/nova/scheduler/filters/aggregate_provider_network_filter.py b/nova/scheduler/filters/aggregate_provider_network_filter.py
+index 81b2f30..cbb0c09 100644
+--- a/nova/scheduler/filters/aggregate_provider_network_filter.py
++++ b/nova/scheduler/filters/aggregate_provider_network_filter.py
+@@ -18,6 +18,7 @@ from nova.i18n import _LI
+ from nova.scheduler import filters
+ 
+ from nova.scheduler.filters import utils
++from nova import utils as nova_utils
+ 
+ LOG = logging.getLogger(__name__)
+ 
+@@ -34,6 +35,10 @@ class AggregateProviderNetworkFilter(filters.BaseHostFilter):
+         needed by each tenant network, it may create instances.
+         """
+ 
++        # - disable this filter for ironic hypervisor
++        if nova_utils.is_ironic_compute(host_state):
++            return True
++
+         physkey = 'provider:physical_network'
+         scheduler_hints = {}
+         if spec_obj.obj_attr_is_set('scheduler_hints'):
+diff --git a/nova/scheduler/filters/baremetal_filter.py b/nova/scheduler/filters/baremetal_filter.py
+new file mode 100644
+index 0000000..2bb4ba4
+--- /dev/null
++++ b/nova/scheduler/filters/baremetal_filter.py
+@@ -0,0 +1,57 @@
++# Copyright (c) 2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
++
++from oslo_log import log as logging
++from oslo_utils import strutils
++
++from nova.scheduler import filters
++from nova import utils as nova_utils
++
++
++BAREMETAL_KEY = 'baremetal'
++BAREMETAL_VALUE = 'true'
++
++LOG = logging.getLogger(__name__)
++
++
++class BaremetalFilter(filters.BaseHostFilter):
++    """Filter hosts that support baremetal if specified.
++    """
++
++    @staticmethod
++    def is_baremetal_enabled(flavor):
++        flavor_baremetal = flavor.get('extra_specs', {}).get(BAREMETAL_KEY)
++        return strutils.bool_from_string(flavor_baremetal)
++
++    def host_passes(self, host_state, spec_obj):
++        """Filter based on host hypervisor_type and baremetal extra-spec.
++
++         Host is capable if:
++         - hypervisor_type is 'ironic' and 'baremetal=true', OR,
++         - hypervisor_type is not 'ironic' and baremetal not specified
++           (or 'baremetal=false').
++        """
++        is_ironic = nova_utils.is_ironic_compute(host_state)
++        is_baremetal = self.is_baremetal_enabled(spec_obj.flavor)
++
++        if is_ironic:
++            if not is_baremetal:
++                msg = ("hypervisor '%(hv)s' requires extra_specs "
++                       "%(k)s=%(v)s." %
++                       {'hv': host_state.hypervisor_type,
++                        'k': BAREMETAL_KEY, 'v': BAREMETAL_VALUE})
++                self.filter_reject(host_state, spec_obj, msg)
++                return False
++        else:
++            if is_baremetal:
++                msg = ("hypervisor '%(hv)s' does not support extra_specs "
++                       "%(k)s=%(v)s." %
++                       {'hv': host_state.hypervisor_type,
++                        'k': BAREMETAL_KEY, 'v': BAREMETAL_VALUE})
++                self.filter_reject(host_state, spec_obj, msg)
++                return False
++        return True
+diff --git a/nova/scheduler/filters/numa_topology_filter.py b/nova/scheduler/filters/numa_topology_filter.py
+index 6806c6f..cbdbe47 100644
+--- a/nova/scheduler/filters/numa_topology_filter.py
++++ b/nova/scheduler/filters/numa_topology_filter.py
+@@ -76,6 +76,10 @@ class NUMATopologyFilter(filters.BaseHostFilter):
+         return True
+ 
+     def host_passes(self, host_state, spec_obj):
++        # - disable this filter for non-libvirt hypervisor
++        if not utils.is_libvirt_compute(host_state):
++            return True
++
+         # TODO(stephenfin): The 'numa_fit_instance_to_host' function has the
+         # unfortunate side effect of modifying 'spec_obj.numa_topology' - an
+         # InstanceNUMATopology object - by populating the 'cpu_pinning' field.
+diff --git a/nova/scheduler/filters/platform_filter.py b/nova/scheduler/filters/platform_filter.py
+index 7002cb7..13e6b3a 100644
+--- a/nova/scheduler/filters/platform_filter.py
++++ b/nova/scheduler/filters/platform_filter.py
+@@ -22,6 +22,7 @@ import nova.conf
+ from nova.i18n import _LW
+ from nova.objects import fields
+ from nova.scheduler import filters
++from nova import utils
+ 
+ CONF = nova.conf.CONF
+ LOG = logging.getLogger(__name__)
+@@ -36,6 +37,10 @@ class PlatformFilter(filters.BaseHostFilter):
+     def host_passes(self, host_state, spec_obj):
+         """Filter based on platform cpu and mem usage."""
+ 
++        # - disable this filter for non-libvirt hypervisor
++        if not utils.is_libvirt_compute(host_state):
++            return True
++
+         # -1 for threshold means the feature is disabled
+         if self._cpu_threshold == -1 or self._mem_threshold == -1:
+             return True
+diff --git a/nova/scheduler/host_manager.py b/nova/scheduler/host_manager.py
+index d4f717c..c3e0acd 100644
+--- a/nova/scheduler/host_manager.py
++++ b/nova/scheduler/host_manager.py
+@@ -167,6 +167,7 @@ class HostState(object):
+         # extension
+         self.patch_prefer = None
+         self.upgrade_prefer = None
++        self.is_ironic = False
+ 
+         self.updated = None
+ 
+@@ -224,6 +225,9 @@ class HostState(object):
+         # Assume virtual size is all consumed by instances if use qcow2 disk.
+         free_gb = compute.free_disk_gb
+         least_gb = compute.disk_available_least
++        self.is_ironic = utils.is_ironic_compute(compute)
++        if self.is_ironic:
++            least_gb = None
+         if least_gb is not None:
+             if least_gb > free_gb:
+                 # can occur when an instance in database is not on host
+@@ -314,8 +318,6 @@ class HostState(object):
+                    spec_obj.ephemeral_gb) * 1024
+         ram_mb = spec_obj.memory_mb
+         vcpus = spec_obj.vcpus
+-        self.free_ram_mb -= ram_mb
+-        self.free_disk_mb -= disk_mb
+ 
+         # - extra_specs are needed in multiple places below
+         extra_specs = spec_obj.flavor.extra_specs
+@@ -370,20 +372,31 @@ class HostState(object):
+         self.numa_topology = hardware.get_host_numa_usage_from_instance(
+                 self, instance, strict=True)
+ 
+-        # Get set of reserved thread sibling pcpus that cannot be allocated
+-        # when using 'isolate' cpu_thread_policy.
+-        reserved = hardware.get_reserved_thread_sibling_pcpus(
+-            instance_numa_topology, host_numa_topology)
+-        threads_per_core = hardware._get_threads_per_core(host_numa_topology)
+-
+-        # - normalized vCPU accounting
+-        vcpus = hardware.normalized_vcpus(vcpus=vcpus,
+-                                          reserved=reserved,
+-                                          extra_specs=extra_specs,
+-                                          image_props=image_props,
+-                                          ratio=self.cpu_allocation_ratio,
+-                                          threads_per_core=threads_per_core)
+-        self.vcpus_used += vcpus
++        if self.is_ironic:
++            # Consume node's entire resources regardless of instance request
++            self.free_ram_mb = 0
++            self.free_disk_mb = 0
++            self.vcpus_used = self.vcpus_total
++        else:
++            # Get set of reserved thread sibling pcpus that cannot be allocated
++            # when using 'isolate' cpu_thread_policy.
++            reserved = hardware.get_reserved_thread_sibling_pcpus(
++                instance_numa_topology, host_numa_topology)
++            threads_per_core = hardware._get_threads_per_core(
++                host_numa_topology)
++
++            # - normalized vCPU accounting
++            vcpus = hardware.normalized_vcpus(
++                vcpus=vcpus,
++                reserved=reserved,
++                extra_specs=extra_specs,
++                image_props=image_props,
++                ratio=self.cpu_allocation_ratio,
++                threads_per_core=threads_per_core)
++
++            self.free_ram_mb -= ram_mb
++            self.free_disk_mb -= disk_mb
++            self.vcpus_used += vcpus
+ 
+         # NOTE(sbauza): By considering all cases when the scheduler is called
+         # and when consume_from_request() is run, we can safely say that there
+@@ -397,11 +410,13 @@ class HostState(object):
+             self.l3_closids_used += 1
+ 
+     def __repr__(self):
+-        return ("(%(host)s, %(node)s) ram: %(free_ram)sMB "
++        return ("(%(host)s, %(node)s, %(hypervisor_type)s) "
++                "ram: %(free_ram)sMB "
+                 "disk: %(free_disk)sMB io_ops: %(num_io_ops)s "
+                 "closids: %(l3_closids_used)s "
+                 "instances: %(num_instances)s" %
+                 {'host': self.host, 'node': self.nodename,
++                 'hypervisor_type': self.hypervisor_type,
+                  'free_ram': self.free_ram_mb, 'free_disk': self.free_disk_mb,
+                  'num_io_ops': self.num_io_ops,
+                  'num_instances': self.num_instances,
+diff --git a/nova/tests/unit/compute/test_claims.py b/nova/tests/unit/compute/test_claims.py
+index 178812d..3ea2cd3 100644
+--- a/nova/tests/unit/compute/test_claims.py
++++ b/nova/tests/unit/compute/test_claims.py
+@@ -136,6 +136,7 @@ class ClaimTestCase(test.NoDBTestCase):
+ 
+     def _fake_resources(self, values=None):
+         resources = {
++            'hypervisor_type': 'fake',
+             'memory_mb': 2048,
+             'memory_mb_used': 0,
+             'free_ram_mb': 2048,
+diff --git a/nova/tests/unit/compute/test_shelve.py b/nova/tests/unit/compute/test_shelve.py
+index a9d9c59..306b385 100644
+--- a/nova/tests/unit/compute/test_shelve.py
++++ b/nova/tests/unit/compute/test_shelve.py
+@@ -34,6 +34,7 @@ CONF = nova.conf.CONF
+ 
+ def _fake_resources():
+     resources = {
++        'hypervisor_type': 'fake',
+         'memory_mb': 2048,
+         'memory_mb_used': 0,
+         'free_ram_mb': 2048,
+diff --git a/nova/tests/unit/scheduler/fakes.py b/nova/tests/unit/scheduler/fakes.py
+index 117ab48..33958f6 100644
+--- a/nova/tests/unit/scheduler/fakes.py
++++ b/nova/tests/unit/scheduler/fakes.py
+@@ -30,7 +30,9 @@ from nova import objects
+ from nova.scheduler import driver
+ from nova.scheduler import host_manager
+ from nova.tests import uuidsentinel
++from nova.virt.libvirt import host as libvirt_host
+ 
++HYPERVISOR_TYPE = libvirt_host.HV_DRIVER_QEMU
+ NUMA_TOPOLOGY = objects.NUMATopology(
+                            cells=[
+                              objects.NUMACell(
+diff --git a/nova/tests/unit/scheduler/filters/test_numa_topology_filters.py b/nova/tests/unit/scheduler/filters/test_numa_topology_filters.py
+index 7a2ff4d..6e090ae 100644
+--- a/nova/tests/unit/scheduler/filters/test_numa_topology_filters.py
++++ b/nova/tests/unit/scheduler/filters/test_numa_topology_filters.py
+@@ -52,6 +52,7 @@ class TestNUMATopologyFilter(test.NoDBTestCase):
+         spec_obj = self._get_spec_obj(numa_topology=instance_topology)
+         host = fakes.FakeHostState('host1', 'node1',
+                                    {'numa_topology': fakes.NUMA_TOPOLOGY,
++                                    'hypervisor_type': fakes.HYPERVISOR_TYPE,
+                                     'pci_stats': None,
+                                     'cpu_allocation_ratio': 16.0,
+                                     'ram_allocation_ratio': 1.5})
+@@ -64,13 +65,16 @@ class TestNUMATopologyFilter(test.NoDBTestCase):
+                ])
+ 
+         spec_obj = self._get_spec_obj(numa_topology=instance_topology)
+-        host = fakes.FakeHostState('host1', 'node1', {'pci_stats': None})
++        host = fakes.FakeHostState('host1', 'node1',
++                                   {'hypervisor_type': fakes.HYPERVISOR_TYPE,
++                                    'pci_stats': None})
+         self.assertFalse(self.filt_cls.host_passes(host, spec_obj))
+ 
+     def test_numa_topology_filter_numa_host_no_numa_instance_pass(self):
+         spec_obj = self._get_spec_obj(numa_topology=None)
+         host = fakes.FakeHostState('host1', 'node1',
+-                                   {'numa_topology': fakes.NUMA_TOPOLOGY})
++                                   {'numa_topology': fakes.NUMA_TOPOLOGY,
++                                    'hypervisor_type': fakes.HYPERVISOR_TYPE})
+         self.assertTrue(self.filt_cls.host_passes(host, spec_obj))
+ 
+     def test_numa_topology_filter_fail_fit(self):
+@@ -82,6 +86,7 @@ class TestNUMATopologyFilter(test.NoDBTestCase):
+         spec_obj = self._get_spec_obj(numa_topology=instance_topology)
+         host = fakes.FakeHostState('host1', 'node1',
+                                    {'numa_topology': fakes.NUMA_TOPOLOGY,
++                                    'hypervisor_type': fakes.HYPERVISOR_TYPE,
+                                     'pci_stats': None,
+                                     'cpu_allocation_ratio': 16.0,
+                                     'ram_allocation_ratio': 1.5})
+@@ -96,6 +101,7 @@ class TestNUMATopologyFilter(test.NoDBTestCase):
+         spec_obj = self._get_spec_obj(numa_topology=instance_topology)
+         host = fakes.FakeHostState('host1', 'node1',
+                                    {'numa_topology': fakes.NUMA_TOPOLOGY,
++                                    'hypervisor_type': fakes.HYPERVISOR_TYPE,
+                                     'pci_stats': None,
+                                     'cpu_allocation_ratio': 16.0,
+                                     'ram_allocation_ratio': 1})
+@@ -109,6 +115,7 @@ class TestNUMATopologyFilter(test.NoDBTestCase):
+         spec_obj = self._get_spec_obj(numa_topology=instance_topology)
+         host = fakes.FakeHostState('host1', 'node1',
+                                    {'numa_topology': fakes.NUMA_TOPOLOGY,
++                                    'hypervisor_type': fakes.HYPERVISOR_TYPE,
+                                     'pci_stats': None,
+                                     'cpu_allocation_ratio': 1,
+                                     'ram_allocation_ratio': 1.5})
+@@ -122,6 +129,7 @@ class TestNUMATopologyFilter(test.NoDBTestCase):
+         spec_obj = self._get_spec_obj(numa_topology=instance_topology)
+         host = fakes.FakeHostState('host1', 'node1',
+                                    {'numa_topology': fakes.NUMA_TOPOLOGY,
++                                    'hypervisor_type': fakes.HYPERVISOR_TYPE,
+                                     'pci_stats': None,
+                                     'cpu_allocation_ratio': 21,
+                                     'ram_allocation_ratio': 1.3})
+@@ -160,6 +168,7 @@ class TestNUMATopologyFilter(test.NoDBTestCase):
+         ]
+         host = fakes.FakeHostState('host1', 'node1', {
+             'numa_topology': numa_topology,
++            'hypervisor_type': fakes.HYPERVISOR_TYPE,
+             'pci_stats': None,
+             'cpu_allocation_ratio': 1,
+             'ram_allocation_ratio': 1.5})
+@@ -218,6 +227,7 @@ class TestNUMATopologyFilter(test.NoDBTestCase):
+         spec_obj = self._get_spec_obj(numa_topology=instance_topology)
+         host = fakes.FakeHostState('host1', 'node1',
+                                    {'numa_topology': fakes.NUMA_TOPOLOGY,
++                                    'hypervisor_type': fakes.HYPERVISOR_TYPE,
+                                     'pci_stats': None,
+                                     'cpu_allocation_ratio': 16.0,
+                                     'ram_allocation_ratio': 1.5})
+@@ -233,6 +243,7 @@ class TestNUMATopologyFilter(test.NoDBTestCase):
+         spec_obj = self._get_spec_obj(numa_topology=instance_topology)
+         host = fakes.FakeHostState('host1', 'node1',
+                                    {'numa_topology': fakes.NUMA_TOPOLOGY,
++                                    'hypervisor_type': fakes.HYPERVISOR_TYPE,
+                                     'pci_stats': None,
+                                     'cpu_allocation_ratio': 16.0,
+                                     'ram_allocation_ratio': 1.5})
+@@ -246,6 +257,7 @@ class TestNUMATopologyFilter(test.NoDBTestCase):
+         spec_obj = self._get_spec_obj(numa_topology=instance_topology)
+         host = fakes.FakeHostState('host1', 'node1',
+                                    {'numa_topology': fakes.NUMA_TOPOLOGY,
++                                    'hypervisor_type': fakes.HYPERVISOR_TYPE,
+                                     'pci_stats': None,
+                                     'metrics': fakes.METRICS,
+                                     'cpu_allocation_ratio': 16.0,
+@@ -268,6 +280,7 @@ class TestNUMATopologyFilter(test.NoDBTestCase):
+         spec_obj.flavor = fake_flavor
+         host = fakes.FakeHostState('host1', 'node1',
+                                    {'numa_topology': fakes.NUMA_TOPOLOGY,
++                                    'hypervisor_type': fakes.HYPERVISOR_TYPE,
+                                     'pci_stats': None,
+                                     'metrics': fakes.METRICS,
+                                     'cpu_allocation_ratio': 16.0,
+diff --git a/nova/utils.py b/nova/utils.py
+index 4e60375..ff3c406 100644
+--- a/nova/utils.py
++++ b/nova/utils.py
+@@ -1684,3 +1684,20 @@ def validate_args(fn, *args, **kwargs):
+     missing = [arg for arg in required_args if arg not in kwargs]
+     missing = missing[len(args):]
+     return missing
++
++
++# Hybrid hypervisor support (eg, libvirt + baremetal)
++def is_libvirt_compute(host_state):
++    """Tests that hypervisor requires backing by libvirt driver.
++
++    Returns True if host_state requires backing by libvirt driver.
++    """
++    if host_state.hypervisor_type is None:
++        return False
++    return host_state.hypervisor_type.lower() in objects.fields.HVType.LIBVIRT
++
++
++def is_ironic_compute(host_state):
++    if host_state.hypervisor_type is None:
++        return False
++    return host_state.hypervisor_type == objects.fields.HVType.IRONIC
+-- 
+2.7.4
+

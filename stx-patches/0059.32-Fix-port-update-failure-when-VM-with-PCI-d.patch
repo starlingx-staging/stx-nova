@@ -1,0 +1,87 @@
+From 1f35530503dcfdbffe63f01747480b0f05f14ed3 Mon Sep 17 00:00:00 2001
+From: Steven Webster <steven.webster@windriver.com>
+Date: Wed, 29 Mar 2017 09:45:55 -0400
+Subject: [PATCH] Fix port update failure when VM with PCI devices is reset
+
+This issue was introduced by new migration context processing in Newton.
+
+It is possible that _update_port_binding_for_instance() is called without
+a migration object and/or for an instance without a migration context, such
+as when a user unshelves and instance, or resets/reboots a VM.
+
+If the instance has a port(s) with a PCI device binding (SRIOV or Passthrough),
+the current logic assumes there is a migration context and associated PCI
+mapping from old to new devices.  If a 'new' device is not found in the PCI
+mapping, an exception is thrown.
+
+In the case of an unshelve/reset, there is no migration context and as such
+we have an empty PCI mapping (and no new device will be found).
+
+This fix will only check for a new device if the PCI mapping is not empty,
+such as in the case of an actual migration.
+
+This commit should be squashed with ea3e6393d732ff8dc6e233d0518abcc73431b30f
+during the next release upgrade.
+---
+ nova/network/neutronv2/api.py | 38 +++++++++++++++++++-------------------
+ 1 file changed, 19 insertions(+), 19 deletions(-)
+
+diff --git a/nova/network/neutronv2/api.py b/nova/network/neutronv2/api.py
+index dd878aa..68f9459 100644
+--- a/nova/network/neutronv2/api.py
++++ b/nova/network/neutronv2/api.py
+@@ -2460,9 +2460,14 @@ class API(base_api.NetworkAPI):
+                     pci_mapping = self._get_pci_mapping_for_migration(context,
+                         instance, migration)
+ 
+-                pci_slot = binding_profile.get('pci_slot')
+-                new_dev = pci_mapping.get(pci_slot)
+-                if new_dev:
++                if pci_mapping:
++                    pci_slot = binding_profile.get('pci_slot')
++                    new_dev = pci_mapping.get(pci_slot)
++                    if not new_dev:
++                        raise exception.PortUpdateFailed(port_id=p['id'],
++                            reason=_("Unable to correlate PCI slot %s") %
++                                     pci_slot)
++
+                     binding_profile.update(get_pci_device_profile(new_dev))
+                     # WRS: Keep original vif pci address.  Else it's going to
+                     # be removed in the neutron port.
+@@ -2471,22 +2476,17 @@ class API(base_api.NetworkAPI):
+                         binding_profile.update(
+                             {'vif_pci_address': vif_pci_address})
+                     updates[BINDING_PROFILE] = binding_profile
+-                else:
+-                    raise exception.PortUpdateFailed(port_id=p['id'],
+-                        reason=_("Unable to correlate PCI slot %s") %
+-                                 pci_slot)
+-                if (new_dev and vnic_type ==
+-                        network_model.VNIC_TYPE_DIRECT_PHYSICAL):
+-                    try:
+-                        mac = pci_utils.get_mac_by_pci_address(
+-                            new_dev.address)
+-                    except exception.PciDeviceNotFoundById as e:
+-                        raise exception.PortUpdateFailed(port_id=p['id'],
+-                            reason=_("Could not determine MAC address for "
+-                                     "%(addr)s, error: %(e)s") %
+-                                   {"addr": new_dev.address, "e": e})
+-                    else:
+-                        updates['mac_address'] = mac
++                    if vnic_type == network_model.VNIC_TYPE_DIRECT_PHYSICAL:
++                        try:
++                            mac = pci_utils.get_mac_by_pci_address(
++                                new_dev.address)
++                        except exception.PciDeviceNotFoundById as e:
++                            raise exception.PortUpdateFailed(port_id=p['id'],
++                                reason=_("Could not determine MAC address for "
++                                         "%(addr)s, error: %(e)s") %
++                                         {"addr": new_dev.address, "e": e})
++                        else:
++                            updates['mac_address'] = mac
+ 
+             port_updates.append((p['id'], updates))
+ 
+-- 
+2.7.4
+

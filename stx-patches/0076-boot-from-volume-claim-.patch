@@ -1,0 +1,218 @@
+From 083812e98f97aab48fb3e3c2b60dc89ecce30fb6 Mon Sep 17 00:00:00 2001
+From: Gerry Kopec <Gerry.Kopec@windriver.com>
+Date: Mon, 4 Dec 2017 20:29:30 -0500
+Subject: [PATCH 076/143] Pike rebase: bug 271: boot-from-volume
+ claim on live migration
+
+On live migration, we should not request any DISK_GB resources for
+boot-from-volume instances.  As upstream fix (af08bdd - Request zero root
+disk for boot-from-volume instances) did not cover live migration, need
+to add support to handle it as well.
+
+__TYPE_upstreamable
+---
+ nova/conductor/tasks/live_migrate.py               | 12 +++++++++-
+ .../unit/conductor/tasks/test_live_migrate.py      | 27 ++++++++++++++++++++--
+ 2 files changed, 36 insertions(+), 3 deletions(-)
+
+diff --git a/nova/conductor/tasks/live_migrate.py b/nova/conductor/tasks/live_migrate.py
+index d9d5061..88aac7c 100644
+--- a/nova/conductor/tasks/live_migrate.py
++++ b/nova/conductor/tasks/live_migrate.py
+@@ -383,8 +383,18 @@ class LiveMigrationTask(base.TaskBase):
+             self._check_not_over_max_retries(attempted_hosts)
+             request_spec.ignore_hosts = attempted_hosts
+             try:
++                # determine if instance is volume backed and update
++                # request spec to avoid allocating local disk resources.
++                request_spec_copy = request_spec
++                if self.instance.is_volume_backed():
++                    LOG.debug('Requesting zero root disk for '
++                              'boot-from-volume instance')
++                    # Clone this so we don't mutate the RequestSpec that was
++                    # passed in
++                    request_spec_copy = request_spec.obj_clone()
++                    request_spec_copy.flavor.root_gb = 0
+                 hoststate = self.scheduler_client.select_destinations(
+-                    self.context, request_spec, [self.instance.uuid])[0]
++                    self.context, request_spec_copy, [self.instance.uuid])[0]
+                 host = hoststate['host']
+                 limits = hoststate['limits']
+             except messaging.RemoteError as ex:
+diff --git a/nova/tests/unit/conductor/tasks/test_live_migrate.py b/nova/tests/unit/conductor/tasks/test_live_migrate.py
+index 46cae53..eb6d5fb 100644
+--- a/nova/tests/unit/conductor/tasks/test_live_migrate.py
++++ b/nova/tests/unit/conductor/tasks/test_live_migrate.py
+@@ -293,12 +293,14 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
+         self.mox.StubOutWithMock(self.task,
+                 '_check_compatible_with_source_hypervisor')
+         self.mox.StubOutWithMock(self.task, '_call_livem_checks_on_host')
++        self.mox.StubOutWithMock(self.instance, 'is_volume_backed')
+ 
+         utils.get_image_from_system_metadata(
+             self.instance.system_metadata).AndReturn("image")
+         scheduler_utils.setup_instance_group(
+             self.context, self.fake_spec)
+         self.fake_spec.reset_forced_destinations()
++        self.instance.is_volume_backed().AndReturn(False)
+         self.task.scheduler_client.select_destinations(
+             self.context, self.fake_spec, [self.instance.uuid]).AndReturn(
+                 [{'host': 'host1',
+@@ -358,6 +360,7 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
+         self.mox.StubOutWithMock(self.task,
+                                  '_check_compatible_with_source_hypervisor')
+         self.mox.StubOutWithMock(self.task, '_call_livem_checks_on_host')
++        self.mox.StubOutWithMock(self.instance, 'is_volume_backed')
+ 
+         def fake_select_destinations(context, request_spec, instance_uuids):
+             self.assertEqual(expected_instance_group.members,
+@@ -367,6 +370,7 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
+             return [{'host': 'host1', 'nodename': 'node1',
+                      'limits': 'fake-limits'}]
+ 
++        self.instance.is_volume_backed().AndReturn(False)
+         self.task.scheduler_client.select_destinations = \
+                                                       fake_select_destinations
+         utils.get_image_from_system_metadata(
+@@ -400,6 +404,7 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
+         self.instance.numa_topology = None
+         self.instance.pci_requests = None
+ 
++        @mock.patch('nova.objects.Instance.is_volume_backed')
+         @mock.patch.object(task, '_call_livem_checks_on_host')
+         @mock.patch.object(task, '_check_compatible_with_source_hypervisor')
+         @mock.patch.object(task.scheduler_client, 'select_destinations')
+@@ -407,12 +412,13 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
+         @mock.patch.object(scheduler_utils, 'setup_instance_group')
+         @mock.patch.object(utils, 'get_image_from_system_metadata')
+         def do_test(get_image, setup_ig, from_components, select_dest,
+-                    check_compat, call_livem_checks):
++                    check_compat, call_livem_checks, is_volume_backed):
+             get_image.return_value = "image"
+             from_components.return_value = another_spec
+             select_dest.return_value = [{'host': 'host1',
+                                          'nodename': 'node1',
+                                          'limits': 'fake-limits'}]
++            is_volume_backed.return_value = False
+ 
+             self.assertEqual(("host1", 'fake-limits'),
+                              task._find_destination())
+@@ -439,8 +445,10 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
+         self.mox.StubOutWithMock(self.task,
+                 '_check_compatible_with_source_hypervisor')
+         self.mox.StubOutWithMock(self.task, '_call_livem_checks_on_host')
++        self.mox.StubOutWithMock(self.instance, 'is_volume_backed')
+ 
+         scheduler_utils.setup_instance_group(self.context, self.fake_spec)
++        self.instance.is_volume_backed().AndReturn(False)
+         self.task.scheduler_client.select_destinations(self.context,
+                 self.fake_spec, [self.instance.uuid]).AndReturn(
+                         [{'host': 'host1',
+@@ -462,10 +470,12 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
+         self.mox.StubOutWithMock(self.task,
+                 '_check_compatible_with_source_hypervisor')
+         self.mox.StubOutWithMock(self.task, '_call_livem_checks_on_host')
++        self.mox.StubOutWithMock(self.instance, 'is_volume_backed')
+ 
+         utils.get_image_from_system_metadata(
+             self.instance.system_metadata).AndReturn("image")
+         scheduler_utils.setup_instance_group(self.context, self.fake_spec)
++        self.instance.is_volume_backed().AndReturn(False)
+         self.task.scheduler_client.select_destinations(self.context,
+                 self.fake_spec, [self.instance.uuid]).AndReturn(
+                         [{'host': 'host1', 'nodename': 'node1',
+@@ -473,6 +483,7 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
+         self.task._check_compatible_with_source_hypervisor("host1")\
+                 .AndRaise(error)
+ 
++        self.instance.is_volume_backed().AndReturn(False)
+         self.task.scheduler_client.select_destinations(self.context,
+                 self.fake_spec, [self.instance.uuid]).AndReturn(
+                         [{'host': 'host2',
+@@ -507,10 +518,12 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
+         self.mox.StubOutWithMock(self.task,
+                 '_check_compatible_with_source_hypervisor')
+         self.mox.StubOutWithMock(self.task, '_call_livem_checks_on_host')
++        self.mox.StubOutWithMock(self.instance, 'is_volume_backed')
+ 
+         utils.get_image_from_system_metadata(
+             self.instance.system_metadata).AndReturn("image")
+         scheduler_utils.setup_instance_group(self.context, self.fake_spec)
++        self.instance.is_volume_backed().AndReturn(False)
+         self.task.scheduler_client.select_destinations(self.context,
+                 self.fake_spec, [self.instance.uuid]).AndReturn(
+                         [{'host': 'host1', 'nodename': 'node1',
+@@ -519,6 +532,7 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
+         self.task._call_livem_checks_on_host(
+             "host1", limits='fake-limits').AndRaise(error)
+ 
++        self.instance.is_volume_backed().AndReturn(False)
+         self.task.scheduler_client.select_destinations(self.context,
+                 self.fake_spec, [self.instance.uuid]).AndReturn(
+                         [{'host': 'host2',
+@@ -546,10 +560,12 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
+         self.mox.StubOutWithMock(self.task,
+                 '_check_compatible_with_source_hypervisor')
+         self.mox.StubOutWithMock(self.task, '_call_livem_checks_on_host')
++        self.mox.StubOutWithMock(self.instance, 'is_volume_backed')
+ 
+         utils.get_image_from_system_metadata(
+             self.instance.system_metadata).AndReturn("image")
+         scheduler_utils.setup_instance_group(self.context, self.fake_spec)
++        self.instance.is_volume_backed().AndReturn(False)
+         self.task.scheduler_client.select_destinations(self.context,
+                 self.fake_spec, [self.instance.uuid]).AndReturn(
+                         [{'host': 'host1', 'nodename': 'node1',
+@@ -559,6 +575,7 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
+             "host1", limits='fake-limits').AndRaise(
+                 exception.MigrationPreCheckError("reason"))
+ 
++        self.instance.is_volume_backed().AndReturn(False)
+         self.task.scheduler_client.select_destinations(self.context,
+                 self.fake_spec, [self.instance.uuid]).AndReturn(
+                         [{'host': 'host2',
+@@ -591,10 +608,12 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
+                                  'select_destinations')
+         self.mox.StubOutWithMock(self.task,
+                 '_check_compatible_with_source_hypervisor')
++        self.mox.StubOutWithMock(self.instance, 'is_volume_backed')
+ 
+         utils.get_image_from_system_metadata(
+             self.instance.system_metadata).AndReturn("image")
+         scheduler_utils.setup_instance_group(self.context, self.fake_spec)
++        self.instance.is_volume_backed().AndReturn(False)
+         self.task.scheduler_client.select_destinations(self.context,
+                 self.fake_spec, [self.instance.uuid]).AndReturn(
+                         [{'host': 'host1', 'nodename': 'node1',
+@@ -623,9 +642,11 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
+         self.mox.StubOutWithMock(scheduler_utils, 'setup_instance_group')
+         self.mox.StubOutWithMock(self.task.scheduler_client,
+                                  'select_destinations')
++        self.mox.StubOutWithMock(self.instance, 'is_volume_backed')
+         utils.get_image_from_system_metadata(
+             self.instance.system_metadata).AndReturn("image")
+         scheduler_utils.setup_instance_group(self.context, self.fake_spec)
++        self.instance.is_volume_backed().AndReturn(False)
+         self.task.scheduler_client.select_destinations(self.context,
+                 self.fake_spec, [self.instance.uuid]).AndRaise(
+                         exception.NoValidHost(reason=""))
+@@ -633,13 +654,15 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
+         self.mox.ReplayAll()
+         self.assertRaises(exception.NoValidHost, self.task._find_destination)
+ 
++    @mock.patch('nova.objects.Instance.is_volume_backed')
+     @mock.patch("nova.utils.get_image_from_system_metadata")
+     @mock.patch("nova.scheduler.utils.build_request_spec")
+     @mock.patch("nova.scheduler.utils.setup_instance_group")
+     @mock.patch("nova.objects.RequestSpec.from_primitives")
+     def test_find_destination_with_remoteError(self,
+         m_from_primitives, m_setup_instance_group,
+-        m_build_request_spec, m_get_image_from_system_metadata):
++        m_build_request_spec, m_get_image_from_system_metadata,
++        m_is_volume_backed):
+         self.instance.numa_topology = None
+         m_get_image_from_system_metadata.return_value = {'properties': {}}
+         m_build_request_spec.return_value = {}
+-- 
+2.7.4
+

@@ -1,0 +1,72 @@
+From 9e14c3697e487da8cb0847a6b5952e774a143b5c Mon Sep 17 00:00:00 2001
+From: Gerry Kopec <Gerry.Kopec@windriver.com>
+Date: Tue, 6 Feb 2018 13:56:50 -0500
+Subject: [PATCH 094/143] Fix online migration creation of request spec in Pike
+
+Upstream commit e211fca5 (_schedule_instances() supporting a RequestSpec
+object) which refactored request spec object handling in pike does not
+generate request spec when triggered by online migration if instance
+belongs to a server group.
+
+Couple of changes are required:
+- need to create instance_group object if it doesn't exist otherwise
+  online migration will fail.
+- instance_group.hosts needs to be empty otherwise it leaves stale hosts
+  in request_spec which can cause scheduling issues later.
+
+This fix is upstreamable.
+---
+ nova/objects/request_spec.py |  3 +++
+ nova/scheduler/utils.py      | 21 +++++++++++++++------
+ 2 files changed, 18 insertions(+), 6 deletions(-)
+
+diff --git a/nova/objects/request_spec.py b/nova/objects/request_spec.py
+index a3ca126..6d477b2 100644
+--- a/nova/objects/request_spec.py
++++ b/nova/objects/request_spec.py
+@@ -641,6 +641,9 @@ def _create_minimal_request_spec(context, instance):
+         project_id=instance.project_id
+     )
+     scheduler_utils.setup_instance_group(context, request_spec)
++    # do not want to store host information in db as it will become stale
++    if request_spec.instance_group:
++        request_spec.instance_group.hosts = []
+     request_spec.create()
+ 
+ 
+diff --git a/nova/scheduler/utils.py b/nova/scheduler/utils.py
+index 157f318..e794aca 100644
+--- a/nova/scheduler/utils.py
++++ b/nova/scheduler/utils.py
+@@ -719,13 +719,22 @@ def setup_instance_group(context, request_spec):
+     group_info = _get_group_details(context, instance_uuid, request_spec,
+                                     user_group_hosts=group_hosts)
+     if group_info is not None:
+-        request_spec.instance_group.hosts = list(group_info.hosts)
+-        request_spec.instance_group.policies = group_info.policies
+-        request_spec.instance_group.members = group_info.members
++        if request_spec.instance_group is None:
++            # create instance_group if it doesn't exist
++            request_spec.instance_group = objects.InstanceGroup(
++                         policies=group_info.policies,
++                         hosts=list(group_info.hosts),
++                         members=group_info.members,
++                         name=group_info.name,
++                         metadetails=group_info.metadetails)
++        else:
++            request_spec.instance_group.hosts = list(group_info.hosts)
++            request_spec.instance_group.policies = group_info.policies
++            request_spec.instance_group.members = group_info.members
+ 
+-        # WRS:extension -- metadetails, name
+-        request_spec.instance_group.metadetails = group_info.metadetails
+-        request_spec.instance_group.name = group_info.name
++            # WRS:extension -- metadetails, name
++            request_spec.instance_group.metadetails = group_info.metadetails
++            request_spec.instance_group.name = group_info.name
+ 
+ 
+ def retry_on_timeout(retries=1):
+-- 
+2.7.4
+

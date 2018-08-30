@@ -1,0 +1,42 @@
+From cff60934724c35b61608efcbc3313349471afbe7 Mon Sep 17 00:00:00 2001
+From: Francois Palin <francois.palin@windriver.com>
+Date: Tue, 20 Feb 2018 20:14:06 -0500
+Subject: [PATCH 106/143] Only attempt a rebuild claim for an
+ evacuation to a new host
+
+Change 9e2d63da94db63d97bd02e373bfc53d95808b833 changed the
+behavior of the API and conductor when rebuilding an instance
+with a new image such that the image is run through the scheduler
+filters again to see if it will work on the existing host that
+the instance is running on.
+
+As a result, conductor started passing 'scheduled_node' to the
+compute which was using it for logic to tell if a claim should be
+attempted. We don't need to do a claim for a rebuild since we're
+on the same host.
+
+This removes the scheduled_node logic from the claim code, as we
+should only ever attempt a claim if we're evacuating, which we
+can determine based on the 'recreate' parameter.
+
+Note: fix was taken from (yet to be merged) upstream change 546268.
+---
+ nova/compute/manager.py | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/nova/compute/manager.py b/nova/compute/manager.py
+index b553fb7..ddf55e5 100644
+--- a/nova/compute/manager.py
++++ b/nova/compute/manager.py
+@@ -3067,7 +3067,7 @@ class ComputeManager(manager.Manager):
+         #
+         # For scenarios #2 and #3, we must do rebuild claim as server is
+         # being evacuated to a different node.
+-        if recreate or scheduled_node is not None:
++        if recreate:
+             rt = self._get_resource_tracker()
+             rebuild_claim = rt.rebuild_claim
+         else:
+-- 
+2.7.4
+

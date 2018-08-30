@@ -1,0 +1,290 @@
+From b98ae425441585b562c572932005844254ac29c8 Mon Sep 17 00:00:00 2001
+From: Jim Gauld <james.gauld@windriver.com>
+Date: Wed, 7 Mar 2018 15:27:29 -0500
+Subject: [PATCH 121/143] Enhance memory available tracking based on
+ actual free pages
+
+This adds tracking of actual linux free memory per-numa node for 4K
+memory, 2M and 1G hugepages. The 'used' pages per page-size are adjusted
+at the 1 minute compute resource audit to account for unexpected usages
+(e.g., orphans, platform overheads) that would make the actual free
+memory less than what is resource tracked. These adjusted values are
+saved as part of the regular compute node update, so the scheduler will
+pick this up.
+
+nova-compute warning logs are displayed when there are usage adjustments.
+
+Example:
+WARNING nova.compute.resource_tracker Numa node=0; Adjusted memory: \
+per-pgsize: 4K: 1000 MiB used, 1219 MiB used adj, 792 MiB avail adj
+---
+ nova/compute/resource_tracker.py                 | 79 ++++++++++++++++++++++++
+ nova/conf/compute.py                             |  4 ++
+ nova/objects/numa.py                             | 14 +++++
+ nova/tests/unit/compute/test_resource_tracker.py |  1 +
+ nova/virt/driver.py                              |  3 +
+ nova/virt/libvirt/driver.py                      |  3 +
+ nova/virt/libvirt/host.py                        | 59 ++++++++++++++++++
+ 7 files changed, 163 insertions(+)
+
+diff --git a/nova/compute/resource_tracker.py b/nova/compute/resource_tracker.py
+index 06d6344..88f4404 100644
+--- a/nova/compute/resource_tracker.py
++++ b/nova/compute/resource_tracker.py
+@@ -1136,6 +1136,12 @@ class ResourceTracker(object):
+                     local_gb_free < cn.free_disk_gb):
+             cn.free_disk_gb = local_gb_free
+ 
++        # Adjust the view of pages used to account for unexpected usages
++        # (e.g., orphans, platform overheads) that would make the actual free
++        # memory less than what is resource tracked.
++        if CONF.adjust_actual_mem_usage:
++            self._adjust_actual_mem_usage(context, nodename)
++
+         # update the compute_node
+         self._update(context, cn)
+         LOG.info('Compute_service record updated for %(host)s:%(node)s',
+@@ -2345,6 +2351,8 @@ class ResourceTracker(object):
+             LOG.warning("Detected running orphan instance: %(uuid)s "
+                         "(consuming %(memory_mb)s MB memory)",
+                         {'uuid': orphan['uuid'], 'memory_mb': memory_mb})
++            if CONF.adjust_actual_mem_usage:
++                continue
+ 
+             # just record memory usage for the orphan
+             usage = {'memory_mb': memory_mb}
+@@ -2421,3 +2429,74 @@ class ResourceTracker(object):
+             if key in updates:
+                 usage[key] = updates[key]
+         return usage
++
++    def _adjust_actual_mem_usage(self, context, nodename):
++        """Adjust host numa topology view of pages 'used' when the actual free
++        pages available is less than what is resource tracked. This accounts
++        for orphans, excessive qemu overheads, and runaway platform resources.
++        """
++        cn = self.compute_nodes[nodename]
++
++        host_numa_topology, jsonify_result = \
++            hardware.host_topology_and_format_from_host(cn)
++        # NOTE(jgauld): We don't expect to return here on real hardware.
++        if host_numa_topology is None:
++            return
++        if not jsonify_result:
++            return
++
++        # Get dictionary of actual free memory pages per numa-cell, per-pgsize
++        actual_free_mempages = self.driver.get_actual_free_mempages()
++        # NOTE(jgauld): We don't expect to return here on real hardware.
++        if not actual_free_mempages:
++            return
++
++        update_numa_topology = False
++        for cell in host_numa_topology.cells:
++            mem = []
++            for mempage in cell.mempages:
++                try:
++                    actual_free = \
++                        actual_free_mempages[cell.id][mempage.size_kb]
++                except Exception as e:
++                    actual_free = None
++                    LOG.error('Could not get actual_free_mempages: '
++                              'cellid=%(id)s, pgsize=%(size)s, error=%(err)s',
++                              {'node': cell.id,
++                               'size': mempage.size_kb,
++                               'err': e})
++                if actual_free is not None:
++                    used_old, used_adjusted = mempage.adjust_used(actual_free)
++                    if used_old != used_adjusted:
++                        update_numa_topology = True
++                        adjust_MiB = mempage.size_kb * (used_adjusted -
++                                                        used_old) / units.Ki
++                        cn.memory_mb_used += adjust_MiB
++                        cn.free_ram_mb -= adjust_MiB
++
++                        unit = 'K'
++                        size = mempage.size_kb
++                        if ((mempage.size_kb >= units.Ki) and
++                            (mempage.size_kb < units.Mi)):
++                            unit = 'M'
++                            size = mempage.size_kb / units.Ki
++                        if mempage.size_kb >= units.Mi:
++                            unit = 'G'
++                            size = mempage.size_kb / units.Mi
++                        m = '%(sz)s%(U)s: %(old).0f MiB used, ' \
++                            '%(adj).0f MiB used adj, %(A).0f MiB avail adj' % \
++                            {'sz': size, 'U': unit,
++                             'old': mempage.size_kb * used_old / units.Ki,
++                             'adj': mempage.size_kb * mempage.used / units.Ki,
++                             'A': mempage.size_kb *
++                                  (mempage.total - mempage.used) / units.Ki,
++                            }
++                        mem.append(m)
++            if mem:
++                LOG.warning(
++                    'Numa node=%(node)d; Adjusted memory: '
++                    'per-pgsize: %(pgsize)s',
++                    {'node': cell.id, 'pgsize': '; '.join(mem)})
++
++        if update_numa_topology:
++            cn.numa_topology = host_numa_topology._to_json()
+diff --git a/nova/conf/compute.py b/nova/conf/compute.py
+index a17c750..65c040d 100644
+--- a/nova/conf/compute.py
++++ b/nova/conf/compute.py
+@@ -1243,6 +1243,10 @@ wrs_compute_opts = [
+     cfg.StrOpt('compute_vm_4K_pages',
+                default=_extend_opts['compute_vm_4K_pages'],
+                help='List of per-numa node VM 4K memory.'),
++
++    cfg.BoolOpt('adjust_actual_mem_usage',
++                default=True,
++                help='Adjust memory usage based on host actual free pages'),
+ ]
+ 
+ 
+diff --git a/nova/objects/numa.py b/nova/objects/numa.py
+index 4a515bb..3a9a899 100644
+--- a/nova/objects/numa.py
++++ b/nova/objects/numa.py
+@@ -390,6 +390,20 @@ class NUMAPagesTopology(base.NovaObject):
+             self.reserved = 0
+         return self.total - self.used - self.reserved
+ 
++    def adjust_used(self, actual_free):
++        """Adjust the number of used pages if there is less actual free pages
++           than what is tracked for VMs.
++        """
++        if not self.obj_attr_is_set('reserved'):
++            # In case where an old compute node is sharing resource to
++            # an updated node we must ensure that this property is defined.
++            self.reserved = 0
++        tracked_free = self.total - self.used - self.reserved
++        used_old = self.used
++        if actual_free < tracked_free:
++            self.used += tracked_free - actual_free
++        return used_old, self.used
++
+     @property
+     def free_kb(self):
+         """Returns the avail memory size in KiB."""
+diff --git a/nova/tests/unit/compute/test_resource_tracker.py b/nova/tests/unit/compute/test_resource_tracker.py
+index 17eab91..ae4119b 100644
+--- a/nova/tests/unit/compute/test_resource_tracker.py
++++ b/nova/tests/unit/compute/test_resource_tracker.py
+@@ -695,6 +695,7 @@ class TestUpdateAvailableResources(BaseTestCase):
+         virt_resources = copy.deepcopy(_VIRT_DRIVER_AVAIL_RESOURCES)
+         virt_resources.update(memory_mb_used=64)
+         self._setup_rt(virt_resources=virt_resources)
++        CONF.set_override('adjust_actual_mem_usage', False)
+ 
+         get_mock.return_value = []
+         migr_mock.return_value = []
+diff --git a/nova/virt/driver.py b/nova/virt/driver.py
+index 06d9eec..f482a44 100644
+--- a/nova/virt/driver.py
++++ b/nova/virt/driver.py
+@@ -1264,6 +1264,9 @@ class ComputeDriver(object):
+         """
+         return {}
+ 
++    def get_actual_free_mempages(self):
++        return {}
++
+     # extension - expose host numa topology
+     def _get_host_numa_topology(self):
+         """Get the currently known host numa topology.
+diff --git a/nova/virt/libvirt/driver.py b/nova/virt/libvirt/driver.py
+index 1be7289..1942221 100644
+--- a/nova/virt/libvirt/driver.py
++++ b/nova/virt/libvirt/driver.py
+@@ -6317,6 +6317,9 @@ class LibvirtDriver(driver.ComputeDriver):
+                     numabankmap[cell.id] = int(bank.id)
+         return numabankmap
+ 
++    def get_actual_free_mempages(self):
++        return self._host.get_actual_free_mempages()
++
+     def _get_host_numa_topology(self):
+         if not self._has_numa_support():
+             return
+diff --git a/nova/virt/libvirt/host.py b/nova/virt/libvirt/host.py
+index ce34398..7958a00 100644
+--- a/nova/virt/libvirt/host.py
++++ b/nova/virt/libvirt/host.py
+@@ -36,6 +36,7 @@ the other libvirt related classes
+ 
+ import operator
+ import os
++import re
+ import socket
+ import sys
+ import threading
+@@ -765,6 +766,64 @@ class Host(object):
+                          {'id': cell.id, 'msg': '; '.join(msg)})
+         return self._caps
+ 
++    def get_actual_free_mempages(self):
++        """Get the host actual free memory pages used per cell per pagesize.
++
++        :returns: dictionary of actual free mempages used per cell per pagesize
++        """
++        free_mempages = {}
++        caps = self.get_capabilities()
++        topology = caps.host.topology
++        if topology is None or not topology.cells:
++            return free_mempages
++
++        # Extract meminfo fields that may be treated as available memory,
++        # including linux free, file cached, and reclaimable.
++        re_node_MemFree = re.compile(r'^Node\s+\d+\s+MemFree:\s+(\d+)')
++        re_node_FilePages = re.compile(r'^Node\s+\d+\s+FilePages:\s+(\d+)')
++        re_node_SReclaim = re.compile(r'^Node\s+\d+\s+SReclaimable:\s+(\d+)')
++
++        for cell in topology.cells:
++            SYSNODE = '/sys/devices/system/node/node%d' % (cell.id)
++            free_mempages[cell.id] = {}
++            for k, pages in enumerate(cell.mempages):
++                pg = cell.mempages[k]
++
++                if pages.size == MEMPAGE_SZ_4K:
++                    free_KiB = 0
++                    meminfo = SYSNODE + '/meminfo'
++                    try:
++                        with open(meminfo, 'r') as infile:
++                            for line in infile:
++                                match = re_node_MemFree.search(line)
++                                if match:
++                                    free_KiB += int(match.group(1))
++                                    continue
++                                match = re_node_FilePages.search(line)
++                                if match:
++                                    free_KiB += int(match.group(1))
++                                    continue
++                                match = re_node_SReclaim.search(line)
++                                if match:
++                                    free_KiB += int(match.group(1))
++                                    continue
++                    except IOError:
++                        pass
++                    free_pages = free_KiB // pages.size
++                    free_mempages[cell.id][pg.size] = free_pages
++
++                else:
++                    f_sz = SYSNODE + '/hugepages/hugepages-%dkB' % (pages.size)
++                    f_nf = f_sz + '/free_hugepages'
++                    try:
++                        with open(f_nf) as f:
++                            free_pages = int(f.read().strip())
++                    except IOError:
++                        free_pages = 0
++                    free_mempages[cell.id][pg.size] = free_pages
++
++        return free_mempages
++
+     def get_driver_type(self):
+         """Get hypervisor type.
+ 
+-- 
+2.7.4
+

@@ -1,0 +1,50 @@
+From 3e0b96073844f0cd843a615509b9d69b101226f5 Mon Sep 17 00:00:00 2001
+From: Daniel Badea <daniel.badea@windriver.com>
+Date: Fri, 22 Dec 2017 01:16:43 +0000
+Subject: [PATCH 081/143] cache-raw image deleted when deleting
+ snapshot
+
+Instance snapshot is created with a copy of original image
+metadata including cache_raw status, size and url. This causes
+two issues:
+1. raw cache image associated with snapshot may not contain
+   the data in the snapshot (it's the data from the original
+   image)
+2. when the snapshot is deleted the raw cache is also deleted
+   and the original image points to an invalid raw cache.
+
+To fix this, when creating the snapshot in nova, any cache_raw
+image metadata attributes (excluding the one that enables raw
+caching) are removed. Glance will notice cache_raw is enabled
+and create a new raw cache for the new snapshot.
+
+__TYPE_single
+---
+ nova/image/glance.py | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/nova/image/glance.py b/nova/image/glance.py
+index fb00055..8bc8171 100644
+--- a/nova/image/glance.py
++++ b/nova/image/glance.py
+@@ -479,6 +479,17 @@ class GlanceImageServiceV2(object):
+                 sent_service_image_meta['container_format'] = 'bare'
+ 
+         location = sent_service_image_meta.pop('location', None)
++
++        # Remove all raw caching attributes except the one that
++        # enables it. We don't want to pass on invalid url, size
++        # and status as they should be generated again for the
++        # new snapshot image
++        cache_raw_attrs_to_remove = [
++            key for key in sent_service_image_meta.keys()
++                if key.startswith('cache_raw_')]
++        for key in cache_raw_attrs_to_remove:
++            del sent_service_image_meta[key]
++
+         image = self._client.call(
+             context, 2, 'create', **sent_service_image_meta)
+         image_id = image['id']
+-- 
+2.7.4
+
