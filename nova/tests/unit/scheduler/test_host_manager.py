@@ -1313,9 +1313,6 @@ class HostStateTestCase(test.NoDBTestCase):
                                                       cpuset=set([0]),
                                                       memory=512, id=0)])
 
-        fake_requests = [{'request_id': uuids.request_id, 'count': 1,
-                          'spec': [{'vendor_id': '8086'}]}]
-
         req_spec = objects.RequestSpec(
             instance_uuid=uuids.instance,
             project_id='12345',

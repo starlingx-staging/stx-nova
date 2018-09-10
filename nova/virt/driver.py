@@ -28,7 +28,6 @@ import six
 
 import nova.conf
 from nova.i18n import _
-from nova import objects
 from nova.virt import event as virtevent
 
 CONF = nova.conf.CONF

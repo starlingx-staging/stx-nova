@@ -4037,46 +4037,6 @@ class ServersControllerCreateTestV252(test.NoDBTestCase):
             exception.ValidationError, self._create_server, tags)
 
 
-@ddt.ddt
-class ServersControllerCreateTestV242(ServersControllerCreateTest):
-    def setUp(self):
-        super(ServersControllerCreateTestV242, self).setUp()
-        self.controller = servers.ServersController()
-
-        self.body = {
-            'server': {
-                'name': 'device-tagging-server',
-                'imageRef': '6b0edabb-8cde-4684-a3f4-978960a51378',
-                'flavorRef': '2',
-                'networks': [{
-                    'uuid': 'ff608d40-75e9-48cb-b745-77bb55b5eaf2'
-                }]
-            }
-        }
-
-        self.req = fakes.HTTPRequestV21.blank('/fake/servers', version='2.42')
-        self.req.method = 'POST'
-        self.req.headers['content-type'] = 'application/json'
-
-    def _create_instance_req(self, set_desc, desc=None):
-        if set_desc:
-            self.body['server']['description'] = desc
-        self.req.body = jsonutils.dump_as_bytes(self.body)
-        self.req.api_version_request = \
-            api_version_request.APIVersionRequest('2.42')
-
-    def test_create_server_with_tags_pre_2_42_vif_model(self):
-        self._create_instance_req(False)
-        self.flags(use_neutron=True)
-        self.body['server'] = {'networks': [{'uuid': FAKE_UUID,
-                               'wrs-if:vif_model': 'virtio'}]}
-        self.body['server']['name'] = 'test'
-        self.body['server']['flavorRef'] = 2
-        image_uuid = 'c905cedb-7281-47e4-8a62-f26bc5fc4c77'
-        self.body['server']['imageRef'] = image_uuid
-        self.controller.create(self.req, body=self.body).obj
-
-
 class ServersControllerCreateTestWithMock(test.TestCase):
     image_uuid = '76fa36fc-c930-4bf3-8c8a-ea2a2420deb6'
     flavor_ref = 'http://localhost/123/flavors/3'

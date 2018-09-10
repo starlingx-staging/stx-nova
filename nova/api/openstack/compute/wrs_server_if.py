@@ -18,7 +18,6 @@
 from nova.api.openstack import api_version_request
 from nova.api.openstack import common
 from nova.api.openstack import wsgi
-from nova import exception
 from nova.policies import wrs_server_if as wrs_if_policies
 
 
