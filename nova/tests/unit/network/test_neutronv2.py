@@ -545,7 +545,7 @@ class TestNeutronv2Base(test.TestCase):
                     self.instance, mox.IgnoreArg(),
                     mox.IgnoreArg(), network=network,
                     neutron=self.moxed_client,
-                    bind_host_id=None).AndReturn(None)
+                    bind_host_id=None, vif_pci_address=None).AndReturn(None)
             elif has_portbinding:
                 # since _populate_neutron_extension_values() will call
                 # _has_port_binding_extension()
@@ -1378,6 +1378,10 @@ class TestNeutronv2(TestNeutronv2Base):
             port_id = getattr(uuids, 'portid_%s' % network['id'])
             port = {'id': port_id, 'mac_address': 'foo'}
 
+            api._populate_neutron_extension_values(self.context,
+                self.instance, None, binding_port_req_body, network=network,
+                neutron=self.moxed_client, bind_host_id=None,
+                vif_pci_address=None).AndReturn(None)
             if index == 0:
                 self.moxed_client.update_port(port_id,
                     MyComparator(binding_port_req_body)).AndReturn(
@@ -1575,7 +1579,8 @@ class TestNeutronv2(TestNeutronv2Base):
                 # NOTE(danms): Temporary and transitional
                 with mock.patch('nova.utils.is_neutron', return_value=True):
                     requested_networks = requested_networks.as_tuples()
-            for net, fip, port, request_id, vif_model in requested_networks:
+            for net, fip, port, request_id, vif_model, vif_pci_address \
+                    in requested_networks:
                 ret_data.append({'network_id': net,
                                  'device_id': self.instance.uuid,
                                  'device_owner': 'compute:nova',
@@ -1590,7 +1595,8 @@ class TestNeutronv2(TestNeutronv2Base):
                 {'ports': ret_data})
         self.moxed_client.list_extensions().AndReturn({'extensions': []})
         if requested_networks:
-            for net, fip, port, request_id, vif_model in requested_networks:
+            for net, fip, port, request_id, vif_model, vif_pci_address \
+                    in requested_networks:
                 self.moxed_client.update_port(port)
         for port in ports:
             self.moxed_client.delete_port(port).InAnyOrder("delete_port_group")
@@ -5080,6 +5086,7 @@ class TestNeutronv2Portbinding(TestNeutronv2Base):
         profile = {'pci_vendor_info': '1377:0047',
                    'pci_slot': '0000:0a:00.1',
                    'physical_network': 'phynet1',
+                   'pci_request_id': 'my_req_id',
                   }
 
         mock_get_instance_pci_devs.return_value = [mydev]

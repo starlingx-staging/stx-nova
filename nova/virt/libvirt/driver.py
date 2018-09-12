@@ -5240,6 +5240,37 @@ class LibvirtDriver(driver.ComputeDriver):
                 cpu_config.features.add(xf)
         return cpu_config
 
+    def _get_guest_vif_pci_address(self, vif):
+        if vif:
+            profile = vif.get('profile')
+            if profile is not None:
+                return profile.get('vif_pci_address')
+            else:
+                return None
+
+    def _get_pcihole64(self, os_type):
+        """Determines whether to set pcihole64 based on OS of guest.
+
+        When hotplugging AVP interfaces, a large amount of address space
+        is required for one of their PCI BARs.  In order to allow the AVP
+        device to become available without rebooting the guest, we need to
+        preallocate that space.  Unfortunately, that causes errors on Windows
+        guests that have more than 4GiB of memory, and as such, we need to not
+        preallocate that space if the Operating System is Windows.
+
+        :param:os_type Operating system type of the guest
+
+        :return: pcihole64 size if it is to be set, else None.
+
+        """
+        if os_type == 'windows':
+            return None
+        else:
+            # This returns 64GiB, which libvirt converts to 67108864 KiB
+            # This is neccesary to allow hotplugging 16 AVP NICs, which
+            # can each use up to 4GiB of address space.
+            return 64
+
     def _get_guest_config(self, instance, network_info, image_meta,
                           disk_info, rescue=None, block_device_info=None,
                           context=None):
@@ -5292,6 +5323,10 @@ class LibvirtDriver(driver.ComputeDriver):
         instance.vcpu_model = self._cpu_config_to_vcpu_model(
             guest.cpu, instance.vcpu_model)
 
+        # WRS: We need to get the maximum value of the bus number so that we
+        # can configure the PCI controller.
+        max_pci_bus = 0
+
         if 'root' in disk_mapping:
             root_device_name = block_device.prepend_dev(
                 disk_mapping['root']['dev'])
@@ -5327,7 +5362,17 @@ class LibvirtDriver(driver.ComputeDriver):
         for vif in network_info:
             config = self.vif_driver.get_config(
                 instance, vif, image_meta,
-                flavor, virt_type, self._host)
+                    flavor, virt_type, self._host)
+
+            # WRS: override guest PCI address
+            vif_pci_address = self._get_guest_vif_pci_address(vif)
+            if vif_pci_address is not None:
+                config.guest_pci_address = vif_pci_address
+
+                domain, bus, slot, func = \
+                    pci_utils.get_pci_address_fields(vif_pci_address)
+                max_pci_bus = max(int(bus, 16), max_pci_bus)
+
             guest.add_device(config)
 
         self._create_consoles(virt_type, guest, instance, flavor, image_meta)
@@ -5348,13 +5393,38 @@ class LibvirtDriver(driver.ComputeDriver):
 
         self._set_cgcs_msg(guest, flavor, instance)
 
-        self._guest_add_pci_devices(guest, instance)
+        self._guest_add_pci_devices(guest, instance, network_info, max_pci_bus)
 
         self._guest_add_watchdog_action(guest, flavor, image_meta)
 
         self._guest_add_memory_balloon(guest)
 
+        self._set_pci_controller(guest, instance, max_pci_bus)
+
         return guest
+
+    def _set_pci_controller(self, guest, instance, max_pci_bus):
+        # WRS: Need to populate the PCI controller correctly when trying to
+        # launch an instance with a PCI address that has a bus different than
+        # 0.  This is only needed for AVP interfaces.  For virtio interfaces
+        # qemu/kvm takes care of it.  The important thing here is to
+        # specify the index, all the other values (domain, bus, slot and
+        # address will be taken care by qemu/kvm).
+        pcihole64 = self._get_pcihole64(instance.os_type)
+        if max_pci_bus > 0 or pcihole64:
+            pci_root = vconfig.LibvirtConfigPciController()
+            pci_root.index = 0
+            pci_root.model = 'pci-root'
+            pci_root.pcihole64 = self._get_pcihole64(instance.os_type)
+            guest.add_device(pci_root)
+
+            index = 1
+            while index <= max_pci_bus:
+                pci_bridge = vconfig.LibvirtConfigPciController()
+                pci_bridge.index = index
+                pci_bridge.model = 'pci-bridge'
+                guest.add_device(pci_bridge)
+                index += 1
 
     @staticmethod
     def _guest_add_spice_channel(guest):
@@ -5396,12 +5466,38 @@ class LibvirtDriver(driver.ComputeDriver):
             else:
                 raise exception.InvalidWatchdogAction(action=watchdog_action)
 
-    def _guest_add_pci_devices(self, guest, instance):
+    def _guest_add_pci_devices(self, guest, instance, network_info,
+                               max_pci_bus):
         virt_type = guest.virt_type
         if virt_type in ('xen', 'qemu', 'kvm'):
             # Get all generic PCI devices (non-SR-IOV).
-            for pci_dev in pci_manager.get_instance_pci_devs(instance):
-                guest.add_device(self._get_guest_pci_device(pci_dev))
+            def get_from_network_info(pci_dev, network_info):
+                for vif in network_info:
+                    if (vif.get('profile', {}).get('pci_slot')
+                            == pci_dev.get('address')):
+                        return vif
+                return None
+
+            for pci_dev in pci_manager.get_instance_pci_devs(instance, 'all'):
+                config = self._get_guest_pci_device(pci_dev)
+
+                # WRS: Don't include PCI devices that were included in the
+                # loop over network_info above (SR-IOV PCI devices for vNIC).
+                # Else libvirt will complain that a given PCI device is
+                # already allocated.
+                vif = get_from_network_info(pci_dev, network_info)
+                if (vif is None or vif.get('vnic_type')
+                        != network_model.VNIC_TYPE_DIRECT):
+                    # WRS: override guest PCI address
+                    vif_pci_address = self._get_guest_vif_pci_address(vif)
+                    if vif_pci_address is not None:
+                        config.guest_pci_address = vif_pci_address
+
+                        domain, bus, slot, func = \
+                            pci_utils.get_pci_address_fields(vif_pci_address)
+                        max_pci_bus = max(int(bus, 16), max_pci_bus)
+
+                    guest.add_device(config)
         else:
             # PCI devices is only supported for hypervisors
             #  'xen', 'qemu' and 'kvm'.

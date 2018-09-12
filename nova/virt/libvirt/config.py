@@ -11,6 +11,11 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+#
+# Copyright (c) 2018 Wind River Systems, Inc.
+#
+# SPDX-License-Identifier: Apache-2.0
+#
 
 """
 Configuration for libvirt objects.
@@ -1407,6 +1412,8 @@ class LibvirtConfigGuestInterface(LibvirtConfigGuestDevice):
         self.vif_outbound_average = None
         self.vlan = None
         self.device_addr = None
+        self.guest_pci_address = None
+        self.target_dev_uuid = None
 
     def format_dom(self):
         dev = super(LibvirtConfigGuestInterface, self).format_dom()
@@ -1459,7 +1466,10 @@ class LibvirtConfigGuestInterface(LibvirtConfigGuestDevice):
             dev.append(vlan_elem)
 
         if self.target_dev is not None:
-            dev.append(etree.Element("target", dev=self.target_dev))
+            target_dev_elem = etree.Element("target", dev=self.target_dev)
+            if self.target_dev_uuid:
+                target_dev_elem.set("uuid", self.target_dev_uuid)
+            dev.append(target_dev_elem)
 
         if self.vporttype is not None:
             vport = etree.Element("virtualport", type=self.vporttype)
@@ -1497,6 +1507,18 @@ class LibvirtConfigGuestInterface(LibvirtConfigGuestDevice):
                     vif_outbound.set("burst", str(self.vif_outbound_burst))
                 bandwidth.append(vif_outbound)
             dev.append(bandwidth)
+
+        # WRS: Put NIC at specific guest PCI address.
+        if self.guest_pci_address:
+            domain, bus, slot, func = \
+                pci_utils.get_pci_address_fields(self.guest_pci_address)
+            guest_address = etree.Element(
+                "address", type='pci',
+                domain='0x{:s}'.format(domain),
+                bus='0x{:s}'.format(bus),
+                slot='0x{:s}'.format(slot),
+                function='0x{:s}'.format(func))
+            dev.append(guest_address)
 
         return dev
 
@@ -1749,6 +1771,7 @@ class LibvirtConfigGuestHostdevPCI(LibvirtConfigGuestHostdev):
         self.bus = None
         self.slot = None
         self.function = None
+        self.guest_pci_address = None
 
     def format_dom(self):
         dev = super(LibvirtConfigGuestHostdevPCI, self).format_dom()
@@ -1761,6 +1784,19 @@ class LibvirtConfigGuestHostdevPCI(LibvirtConfigGuestHostdev):
         source = etree.Element("source")
         source.append(address)
         dev.append(source)
+
+        # WRS: Put NIC at specific guest PCI address.
+        if self.guest_pci_address:
+            domain, bus, slot, func = \
+                pci_utils.get_pci_address_fields(self.guest_pci_address)
+            guest_address = etree.Element(
+                "address", type='pci',
+                domain='0x{:s}'.format(domain),
+                bus='0x{:s}'.format(bus),
+                slot='0x{:s}'.format(slot),
+                function='0x{:s}'.format(func))
+            dev.append(guest_address)
+
         return dev
 
     def parse_dom(self, xmldoc):
@@ -2806,3 +2842,28 @@ class LibvirtConfigSecret(LibvirtConfigObject):
             usage.append(self._text_node('volume', str(self.usage_id)))
         root.append(usage)
         return root
+
+
+class LibvirtConfigPciController(LibvirtConfigGuestDevice):
+    def __init__(self, **kwargs):
+        super(LibvirtConfigGuestDevice, self).__init__(
+            root_name='controller',
+            **kwargs)
+        self.type = "pci"
+        self.index = None
+        self.model = None
+        self.pcihole64 = None
+
+    def format_dom(self):
+        dev = super(LibvirtConfigGuestDevice, self).format_dom()
+
+        dev.set("type", self.type)
+        dev.set("index", str(self.index))
+        dev.set("model", self.model)
+        if self.pcihole64:
+            pcihole64 = etree.Element("pcihole64")
+            pcihole64.set('unit', 'GiB')
+            pcihole64.text = str(self.pcihole64)
+            dev.append(pcihole64)
+
+        return dev

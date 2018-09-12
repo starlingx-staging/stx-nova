@@ -369,9 +369,13 @@ def get_nics_for_instance_from_nw_info(nw_info):
     nics = []
     for index, vif in enumerate(nw_info):
         name = "nic" + str(index + 1)
+        vif_pci_address = ""
+        if vif.get('profile') is not None:
+            vif_pci_address = vif.get('profile', {}).get('vif_pci_address', "")
         nics.append({name: {'port_id': vif['id'],
                             'mac_address': vif['address'],
                             'vif_model': vif['vif_model'],
+                            'vif_pci_address': vif_pci_address,
                             'mtu': vif['mtu'],
                             'network': vif['network']['label']}})
     return nics
