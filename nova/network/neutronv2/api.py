@@ -980,7 +980,8 @@ class API(base_api.NetworkAPI):
                 self._populate_neutron_extension_values(
                     context, instance, request.pci_request_id, port_req_body,
                     network=network, neutron=neutron,
-                    bind_host_id=bind_host_id)
+                    bind_host_id=bind_host_id,
+                    vif_pci_address=request.vif_pci_address)
                 self._populate_pci_mac_address(instance,
                     request.pci_request_id, port_req_body)
                 self._populate_mac_address(
@@ -1080,16 +1081,24 @@ class API(base_api.NetworkAPI):
         raise exception.PciDeviceNotFound(node_id=pci_dev.compute_node_id,
                                           address=pci_dev.address)
 
+    # WRS: add vif_pci_address
     def _populate_neutron_binding_profile(self, instance, pci_request_id,
-                                          port_req_body):
+                                          port_req_body,
+                                          vif_pci_address=None):
         """Populate neutron binding:profile.
 
         Populate it with SR-IOV related information
         """
+        profile = {}
         if pci_request_id:
             pci_dev = pci_manager.get_instance_pci_devs(
                 instance, pci_request_id).pop()
             profile = self._get_pci_device_profile(pci_dev)
+            profile.update({'pci_request_id': pci_request_id})
+        if vif_pci_address is not None:
+            profile.update({'vif_pci_address': vif_pci_address})
+
+        if profile:
             port_req_body['port'][BINDING_PROFILE] = profile
 
     @staticmethod
@@ -1124,10 +1133,12 @@ class API(base_api.NetworkAPI):
                 else:
                     port_req_body['port']['mac_address'] = mac
 
+    # WRS: add vif_pci_address
     def _populate_neutron_extension_values(self, context, instance,
                                            pci_request_id, port_req_body,
                                            network=None, neutron=None,
-                                           bind_host_id=None):
+                                           bind_host_id=None,
+                                           vif_pci_address=None):
         """Populate neutron extension values for the instance.
 
         If the extensions loaded contain QOS_QUEUE then pass the rxtx_factor.
@@ -1142,8 +1153,10 @@ class API(base_api.NetworkAPI):
         if has_port_binding_extension:
             port_req_body['port'][BINDING_HOST_ID] = bind_host_id
             self._populate_neutron_binding_profile(instance,
-                                                   pci_request_id,
-                                                   port_req_body)
+                                               pci_request_id,
+                                               port_req_body,
+                                               vif_pci_address=vif_pci_address)
+
         if constants.DNS_INTEGRATION in self.extensions:
             # If the DNS integration extension is enabled in Neutron, most
             # ports will get their dns_name attribute set in the port create or
@@ -1214,9 +1227,9 @@ class API(base_api.NetworkAPI):
         # NOTE(danms): Temporary and transitional
         if isinstance(requested_networks, objects.NetworkRequestList):
             requested_networks = requested_networks.as_tuples()
-        # WRS extension: add vif_model
+        # WRS extension: add vif_model & vif_pci_address
         ports_to_skip = set([port_id for nets, fips, port_id,
-                             pci_request_id, vif_model
+                             pci_request_id, vif_model, vif_pci_address
                              in requested_networks])
         # NOTE(boden): requested_networks only passed in when deallocating
         # from a failed build / spawn call. Therefore we need to include

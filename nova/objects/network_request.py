@@ -34,9 +34,9 @@ NETWORK_ID_AUTO = 'auto'
 class NetworkRequest(obj_base.NovaObject):
     # Version 1.0: Initial version
     # Version 1.1: Added pci_request_id
+    #              WRS: Added vif_model & vif_pci_address
     # Version 1.2: Added tag field
     VERSION = '1.2'
-    #              WRS: Added vif_model
     fields = {
         'network_id': fields.StringField(nullable=True),
         'address': fields.IPAddressField(nullable=True),
@@ -44,6 +44,7 @@ class NetworkRequest(obj_base.NovaObject):
         'pci_request_id': fields.UUIDField(nullable=True),
         'tag': fields.StringField(nullable=True),
         'vif_model': fields.StringField(nullable=True),
+        'vif_pci_address': fields.StringField(nullable=True),
     }
 
     def obj_make_compatible(self, primitive, target_version):
@@ -58,13 +59,19 @@ class NetworkRequest(obj_base.NovaObject):
         address = str(self.address) if self.address is not None else None
         if utils.is_neutron():
             return (self.network_id, address, self.port_id,
-                    self.pci_request_id, self.vif_model)
+                    self.pci_request_id, self.vif_model, self.vif_pci_address)
         else:
             return self.network_id, address
 
     @classmethod
     def from_tuple(cls, net_tuple):
-        if len(net_tuple) == 5:
+        if len(net_tuple) == 6:
+            network_id, address, port_id, pci_request_id, vif_model, \
+                vif_pci_address = net_tuple
+            return cls(network_id=network_id, address=address,
+                       port_id=port_id, pci_request_id=pci_request_id,
+                       vif_model=vif_model, vif_pci_address=vif_pci_address)
+        elif len(net_tuple) == 5:
             network_id, address, port_id, pci_request_id, vif_model = net_tuple
             return cls(network_id=network_id, address=address,
                        port_id=port_id, pci_request_id=pci_request_id,

@@ -55,6 +55,8 @@ from nova.i18n import _
 from nova.image import glance
 from nova import objects
 from nova.objects import service as service_obj
+from nova.pci import devspec
+from nova.pci import utils as pci_utils
 from nova.policies import servers as server_policies
 from nova import utils
 
@@ -350,6 +352,35 @@ class ServersController(wsgi.Controller):
         req.cache_db_instance(instance)
         return instance
 
+    # WRS: extension
+    def _validate_vif_pci_address(self, vif_model, pci_address):
+        domain, bus, slot, func = pci_utils.get_pci_address_fields(pci_address)
+
+        if domain != '0000':
+            msg = _("Only domain 0000 is supported")
+            raise exc.HTTPBadRequest(explanation=msg)
+
+        if bus == '00' and slot in ('00', '01'):
+            msg = _("Slots 0,1 are reserved for PCI bus 0")
+            raise exc.HTTPBadRequest(explanation=msg)
+
+        if bus != '00' and slot == '00':
+            msg = _("Slots 0 is reserved for any PCI bus")
+            raise exc.HTTPBadRequest(explanation=msg)
+
+        if func != '0':
+            msg = _("Only function 0 is supported")
+            raise exc.HTTPBadRequest(explanation=msg)
+
+        # WRS: Max bus is 8, possibly kvm/qemu limitation.
+        if int(bus, 16) > 8:
+            msg = _("PCI bus maximum value is 8")
+            raise exc.HTTPBadRequest(explanation=msg)
+
+        if int(slot, 16) > devspec.MAX_SLOT:
+            msg = _("PCI slot maximum value is %s") % devspec.MAX_SLOT
+            raise exc.HTTPBadRequest(explanation=msg)
+
     @staticmethod
     def _validate_network_id(net_id, network_uuids):
         """Validates that a requested network id.
@@ -393,6 +424,7 @@ class ServersController(wsgi.Controller):
 
         networks = []
         network_uuids = []
+        vif_pci_addresses = []
 
         for network in requested_networks:
             request = objects.NetworkRequest()
@@ -425,12 +457,32 @@ class ServersController(wsgi.Controller):
                     request.network_id = network['uuid']
                     self._validate_network_id(
                         request.network_id, network_uuids)
-                    network_uuids.append(request.network_id)
 
-                # WRS: vif_model is optional
+                # WRS: vif_model and vif_pci_address are optional
                 if utils.is_neutron():
                     request.vif_model = network.get('wrs-if:vif_model', None)
 
+                    request.vif_pci_address = network.get(
+                        'wrs-if:vif_pci_address', None)
+                    if request.vif_pci_address is not None:
+                        try:
+                            pci_utils.parse_address(request.vif_pci_address)
+                        except exception.PciDeviceWrongAddressFormat:
+                            msg = _("Bad PCI address format")
+                            raise exc.HTTPBadRequest(explanation=msg)
+
+                        self._validate_vif_pci_address(request.vif_model,
+                                                       request.vif_pci_address)
+                        vif_pci_addresses.append(request.vif_pci_address)
+
+                # duplicate networks are allowed only for neutron v2.0
+                if (not utils.is_neutron() and request.network_id and
+                        request.network_id in network_uuids):
+                    expl = (_("Duplicate networks"
+                              " (%s) are not allowed") %
+                            request.network_id)
+                    raise exc.HTTPBadRequest(explanation=expl)
+                network_uuids.append(request.network_id)
                 networks.append(request)
             except KeyError as key:
                 expl = _('Bad network format: missing %s') % key
@@ -438,6 +490,14 @@ class ServersController(wsgi.Controller):
             except TypeError:
                 expl = _('Bad networks format')
                 raise exc.HTTPBadRequest(explanation=expl)
+
+        # WRS: Verify that all virtual PCI addresses for network devices
+        # are unique.
+        duplicates = [x for x in vif_pci_addresses
+                      if vif_pci_addresses.count(x) > 1]
+        if duplicates:
+            expl = _('PCI addresses must be unique')
+            raise exc.HTTPBadRequest(explanation=expl)
 
         return objects.NetworkRequestList(objects=networks)
 

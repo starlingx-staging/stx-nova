@@ -218,14 +218,14 @@ class ServersControllerTest(ControllerTest):
         uuid = 'br-00000000-0000-0000-0000-000000000000'
         requested_networks = [{'uuid': uuid}]
         res = self.controller._get_requested_networks(requested_networks)
-        self.assertIn((uuid, None, None, None, None), res.as_tuples())
+        self.assertIn((uuid, None, None, None, None, None), res.as_tuples())
 
     def test_requested_networks_neutronv2_enabled_with_port(self):
         self.flags(use_neutron=True)
         port = 'eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee'
         requested_networks = [{'port': port}]
         res = self.controller._get_requested_networks(requested_networks)
-        self.assertEqual([(None, None, port, None, None)],
+        self.assertEqual([(None, None, port, None, None, None)],
                          res.as_tuples())
 
     def test_requested_networks_neutronv2_enabled_with_network(self):
@@ -233,7 +233,7 @@ class ServersControllerTest(ControllerTest):
         network = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
         requested_networks = [{'uuid': network}]
         res = self.controller._get_requested_networks(requested_networks)
-        self.assertEqual([(network, None, None, None, None)],
+        self.assertEqual([(network, None, None, None, None, None)],
                          res.as_tuples())
 
     # WRS: add testcase for wrs-if:vif_model
@@ -242,7 +242,7 @@ class ServersControllerTest(ControllerTest):
         network = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
         requested_networks = [{'uuid': network, 'wrs-if:vif_model': 'virtio'}]
         res = self.controller._get_requested_networks(requested_networks)
-        self.assertEqual([(network, None, None, None, 'virtio')],
+        self.assertEqual([(network, None, None, None, 'virtio', None)],
                          res.as_tuples())
 
     def test_requested_networks_neutronv2_enabled_with_network_and_port(self):
@@ -251,7 +251,7 @@ class ServersControllerTest(ControllerTest):
         port = 'eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee'
         requested_networks = [{'uuid': network, 'port': port}]
         res = self.controller._get_requested_networks(requested_networks)
-        self.assertEqual([(None, None, port, None, None)],
+        self.assertEqual([(None, None, port, None, None, None)],
                          res.as_tuples())
 
     def test_requested_networks_with_duplicate_networks_nova_net(self):
@@ -270,8 +270,8 @@ class ServersControllerTest(ControllerTest):
         network = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
         requested_networks = [{'uuid': network}, {'uuid': network}]
         res = self.controller._get_requested_networks(requested_networks)
-        self.assertEqual([(network, None, None, None, None),
-                          (network, None, None, None, None)],
+        self.assertEqual([(network, None, None, None, None, None),
+                          (network, None, None, None, None, None)],
                          res.as_tuples())
 
     def test_requested_networks_neutronv2_enabled_conflict_on_fixed_ip(self):
@@ -302,7 +302,7 @@ class ServersControllerTest(ControllerTest):
         port = 'eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee'
         requested_networks = [{'uuid': network, 'port': port}]
         res = self.controller._get_requested_networks(requested_networks)
-        self.assertEqual([(None, None, port, None, None)],
+        self.assertEqual([(None, None, port, None, None, None)],
                          res.as_tuples())
 
     def test_get_server_by_uuid(self):
@@ -2997,7 +2997,7 @@ class ServersControllerCreateTest(test.TestCase):
 
         def create(*args, **kwargs):
             result = [('76fa36fc-c930-4bf3-8c8a-ea2a2420deb6', None,
-                       None, None, None)]
+                       None, None, None, None)]
             self.assertEqual(result, kwargs['requested_networks'].as_tuples())
             return old_create(*args, **kwargs)
 

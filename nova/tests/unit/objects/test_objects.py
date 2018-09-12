@@ -1142,7 +1142,7 @@ object_data = {
     'Network': '1.2-a977ab383aa462a479b2fae8211a5dde',
     'NetworkInterfaceMetadata': '1.1-3269ce11b30531eb1febfa5173b78b81',
     'NetworkList': '1.2-69eca910d8fa035dfecd8ba10877ee59',
-    'NetworkRequest': '1.2-3eeb5369745665f03fe792cf5d25eda4',
+    'NetworkRequest': '1.2-a765c8f0c0800ef704b83e4242ea50d2',
     'NetworkRequestList': '1.1-15ecf022a68ddbb8c2a6739cfc9f8f5e',
     'PciDevice': '1.6-5411e27b90bfe6e82c53454490bdf467',
     'PCIDeviceBus': '1.0-2b891cb77e42961044689f3dc2718995',

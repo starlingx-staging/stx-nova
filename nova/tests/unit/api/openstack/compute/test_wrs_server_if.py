@@ -79,6 +79,7 @@ for index, cache in enumerate(NW_CACHE):
     nic = {name: {'port_id': cache['id'],
                   'mac_address': cache['address'],
                   'vif_model': cache['vif_model'],
+                  'vif_pci_address': '',
                   'mtu': None,  # only available from neutron in real env
                   'network': cache['network']['label']}}
     ALL_NICS.append(nic)

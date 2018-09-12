@@ -46,7 +46,7 @@ class _TestNetworkRequestObject(object):
                                          port_id=FAKE_UUID,
                                      )
         with mock.patch('nova.utils.is_neutron', return_value=True):
-            self.assertEqual(('123', '1.2.3.4', FAKE_UUID, None, None),
+            self.assertEqual(('123', '1.2.3.4', FAKE_UUID, None, None, None),
                              request.to_tuple())
 
     def test_to_tuple_nova(self):
@@ -80,7 +80,8 @@ class _TestNetworkRequestObject(object):
             objects=[objects.NetworkRequest(network_id='123'),
                      objects.NetworkRequest(network_id='456')])
         self.assertEqual(
-            [('123', None, None, None, None), ('456', None, None, None, None)],
+            [('123', None, None, None, None, None),
+             ('456', None, None, None, None, None)],
              requests.as_tuples())
 
     def test_is_single_unspecified(self):
