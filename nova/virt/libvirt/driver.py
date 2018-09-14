@@ -6147,16 +6147,25 @@ class LibvirtDriver(driver.ComputeDriver):
             parent's network capabilities (must be always a NIC device) and
             appends this information to the device's dictionary.
             """
-            exclude_capabilities = ["QAT"]
+
+            # WRS: exclude QAT devices since they do not have a "net" subdir
+            # under /sys/bus/pci/devices/<pci address> and would end up with
+            # an exception when trying to get pci net info
+            exclude_products = ["QAT", "14281"]
 
             if device.get('dev_type') == fields.PciDeviceType.SRIOV_VF:
-                # WRS: exclude QAT devices
-                if not any(item in cfgdev.pci_capability.product
-                               for item in exclude_capabilities):
-                    pcinet_info = self._get_pcinet_info(address)
-                    if pcinet_info:
-                        return {'capabilities':
-                                  {'network': pcinet_info.get('capabilities')}}
+                for product in exclude_products:
+                    if (cfgdev.pci_capability.product and product
+                            in cfgdev.pci_capability.product):
+                        return {}
+                    if (cfgdev.pci_capability.product_id and product
+                            in str(cfgdev.pci_capability.product_id)):
+                        return {}
+
+                pcinet_info = self._get_pcinet_info(address)
+                if pcinet_info:
+                    return {'capabilities':
+                              {'network': pcinet_info.get('capabilities')}}
             return {}
 
         virtdev = self._host.device_lookup_by_name(devname)
