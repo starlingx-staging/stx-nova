@@ -4711,7 +4711,7 @@ class LibvirtDriver(driver.ComputeDriver):
         if image_meta.properties.get("os_command_line"):
             guest.os_cmdline = image_meta.properties.os_command_line
 
-    def _set_clock(self, guest, os_type, image_meta, virt_type):
+    def _set_clock(self, guest, os_type, image_meta, virt_type, want_hpet):
         # NOTE(mikal): Microsoft Windows expects the clock to be in
         # "localtime". If the clock is set to UTC, then you can use a
         # registry key to let windows know, but Microsoft says this is
@@ -4725,9 +4725,9 @@ class LibvirtDriver(driver.ComputeDriver):
         guest.set_clock(clk)
 
         if virt_type == "kvm":
-            self._set_kvm_timers(clk, os_type, image_meta)
+            self._set_kvm_timers(clk, os_type, image_meta, want_hpet)
 
-    def _set_kvm_timers(self, clk, os_type, image_meta):
+    def _set_kvm_timers(self, clk, os_type, image_meta, want_hpet):
         # TODO(berrange) One day this should be per-guest
         # OS type configurable
         tmpit = vconfig.LibvirtConfigGuestTimer()
@@ -4750,7 +4750,10 @@ class LibvirtDriver(driver.ComputeDriver):
             # qemu -no-hpet is not supported on non-x86 targets.
             tmhpet = vconfig.LibvirtConfigGuestTimer()
             tmhpet.name = "hpet"
-            tmhpet.present = False
+            if want_hpet:
+                tmhpet.present = True
+            else:
+                tmhpet.present = False
             clk.add_timer(tmhpet)
 
         # Provide Windows guests with the paravirtualized hyperv timer source.
@@ -5351,7 +5354,9 @@ class LibvirtDriver(driver.ComputeDriver):
 
         self._set_features(guest, instance.os_type, caps, virt_type,
                            image_meta)
-        self._set_clock(guest, instance.os_type, image_meta, virt_type)
+        want_hpet = flavor.extra_specs.get("hw:hpet", False)
+        self._set_clock(guest, instance.os_type, image_meta, virt_type,
+                        want_hpet)
 
         storage_configs = self._get_guest_storage_config(
                 instance, image_meta, disk_info, rescue, block_device_info,

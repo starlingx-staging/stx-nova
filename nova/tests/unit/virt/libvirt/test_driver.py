@@ -3332,6 +3332,37 @@ class LibvirtConnTestCase(test.NoDBTestCase,
         self.assertIsInstance(cfg.features[2],
                               vconfig.LibvirtConfigGuestFeatureHyperV)
 
+    @mock.patch.object(libvirt_utils, 'get_arch')
+    def test_get_guest_config_hpet_timer(self, mock_get_arch):
+        mock_get_arch.return_value = fields.Architecture.I686
+        drvr = libvirt_driver.LibvirtDriver(fake.FakeVirtAPI(), True)
+        instance_ref = objects.Instance(**self.test_instance)
+        instance_ref.flavor.extra_specs = {'hw:hpet': True}
+        image_meta = objects.ImageMeta.from_dict(self.test_image_meta)
+        disk_info = blockinfo.get_disk_info(CONF.libvirt.virt_type,
+                                            instance_ref,
+                                            image_meta)
+
+        cfg = drvr._get_guest_config(instance_ref,
+                                     _fake_network_info(self, 1),
+                                     image_meta, disk_info)
+
+        self.assertIsInstance(cfg.clock,
+                              vconfig.LibvirtConfigGuestClock)
+        self.assertEqual(cfg.clock.offset, "utc")
+
+        self.assertEqual(3, len(cfg.clock.timers), cfg.clock.timers)
+        self.assertEqual("pit", cfg.clock.timers[0].name)
+        self.assertEqual("rtc", cfg.clock.timers[1].name)
+        self.assertEqual("hpet", cfg.clock.timers[2].name)
+        self.assertTrue(cfg.clock.timers[2].present)
+
+        self.assertEqual(2, len(cfg.features))
+        self.assertIsInstance(cfg.features[0],
+                              vconfig.LibvirtConfigGuestFeatureACPI)
+        self.assertIsInstance(cfg.features[1],
+                              vconfig.LibvirtConfigGuestFeatureAPIC)
+
     @mock.patch.object(host.Host, 'has_min_version')
     def test_get_guest_config_windows_hyperv_feature2(self, mock_version):
         mock_version.return_value = True
