@@ -61,7 +61,6 @@ from nova import block_device
 from nova.cells import rpcapi as cells_rpcapi
 from nova import compute
 from nova.compute import build_results
-from nova.compute import cgcs_messaging
 from nova.compute import claims
 from nova.compute import power_state
 from nova.compute import resource_tracker
@@ -568,12 +567,6 @@ class ComputeManager(manager.Manager):
             rt = resource_tracker.ResourceTracker(self.host, self.driver)
             self._resource_tracker = rt
         return self._resource_tracker
-
-    # WRS: server group messaging
-    def send_server_group_msg(self, context, instance_name_list, data):
-        """Forward the data to all the instances in the list """
-        for instance_name in instance_name_list:
-            self.cgcs_messaging.send_server_grp_msg(instance_name, data)
 
     def _update_resource_tracker(self, context, instance):
         """Let the resource tracker know that an instance has changed state."""
@@ -1217,10 +1210,6 @@ class ComputeManager(manager.Manager):
         utils.disk_op_sema = \
             eventlet.semaphore.BoundedSemaphore(
                 CONF.concurrent_disk_operations)
-
-        # WRS: add support for server group messaging
-        self.cgcs_messaging = \
-                           cgcs_messaging.CGCSMessaging(self.compute_task_api)
 
         try:
             # Destroy any running domains not in the DB

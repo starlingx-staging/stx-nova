@@ -31,7 +31,6 @@ from oslo_utils import encodeutils
 import six
 
 from nova import block_device
-from nova.compute import cgcs_messaging
 from nova.compute import power_state
 from nova.compute import task_states
 import nova.conf
@@ -353,15 +352,6 @@ def notify_about_instance_usage(notifier, context, instance, event_suffix,
         method = notifier.error
     else:
         method = notifier.info
-
-    # WRS: send server group notifications
-    try:
-        objects.InstanceGroup.get_by_instance_uuid(context, instance.uuid)
-        cgcs_messaging.send_server_grp_notification(
-            context, 'compute.instance.%s' % event_suffix, usage_info,
-            instance.uuid)
-    except exception.InstanceGroupNotFound:
-        pass
 
     method(context, 'compute.instance.%s' % event_suffix, usage_info)
 

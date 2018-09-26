@@ -1521,9 +1521,6 @@ class ComputeTestCase(BaseTestCase,
     def setUp(self):
         super(ComputeTestCase, self).setUp()
         self.useFixture(fixtures.SpawnIsSynchronousFixture())
-        # WRS: stub out server group messaging
-        self.stubs.Set(nova.compute.cgcs_messaging,
-                      'send_server_grp_notification', lambda *a, **kw: None)
 
     def test_wrap_instance_fault(self):
         inst = {"uuid": uuids.instance}
@@ -3414,9 +3411,8 @@ class ComputeTestCase(BaseTestCase,
         instance.save()
         return instance
 
-    @mock.patch.object(objects.InstanceGroup, 'get_by_instance_uuid')
     @mock.patch.object(nova.compute.utils, 'notify_about_instance_action')
-    def test_snapshot(self, mock_notify_action, mock_get_sg):
+    def test_snapshot(self, mock_notify_action):
         inst_obj = self._get_snapshotting_instance()
         mock_context = mock.Mock()
         with mock.patch.object(self.context, 'elevated',
@@ -6501,11 +6497,10 @@ class ComputeTestCase(BaseTestCase,
         mock_get_node.return_value = dest_node
         mock_bdms.return_value = objects.BlockDeviceMappingList()
 
-        @mock.patch.object(objects.InstanceGroup, 'get_by_instance_uuid')
         @mock.patch('nova.compute.utils.notify_about_instance_action')
         @mock.patch.object(self.compute, '_live_migration_cleanup_flags')
         @mock.patch.object(self.compute, 'network_api')
-        def _test(mock_nw_api, mock_lmcf, mock_notify, mock_get_sg):
+        def _test(mock_nw_api, mock_lmcf, mock_notify):
             mock_lmcf.return_value = False, False
             self.compute._rollback_live_migration(c, instance, 'foo',
                                                   migrate_data=migrate_data)
@@ -6542,11 +6537,10 @@ class ComputeTestCase(BaseTestCase,
         mock_get_node.return_value = dest_node
         mock_bdms.return_value = objects.BlockDeviceMappingList()
 
-        @mock.patch.object(objects.InstanceGroup, 'get_by_instance_uuid')
         @mock.patch('nova.compute.utils.notify_about_instance_action')
         @mock.patch.object(self.compute, '_live_migration_cleanup_flags')
         @mock.patch.object(self.compute, 'network_api')
-        def _test(mock_nw_api, mock_lmcf, mock_notify, mock_get_sg):
+        def _test(mock_nw_api, mock_lmcf, mock_notify):
             mock_lmcf.return_value = False, False
             self.compute._rollback_live_migration(c, instance, 'foo',
                                                   migrate_data=migrate_data,

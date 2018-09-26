@@ -9563,11 +9563,9 @@ class LibvirtDriver(driver.ComputeDriver):
             LOG.info("Guest Heartbeat Disabled", instance=instance)
 
     def _set_cgcs_msg(self, guest, flavor, instance):
-        # WRS: Set up virtio channel for cgcs messaging
-        srv_grp_messaging = strutils.bool_from_string(flavor.extra_specs.get(
-                'sw:wrs:srv_grp_messaging', 'false'))
+        # WRS: Set up virtio channel for cpu_scaling
         cpu_scaling = flavor.extra_specs.get('hw:wrs:min_vcpus', None)
-        if cpu_scaling or srv_grp_messaging:
+        if cpu_scaling:
             wrs_msg = vconfig.LibvirtConfigGuestChannel()
             wrs_msg.type = "unix"
             wrs_msg.target_name = "cgcs.messaging"
