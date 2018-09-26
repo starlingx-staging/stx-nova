@@ -89,9 +89,6 @@ class ComputeManagerUnitTestCase(test.NoDBTestCase):
 
         self.useFixture(fixtures.SpawnIsSynchronousFixture())
         self.useFixture(fixtures.EventReporterStub())
-        # WRS: stub out server group messaging
-        self.stubs.Set(nova.compute.cgcs_messaging.CGCSMessaging,
-                      '_do_setup', lambda *a, **kw: None)
         # WRS: Required since adding new_allowed_cpus to migration_context.
         self.flags(vcpu_pin_set="1-4")
 
@@ -6346,14 +6343,13 @@ class ComputeManagerMigrationTestCase(test.NoDBTestCase):
         migration.status = 'running'
         migration.id = 0
 
-        @mock.patch.object(objects.InstanceGroup, 'get_by_instance_uuid')
         @mock.patch('nova.image.glance.generate_image_url',
                     return_value='fake-url')
         @mock.patch.object(objects.Migration, 'get_by_id',
                            return_value=migration)
         @mock.patch.object(self.compute.driver,
                            'live_migration_force_complete')
-        def _do_test(force_complete, get_by_id, gen_img_url, get_group_by_id):
+        def _do_test(force_complete, get_by_id, gen_img_url):
             self.compute.live_migration_force_complete(
                 self.context, self.instance, migration.id)
 

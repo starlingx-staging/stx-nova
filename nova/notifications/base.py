@@ -29,7 +29,6 @@ from oslo_utils import excutils
 from oslo_utils import timeutils
 import six
 
-from nova.compute import cgcs_messaging
 import nova.conf
 import nova.context
 from nova import exception
@@ -256,15 +255,6 @@ def send_instance_update_notification(context, instance, old_vm_state=None,
                                          'compute.instance.update', payload)
 
     _send_versioned_instance_update(context, instance, payload, host, service)
-
-    # WRS: server group notification
-    try:
-        objects.InstanceGroup.get_by_instance_uuid(context, instance.uuid)
-        cgcs_messaging.send_server_grp_notification(context,
-                                                    'compute.instance.update',
-                                                    payload, instance.uuid)
-    except exception.InstanceGroupNotFound:
-        pass
 
 
 @rpc.if_notifications_enabled
