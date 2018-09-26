@@ -20,7 +20,6 @@
 Test the base rpc API.
 """
 
-import mock
 from nova import baserpc
 from nova.compute import rpcapi as compute_rpcapi
 import nova.conf
@@ -32,9 +31,7 @@ CONF = nova.conf.CONF
 
 class BaseAPITestCase(test.TestCase):
 
-    # WRS: mock out server group messaging
-    @mock.patch('nova.compute.cgcs_messaging.CGCSMessaging._do_setup')
-    def setUp(self, mock_do_setup):
+    def setUp(self):
         super(BaseAPITestCase, self).setUp()
         self.user_id = 'fake'
         self.project_id = 'fake'

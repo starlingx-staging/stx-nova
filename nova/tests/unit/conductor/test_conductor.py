@@ -28,7 +28,6 @@ from oslo_versionedobjects import exception as ovo_exc
 import six
 
 from nova import block_device
-from nova.compute import cgcs_messaging
 from nova.compute import flavors
 from nova.compute import rpcapi as compute_rpcapi
 from nova.compute import task_states
@@ -1585,10 +1584,6 @@ class ConductorTaskTestCase(_BaseTaskTestCase, test_compute.BaseTestCase):
         tag = objects.Tag(self.ctxt, tag='tag1')
         params['tags'] = objects.TagList(objects=[tag])
         self.params = params
-
-        # WRS: stub out server group messaging
-        self.stubs.Set(cgcs_messaging.CGCSMessaging,
-                       '_do_setup', lambda *a, **kw: None)
 
     @mock.patch('nova.availability_zones.get_host_availability_zone')
     @mock.patch('nova.compute.rpcapi.ComputeAPI.build_and_run_instance')

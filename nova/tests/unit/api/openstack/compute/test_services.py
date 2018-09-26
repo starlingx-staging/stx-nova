@@ -962,10 +962,6 @@ class ServicesTestV253(test.TestCase):
         self.req = fakes.HTTPRequest.blank(
             '', version=services_v21.UUID_FOR_ID_MIN_VERSION)
 
-        # WRS: stub out server group messaging
-        self.stubs.Set(compute.cgcs_messaging.CGCSMessaging,
-                       '_do_setup', lambda *a, **kw: None)
-
     def assert_services_equal(self, s1, s2):
         for k in ('binary', 'host'):
             self.assertEqual(s1[k], s2[k])

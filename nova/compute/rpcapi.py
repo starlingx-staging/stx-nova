@@ -1144,17 +1144,6 @@ class ComputeAPI(object):
                    volume_id=volume_id, snapshot_id=snapshot_id,
                    delete_info=delete_info)
 
-    # WRS: add server group messaging, support Kilo compatible version
-    def send_server_group_msg(self, ctxt, host, instance_name_list, data):
-        """Forward the data to all the instances in the list."""
-        LOG.debug('Sending server group message to %s on host %s: %s',
-                  (str(instance_name_list), host, repr(data)))
-        version = '4.0'
-        cctxt = self.router.client(ctxt).prepare(
-                server=host, version=version)
-        cctxt.cast(ctxt, 'send_server_group_msg',
-                   instance_name_list=instance_name_list, data=data)
-
     def external_instance_event(self, ctxt, instances, events, host=None):
         instance = instances[0]
         cctxt = self.router.client(ctxt).prepare(

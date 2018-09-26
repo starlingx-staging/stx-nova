@@ -30,7 +30,6 @@ from oslo_utils import importutils
 from oslo_utils import timeutils
 import six
 
-from nova.compute import cgcs_messaging
 from nova.compute import manager
 from nova.compute import power_state
 from nova.console import type as ctype
@@ -246,11 +245,6 @@ class VirtDriverLoaderTestCase(_FakeDriverBackendTestCase, test.TestCase):
         }
 
     def test_load_new_drivers(self):
-        def fake_do_setup(_self, compute_task_api):
-            pass
-
-        self.stubs.Set(cgcs_messaging.CGCSMessaging,
-                       '_do_setup', fake_do_setup)
         for cls, driver in self.new_drivers.items():
             self.flags(compute_driver=cls)
             # NOTE(sdague) the try block is to make it easier to debug a

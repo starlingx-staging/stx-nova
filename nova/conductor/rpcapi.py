@@ -419,19 +419,3 @@ class ComputeTaskAPI(object):
             del kw['request_spec']
         cctxt = self.client.prepare(version=version)
         cctxt.cast(ctxt, 'rebuild_instance', **kw)
-
-    # WRS: send server group messaging, same api version (1.6) as R2/Kilo
-    def send_server_group_msg(self, context, exclude_instance, instance_id,
-                              instance_uuid, data):
-        """Send message to all instances in the same server group"""
-        cctxt = self.client.prepare(version='1.6')
-        return cctxt.cast(context, 'send_server_group_msg',
-                          exclude_instance=exclude_instance,
-                          instance_id=instance_id,
-                          instance_uuid=instance_uuid, data=data)
-
-    # WRS: get server group status, same api version (1.6) as R2/Kilo
-    def get_server_group_status(self, context, instance_id):
-        cctxt = self.client.prepare(version='1.6')
-        return cctxt.call(context, 'get_server_group_status',
-                          instance_id=instance_id)

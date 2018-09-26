@@ -19,7 +19,6 @@
 
 """Tests for the testing base code."""
 
-import mock
 from oslo_log import log as logging
 import oslo_messaging as messaging
 import six
@@ -42,9 +41,7 @@ class IsolationTestCase(test.TestCase):
     of other tests should fail.
 
     """
-    # WRS: mock out server group messaging
-    @mock.patch('nova.compute.cgcs_messaging.CGCSMessaging._do_setup')
-    def test_service_isolation(self, mock_do_setup):
+    def test_service_isolation(self):
         self.useFixture(fixtures.ServiceFixture('compute'))
 
     def test_rpc_consumer_isolation(self):
