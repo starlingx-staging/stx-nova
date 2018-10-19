@@ -2315,6 +2315,7 @@ class LibvirtConfigGuest(LibvirtConfigObject):
         self.perf_events = []
         self.os_nvram = None
         self.os_nvram_template = None
+        self.tpm_qemu = None
 
     def _format_basic_props(self, root):
         root.append(self._text_node("uuid", self.uuid))
@@ -2444,6 +2445,9 @@ class LibvirtConfigGuest(LibvirtConfigObject):
         self._format_idmaps(root)
 
         self._format_perf_events(root)
+
+        if self.tpm_qemu:
+            root.append(self.tpm_qemu.format_dom())
 
         return root
 
@@ -2867,3 +2871,81 @@ class LibvirtConfigPciController(LibvirtConfigGuestDevice):
             dev.append(pcihole64)
 
         return dev
+
+# QEMU XML namespace definitions
+QEMUNS = 'http://libvirt.org/schemas/domain/qemu/1.0'
+QEMUTREE = '{%s}' % QEMUNS
+NSMAP = {"qemu": QEMUNS}
+
+
+class LibvirtConfigGuestQemuRawDevice(LibvirtConfigObject):
+    """Configuration object which can be used to pass arbitrary QEMU
+    commandline arguments to libvirt via its XML file.
+    """
+
+    def __init__(self, **kwargs):
+        super(LibvirtConfigGuestQemuRawDevice, self).__init__(
+            root_name="commandline",
+            ns_prefix="qemu",
+            ns_uri=QEMUNS,
+            **kwargs)
+        self.arguments = []
+        self.variables = []
+
+    def add_argument(self, value):
+        self.arguments.append(value)
+
+    def add_variable(self, value):
+        self.variables.append(value)
+
+    def format_dom(self):
+        root = super(LibvirtConfigGuestQemuRawDevice, self).format_dom()
+
+        for argument in self.arguments:
+            arg = etree.Element(QEMUTREE + "arg", nsmap=NSMAP)
+            arg.set("value", argument)
+            root.append(arg)
+
+        for variable in self.variables:
+            arg = etree.Element(QEMUTREE + "env", nsmap=NSMAP)
+            arg.set("value", variable)
+            root.append(arg)
+
+        return root
+
+
+class LibvirtConfigGuestvTPMDevice(LibvirtConfigGuestQemuRawDevice):
+    """Configuration object which can be used to specify the QEMU configuration
+    for vTPM. See example below.
+
+    <qemu:commandline xmlns:qemu="http://libvirt.org/schemas/domain/qemu/1.0">
+    <qemu:arg value="-device"/>
+    <qemu:arg value="tpm-tis,tpmdev=tpm-tpm0,id=tpm0"/>
+    <qemu:arg value="-bios"/>
+    <qemu:arg value="bios.bin"/>
+    <qemu:arg value="-tpmdev"/>
+    <qemu:arg value="cuse-tpm,id=tpm-tpm0,path=/dev/<device-name>,
+                                                      cancel-path=/dev/null"/>
+    </qemu:commandline>
+
+    """
+
+    def __init__(self, **kwargs):
+        super(LibvirtConfigGuestvTPMDevice, self).__init__(**kwargs)
+        self.instance_name = None
+
+    def format_dom(self):
+        self.add_argument("-device")
+        self.add_argument("tpm-tis,tpmdev=tpm-tpm0,id=tpm0")
+
+        self.add_argument("-bios")
+        self.add_argument("/usr/share/seabios/bios-256k.bin")
+
+        self.add_argument("-tpmdev")
+        value = "{}{}{}".format(
+            "cuse-tpm,id=tpm-tpm0,path=/dev/vtpm-", self.instance_name,
+            ",cancel-path=/dev/null")
+        self.add_argument(value)
+
+        return super(LibvirtConfigGuestvTPMDevice, self).format_dom()
+
