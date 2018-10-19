@@ -467,7 +467,7 @@ class FlavorExtraSpecsController(wsgi.Controller):
     @staticmethod
     def _validate_sw_keys(flavor):
         keys = ['sw:wrs:auto_recovery', 'sw:wrs:guest:heartbeat',
-                'hw:hpet']
+                'sw:wrs:vtpm', 'hw:hpet']
         specs = flavor.extra_specs
         for key in keys:
             if key in specs:

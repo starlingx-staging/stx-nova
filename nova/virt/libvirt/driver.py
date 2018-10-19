@@ -4237,6 +4237,11 @@ class LibvirtDriver(driver.ComputeDriver):
 
         return sysinfo
 
+    def _get_guest_config_tpm_qemu(self, instance_name):
+        tpm_qemu = vconfig.LibvirtConfigGuestvTPMDevice()
+        tpm_qemu.instance_name = instance_name
+        return tpm_qemu
+
     def _get_guest_pci_device(self, pci_device):
 
         dbsf = pci_utils.parse_address(pci_device.address)
@@ -5405,6 +5410,16 @@ class LibvirtDriver(driver.ComputeDriver):
         self._guest_add_memory_balloon(guest)
 
         self._set_pci_controller(guest, instance, max_pci_bus)
+
+        if CONF.libvirt.virt_type in ("kvm", "qemu"):
+
+            # Get the vTPM flavour
+            vtpm = instance.flavor.extra_specs.get('sw:wrs:vtpm')
+            do_vtpm = strutils.bool_from_string(vtpm)
+
+            if do_vtpm:
+                # vTPM flavour is set, setup the qemu tpm arguments
+                guest.tpm_qemu = self._get_guest_config_tpm_qemu(instance.name)
 
         return guest
 
@@ -8615,6 +8630,21 @@ class LibvirtDriver(driver.ComputeDriver):
                                          dst_disk_info_path,
                                          host=dest, on_execute=on_execute,
                                          on_completion=on_completion)
+
+            # If the VMs has a vtpm flavour then we need to migrate its
+            # vTPM data. This will be located under
+            #   inst_base/vtpm-<instance name>
+            # We copy this whole directory to the destination node.
+            vtpm_files = os.path.join(inst_base_resize, 'vtpm*')
+            for vtpm_file in glob.iglob(vtpm_files):
+                LOG.info("Moving the vTPM data %s", vtpm_file)
+                if os.path.isdir(vtpm_file):
+                    src_vtpm_files = os.path.join(inst_base_resize, vtpm_file)
+                    libvirt_utils.copy_image(src_vtpm_files,
+                                             inst_base,
+                                             host=dest, on_execute=on_execute,
+                                             on_completion=on_completion)
+
             # WRS: Migrate UEFI variable store file
             nvram_file = "%s/%s_VARS.fd" % (inst_base_resize, instance.name)
             if libvirt_utils.path_exists(nvram_file):
