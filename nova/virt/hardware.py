@@ -44,7 +44,7 @@ MEMPAGES_LARGE = -2
 MEMPAGES_ANY = -3
 
 # WRS base path used for floating instance cpusets
-CPUSET_BASE = '/dev/cpuset/floating'
+CPUSET_BASE = '/sys/fs/cgroup/cpuset/floating'
 
 
 # WRS - extra_specs, image_props helper functions
