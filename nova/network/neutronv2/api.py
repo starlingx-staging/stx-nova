@@ -775,7 +775,7 @@ class API(base_api.NetworkAPI):
 
             try:
                 port_security_enabled = network.get(
-                    'port_security_enabled', False)
+                    'port_security_enabled', True)
                 if port_security_enabled:
                     if not network.get('subnets'):
                         # Neutron can't apply security groups to a port
@@ -1670,6 +1670,14 @@ class API(base_api.NetworkAPI):
                                            neutron_client=neutron)
                     if port.get('device_id', None):
                         raise exception.PortInUse(port_id=request.port_id)
+                    deferred_ip = port.get('ip_allocation') == 'deferred'
+                    # NOTE(carl_baldwin) A deferred IP port doesn't have an
+                    # address here. If it fails to get one later when nova
+                    # updates it with host info, Neutron will error which
+                    # raises an exception.
+                    if not deferred_ip and not port.get('fixed_ips'):
+                        raise exception.PortRequiresFixedIP(
+                            port_id=request.port_id)
                     request.network_id = port['network_id']
                 else:
                     ports_needed_per_instance += 1
@@ -2310,14 +2318,12 @@ class API(base_api.NetworkAPI):
                                                network_model.VNIC_TYPE_NORMAL),
             type=current_neutron_port.get('binding:vif_type'),
             profile=_get_binding_profile(current_neutron_port),
-            # WRS extension: add mtu, vif_model, mac_filter
+            # WRS extension: add mtu, vif_model
             mtu=current_neutron_port.get('wrs-binding:mtu'),
             vif_model= current_neutron_port.get(constants.PORT_VIF_MODEL),
             details=current_neutron_port.get('binding:vif_details'),
             ovs_interfaceid=ovs_interfaceid,
             devname=devname,
-            mac_filter=current_neutron_port.get(
-                constants.PORT_MAC_FILTERING, False),
             active=vif_active,
             preserve_on_delete=preserve_on_delete)
 

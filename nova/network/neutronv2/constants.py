@@ -25,4 +25,3 @@ AUTO_ALLOCATE_TOPO_EXT = 'Auto Allocated Topology Services'
 MULTI_NET_EXT = 'Multi Provider Network'
 WRS_PORTBINDING_EXT = "wrs-port-binding"
 PORT_VIF_MODEL = 'wrs-binding:vif_model'
-PORT_MAC_FILTERING = 'wrs-binding:mac_filtering'
