@@ -49,6 +49,12 @@ class VCpuModelFilter(filters.BaseHostFilter):
             # The guest CPU model is not in our list.  We can't tell whether
             # we can support it or not.
             return False
+
+        # if guest request IBRS cpu, but host does not support 'IBRS', then 
+        # return false directly
+        if('IBRS' in guest and 'IBRS' not in host):
+            return False
+
         return bool(guest_index <= host_index)
 
     def _passthrough_host_passes(self, host_state, spec_obj):
