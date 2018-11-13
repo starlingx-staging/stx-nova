@@ -347,14 +347,23 @@ class CPUModel(BaseNovaEnum):
            "Conroe",
            "Penryn",
            "Nehalem",
+           "Nehalem-IBRS",
            "Westmere",
+           "Westmere-IBRS",
            "SandyBridge",
+           "SandyBridge-IBRS",
            "IvyBridge",
+           "IvyBridge-IBRS",
            "Haswell",
+           "Haswell-IBRS",
            "Broadwell-noTSX",
+           "Broadwell-noTSX-IBRS",
            "Broadwell",
+           "Broadwell-IBRS",
            "Skylake-Client",
-           "Skylake-Server")
+           "Skylake-Client-IBRS",
+           "Skylake-Server",
+           "Skylake-Server-IBRS")
 
 
 class CPUMatch(BaseNovaEnum):
