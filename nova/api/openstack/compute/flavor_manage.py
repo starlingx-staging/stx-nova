@@ -105,11 +105,6 @@ class FlavorManageController(wsgi.Controller):
                                     rxtx_factor=rxtx_factor,
                                     is_public=is_public)
 
-            # WRS: set local storage backend default to local_image
-            flavor.extra_specs = {
-                'aggregate_instance_extra_specs:storage': 'local_image'}
-            flavor.save()
-
             # NOTE(gmann): For backward compatibility, non public flavor
             # access is not being added for created tenant. Ref -bug/1209101
             req.cache_db_flavor(flavor)
