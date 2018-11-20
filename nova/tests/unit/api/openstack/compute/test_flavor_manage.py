@@ -44,10 +44,6 @@ def fake_create(newflavor):
     newflavor["disabled"] = False
 
 
-def fake_save(context):
-    pass
-
-
 class FlavorManageTestV21(test.NoDBTestCase):
     controller = flavormanage_v21.FlavorManageController()
     validation_error = exception.ValidationError
@@ -56,8 +52,6 @@ class FlavorManageTestV21(test.NoDBTestCase):
     def setUp(self):
         super(FlavorManageTestV21, self).setUp()
         self.stub_out("nova.objects.Flavor.create", fake_create)
-        # WRS: stub out flavor save
-        self.stub_out("nova.objects.Flavor.save", fake_save)
 
         self.request_body = {
             "flavor": {
