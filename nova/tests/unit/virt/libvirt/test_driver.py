@@ -17007,51 +17007,6 @@ class LibvirtDriverTestCase(test.NoDBTestCase):
         disk_info_text = jsonutils.dumps(disk_info)
         self.assertEqual(disk_info_text, out)
 
-    # WRS
-    @mock.patch('nova.virt.libvirt.driver.LibvirtDriver'
-                '.get_host_ip_addr')
-    @mock.patch('nova.utils.execute')
-    @mock.patch('nova.virt.libvirt.driver.LibvirtDriver'
-                '._get_instance_disk_info')
-    @mock.patch('nova.virt.libvirt.driver.LibvirtDriver'
-                '._is_storage_shared_with')
-    def _test_migrate_disk_and_power_off_resize_lvm(self,
-                                                    mock_is_shared_storage,
-                                                    mock_get_disk_info,
-                                                    mock_execute,
-                                                    mock_get_host_ip_addr):
-        instance = self._create_instance()
-        flavor = {'root_gb': 10, 'ephemeral_gb': 20}
-        flavor_obj = objects.Flavor(**flavor)
-        disk_info = [{'type': 'raw', 'path': '/dev/vg/1234_disk',
-                      'disk_size': '83886080'},
-                     {'type': 'raw', 'path': '/dev/vg/1234_disk.local',
-                      'disk_size': '83886080'}]
-
-        mock_get_disk_info.return_value = disk_info
-        mock_is_shared_storage.return_value = True
-        mock_get_host_ip_addr.return_value = '10.0.0.1'
-
-        def fake_execute(*args, **kwargs):
-            pass
-
-        mock_execute.side_effect = fake_execute
-
-        # dest is different host case
-        out = self.drvr.migrate_disk_and_power_off(
-            context.get_admin_context(), instance, '10.0.0.2',
-            flavor_obj, None)
-        self.assertTrue(mock_is_shared_storage.called)
-        disk_info_text = jsonutils.dumps(disk_info)
-        self.assertEqual(out, disk_info_text)
-
-        # dest is same host case
-        out = self.drvr.migrate_disk_and_power_off(
-            context.get_admin_context(), instance, '10.0.0.1',
-            flavor_obj, None)
-        self.assertTrue(mock_is_shared_storage.called)
-        self.assertEqual(out, disk_info_text)
-
     def _test_migrate_disk_and_power_off_resize_check(self, expected_exc):
         """Test for nova.virt.libvirt.libvirt_driver.LibvirtConnection
         .migrate_disk_and_power_off.
@@ -17078,6 +17033,7 @@ class LibvirtDriverTestCase(test.NoDBTestCase):
         flavor = {'root_gb': 10, 'ephemeral_gb': 20}
         flavor_obj = objects.Flavor(**flavor)
 
+        # Migration is not implemented for LVM backed instances
         self.assertRaises(expected_exc,
               self.drvr.migrate_disk_and_power_off,
               None, instance, '10.0.0.1', flavor_obj, None)
@@ -17132,15 +17088,10 @@ class LibvirtDriverTestCase(test.NoDBTestCase):
         def fake_execute(*args, **kwargs):
             pass
 
-        def fake_get_volume_vg(path):
-            return path.split('/')[1]
-
         self.stubs.Set(utils, 'execute', fake_execute)
-        self.stubs.Set(nova.virt.libvirt.storage.lvm,
-                       'get_volume_vg',
-                       fake_get_volume_vg)
 
-        self._test_migrate_disk_and_power_off_resize_lvm()
+        expected_exc = exception.InstanceFaultRollback
+        self._test_migrate_disk_and_power_off_resize_check(expected_exc)
 
     def test_migrate_disk_and_power_off_resize_cannot_ssh(self):
         def fake_execute(*args, **kwargs):
@@ -17704,10 +17655,8 @@ class LibvirtDriverTestCase(test.NoDBTestCase):
                 mock.patch.object(os.path, 'exists'),
                 mock.patch.object(libvirt_utils, 'get_instance_path'),
                 mock.patch.object(utils, 'execute'),
-                mock.patch.object(shutil, 'rmtree'),
-                mock.patch.object(drvr, '_cleanup_lvm')) as (
-                mock_exists, mock_get_path, mock_exec, mock_rmtree,
-                mock_cleanup_lvm):
+                mock.patch.object(shutil, 'rmtree')) as (
+                mock_exists, mock_get_path, mock_exec, mock_rmtree):
             mock_exists.return_value = True
             mock_get_path.return_value = '/fake/inst'
 
@@ -17717,8 +17666,6 @@ class LibvirtDriverTestCase(test.NoDBTestCase):
             mock_exec.assert_called_once_with('rm', '-rf', '/fake/inst_resize',
                                               delay_on_retry=True, attempts=5)
             mock_rmtree.assert_not_called()
-            mock_cleanup_lvm.assert_called_once_with(
-                ins_ref, preserve_disk_filter="Non-Resize")
 
     def test_cleanup_resize_not_same_host(self):
         CONF.set_override('policy_dirs', [], group='oslo_policy')
@@ -17740,11 +17687,10 @@ class LibvirtDriverTestCase(test.NoDBTestCase):
                 mock.patch.object(drvr, '_undefine_domain'),
                 mock.patch.object(drvr, 'unplug_vifs'),
                 mock.patch.object(drvr, 'unfilter_instance'),
-                mock.patch.object(drvr, '_cleanup_lvm'),
                 mock.patch.object(drvr, '_cleanup_target')
         ) as (mock_volume_backed, mock_exists, mock_get_path,
               mock_rmtree, mock_undef, mock_unplug, mock_unfilter,
-              mock_cleanup_lvm, mock_cleanup_target):
+              mock_cleanup_target):
             mock_exists.return_value = True
             mock_get_path.return_value = '/fake/inst'
 
@@ -17755,8 +17701,6 @@ class LibvirtDriverTestCase(test.NoDBTestCase):
             mock_unfilter.assert_called_once_with(ins_ref, fake_net)
             self.assertEqual(2, mock_get_path.call_count)
             self.assertEqual(2, mock_cleanup_target.call_count)
-            mock_cleanup_lvm.assert_called_once_with(
-                ins_ref, preserve_disk_filter="Non-Resize")
 
     def test_cleanup_resize_not_same_host_volume_backed(self):
         """Tests cleaning up after a resize is confirmed with a volume-backed
@@ -17782,11 +17726,10 @@ class LibvirtDriverTestCase(test.NoDBTestCase):
                 mock.patch.object(drvr, '_undefine_domain'),
                 mock.patch.object(drvr, 'unplug_vifs'),
                 mock.patch.object(drvr, 'unfilter_instance'),
-                mock.patch.object(drvr, '_cleanup_lvm'),
                 mock.patch.object(drvr, '_cleanup_target')
         ) as (mock_volume_backed, mock_exists, mock_get_path,
               mock_rmtree, mock_undef, mock_unplug, mock_unfilter,
-              mock_cleanup_lvm, mock_cleanup_target):
+              mock_cleanup_target):
             mock_exists.return_value = True
             mock_get_path.return_value = '/fake/inst'
 
@@ -17797,8 +17740,6 @@ class LibvirtDriverTestCase(test.NoDBTestCase):
             mock_unfilter.assert_called_once_with(ins_ref, fake_net)
             self.assertEqual(2, mock_get_path.call_count)
             self.assertEqual(2, mock_cleanup_target.call_count)
-            mock_cleanup_lvm.assert_called_once_with(
-                ins_ref, preserve_disk_filter="Non-Resize")
 
     def test_cleanup_resize_snap_backend(self):
         CONF.set_override('policy_dirs', [], group='oslo_policy')
@@ -17812,10 +17753,9 @@ class LibvirtDriverTestCase(test.NoDBTestCase):
                 mock.patch.object(libvirt_utils, 'get_instance_path'),
                 mock.patch.object(utils, 'execute'),
                 mock.patch.object(shutil, 'rmtree'),
-                mock.patch.object(drvr.image_backend, 'remove_snap'),
-                mock.patch.object(drvr, '_cleanup_lvm')) as (
+                mock.patch.object(drvr.image_backend, 'remove_snap')) as (
                 mock_exists, mock_get_path, mock_exec, mock_rmtree,
-                mock_remove, mock_cleanup_lvm):
+                mock_remove):
             mock_exists.return_value = True
             mock_get_path.return_value = '/fake/inst'
 
@@ -17827,8 +17767,6 @@ class LibvirtDriverTestCase(test.NoDBTestCase):
             mock_remove.assert_called_once_with(
                     libvirt_utils.RESIZE_SNAPSHOT_NAME, ignore_errors=True)
             self.assertFalse(mock_rmtree.called)
-            mock_cleanup_lvm.assert_called_once_with(
-                ins_ref, preserve_disk_filter="Non-Resize")
 
     def test_cleanup_resize_snap_backend_image_does_not_exist(self):
         CONF.set_override('policy_dirs', [], group='oslo_policy')
@@ -17845,10 +17783,9 @@ class LibvirtDriverTestCase(test.NoDBTestCase):
                 mock.patch.object(libvirt_utils, 'get_instance_path'),
                 mock.patch.object(utils, 'execute'),
                 mock.patch.object(shutil, 'rmtree'),
-                mock.patch.object(drvr.image_backend, 'remove_snap'),
-                mock.patch.object(drvr, '_cleanup_lvm')) as (
+                mock.patch.object(drvr.image_backend, 'remove_snap')) as (
                 mock_volume_backed, mock_exists, mock_get_path,
-                mock_exec, mock_rmtree, mock_remove, mock_cleanup_lvm):
+                mock_exec, mock_rmtree, mock_remove):
             mock_exists.return_value = True
             mock_get_path.return_value = '/fake/inst'
 
@@ -17859,8 +17796,6 @@ class LibvirtDriverTestCase(test.NoDBTestCase):
                                               delay_on_retry=True, attempts=5)
             self.assertFalse(mock_remove.called)
             mock_rmtree.called_once_with('/fake/inst')
-            mock_cleanup_lvm.assert_called_once_with(
-                ins_ref, preserve_disk_filter="Non-Resize")
 
     def test_get_instance_disk_info_exception(self):
         instance = self._create_instance()

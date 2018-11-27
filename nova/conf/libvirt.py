@@ -748,17 +748,6 @@ Related options:
 * volume_clear - must be set and the value must be different than ``none``
   for this option to have any impact
 """),
-    cfg.BoolOpt('thin_logical_volumes',
-                default=True,
-                help="""
-Create thin logical volumes if this flag is set to True.  This will also skip
-zeroing/shredding the volume regardless of the volume_clear setting.
-"""),
-    cfg.StrOpt('thinpool_suffix',
-               default='-pool',
-               help="""
-The suffix to generate the thinpool name from the VG.
-"""),
 ]
 
 libvirt_utils_opts = [

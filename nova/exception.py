@@ -1324,10 +1324,6 @@ class MigrationPreCheckClientException(MigrationError):
     msg_fmt = _("Client exception during Migration Pre check: %(reason)s")
 
 
-class MigrationPreCheckErrorNoRetry(MigrationError):
-    msg_fmt = _("Migration pre-check error no retry: %(reason)s")
-
-
 class MigrationSchedulerRPCError(MigrationError):
     msg_fmt = _("Migration select destinations error: %(reason)s")
 

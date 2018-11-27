@@ -476,10 +476,6 @@ class Image(object):
         """
         pass
 
-    @staticmethod
-    def init_host():
-        pass
-
 
 class Flat(Image):
     """The Flat backend uses either raw or qcow2 storage. It never uses
@@ -791,10 +787,6 @@ class Lvm(Image):
 
     def get_model(self, connection):
         return imgmodel.LocalBlockImage(self.path)
-
-    @staticmethod
-    def init_host():
-        lvm.create_thinpool_if_needed(CONF.libvirt.images_volume_group)
 
 
 class Rbd(Image):
