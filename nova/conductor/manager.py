@@ -255,7 +255,6 @@ class ComputeTaskManager(base.Base):
         exception.InstanceInvalidState,
         exception.MigrationPreCheckError,
         exception.MigrationPreCheckClientException,
-        exception.MigrationPreCheckErrorNoRetry,
         exception.LiveMigrationWithOldNovaNotSupported,
         exception.UnsupportedPolicyException)
     @targets_cell
@@ -458,7 +457,6 @@ class ComputeTaskManager(base.Base):
                 exception.InstanceInvalidState,
                 exception.MigrationPreCheckError,
                 exception.MigrationPreCheckClientException,
-                exception.MigrationPreCheckErrorNoRetry,
                 exception.LiveMigrationWithOldNovaNotSupported,
                 exception.MigrationSchedulerRPCError) as ex:
             with excutils.save_and_reraise_exception():

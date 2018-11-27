@@ -21,7 +21,6 @@
 # Copyright (c) 2016-2017 Wind River Systems, Inc.
 #
 
-import os.path
 from oslo_concurrency import processutils
 from oslo_log import log as logging
 from oslo_utils import units
@@ -36,80 +35,17 @@ CONF = nova.conf.CONF
 LOG = logging.getLogger(__name__)
 
 
-def create_thinpool_if_needed(vg):
-    if CONF.libvirt.thin_logical_volumes is False:
-        return
-
-    poolname = vg + CONF.libvirt.thinpool_suffix
-    # Do we need to worry about resizing the VG and thinpool?
-    if poolname in list_volumes(vg):
-        return
-    # Create thinpool.  Leave 5% of free space for metadata.
-    size = _get_volume_group_info(vg)['free'] * 0.95
-    # Round down to the nearest GiB like cinder.  This also means we don't
-    # need to worry about being a multiple of the chunk size.
-    size = int(size) >> 30 << 30
-    create_volume(vg, poolname, size)
-
-
-def thin_copy_volume(lv_src, lv_dest, vg, size):
-    """Copies a thin-provisioned volume.
-
-    Because we know we're dealing with thin-provisioned volumes, we can just
-    do a snapshot.  (As long as there's enough free space.)
-
-    :param lv_src: source thin volume
-    :param lv_dest: dest thin volume
-    :param vg: volume group
-    :param size: size of the volume being copied
-
-    This duplicates some code from create_duplicate_volume() and from
-    create_volume(), the alternative would be to mangle create_volume() to
-    also handle snapshots and then tweak a bunch of unit tests.
-    """
-    thinpool = vg + CONF.libvirt.thinpool_suffix
-    vg_info = _get_thinpool_info(vg, thinpool)
-    free_space = vg_info['free']
-    if size > free_space:
-        raise RuntimeError(_('Insufficient Space on Volume Group %(vg)s.'
-                             ' Only %(free_space)db available,'
-                             ' but %(size)db required'
-                             ' by thin volume %(lv)s.') %
-                           {'vg': vg,
-                            'free_space': free_space,
-                            'size': size,
-                            'lv': lv_dest})
-    cmd = ('lvcreate', '-s', '-kn', '-n', lv_dest, '%s/%s' % (vg, lv_src))
-    utils.execute(*cmd, run_as_root=True, attempts=3)
-
-
 def create_volume(vg, lv, size, sparse=False):
     """Create LVM image.
 
     Creates a LVM image with given size.
 
     :param vg: existing volume group which should hold this image
-    :param lv: name for this volume (logical volume)
+    :param lv: name for this image (logical volume)
     :size: size of image in bytes
     :sparse: create sparse logical volume
     """
-
-    # Figure out thinpool name and type of volume to create.
-    thinpool = vg + CONF.libvirt.thinpool_suffix
-    if CONF.libvirt.thin_logical_volumes:
-        if lv == thinpool:
-            vtype = 'thinpool'
-        else:
-            vtype = 'thin'
-    else:
-        vtype = 'default'
-
-    # Can't call get_volume_group_info() because we want to do special
-    # handling when creating the thinpool itself.
-    if vtype == 'thin':
-        vg_info = _get_thinpool_info(vg, thinpool)
-    else:
-        vg_info = _get_volume_group_info(vg)
+    vg_info = get_volume_group_info(vg)
     free_space = vg_info['free']
 
     def check_size(vg, lv, size):
@@ -141,49 +77,11 @@ def create_volume(vg, lv, size, sparse=False):
                 '--virtualsize', '%db' % size, '-n', lv, vg)
     else:
         check_size(vg, lv, size)
-        if vtype == 'default':
-            cmd = ('lvcreate', '-L', '%db' % size, '-n', lv, vg)
-        elif vtype == 'thinpool':
-            cmd = ('lvcreate', '-L', '%db' % size, '-T', '%s/%s' % (vg, lv))
-        elif vtype == 'thin':
-            cmd = ('lvcreate', '-V', '%db' % size, '-T',
-                   '%s/%s' % (vg, thinpool), '-n', lv)
-
+        cmd = ('lvcreate', '-L', '%db' % size, '-n', lv, vg)
     utils.execute(*cmd, run_as_root=True, attempts=3)
 
 
-def _get_thinpool_info(vg, thinpool):
-    """Return free/used/total space info for a thinpool in the specified vg
-
-    :param vg: volume group name
-    :param thinpool: thin pool name
-    :returns: A dict containing:
-             :total: How big the filesystem is (in bytes)
-             :free: How much space is free (in bytes)
-             :used: How much space is used (in bytes)
-    """
-    thinpool_used = 0
-    thinpool_size = 0
-    out, err = utils.execute('vgs', '--noheadings', '--nosuffix',
-                       '--separator', '|',
-                       '--units', 'b', '-o', 'lv_name,lv_size,pool_lv', vg,
-                       run_as_root=True)
-    for line in out.splitlines():
-        lvinfo = line.split('|')
-        lv_name = lvinfo[0].strip()
-        lv_size = int(lvinfo[1])
-        lv_pool = lvinfo[2]
-        if lv_name == thinpool:
-            thinpool_size = lv_size
-        elif lv_pool == thinpool:
-            # Account for total size of all volumes in the thin pool.
-            thinpool_used += lv_size
-    return {'total': thinpool_size,
-            'free': thinpool_size - thinpool_used,
-            'used': thinpool_used}
-
-
-def _get_volume_group_info(vg):
+def get_volume_group_info(vg):
     """Return free/used/total space info for a volume group in bytes
 
     :param vg: volume group name
@@ -205,19 +103,6 @@ def _get_volume_group_info(vg):
     return {'total': int(info[0]),
             'free': int(info[1]),
             'used': int(info[0]) - int(info[1])}
-
-
-def get_volume_group_info(vg):
-    """Return free/used/total space info in bytes
-
-    If thin provisioning is enabled then return data for the thin pool,
-    otherwise return data for the volume group.
-    """
-    if CONF.libvirt.thin_logical_volumes:
-        thinpool = vg + CONF.libvirt.thinpool_suffix
-        return _get_thinpool_info(vg, thinpool)
-    else:
-        return _get_volume_group_info(vg)
 
 
 def list_volumes(vg):
@@ -316,10 +201,6 @@ def clear_volume(path):
 
     :param path: logical volume path
     """
-    # If using thin volumes it doesn't make sense to clear them.
-    if CONF.libvirt.thin_logical_volumes:
-        return
-
     volume_clear = CONF.libvirt.volume_clear
 
     if volume_clear == 'none':
@@ -358,82 +239,3 @@ def remove_volumes(paths):
             errors.append(six.text_type(exp))
     if errors:
         raise exception.VolumesNotRemoved(reason=(', ').join(errors))
-
-
-# WRS: Enable instance resizing for LVM backed instances
-def get_volume_vg(path):
-    """Get logical volume's volume group name.
-
-    :param path: logical volume path
-    """
-    lv_info = volume_info(path)
-    vg = lv_info['VG']
-    return vg
-
-
-def rename_volume(lv_name, lv_new_name):
-    """Rename an LVM image.
-
-    Rename an LVM image.
-
-    :param vg: existing volume group which holds the image volume
-    :param lv_name: current name for this image (logical volume)
-    :param lv_new_name: bew name for this image (logical volume)
-    """
-    vg = get_volume_vg(lv_name)
-    errors = []
-    lvrename = ('lvrename', vg, lv_name, lv_new_name)
-    try:
-        utils.execute(*lvrename, run_as_root=True, attempts=3)
-    except processutils.ProcessExecutionError as exp:
-        errors.append(six.text_type(exp))
-        if errors:
-            raise exception.ResizeError(reason=(', ').join(errors))
-
-
-def create_duplicate_volume(lv_name, lv_new_name):
-    """Duplicate a reference logical volume.
-
-    Creates an LVM volume the same size as a reference volume and with the
-    same contents.
-
-    :param lv_name: path of the reference image (logical volume)
-    :param lv_new_name: path for the new logical volume
-    """
-    vg = get_volume_vg(lv_name)
-    size = get_volume_size(lv_name)
-    errors = []
-    try:
-        if CONF.libvirt.thin_logical_volumes:
-            # Special-case for thin volumes
-            name = os.path.basename(lv_name)
-            new_name = os.path.basename(lv_new_name)
-            thin_copy_volume(name, new_name, vg, size)
-        else:
-            create_volume(vg, lv_new_name, size, sparse=False)
-
-            # copy the preserved volume contents to the new volume
-            utils.copy_image(lv_name, lv_new_name)
-    except processutils.ProcessExecutionError as exp:
-        errors.append(six.text_type(exp))
-        if errors:
-            raise exception.ResizeError(reason=(', ').join(errors))
-
-
-def resize_volume(lv_name, size):
-    """Resizes an LVM image.
-
-    Resizes an LVM image to the requested new size.
-
-    :param lv_name: name for the image to be resized (logical volume)
-    :param size: new size in bytes for the image (logical volume)
-    """
-    sizeInMB = size / units.Mi
-    errors = []
-    lvresize = ('lvresize', '--size', sizeInMB, lv_name)
-    try:
-        utils.execute(*lvresize, attempts=3, run_as_root=True)
-    except processutils.ProcessExecutionError as exp:
-        errors.append(six.text_type(exp))
-        if errors:
-            raise exception.ResizeError(reason=(', ').join(errors))

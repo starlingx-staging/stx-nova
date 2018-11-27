@@ -4194,6 +4194,16 @@ class ComputeManager(manager.Manager):
                 self._prep_resize(context, image, instance,
                                   instance_type, filter_properties,
                                   node, clean_shutdown)
+            # NOTE(dgenin): This is thrown in LibvirtDriver when the
+            #               instance to be migrated is backed by LVM.
+            #               Remove when LVM migration is implemented.
+            except exception.MigrationPreCheckError:
+                # TODO(mriedem): How is it even possible to get here?
+                # _prep_resize does not call the driver. The resize_instance
+                # method does, but we RPC cast to the source node to do that
+                # so we shouldn't even get this exception...
+                failed = True
+                raise
             except Exception:
                 failed = True
                 # try to re-schedule the resize elsewhere:
@@ -7718,8 +7728,6 @@ class ComputeManager(manager.Manager):
                             instance_dir = os.path.join(inst_path, inst_file)
                             utils.execute('rm', '-rf', instance_dir,
                                           delay_on_retry=True, attempts=5)
-                            self.driver._cleanup_lvm(instance,
-                                         preserve_disk_filter="Non-Resize")
 
     @periodic_task.periodic_task(spacing=CONF.instance_delete_interval)
     def _run_pending_deletes(self, context):

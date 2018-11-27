@@ -180,10 +180,6 @@ class ImageBackendFixture(fixtures.Fixture):
 
             return disk
 
-        def mock_function():
-            pass
-
-        image_init.is_file_in_instance_path = mock_function
         return image_init
 
     def _fake_cache(self, fetch_func, filename, size=None, *args, **kwargs):

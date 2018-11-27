@@ -122,7 +122,6 @@ class MigrateServerController(wsgi.Controller):
                 exception.InvalidSharedStorage,
                 exception.HypervisorUnavailable,
                 exception.MigrationPreCheckError,
-                exception.MigrationPreCheckErrorNoRetry,
                 exception.LiveMigrationWithOldNovaNotSupported) as ex:
             if async:
                 with excutils.save_and_reraise_exception():

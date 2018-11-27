@@ -78,16 +78,6 @@ class LvmTestCase(test.NoDBTestCase):
                       fake_lvm_size)
         self.stub_out('nova.utils.execute', fake_execute)
 
-        # One test for thin volumes
-        CONF.set_override('thin_logical_volumes', True, 'libvirt')
-        executes = []
-        expected_commands = []
-        lvm.clear_volume('/dev/v1')
-        self.assertEqual(expected_commands, executes)
-
-        # Explicitly set fat volumes for the rest of the tests.
-        CONF.set_override('thin_logical_volumes', False, 'libvirt')
-
         # Test the correct dd commands are run for various sizes
         lvm_size = 1
         executes = []

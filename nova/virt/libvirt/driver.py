@@ -564,7 +564,6 @@ class LibvirtDriver(driver.ComputeDriver):
 
     def init_host(self, host):
         self._host.initialize()
-        self.image_backend.backend().init_host()
 
         self._do_quality_warnings()
 
@@ -1018,12 +1017,6 @@ class LibvirtDriver(driver.ComputeDriver):
         self._destroy(instance)
         self.cleanup(context, instance, network_info, block_device_info,
                      destroy_disks)
-        # If we arrived here from revert_resize and have shared
-        # instance storage, destroy_disks will be false, but we need
-        # to remove the volumes that were created so that we can
-        # rename the _resize volumes to revert the resize/migration.
-        if not destroy_disks:
-            self._cleanup_lvm(instance, preserve_disk_filter="Resize")
 
     def _undefine_domain(self, instance, keep_nvram=False):
         try:
@@ -1206,30 +1199,15 @@ class LibvirtDriver(driver.ComputeDriver):
             filter_fn = lambda disk: disk.startswith(instance.uuid)
         LibvirtDriver._get_rbd_driver().cleanup_volumes(filter_fn)
 
-    def _cleanup_lvm(self, instance, block_device_info=None,
-                     preserve_disk_filter=None):
+    def _cleanup_lvm(self, instance, block_device_info):
         """Delete all LVM disks for given instance object."""
         if instance.get('ephemeral_key_uuid') is not None:
             self._detach_encrypted_volumes(instance, block_device_info)
 
         disks = self._lvm_disks(instance)
-        if disks and not preserve_disk_filter:
+        if disks:
             # This will remove all all LVM disks for this instance
             lvm.remove_volumes(disks)
-        else:
-            # When resizing on the same compute we will have a 2x the
-            # LVM disks some with _resize extensions. When reverting
-            # or confirming a resize we need to apply a filter on
-            # which volumes to remove.
-            remove_lvs = []
-            for lv in disks:
-                if (preserve_disk_filter == "Resize" and
-                        not lv.endswith('_resize')):
-                    remove_lvs.append(lv)
-                if (preserve_disk_filter == "Non-Resize" and
-                        lv.endswith('_resize')):
-                    remove_lvs.append(lv)
-            lvm.remove_volumes(remove_lvs)
 
     def _lvm_disks(self, instance):
         """Returns all LVM disks for given instance object."""
@@ -1312,10 +1290,6 @@ class LibvirtDriver(driver.ComputeDriver):
             # belonging to it, from the source host.
             instance_nova_path = libvirt_utils.get_instance_path(instance)
             self._cleanup_target(instance_nova_path)
-
-        # Resize is complete. Remove any _resize volumes associated
-        # with the instance
-        self._cleanup_lvm(instance, preserve_disk_filter="Non-Resize")
 
     def _get_volume_driver(self, connection_info):
         driver_type = connection_info.get('driver_volume_type')
@@ -6688,11 +6662,6 @@ class LibvirtDriver(driver.ComputeDriver):
         :param disk_over_commit: if true, allow disk over commit
         :returns: a LibvirtLiveMigrateData object
         """
-        if block_migration and CONF.libvirt.images_type == 'lvm':
-            reason = _("Block live migration is not supported "
-                           "for hosts with LVM backed storage.")
-            raise exception.MigrationPreCheckError(reason=reason)
-
         disk_available_gb = dst_compute_info['disk_available_least']
         disk_available_mb = (
             (disk_available_gb * units.Ki) - CONF.reserved_host_disk_mb)
@@ -6770,24 +6739,10 @@ class LibvirtDriver(driver.ComputeDriver):
                                           block_device_info))
 
         if 'block_migration' not in dest_check_data:
-            block_migration_explicit = False
             dest_check_data.block_migration = (
                 not dest_check_data.is_on_shared_storage())
-        else:
-            block_migration_explicit = True
 
         if dest_check_data.block_migration:
-            if CONF.libvirt.images_type == 'lvm':
-                if block_migration_explicit:
-                    reason = _("Block live migration is not supported "
-                               "for instances with LVM backed storage.")
-                else:
-                    reason = _("Live migration can not be used "
-                               "with LVM backed storage except "
-                               "a booted from volume VM which "
-                               "does not have a local disk.")
-                raise exception.MigrationPreCheckErrorNoRetry(reason=reason)
-
             # TODO(eliqiao): Once block_migration flag is removed from the API
             # we can safely remove the if condition
             if dest_check_data.is_on_shared_storage():
@@ -6875,15 +6830,9 @@ class LibvirtDriver(driver.ComputeDriver):
             return True
 
         if (dest_check_data.is_shared_instance_path and
-                self.image_backend.backend().is_file_in_instance_path() and
-                CONF.libvirt.images_type != 'lvm'):
+                self.image_backend.backend().is_file_in_instance_path()):
             # NOTE(angdraug): file based image backends (Flat, Qcow2)
             # place block device files under the instance path
-
-            # Add an additional check to see if local disks are backed
-            # by lvm. These are not shared, so fail this check. Below
-            # we will allow instances backed by volume but without
-            # local disks to pass.
             return True
 
         if (dest_check_data.is_volume_backed and
@@ -8112,12 +8061,10 @@ class LibvirtDriver(driver.ComputeDriver):
             disk_info = []
 
         for info in disk_info:
-            instance_disk = info['path']
-            if self.image_backend.backend().is_file_in_instance_path():
-                base = os.path.basename(info['path'])
-                # Get image type and create empty disk image, and
-                # create backing file in case of qcow2.
-                instance_disk = os.path.join(instance_dir, base)
+            base = os.path.basename(info['path'])
+            # Get image type and create empty disk image, and
+            # create backing file in case of qcow2.
+            instance_disk = os.path.join(instance_dir, base)
             if not info['backing_file'] and not os.path.exists(instance_disk):
                 libvirt_utils.create_image(info['type'], instance_disk,
                                            info['virt_disk_size'])
@@ -8535,12 +8482,11 @@ class LibvirtDriver(driver.ComputeDriver):
             raise exception.InstanceFaultRollback(
                 exception.ResizeError(reason=reason))
 
-        # WRS: allow migration of LVM backed instances
         # NOTE(dgenin): Migration is not implemented for LVM backed instances.
-        # if CONF.libvirt.images_type == 'lvm' and not booted_from_volume:
-        #     reason = _("Migration is not supported for LVM backed instances")
-        #     raise exception.InstanceFaultRollback(
-        #         exception.MigrationPreCheckError(reason=reason))
+        if CONF.libvirt.images_type == 'lvm' and not booted_from_volume:
+            reason = _("Migration is not supported for LVM backed instances")
+            raise exception.InstanceFaultRollback(
+                exception.MigrationPreCheckError(reason=reason))
 
         # copy disks to destination
         # rename instance dir to +_resize at first for using
@@ -8589,37 +8535,22 @@ class LibvirtDriver(driver.ComputeDriver):
                 # assume inst_base == dirname(info['path'])
                 img_path = info['path']
                 fname = os.path.basename(img_path)
+                from_path = os.path.join(inst_base_resize, fname)
 
-                # WRS: Enable instance resizing for LVM backed instances
-                # Check to see if the disk is an lvm disk
-                if (CONF.libvirt.images_type == 'lvm' and
-                    libvirt_utils.get_disk_type_from_path(img_path) == 'lvm'):
-                    # Preserve the original volumes for reverting by
-                    # renaming. At this point we do not know if the
-                    # scheduler will select this compute or another
-                    # compute to perform the resize on, so do not
-                    # perform any lvm disk copies at this point. We
-                    # will defer the resize operations until the
-                    # resize is confirmed.
-                    lv_preserve_path = img_path + "_resize"
-                    lvm.rename_volume(img_path, lv_preserve_path)
-                else:
-                    from_path = os.path.join(inst_base_resize, fname)
+                # We will not copy over the swap disk here, and rely on
+                # finish_migration to re-create it for us. This is ok
+                # because the OS is shut down, and as recreating a swap
+                # disk is very cheap it is more efficient than copying
+                # either locally or over the network.
+                # This also means we don't have to resize it.
+                if fname == 'disk.swap':
+                    continue
 
-                    # We will not copy over the swap disk here, and rely on
-                    # finish_migration to re-create it for us. This is ok
-                    # because the OS is shut down, and as recreating a swap
-                    # disk is very cheap it is more efficient than copying
-                    # either locally or over the network.
-                    # This also means we don't have to resize it.
-                    if fname == 'disk.swap':
-                        continue
-
-                    compression = info['type'] not in NO_COMPRESSION_TYPES
-                    libvirt_utils.copy_image(from_path, img_path, host=dest,
-                                             on_execute=on_execute,
-                                             on_completion=on_completion,
-                                             compression=compression)
+                compression = info['type'] not in NO_COMPRESSION_TYPES
+                libvirt_utils.copy_image(from_path, img_path, host=dest,
+                                         on_execute=on_execute,
+                                         on_completion=on_completion,
+                                         compression=compression)
 
             # Ensure disk.info is written to the new path to avoid disks being
             # reinspected and potentially changing format.
@@ -8669,27 +8600,6 @@ class LibvirtDriver(driver.ComputeDriver):
             raise loopingcall.LoopingCallDone()
 
     @staticmethod
-    def _disk_size_from_instance(instance, disk_name):
-        """Determines the disk size from instance properties
-
-        Returns the disk size by using the disk name to determine whether it
-        is a root or an ephemeral disk, then by checking properties of the
-        instance returns the size converted to bytes.
-
-        Returns 0 if the disk name not match (disk, disk.local).
-        """
-        if disk_name == 'disk':
-            size = instance.flavor.root_gb
-        elif disk_name == 'disk.local':
-            size = instance.flavor.ephemeral_gb
-        # N.B. We don't handle ephemeral disks named disk.ephN here,
-        # which is almost certainly a bug. It's not clear what this function
-        # should return if an instance has multiple ephemeral disks.
-        else:
-            size = 0
-        return size * units.Gi
-
-    @staticmethod
     def _disk_raw_to_qcow2(path):
         """Converts a raw disk to qcow2."""
         path_qcow = path + '_qcow'
@@ -8712,40 +8622,6 @@ class LibvirtDriver(driver.ComputeDriver):
                           'qemu-img', 'convert', '-f', 'qcow2', '-t', 'none',
                           '-O', 'raw', path, path_raw)
         utils.execute('mv', path_raw, path)
-
-    # WRS: Enable instance resizing for LVM backed instances
-    def _disk_resize_lvm(self, info, size):
-        """Attempts to resize an lvm disk to size
-
-        Attempts to resize an lvm disk by checking the capabilities and
-        preparing the format, then calling disk.api.extend.
-
-        """
-        try:
-            base, ext = os.path.splitext(info['path'])
-            # Ignore swap/ephemeral disks (i.e. .local or .swap
-            # extensions). They currently get regenerated regardless
-            # of resizing.
-            if not ext:
-                # An instance has already been spun up at this point but since
-                # we are resizing to the same host we would like to preserve
-                # the contents of the original LVM disk. So nuke the new disk
-                # and copy the original volume
-                lvm.remove_volumes([info['path']])
-
-                # Make a duplicate volume of the same size which we
-                # will use for resizing. This preserves the original
-                # for reverting if resize fails
-                lvm.create_duplicate_volume(
-                    info['path'] + "_resize",
-                    info['path'])
-                if size:
-                    lvm.resize_volume(info['path'], size)
-        except exception.ResizeError as e:
-            # Allow resize errors if they are a result of attempting
-            # to resize the volume to the same size
-            if "matches existing size" not in e.message:
-                raise
 
     def finish_migration(self, context, migration, instance, disk_info,
                          network_info, image_meta, resize_instance,
@@ -8792,70 +8668,32 @@ class LibvirtDriver(driver.ComputeDriver):
             # appropriately between them as long as disk.info exists and is
             # correctly populated, which it is because Qcow2 writes to
             # disk.info.
-            # For lvm backed images check to see if we are migrating.
-            #
-            # If we are migrating, avoid resizing as we do not have
-            # shared lvm storage and have not migrated the local disk
-            # data from the source compute. Avoiding the resize
-            # operation will rebuild in the instance in the
-            # _create_image call.
-            #
-            # If we are not migrating, then call the _disk_resize_lvm
-            # function to copy and resize the lvm disks
-            if libvirt_utils.get_disk_type_from_path(info['path']) == 'lvm':
-                # Adjust the file name if the disk is lvm based filename is of
-                # the format <UUID>_disk, <UUID>_disk.local, or
-                # <UUID>_disk.swap
-                disk_name = disk_name.split('_')[1]
-                size = self._disk_size_from_instance(instance, disk_name)
 
-                if (resize_instance and
-                        (migration['dest_compute'] ==
-                         migration['source_compute'])):
-                    self._disk_resize_lvm(info, size)
-            else:
-                # NOTE(mdbooth): The code below looks wrong, but is actually
-                # required to prevent a security hole when migrating from a
-                # host with use_cow_images=False to one with
-                # use_cow_images=True.
-                # Imagebackend uses use_cow_images to select between the
-                # atrociously-named-Raw and Qcow2 backends. The Qcow2 backend
-                # writes to disk.info, but does not read it as it assumes
-                # qcow2.
-                # Therefore if we don't convert raw to qcow2 here, a raw disk
-                # will be incorrectly assumed to be qcow2, which is a severe
-                # security flaw.
-                # The reverse is not true, because the atrociously-named-Raw
-                # backend supports both qcow2 and raw disks, and will choose
-                # appropriately between them as long as disk.info exists and
-                # is correctly populated, which it is because Qcow2 writes to
-                # disk.info.
-                #
-                # In general, we do not yet support format conversion during
-                # migration. For example:
-                #   * Converting from use_cow_images=True to
-                #     use_cow_images=False isn't handled. This isn't a
-                #     security bug, but is almost certainly buggy in other
-                #     cases, as the 'Raw' backend doesn't expect a backing
-                #     file.
-                #   * Converting to/from lvm and rbd backends is not supported.
-                #
-                # This behaviour is inconsistent, and therefore undesirable for
-                # users. It is tightly-coupled to implementation quirks of 2
-                # out of 5 backends in imagebackend and defends against a
-                # severe security flaw which is not at all obvious without
-                # deep analysis, and is therefore undesirable to developers.
-                # We should aim to remove it. This will not be possible
-                # though, until we can represent the storage layout of a
-                # specific instance independent of the default configuration
-                # of the local compute host.
+            # In general, we do not yet support format conversion during
+            # migration. For example:
+            #   * Converting from use_cow_images=True to
+            #     use_cow_images=False isn't handled. This isn't a
+            #     security bug, but is almost certainly buggy in other
+            #     cases, as the 'Raw' backend doesn't expect a backing
+            #     file.
+            #   * Converting to/from lvm and rbd backends is not supported.
+            #
+            # This behaviour is inconsistent, and therefore undesirable for
+            # users. It is tightly-coupled to implementation quirks of 2
+            # out of 5 backends in imagebackend and defends against a
+            # severe security flaw which is not at all obvious without
+            # deep analysis, and is therefore undesirable to developers.
+            # We should aim to remove it. This will not be possible
+            # though, until we can represent the storage layout of a
+            # specific instance independent of the default configuration
+            # of the local compute host.
 
-                # Config disks are hard-coded to be raw even when
-                # use_cow_images=True (see _get_disk_config_image_type),so
-                # don't need to be converted.
-                if (disk_name != 'disk.config' and
-                            info['type'] == 'raw' and CONF.use_cow_images):
-                    self._disk_raw_to_qcow2(info['path'])
+            # Config disks are hard-coded to be raw even when
+            # use_cow_images=True (see _get_disk_config_image_type),so
+            # don't need to be converted.
+            if (disk_name != 'disk.config' and
+                        info['type'] == 'raw' and CONF.use_cow_images):
+                self._disk_raw_to_qcow2(info['path'])
 
         xml = self._get_guest_xml(context, instance, network_info,
                                   block_disk_info, image_meta,
@@ -8892,20 +8730,6 @@ class LibvirtDriver(driver.ComputeDriver):
             if e.errno != errno.ENOENT:
                 raise
 
-    # WRS: Enable instance resizing for LVM backed instances
-    def _cleanup_lvm_rename_resize(self, instance):
-        # Go through all the lvm disks for the instance and identify
-        # those that should be renamed for reinstatement
-        rename_lvs = []
-        lvm_disks = self._lvm_disks(instance)
-        for lv in lvm_disks:
-            if lv.endswith('_resize'):
-                rename_lvs.append(lv)
-
-        # Reinstate the volume copies with the original sizes
-        for lv_path in rename_lvs:
-            lvm.rename_volume(lv_path, lv_path[:-7])
-
     def finish_revert_migration(self, context, instance, network_info,
                                 block_device_info=None, power_on=True):
         LOG.debug("Starting finish_revert_migration",
@@ -8921,9 +8745,6 @@ class LibvirtDriver(driver.ComputeDriver):
         if os.path.exists(inst_base_resize):
             self._cleanup_failed_migration(inst_base)
             utils.execute('mv', inst_base_resize, inst_base)
-
-        # WRS: Rename any _resize volumes to complete the reversion
-        self._cleanup_lvm_rename_resize(instance)
 
         root_disk = self.image_backend.by_name(instance, 'disk')
         # Once we rollback, the snapshot is no longer needed, so remove it
