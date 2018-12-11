@@ -2948,4 +2948,3 @@ class LibvirtConfigGuestvTPMDevice(LibvirtConfigGuestQemuRawDevice):
         self.add_argument(value)
 
         return super(LibvirtConfigGuestvTPMDevice, self).format_dom()
-

@@ -1181,6 +1181,19 @@ Possible values:
   or with the CLI with ``nova service-enable <hostname> <binary>``, otherwise
   they are not ready to use.
 """),
+    cfg.BoolOpt('map_new_hosts',
+        default=True,
+        help="""
+Map a host when creating its Compute Node.
+
+Add an entry in nova_api host_mappings table for
+the compute node while creating host service.
+
+Possible values:
+
+* ``True``: map a new host when its Compute Node object is created.
+* ``False``: Do not map a new host when its Compute Node object is created.
+"""),
     cfg.StrOpt('instance_name_template',
          default='instance-%08x',
          help="""

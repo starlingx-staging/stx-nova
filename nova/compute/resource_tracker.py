@@ -917,7 +917,8 @@ class ResourceTracker(object):
         cn = objects.ComputeNode(context)
         cn.host = self.host
         # WRS: host mapping is already done at service_create
-        cn.mapped = 1
+        if CONF.map_new_hosts:
+            cn.mapped = 1
         self._copy_resources(cn, resources)
         self.compute_nodes[nodename] = cn
         cn.create()
