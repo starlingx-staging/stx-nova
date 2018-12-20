@@ -1,0 +1,76 @@
+From 72c6fdfa45241d530f644497b3a895381f85aa34 Mon Sep 17 00:00:00 2001
+From: Jim Gauld <james.gauld@windriver.com>
+Date: Fri, 19 May 2017 14:29:19 -0400
+Subject: [PATCH] Increase RPC timeout to 120s for post live migration
+
+This increases post_live_migration_at_destination RPC timeout to 120
+seconds from the 60 seconds default. This should prevent the
+MessagingTimeout we see due to updating ports taking a long time when
+there are many VIFs.
+
+For future rebase, this should be merged with the following commit:
+c69528059048b0a2bc44d42cda5795e03fe19e29
+(increase RPC timeout to 5 min for block migration)
+---
+ nova/compute/rpcapi.py                 |  3 ++-
+ nova/tests/unit/compute/test_rpcapi.py | 15 +++++++++++----
+ 2 files changed, 13 insertions(+), 5 deletions(-)
+
+diff --git a/nova/compute/rpcapi.py b/nova/compute/rpcapi.py
+index 7a5a12f..c7d4254 100644
+--- a/nova/compute/rpcapi.py
++++ b/nova/compute/rpcapi.py
+@@ -722,8 +722,9 @@ class ComputeAPI(object):
+     def post_live_migration_at_destination(self, ctxt, instance,
+             block_migration, host):
+         version = '4.0'
++        # Increase RPC timeout to handle VMs with lots of VIFs
+         cctxt = self.router.by_host(ctxt, host).prepare(
+-                server=host, version=version)
++                server=host, version=version, timeout=120)
+         return cctxt.call(ctxt, 'post_live_migration_at_destination',
+             instance=instance, block_migration=block_migration)
+ 
+diff --git a/nova/tests/unit/compute/test_rpcapi.py b/nova/tests/unit/compute/test_rpcapi.py
+index a6c7cc3..a38e890 100644
+--- a/nova/tests/unit/compute/test_rpcapi.py
++++ b/nova/tests/unit/compute/test_rpcapi.py
+@@ -114,7 +114,8 @@ class ComputeRpcAPITestCase(test.NoDBTestCase):
+         self.assertEqual('4.4', compute_rpcapi.LAST_VERSION)
+ 
+     def _test_compute_api(self, method, rpc_method,
+-                          expected_args=None, drop_kwargs=None, **kwargs):
++                          expected_args=None, drop_kwargs=None, timeout=None,
++                          **kwargs):
+         ctxt = context.RequestContext('fake_user', 'fake_project')
+ 
+         rpcapi = kwargs.pop('rpcapi_class', compute_rpcapi.ComputeAPI)()
+@@ -181,8 +182,13 @@ class ComputeRpcAPITestCase(test.NoDBTestCase):
+             retval = getattr(rpcapi, method)(ctxt, **kwargs)
+             self.assertEqual(retval, rpc_mock.return_value)
+ 
+-            prepare_mock.assert_called_once_with(version=expected_version,
+-                                                 server=host)
++            if timeout is None:
++                prepare_mock.assert_called_once_with(version=expected_version,
++                                                     server=host)
++            else:
++                prepare_mock.assert_called_once_with(version=expected_version,
++                                                     server=host,
++                                                     timeout=timeout)
+             rpc_mock.assert_called_once_with(ctxt, method, **expected_kwargs)
+ 
+     def test_add_aggregate_host(self):
+@@ -416,7 +422,8 @@ class ComputeRpcAPITestCase(test.NoDBTestCase):
+     def test_post_live_migration_at_destination(self):
+         self._test_compute_api('post_live_migration_at_destination', 'call',
+                 instance=self.fake_instance_obj,
+-                block_migration='block_migration', host='host', version='4.0')
++                block_migration='block_migration', host='host', version='4.0',
++                timeout=120)
+ 
+     def test_pause_instance(self):
+         self._test_compute_api('pause_instance', 'cast',
+-- 
+2.7.4
+

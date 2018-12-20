@@ -1,0 +1,25 @@
+From f70f57105372c840269d2902c104d69231d1e749 Mon Sep 17 00:00:00 2001
+From: Daniel Chavolla <daniel.chavolla@windriver.com>
+Date: Wed, 7 Sep 2016 13:49:27 -0400
+Subject: [PATCH] restore backwards compatibility with Kilo nodes
+
+---
+ nova/scheduler/filters/platform_filter.py | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/nova/scheduler/filters/platform_filter.py b/nova/scheduler/filters/platform_filter.py
+index d9ca414..f426068 100644
+--- a/nova/scheduler/filters/platform_filter.py
++++ b/nova/scheduler/filters/platform_filter.py
+@@ -65,7 +65,7 @@ class PlatformFilter(filters.BaseHostFilter):
+                 metrics_[fields.MonitorMetricType.PLATFORM_CPU_PERCENT]
+             host_plat_mem_usage = \
+                 metrics_[fields.MonitorMetricType.PLATFORM_MEM_PERCENT]
+-        except AttributeError as ex:
++        except KeyError as ex:
+             # If host does not support these metrics we fall into legacy mode
+             LOG.warning(_LW('Unable to get metric: %s.'), ex.message)
+             return True
+-- 
+2.7.4
+

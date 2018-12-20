@@ -1,0 +1,691 @@
+From b38705cf2f27dea76de5c55b4ce8a8cfdd14202d Mon Sep 17 00:00:00 2001
+From: Chris Friesen <chris.friesen@windriver.com>
+Date: Wed, 8 Jun 2016 09:43:31 -0600
+Subject: [PATCH 038/143] Support dedicated/floating instances on one
+ compute node
+
+In order to enable instances with dedicated CPUs and instances with
+non-dedicated CPUs on the same compute node we need to ensure that
+the non-dedicated instances cannot run on CPUs that are assigned
+to dedicated instances.
+
+In order to do this we rely on cpusets. nova-compute assumes that
+during compute node setup something has mounted /dev/cpuset and has
+created a "floating" cpuset (for vCPU tasks which are not restricted
+to a particular host NUMA node), as well as per-NUMA-node
+"floating/nodeX" cpusets (for vCPU tasks which are restricted to a
+single host NUMA node).
+
+The threads corresponding to vCPUs of floating instances are placed
+into the applicable per-NUMA-node or global cpuset.  The other qemu
+threads of floating instances are placed in the global floating
+cpuset.
+
+These cpusets start with the full set of available instance CPUs,
+either globally or per-NUMA-node depending on the cpuset.  Any
+time we change the set of pinned host CPUs (creating a new
+instance, resize, migrate, scale up/down, etc.) we will adjust the
+affinity of these cpusets appropriately to ensure that the floating
+instances do not interfere with the pinned instances.
+
+It would be nice if we could just use a single cpuset, but that
+doesn't work because changing the cpus in a cpuset resets the
+affinity of all tasks in that set even if they had previously been
+restricted by sched_setaffinity().
+
+As part of this we modify the code to always pass the instance in
+to _create_domain() so that we can use the instance numa topology
+to properly assign the instance vCPUs to the cpusets.
+
+Change-Id: Ic4248ef65df954034dedbc4fac1260bbf6df910e
+
+This commit is a merge of R3 commits 748dcba and 7ecaecb.
+For port to Newton, required minor changes to resource tracker to move
+resource references from dict to object form.  Also added additional
+mock outs for new unit tests.
+
+1bbca5d Handle floating cpuset exception if domain does not exist
+   This corrects unhandled exception in assign_floating_cpusets where the
+   function qemuMonitorCommand fails due to no existing domain, so subsequent
+   cleanup of the VM would fail. Saw this rare scenario when there was a
+   fault in detach_device.
+
+ebdf4a0 AIO Simplex: VM fails to recover after reboot
+   Handle rare nova exceptions and log errors:
+   - when writing floating cpusets
+   - when qemuMonitorCommand fails due to no domain existing
+
+efd488d CPU affinity of emulator tasks incorrect for floating VMs
+   This changes the affinity behaviour of floating VMs
+   (i.e., hw:cpu_policy=shared) for the non-vCPU threads. The qemu
+   emulatorpin and worker threads are now affined to the same NUMA node
+   as the VM if the VM is single NUMA, else they float in the global cpuset
+   that spans NUMA nodes.
+
+   The /dev/cpuset/floating/node<x>/cpuset.mems configuration is relaxed to
+   span all NUMA nodes. We now rely on linux default mempolicy for
+   allocations to get memory from like-NUMA node as CPU affinity if that is
+   possible. This enables VMs that may have large dynamic IO allocations to
+   not be constrained by a single NUMA node yet generally have good NUMA
+   performance.
+
+__TYPE_primary
+__TAG_floatcpus,mixedfloatpinned
+__R4_commit_e642ee0
+__R3_commit_32d6b94
+__TC5067
+---
+ nova/compute/resource_tracker.py                   | 25 ++++++-
+ nova/tests/unit/compute/test_compute.py            |  4 +-
+ nova/tests/unit/compute/test_resource_tracker.py   | 25 +++++--
+ nova/tests/unit/virt/libvirt/fake_libvirt_qemu.py  | 17 +++++
+ nova/tests/unit/virt/libvirt/fake_libvirt_utils.py | 11 +++
+ nova/tests/unit/virt/libvirt/test_driver.py        |  8 ++-
+ nova/virt/hardware.py                              | 84 ++++++++++++++++++++++
+ nova/virt/libvirt/driver.py                        | 31 +++++---
+ nova/virt/libvirt/guest.py                         |  5 ++
+ nova/virt/libvirt/utils.py                         | 77 ++++++++++++++++++++
+ 10 files changed, 266 insertions(+), 21 deletions(-)
+ create mode 100644 nova/tests/unit/virt/libvirt/fake_libvirt_qemu.py
+
+diff --git a/nova/compute/resource_tracker.py b/nova/compute/resource_tracker.py
+index 8d95a5a..3bfaafa 100644
+--- a/nova/compute/resource_tracker.py
++++ b/nova/compute/resource_tracker.py
+@@ -162,6 +162,12 @@ class ResourceTracker(object):
+         to deal with shared platform CPU, HT siblings, and multi-numa-node
+         instances.
+         """
++        # Make sure we don't squeeze out globally floating instances.
++        # We don't currently support this, but we might eventually.
++        if (resources.vcpus - resources.vcpus_used) < 1:
++            raise exception.ComputeResourcesUnavailable(
++                        reason="no free pcpu available on host")
++
+         vcpu0_cell, vcpu0_phys = hardware.instance_vcpu_to_pcpu(instance, 0)
+         host_numa_topology, jsonify_result = \
+             hardware.host_topology_and_format_from_host(resources)
+@@ -211,6 +217,8 @@ class ResourceTracker(object):
+ 
+                 if jsonify_result:
+                     resources.numa_topology = host_numa_topology._to_json()
++                # update the affinity of instances with floating CPUs.
++                hardware.update_floating_affinity(resources)
+                 return pcpu
+         err = (_("Couldn't find host numa node containing pcpu %d") %
+                  vcpu0_phys)
+@@ -238,6 +246,8 @@ class ResourceTracker(object):
+                     resources.vcpus_used -= 1
+                 if jsonify_result:
+                     resources.numa_topology = host_numa_topology._to_json()
++                # update the affinity of instances with floating CPUs.
++                hardware.update_floating_affinity(resources)
+                 return
+         err = (_("Couldn't find host numa node containing pcpu %d") % pcpu)
+         raise exception.InternalError(message=err)
+@@ -1210,7 +1220,8 @@ class ResourceTracker(object):
+                                           threads_per_core=threads_per_core)
+         return vcpus
+ 
+-    def _update_usage(self, usage, nodename, sign=1):
++    # add update_affinity
++    def _update_usage(self, usage, nodename, sign=1, update_affinity=True):
+         # tracker debug logging
+         if CONF.compute_resource_debug:
+             # Get parent calling functions
+@@ -1287,6 +1298,10 @@ class ResourceTracker(object):
+                 cn, usage, free)
+         cn.numa_topology = updated_numa_topology
+ 
++        # update the affinity of instances with non-dedicated CPUs.
++        if update_affinity:
++            hardware.update_floating_affinity(cn)
++
+         # tracker debug logging
+         if CONF.compute_resource_debug:
+             self._populate_usage(nodename, id=1)
+@@ -1570,8 +1585,10 @@ class ResourceTracker(object):
+                             instance_uuid=instance.uuid)
+                 continue
+ 
++    # add update_affinity
+     def _update_usage_from_instance(self, context, instance, nodename,
+-            is_removed=False, require_allocation_refresh=False):
++            is_removed=False, require_allocation_refresh=False,
++            update_affinity=True):
+         """Update usage for a single instance."""
+         def getter(obj, attr, default=None):
+             """Method to get object attributes without exception."""
+@@ -1639,7 +1656,7 @@ class ResourceTracker(object):
+ 
+             # new instance, update compute node resource usage:
+             self._update_usage(self._get_usage_dict(instance), nodename,
+-                               sign=sign)
++                               sign=sign, update_affinity=update_affinity)
+ 
+             # Display instances that audit includes via _update_usage.
+             pstate = instance.get('power_state')
+@@ -1733,6 +1750,8 @@ class ResourceTracker(object):
+                     require_allocation_refresh=require_allocation_refresh)
+ 
+         self._remove_deleted_instances_allocations(context, cn)
++        # update the affinity of instances with non-dedicated CPUs.
++        hardware.update_floating_affinity(cn)
+ 
+     def _remove_deleted_instances_allocations(self, context, cn):
+         # NOTE(jaypipes): All of this code sucks. It's basically dealing with
+diff --git a/nova/tests/unit/compute/test_compute.py b/nova/tests/unit/compute/test_compute.py
+index 2457b9e..23b63fa 100644
+--- a/nova/tests/unit/compute/test_compute.py
++++ b/nova/tests/unit/compute/test_compute.py
+@@ -5573,7 +5573,9 @@ class ComputeTestCase(BaseTestCase,
+                 self.context))
+         self._test_confirm_resize(power_on=True, numa_topology=numa_topology)
+ 
+-    def test_confirm_resize_with_numa_topology_and_cpu_pinning(self):
++    @mock.patch.object(nova.virt.hardware, 'update_floating_affinity')
++    def test_confirm_resize_with_numa_topology_and_cpu_pinning(self,
++              mock_update_floating_affinity):
+         instance = self._create_fake_instance_obj()
+         instance.old_flavor = instance.flavor
+         instance.new_flavor = instance.flavor
+diff --git a/nova/tests/unit/compute/test_resource_tracker.py b/nova/tests/unit/compute/test_resource_tracker.py
+index f9e24c9..66374c5 100644
+--- a/nova/tests/unit/compute/test_resource_tracker.py
++++ b/nova/tests/unit/compute/test_resource_tracker.py
+@@ -44,6 +44,7 @@ from nova import test
+ from nova.tests.unit import fake_notifier
+ from nova.tests.unit.objects import test_pci_device as fake_pci_device
+ from nova.tests import uuidsentinel as uuids
++from nova.virt import hardware
+ 
+ _HOSTNAME = 'fake-host'
+ _NODENAME = 'fake-node'
+@@ -1649,10 +1650,11 @@ class TestInstanceClaim(BaseTestCase):
+                     self.rt.instance_claim,
+                     self.ctx, self.instance, _NODENAME, bad_limits)
+ 
++    @mock.patch('nova.virt.hardware.update_floating_affinity')
+     @mock.patch('nova.objects.InstancePCIRequests.get_by_instance_uuid')
+     @mock.patch('nova.objects.MigrationList.get_in_progress_by_host_and_node')
+     @mock.patch('nova.objects.ComputeNode.save')
+-    def test_claim_numa(self, save_mock, migr_mock, pci_mock):
++    def test_claim_numa(self, save_mock, migr_mock, pci_mock, affinity_mock):
+         pci_mock.return_value = objects.InstancePCIRequests(requests=[])
+         cn = self.rt.compute_nodes[_NODENAME]
+ 
+@@ -2367,7 +2369,8 @@ class TestUpdateUsageFromInstance(BaseTestCase):
+                                             _NODENAME)
+ 
+         mock_update_usage.assert_called_once_with(
+-            self.rt._get_usage_dict(self.instance), _NODENAME, sign=1)
++            self.rt._get_usage_dict(self.instance), _NODENAME, sign=1,
++            update_affinity=True)
+ 
+     @mock.patch('nova.compute.resource_tracker.ResourceTracker.'
+                 '_update_usage')
+@@ -2380,7 +2383,8 @@ class TestUpdateUsageFromInstance(BaseTestCase):
+                                             _NODENAME)
+ 
+         mock_update_usage.assert_called_once_with(
+-            self.rt._get_usage_dict(self.instance), _NODENAME, sign=-1)
++            self.rt._get_usage_dict(self.instance), _NODENAME, sign=-1,
++            update_affinity=True)
+ 
+     @mock.patch('nova.compute.resource_tracker.ResourceTracker.'
+                 '_update_usage')
+@@ -2390,7 +2394,8 @@ class TestUpdateUsageFromInstance(BaseTestCase):
+                                             _NODENAME)
+ 
+         mock_update_usage.assert_called_once_with(
+-            self.rt._get_usage_dict(self.instance), _NODENAME, sign=1)
++            self.rt._get_usage_dict(self.instance), _NODENAME, sign=1,
++            update_affinity=True)
+ 
+     @mock.patch('nova.compute.resource_tracker.ResourceTracker.'
+                 '_update_usage')
+@@ -2403,7 +2408,8 @@ class TestUpdateUsageFromInstance(BaseTestCase):
+                                             self.instance, _NODENAME, True)
+ 
+         mock_update_usage.assert_called_once_with(
+-            self.rt._get_usage_dict(self.instance), _NODENAME, sign=-1)
++            self.rt._get_usage_dict(self.instance), _NODENAME, sign=-1,
++            update_affinity=True)
+ 
+     @mock.patch('nova.objects.Instance.get_by_uuid')
+     def test_remove_deleted_instances_allocations_deleted_instance(self,
+@@ -2519,12 +2525,13 @@ class TestUpdateUsageFromInstance(BaseTestCase):
+         cn = objects.ComputeNode(memory_mb=1024, local_gb=10)
+         self.rt.compute_nodes['foo'] = cn
+ 
++        @mock.patch.object(hardware, 'update_floating_affinity')
+         @mock.patch.object(self.rt,
+                            '_remove_deleted_instances_allocations')
+         @mock.patch.object(self.rt, '_update_usage_from_instance')
+         @mock.patch('nova.objects.Service.get_minimum_version',
+                     return_value=22)
+-        def test(version_mock, uufi, rdia):
++        def test(version_mock, uufi, rdia, mock_affinity):
+             self.rt._update_usage_from_instances('ctxt', [], 'foo')
+ 
+         test()
+@@ -2741,6 +2748,12 @@ class TestCPUScaling(BaseTestCase):
+         self.instance = _INSTANCE_FIXTURES[0].obj_clone()
+         self.rt.compute_nodes[_NODENAME] = self.host
+ 
++        def fake_update_floating_affinity(host):
++            pass
++
++        self.stubs.Set(hardware, 'update_floating_affinity',
++                       fake_update_floating_affinity)
++
+     def test_get_compat_cpu(self):
+         numa_topology_obj = objects.NUMATopology(cells=[
+             objects.NUMACell(id=0, cpuset=set([0, 1, 2, 3]), memory=512,
+diff --git a/nova/tests/unit/virt/libvirt/fake_libvirt_qemu.py b/nova/tests/unit/virt/libvirt/fake_libvirt_qemu.py
+new file mode 100644
+index 0000000..7eb3764
+--- /dev/null
++++ b/nova/tests/unit/virt/libvirt/fake_libvirt_qemu.py
+@@ -0,0 +1,17 @@
++# Copyright (c) 2015-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++
++
++def qemuMonitorCommand(domain, cmd, flags):
++    retval = '{"return":[{"current":true,"CPU":0,"pc":-2130513274,' \
++             '"halted":true,"thread_id":86064},' \
++             '{"current":false,"CPU":1,"pc":-2130513274,' \
++             '"halted":true,"thread_id":86065},' \
++             '{"current":false,"CPU":2,"pc":-2130513274,' \
++             '"halted":true,"thread_id":86066},' \
++             '{"current":false,"CPU":3,"pc":-2130513274,' \
++             '"halted":true,"thread_id":86067}],"id":"libvirt-156"}'
++    return retval
+diff --git a/nova/tests/unit/virt/libvirt/fake_libvirt_utils.py b/nova/tests/unit/virt/libvirt/fake_libvirt_utils.py
+index e6831e3..ff6f161 100644
+--- a/nova/tests/unit/virt/libvirt/fake_libvirt_utils.py
++++ b/nova/tests/unit/virt/libvirt/fake_libvirt_utils.py
+@@ -11,6 +11,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2016-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ import io
+ import os
+@@ -181,3 +188,7 @@ def get_arch(image_meta):
+ 
+ def last_bytes(file_like_object, num):
+     return libvirt_utils.last_bytes(file_like_object, num)
++
++
++def assign_floating_cpusets(domain, instance):
++    pass
+diff --git a/nova/tests/unit/virt/libvirt/test_driver.py b/nova/tests/unit/virt/libvirt/test_driver.py
+index 697cbce..1c9ddf2 100755
+--- a/nova/tests/unit/virt/libvirt/test_driver.py
++++ b/nova/tests/unit/virt/libvirt/test_driver.py
+@@ -15570,7 +15570,8 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+                                                           network_info)
+             pause = self._get_pause_flag(drvr, network_info)
+             create_domain.assert_called_once_with(
+-                fake_xml, pause=pause, power_on=True, post_xml_callback=None)
++                fake_xml, pause=pause, power_on=True, post_xml_callback=None,
++                instance=instance)
+             self.assertEqual(mock_dom, guest._domain)
+ 
+     def test_get_guest_storage_config(self):
+@@ -18179,7 +18180,8 @@ class LibvirtDriverTestCase(test.NoDBTestCase):
+         domain_xml = [None]
+ 
+         def fake_create_domain(xml=None, domain=None, power_on=True,
+-                               pause=False, post_xml_callback=None):
++                               pause=False, post_xml_callback=None,
++                               instance=instance):
+             domain_xml[0] = xml
+             if post_xml_callback is not None:
+                 post_xml_callback()
+@@ -18323,7 +18325,7 @@ class LibvirtDriverTestCase(test.NoDBTestCase):
+             drvr.unrescue(instance, None)
+             mock_destroy.assert_called_once_with(instance)
+             mock_create.assert_called_once_with("fake_unrescue_xml",
+-                                                 fake_dom)
++                                                 fake_dom, instance=instance)
+             self.assertEqual(2, mock_del.call_count)
+             self.assertEqual(unrescue_xml_path,
+                              mock_del.call_args_list[0][0][0])
+diff --git a/nova/virt/hardware.py b/nova/virt/hardware.py
+index 57b1b02..1da8d8a 100644
+--- a/nova/virt/hardware.py
++++ b/nova/virt/hardware.py
+@@ -21,6 +21,7 @@
+ import collections
+ import fractions
+ import itertools
++import os
+ import sys
+ 
+ from oslo_log import log as logging
+@@ -45,6 +46,9 @@ MEMPAGES_SMALL = -1
+ MEMPAGES_LARGE = -2
+ MEMPAGES_ANY = -3
+ 
++# base path used for floating instance cpusets
++CPUSET_BASE = '/dev/cpuset/floating'
++
+ 
+ # - extra_specs, image_props helper functions
+ # NOTE: This must be consistent with _add_pinning_constraint().
+@@ -2391,3 +2395,83 @@ def is_vswitch_strict_from_extra_specs(extra_specs):
+     else:
+         vswitch_strict = True
+     return vswitch_strict
++
++
++# extension
++def update_floating_affinity(host):
++    """Update the CPU affinity for instances with non-dedicated CPUs.
++
++    This is a helper function to update the CPU affinity of floating
++    instances.  We assume that each floating instance is assigned to a cpuset,
++    either global or per-host-NUMA-node.
++
++    The kernel will not allow us to add a CPU to a subset before the global
++    set, or remove a CPU from the global set before removing it from all
++    subsets.  This means that we need to first remove CPUs from the subsets,
++    then set the desired affinity in the global set, then set the desired
++    affinity in the subsets.
++
++    :param resources: the compute node resources
++    :return: None
++    """
++    def get_cpuset_cpus(node):
++        node_str = '' if node is None else '/node' + str(node)
++        filename = CPUSET_BASE + node_str + '/cpuset.cpus'
++        with open(filename, 'r') as f:
++            cpus_string = f.read().rstrip('\n')
++            return set(utils.range_to_list(cpus_string))
++
++    def set_cpuset_cpus(node, cpus):
++        node_str = '' if node is None else '/node' + str(node)
++        filename = CPUSET_BASE + node_str + '/cpuset.cpus'
++        # We want cpus separated by commas with no spaces
++        cpus_string = ','.join(str(e) for e in cpus)
++        try:
++            with open(filename, 'w') as f:
++                # Need to use this version, f.write() with an empty string
++                # doesn't actually do a write() syscall.
++                os.write(f.fileno(), cpus_string)
++        except Exception as e:
++            LOG.error('Unable to assign floating cpuset: %(cpus)r, '
++                      'filename: %(f)s, error=%(e)s',
++                      {'f': filename, 'cpus': cpus_string, 'e': e})
++
++    host_numa_topology, jsonify_result = \
++            host_topology_and_format_from_host(host)
++
++    # Host doesn't report numa topology, can't continue.
++    if host_numa_topology is None or not host_numa_topology.cells:
++        return
++
++    # Handle any CPU deletions from the subsets
++    for cell in host_numa_topology.cells:
++        cur_cpuset_cpus = get_cpuset_cpus(cell.id)
++        new_cpuset_cpus = cur_cpuset_cpus.intersection(cell.free_cpus)
++        set_cpuset_cpus(cell.id, new_cpuset_cpus)
++
++    # Set the new global affinity
++    floating_cpuset = set()
++    for cell in host_numa_topology.cells:
++        floating_cpuset.update(cell.free_cpus)
++    set_cpuset_cpus(None, floating_cpuset)
++
++    # Set the new affinity for all subsets
++    for cell in host_numa_topology.cells:
++        set_cpuset_cpus(cell.id, cell.free_cpus)
++
++
++# extension
++def set_cpuset_tasks(node, tids):
++    """Assign tasks represented by tids to the specified cpuset
++
++    :param node: Either None or a NUMA node number
++    :param tids: a set of Linux task IDs representing qemu vCPUs
++    """
++    node_str = '' if node is None else '/node' + str(node)
++    filename = CPUSET_BASE + node_str + '/tasks'
++    with open(filename, 'w') as f:
++        for tid in tids:
++            f.write(str(tid))
++            # Need to flush because the kernel only takes one TID
++            # per write() syscall.
++            f.flush()
+diff --git a/nova/virt/libvirt/driver.py b/nova/virt/libvirt/driver.py
+index cbd38f2..9c0f772 100644
+--- a/nova/virt/libvirt/driver.py
++++ b/nova/virt/libvirt/driver.py
+@@ -1946,10 +1946,12 @@ class LibvirtDriver(driver.ComputeDriver):
+         # NOTE(dkang): because previous managedSave is not called
+         #              for LXC, _create_domain must not be called.
+         if CONF.libvirt.virt_type != 'lxc' and not live_snapshot:
++            # add instance to _create_domain
+             if state == power_state.RUNNING:
+-                guest = self._create_domain(domain=virt_dom)
++                guest = self._create_domain(domain=virt_dom, instance=instance)
+             elif state == power_state.PAUSED:
+-                guest = self._create_domain(domain=virt_dom, pause=True)
++                guest = self._create_domain(domain=virt_dom, pause=True,
++                                            instance=instance)
+ 
+             if guest is not None:
+                 self._attach_pci_devices(
+@@ -2632,7 +2634,9 @@ class LibvirtDriver(driver.ComputeDriver):
+                              power_state.CRASHED]:
+                     LOG.info("Instance shutdown successfully.",
+                              instance=instance)
+-                    self._create_domain(domain=guest._domain)
++                    # add instance to _create_domain
++                    self._create_domain(domain=guest._domain,
++                                        instance=instance)
+                     timer = loopingcall.FixedIntervalLoopingCall(
+                         self._wait_for_running, instance)
+                     timer.start(interval=0.5).wait()
+@@ -2921,7 +2925,9 @@ class LibvirtDriver(driver.ComputeDriver):
+         xml = self._get_guest_xml(context, instance, network_info, disk_info,
+                                   image_meta, rescue=rescue_images)
+         self._destroy(instance)
+-        self._create_domain(xml, post_xml_callback=gen_confdrive)
++        # add instance to _create_domain
++        self._create_domain(xml, post_xml_callback=gen_confdrive,
++                            instance=instance)
+ 
+     def unrescue(self, instance, network_info):
+         """Reboot the VM which is being rescued back into primary images.
+@@ -2936,7 +2942,8 @@ class LibvirtDriver(driver.ComputeDriver):
+         # We should be able to remove virt_dom at the end.
+         virt_dom = guest._domain
+         self._destroy(instance)
+-        self._create_domain(xml, virt_dom)
++        # add instance to _create_domain
++        self._create_domain(xml, virt_dom, instance=instance)
+         libvirt_utils.file_delete(unrescue_xml_path)
+         rescue_files = os.path.join(instance_dir, "*.rescue")
+         for rescue_file in glob.iglob(rescue_files):
+@@ -5426,9 +5433,11 @@ class LibvirtDriver(driver.ComputeDriver):
+         finally:
+             self._create_domain_cleanup_lxc(instance)
+ 
++    # add instance to _create_domain
+     # TODO(sahid): Consider renaming this to _create_guest.
+     def _create_domain(self, xml=None, domain=None,
+-                       power_on=True, pause=False, post_xml_callback=None):
++                       power_on=True, pause=False, post_xml_callback=None,
++                       instance=None):
+         """Create a domain.
+ 
+         Either domain or xml must be passed in. If both are passed, then
+@@ -5445,6 +5454,8 @@ class LibvirtDriver(driver.ComputeDriver):
+ 
+         if power_on or pause:
+             guest.launch(pause=pause)
++            # put floating vCPU tasks in proper cpusets
++            libvirt_utils.assign_floating_cpusets(guest.domain, instance)
+ 
+         if not utils.is_neutron():
+             guest.enable_hairpin()
+@@ -5524,9 +5535,11 @@ class LibvirtDriver(driver.ComputeDriver):
+                                                              network_info)
+                 with self._lxc_disk_handler(instance, instance.image_meta,
+                                             block_device_info):
++                    # add instance to _create_domain
+                     guest = self._create_domain(
+                         xml, pause=pause, power_on=power_on,
+-                        post_xml_callback=post_xml_callback)
++                        post_xml_callback=post_xml_callback,
++                        instance=instance)
+ 
+                 self.firewall_driver.apply_instance_filter(instance,
+                                                            network_info)
+@@ -7732,7 +7745,9 @@ class LibvirtDriver(driver.ComputeDriver):
+ 
+         # Make sure we define the migrated instance in libvirt
+         xml = guest.get_xml_desc()
+-        self._host.write_instance_config(xml)
++        domain = self._host.write_instance_config(xml)
++        # put floating vCPU tasks in proper cpusets
++        libvirt_utils.assign_floating_cpusets(domain, instance)
+ 
+     def _get_instance_disk_info_from_config(self, guest_config,
+                                             block_device_info):
+diff --git a/nova/virt/libvirt/guest.py b/nova/virt/libvirt/guest.py
+index 7e767ac..97c8758 100755
+--- a/nova/virt/libvirt/guest.py
++++ b/nova/virt/libvirt/guest.py
+@@ -120,6 +120,11 @@ class Guest(object):
+     def _encoded_xml(self):
+         return encodeutils.safe_decode(self._domain.XMLDesc(0))
+ 
++    # ugly hack, mea culpa
++    @property
++    def domain(self):
++        return self._domain
++
+     @classmethod
+     def create(cls, xml, host):
+         """Create a new Guest
+diff --git a/nova/virt/libvirt/utils.py b/nova/virt/libvirt/utils.py
+index 3e90f8f..26c447c 100644
+--- a/nova/virt/libvirt/utils.py
++++ b/nova/virt/libvirt/utils.py
+@@ -32,17 +32,23 @@ import re
+ 
+ from oslo_concurrency import processutils
+ from oslo_log import log as logging
++from oslo_serialization import jsonutils
++from oslo_utils import importutils
+ 
+ import nova.conf
+ from nova.i18n import _
+ from nova.objects import fields as obj_fields
+ from nova import utils
+ from nova.virt.disk import api as disk
++from nova.virt import hardware
+ from nova.virt import images
+ from nova.virt.libvirt import config as vconfig
+ from nova.virt.libvirt.volume import remotefs
+ from nova.virt import volumeutils
+ 
++# add libvirt_qemu
++libvirt_qemu = None
++
+ CONF = nova.conf.CONF
+ LOG = logging.getLogger(__name__)
+ 
+@@ -569,3 +575,74 @@ def last_bytes(file_like_object, num):
+ 
+     remaining = file_like_object.tell()
+     return (file_like_object.read(), remaining)
++
++
++# extension
++def assign_floating_cpusets(domain, instance):
++    """Assign the Linux tasks corresponding to the vCPUs to cpusets
++
++    Each vCPU has a corresponding Linux task that has been affined to
++    individual CPUs or is left to float across all available host CPUs.
++    In the case where the instances are floating, we want to add the
++    vCPU tasks to cpusets to make it easier to re-affine them later
++    when the available floating CPU pool changes.
++    """
++
++    # Do we need to do anything to make sure instance.numa_topology
++    # is available?
++
++    global libvirt_qemu
++    if libvirt_qemu is None:
++        libvirt_qemu = importutils.import_module('libvirt_qemu')
++
++    task_mapping = []
++    if instance.numa_topology is None:
++        # Guest has no NUMA restrictions, put it in the global set.
++        task_mapping.append({'node': None, 'vcpus': range(instance.vcpus)})
++    else:
++        for cell in instance.numa_topology.cells:
++            # If we're using dedicated CPUs, then don't do anything.
++            if cell.cpu_policy == 'dedicated':
++                return
++            task_mapping.append({'node': cell.id, 'vcpus': cell.cpuset})
++
++    # Get CPU information from qemu.  This includes vCPU-to-thread mapping.
++    # The result of this looks like:
++    # {"return":[{"current":true,"CPU":0,"pc":-2130513274,"halted":true,
++    # "thread_id":86064},{"current":false,"CPU":1,"pc":-2130513274,
++    # "halted":true,"thread_id":86065},],"id":"libvirt-156"}
++    try:
++        cpuinfostr = libvirt_qemu.qemuMonitorCommand(
++            domain, '{"execute":"query-cpus"}', 0)
++    except Exception as e:
++        LOG.error('Unable to query cpuset info, '
++                  'qemuMonitorCommand failed: %s', e,
++                  instance=instance)
++        return
++    cpuinfolist = jsonutils.loads(cpuinfostr)['return']
++
++    # For each mapping, figure out the set of threads that correspond to
++    # the vCPUs in the mapping.
++    for mapping in task_mapping:
++        tids = set()
++        for cpu in mapping['vcpus']:
++            for cpuinfo in cpuinfolist:
++                if cpuinfo['CPU'] == cpu:
++                    tids.add(cpuinfo['thread_id'])
++
++        # Assign the threads to the cpuset
++        hardware.set_cpuset_tasks(mapping['node'], tids)
++
++    # Put all qemu threads that aren't vCPU threads into the floating cpuset.
++    # Place in the same numa node as the VM if it is single numa, otherwise
++    # place in the global floating cpuset. Originally we couldn't use libvirt
++    # emulatorpin because it crashed, but with CentOS we could rework this.
++    vcpu_tasks = [cpuinfo['thread_id'] for cpuinfo in cpuinfolist]
++    qemu_task_strings = os.listdir('/proc/' + str(vcpu_tasks[0]) + '/task')
++    qemu_tasks = [int(task) for task in qemu_task_strings]
++    emulator_tasks = set(qemu_tasks) - set(vcpu_tasks)
++    if len(task_mapping) == 1:
++        node = task_mapping[0]['node']
++    else:
++        node = None
++    hardware.set_cpuset_tasks(node, emulator_tasks)
+-- 
+2.7.4
+

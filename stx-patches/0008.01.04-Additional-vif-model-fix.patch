@@ -1,0 +1,33 @@
+From 30469cf698559edad8633683d927a8989125c9fb Mon Sep 17 00:00:00 2001
+From: Chris Friesen <chris.friesen@windriver.com>
+Date: Wed, 15 Jul 2015 23:48:19 -0600
+Subject: [PATCH] Additional vif model fix
+
+When submitting 3019232 I somehow missed the usage in
+virt/wrs/libvirt/vif.py.
+
+This fixes up that file accordingly, making use of the fact that
+the fix for commit a2dba07 means that the vif model
+will always be set.
+---
+ nova/virt/wrs/libvirt/vif.py | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/nova/virt/wrs/libvirt/vif.py b/nova/virt/wrs/libvirt/vif.py
+index 98793c3..cede5cf 100644
+--- a/nova/virt/wrs/libvirt/vif.py
++++ b/nova/virt/wrs/libvirt/vif.py
+@@ -62,7 +62,9 @@ class LibvirtGenericVIFDriver(vif.LibvirtGenericVIFDriver):
+     def get_config_avs(self, instance, vif, image_meta, inst_type, virt_type):
+         """Determine which type of vswitch interface to publish to the guest.
+         """
+-        model = self._get_hw_vif_model(vif, image_meta)
++        # We should always be setting the vif model in
++        # compute.api.API._create_instance()
++        model = vif.get('vif_model')
+         if model and model == VIF_MODEL_AVP:
+             return self._get_config_vswitch_avp(vif)
+         else:
+-- 
+2.7.4
+

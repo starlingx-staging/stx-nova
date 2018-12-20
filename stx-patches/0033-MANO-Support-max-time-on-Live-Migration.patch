@@ -1,0 +1,1010 @@
+From 86cbf3d5f8ff18967101fe0911c7b17845dac94a Mon Sep 17 00:00:00 2001
+From: Jack Ding <jack.ding@windriver.com>
+Date: Fri, 28 Aug 2015 11:50:55 -0400
+Subject: [PATCH 033/143] MANO: Support 'max time' on Live Migration
+
+This modifies the upstream migration completion config options
+to allow the "downtime" and "overall completion timeout" to be
+set in the flavor extra specs or image metadata.
+
+The timeout can be specified as 0 or 100-800 sec, while the max
+downtime must be at least 100msec.
+
+This is an amalgamation of a numnber of kilo commits:
+203397fe
+c7563237
+4c2869d6
+71529188
+918c1d58
+
+- pass live_migration_downtime from Flavor extra spec and
+  Image metadata
+
+- handle 0 for live migration timeout to be a special value
+  to turn timeout off
+
+- retrieve live_migration_timeout value from Flavor Extra Spec or
+ Image metadata, whichever is smaller with the exception of 0
+
+- Use the timeout value as total value instead of value per GB of
+ RAM as in upstream.
+
+- handle invalid input values from flavor extra spec and image
+  metadata
+
+- add customer log for live migration abort due to timeout
+  or other reasons.
+
+- add flavor extra specs validation
+
+Change-Id: Ifbcc8b7509db4d5f89542002907effd22351c398
+
+(cherry picked from R3 commit 207b06a)
+
+b14cae7 Block migration status not set to error on failure
+   For function with signature:
+   def _rollback_live_migration(self, context, instance,
+                                dest, block_migration, migrate_data=None,
+                                migration_status='error', fault=None):
+   we're calling it as:
+   recover_method(context, instance, dest, block_migration, migrate_data, fault)
+
+   This will end up passing in the fault as the migration_status,
+   resulting in not setting the migration_status to "error".
+
+21463ef allow instance to set live migration timeout
+   Currently we allow the live migration overall completion timeout
+   to be set in the image properties and the flavor extra-specs.  This
+   extends the code to allow it to be set as part of the instance
+   metadata.  This can be useful when using a standard flavor/image
+   and customizing via cloud-init.
+
+   The instance metadata key "hw:wrs:live_migration_timeout" is used
+   for this purpose, and the value must be an integer representing the
+   number of seconds in the timeout.  A value of zero disables the
+   timeout.
+
+   If none of the image/flavor/instance sets the timeout, the default
+   timeout is used.
+
+   If any of the image/flavor/instance sets a timeout, then if all
+   the set values are zero then the timeout is disabled, otherwise the
+   lowest specified timeout is used.
+
+ec2db54 modify the live migration downtime steps to ramp up properly
+   Rather than using a config option to determine the delay between
+   ramping up the allowed live migration downtime, we calculate it
+   from the overall live migration completion timeout such that we
+   ramp up the downtime during the first 2/3 of the completion timeout.
+
+   We make the delay fixed rather than dependent on the data size.
+   This lines up with our change to make the overall completion timeout
+   fixed rather than dependent on data size.
+
+   We modify the delay step algorithm to ramp up faster rather
+   than wasting the first few steps hardly ramping up at all.
+
+a53ee50 allow specifying live migration max downtime in instance metadata
+   Currently we allow the live migration max downtime to be specified in the
+   flavor extra-specs and image properties.  For running instances we need
+   to also be able to specify the max downtime in the instance metadata.
+
+858f5a4 nova on boot from cli is not validating values
+   specified for --meta (only validating on nova update meta).
+   The root cause of this issue is that when a new instance is created via
+   "nova boot...", the metadata validation routines is not invoked. The
+   validation code is only called during metadata creation and update. The
+   solution is to add metadata validation for "nova boot..." as well.
+
+640672a bug 218: Fix call to _rollback_live_migration()
+
+__TYPE_primary
+__TAG_livemigration,robustness,resource
+__R4_commit_e614f82
+__R3_commit_7f16491
+__TC5070,TC5071
+
+Pike rebase: bug 218: Fix call to _rollback_live_migration()
+
+In Pike, upstream (44e7f6e8) removed block_migration parameter from
+_rollback_live_migration() so we need to do the same in the call that we
+added in _live_migration_monitor() in the driver on post live migration
+exceptions.
+
+On next rebase, this should be merged with commit:
+b96c49e1cdc46a9e7f42f89aae1e1c2d1c3878b0 -
+MANO: Support 'max time' on Live Migration
+---
+ nova/api/openstack/common.py                     |  44 +++++
+ nova/api/openstack/compute/flavors_extraspecs.py |   2 +
+ nova/api/openstack/compute/server_metadata.py    |   1 +
+ nova/api/openstack/compute/servers.py            |  11 ++
+ nova/compute/manager.py                          |   6 +-
+ nova/objects/image_meta.py                       |   6 +
+ nova/tests/unit/objects/test_objects.py          |   2 +-
+ nova/tests/unit/virt/libvirt/test_driver.py      | 219 ++++++++++++++++++++++-
+ nova/tests/unit/virt/libvirt/test_migration.py   |  48 ++---
+ nova/tests/unit/virt/test_virt_drivers.py        |   3 +-
+ nova/virt/libvirt/driver.py                      | 148 +++++++++++++--
+ nova/virt/libvirt/migration.py                   |  35 ++--
+ 12 files changed, 470 insertions(+), 55 deletions(-)
+
+diff --git a/nova/api/openstack/common.py b/nova/api/openstack/common.py
+index 582f1fd..89fefa9 100644
+--- a/nova/api/openstack/common.py
++++ b/nova/api/openstack/common.py
+@@ -46,6 +46,8 @@ CONF = nova.conf.CONF
+ LOG = logging.getLogger(__name__)
+ QUOTAS = quota.QUOTAS
+ 
++# minimum value in msec for live migration max downtime
++LIVE_MIGRATION_MAX_DOWNTIME_MIN = 100
+ 
+ _STATE_MAP = {
+     vm_states.ACTIVE: {
+@@ -295,6 +297,48 @@ def check_img_metadata_properties_quota(context, metadata):
+         raise webob.exc.HTTPForbidden(explanation=expl)
+ 
+ 
++# validation shared between instance metadata and flavor extra-specs
++def validate_live_migration_max_downtime(metadata):
++    key = 'hw:wrs:live_migration_max_downtime'
++    if key in metadata:
++        try:
++            live_migration_max_downtime = int(metadata[key])
++        except ValueError:
++            msg = "%s must be an integer." % key
++            raise webob.exc.HTTPBadRequest(explanation=msg)
++        if live_migration_max_downtime < LIVE_MIGRATION_MAX_DOWNTIME_MIN:
++            msg = "%s must be greater than or equal to %s" % \
++                  (key, LIVE_MIGRATION_MAX_DOWNTIME_MIN)
++            raise webob.exc.HTTPBadRequest(explanation=msg)
++
++
++# validation shared between instance metadata and flavor extra-specs
++def validate_live_migration_timeout(metadata):
++    # Timeout min/max in seconds.
++    LIVE_MIGRATION_TIMEOUT_MIN = 120
++    LIVE_MIGRATION_TIMEOUT_MAX = 800
++    key = 'hw:wrs:live_migration_timeout'
++    if key in metadata:
++        try:
++            live_migration_timeout = int(metadata[key])
++        except ValueError:
++            msg = "%s must be an integer." % key
++            raise webob.exc.HTTPBadRequest(explanation=msg)
++        if (live_migration_timeout != 0) and \
++           ((live_migration_timeout < LIVE_MIGRATION_TIMEOUT_MIN) or
++            (live_migration_timeout > LIVE_MIGRATION_TIMEOUT_MAX)):
++            msg = "%s must be 0 or in the range %s to %s" % \
++                  (key,
++                   LIVE_MIGRATION_TIMEOUT_MIN,
++                   LIVE_MIGRATION_TIMEOUT_MAX)
++            raise webob.exc.HTTPBadRequest(explanation=msg)
++
++
++def validate_metadata(metadata):
++    validate_live_migration_timeout(metadata)
++    validate_live_migration_max_downtime(metadata)
++
++
+ # extension
+ def get_nics_for_instance_from_nw_info(nw_info):
+     nics = []
+diff --git a/nova/api/openstack/compute/flavors_extraspecs.py b/nova/api/openstack/compute/flavors_extraspecs.py
+index d1561da..f0d13be 100644
+--- a/nova/api/openstack/compute/flavors_extraspecs.py
++++ b/nova/api/openstack/compute/flavors_extraspecs.py
+@@ -349,6 +349,8 @@ class FlavorExtraSpecsController(wsgi.Controller):
+         self._validate_shared_vcpu(flavor)
+         self._validate_min_vcpus(flavor)
+         self._validate_numa_node(flavor)
++        common.validate_live_migration_timeout(flavor.extra_specs)
++        common.validate_live_migration_max_downtime(flavor.extra_specs)
+         self._validate_sw_keys(flavor)
+         self._validate_nested_vmx(flavor)
+         self._validate_cpu_realtime_mask(flavor)
+diff --git a/nova/api/openstack/compute/server_metadata.py b/nova/api/openstack/compute/server_metadata.py
+index 543a34d..8c1bc01 100644
+--- a/nova/api/openstack/compute/server_metadata.py
++++ b/nova/api/openstack/compute/server_metadata.py
+@@ -103,6 +103,7 @@ class ServerMetadataController(wsgi.Controller):
+ 
+     def _update_instance_metadata(self, context, server_id, metadata,
+                                   delete=False):
++        common.validate_metadata(metadata)
+         server = common.get_instance(self.compute_api, context, server_id)
+         try:
+             return self.compute_api.update_instance_metadata(context,
+diff --git a/nova/api/openstack/compute/servers.py b/nova/api/openstack/compute/servers.py
+index 15015b2..cabdc6a 100644
+--- a/nova/api/openstack/compute/servers.py
++++ b/nova/api/openstack/compute/servers.py
+@@ -476,6 +476,12 @@ class ServersController(wsgi.Controller):
+         password = self._get_server_admin_password(server_dict)
+         name = common.normalize_name(server_dict['name'])
+         description = name
++
++        # Validate Metadata before instance creation
++        meta = server_dict.get('metadata', {})
++        if meta:
++            common.validate_metadata(meta)
++
+         if api_version_request.is_supported(req, min_version='2.19'):
+             description = server_dict.get('description')
+ 
+@@ -912,6 +918,11 @@ class ServersController(wsgi.Controller):
+ 
+         image_href = rebuild_dict["imageRef"]
+ 
++        # validate metadata before rebuilding
++        meta = rebuild_dict.get('metadata', {})
++        if meta:
++            common.validate_metadata(meta)
++
+         password = self._get_server_admin_password(rebuild_dict)
+ 
+         context = req.environ['nova.context']
+diff --git a/nova/compute/manager.py b/nova/compute/manager.py
+index 7d407ce..9ca704a 100644
+--- a/nova/compute/manager.py
++++ b/nova/compute/manager.py
+@@ -6191,7 +6191,7 @@ class ComputeManager(manager.Manager):
+     @wrap_instance_fault
+     def _rollback_live_migration(self, context, instance,
+                                  dest, migrate_data=None,
+-                                 migration_status='error'):
++                                 migration_status='error', fault=None):
+         """Recovers Instance/volume state from migrating -> running.
+ 
+         :param context: security context
+@@ -6203,6 +6203,7 @@ class ComputeManager(manager.Manager):
+             if not none, contains implementation specific data.
+         :param migration_status:
+             Contains the status we want to set for the migration object
++        :param fault: fault lead to abort the migration
+ 
+         """
+         # Remove allocations created in Placement for the dest node.
+@@ -6246,7 +6247,8 @@ class ComputeManager(manager.Manager):
+                         context, instance, bdm.volume_id, dest)
+ 
+         self._notify_about_instance_usage(context, instance,
+-                                          "live_migration._rollback.start")
++                                          "live_migration._rollback.start",
++                                          fault=fault)
+         compute_utils.notify_about_instance_action(context, instance,
+                 self.host,
+                 action=fields.NotificationAction.LIVE_MIGRATION_ROLLBACK,
+diff --git a/nova/objects/image_meta.py b/nova/objects/image_meta.py
+index 22f6412..4dea2c1 100644
+--- a/nova/objects/image_meta.py
++++ b/nova/objects/image_meta.py
+@@ -357,6 +357,12 @@ class ImageMetaProps(base.NovaObject):
+         # none
+         'hw_watchdog_action': fields.WatchdogActionField(),
+ 
++        # Max downtime for live migration, in msec
++        'hw_wrs_live_migration_max_downtime': fields.IntegerField(),
++
++        # Live migration completion timeout, in seconds
++        'hw_wrs_live_migration_timeout': fields.IntegerField(),
++
+         # boolean - If true, this will enable the virtio-multiqueue feature
+         'hw_vif_multiqueue_enabled': fields.FlexibleBooleanField(),
+ 
+diff --git a/nova/tests/unit/objects/test_objects.py b/nova/tests/unit/objects/test_objects.py
+index 54935bd..0aa8a02 100644
+--- a/nova/tests/unit/objects/test_objects.py
++++ b/nova/tests/unit/objects/test_objects.py
+@@ -1106,7 +1106,7 @@ object_data = {
+     'HVSpec': '1.2-de06bcec472a2f04966b855a49c46b41',
+     'IDEDeviceBus': '1.0-29d4c9f27ac44197f01b6ac1b7e16502',
+     'ImageMeta': '1.8-642d1b2eb3e880a367f37d72dd76162d',
+-    'ImageMetaProps': '1.19-248e4e71d64cc694b4167485a9f9b251',
++    'ImageMetaProps': '1.19-9133d4d5dbd6bd014de178fe25c57c04',
+     'Instance': '2.3-9b20afdc7f46ea0d83f9f0fb4a01f02d',
+     'InstanceAction': '1.1-f9f293e526b66fca0d05c3b3a2d13914',
+     'InstanceActionEvent': '1.1-cc5342ce9da679b9ee3f704cbbfbb63f',
+diff --git a/nova/tests/unit/virt/libvirt/test_driver.py b/nova/tests/unit/virt/libvirt/test_driver.py
+index da5b6de..0418290 100755
+--- a/nova/tests/unit/virt/libvirt/test_driver.py
++++ b/nova/tests/unit/virt/libvirt/test_driver.py
+@@ -714,6 +714,7 @@ def _create_test_instance():
+         'system_metadata': {
+             'image_disk_format': 'raw'
+         },
++        'metadata': {},
+         'flavor': flavor,
+         'new_flavor': None,
+         'old_flavor': None,
+@@ -9280,7 +9281,8 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+ 
+     EXPECT_SUCCESS = 1
+     EXPECT_FAILURE = 2
+-    EXPECT_ABORT = 3
++    EXPECT_ABORT_TIMEOUT = 3
++    EXPECT_ABORT_STUCK = 4
+ 
+     @mock.patch.object(libvirt_guest.Guest, "migrate_start_postcopy")
+     @mock.patch.object(time, "time")
+@@ -9360,6 +9362,7 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+         else:
+             migrate_data.migration.status = "unset"
+         migrate_data.migration.save()
++        fault = None
+ 
+         fake_post_method = mock.MagicMock()
+         fake_recover_method = mock.MagicMock()
+@@ -9393,7 +9396,12 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+             fake_post_method.assert_called_once_with(
+                 self.context, instance, dest, False, migrate_data)
+         else:
+-            if expect_result == self.EXPECT_ABORT:
++            if expect_result == self.EXPECT_ABORT_TIMEOUT:
++                fault = 'Live migration timeout after 100 sec.'
++                self.assertTrue(mock_abort.called,
++                                'abortJob called when abort expected')
++            elif expect_result == self.EXPECT_ABORT_STUCK:
++                fault = 'Live migration stuck for 160 sec.'
+                 self.assertTrue(mock_abort.called,
+                                 'abortJob called when abort expected')
+             else:
+@@ -9404,10 +9412,10 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+             if expected_mig_status:
+                 fake_recover_method.assert_called_once_with(
+                     self.context, instance, dest, migrate_data,
+-                    migration_status=expected_mig_status)
++                    migration_status=expected_mig_status, fault=fault)
+             else:
+                 fake_recover_method.assert_called_once_with(
+-                    self.context, instance, dest, migrate_data)
++                    self.context, instance, dest, migrate_data, fault=fault)
+         self.assertNotIn(instance.uuid, drvr.active_migrations)
+ 
+     def test_live_migration_monitor_success(self):
+@@ -9922,7 +9930,8 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+         ]
+ 
+         self._test_live_migration_monitoring(domain_info_records,
+-                                             fake_times, self.EXPECT_ABORT,
++                                             fake_times,
++                                             self.EXPECT_ABORT_TIMEOUT,
+                                              expected_mig_status='cancelled')
+ 
+     def test_live_migration_monitor_progress(self):
+@@ -9954,7 +9963,8 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+         ]
+ 
+         self._test_live_migration_monitoring(domain_info_records,
+-                                             fake_times, self.EXPECT_ABORT,
++                                             fake_times,
++                                             self.EXPECT_ABORT_STUCK,
+                                              expected_mig_status='cancelled')
+ 
+     def test_live_migration_monitor_progress_zero_data_remaining(self):
+@@ -9992,6 +10002,54 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+         self._test_live_migration_monitoring(domain_info_records,
+                                              fake_times, self.EXPECT_FAILURE)
+ 
++    def test_live_migration_max_downtime_override(self):
++        self.flags(live_migration_downtime=400, group='libvirt')
++        drvr = libvirt_driver.LibvirtDriver(fake.FakeVirtAPI(), False)
++        flavor = objects.Flavor(extra_specs={})
++        image_meta = objects.ImageMeta.from_dict({})
++        instance_meta = {}
++
++        downtime = drvr._live_migration_max_downtime(flavor, image_meta,
++                                                  instance_meta)
++        self.assertEqual(400, downtime)
++
++        flavor = objects.Flavor(extra_specs={
++            "hw:wrs:live_migration_max_downtime": 100})
++        downtime = drvr._live_migration_max_downtime(flavor, image_meta,
++                                                  instance_meta)
++        self.assertEqual(100, downtime)
++
++        flavor = objects.Flavor(extra_specs={})
++        image_meta = objects.ImageMeta.from_dict(
++            {"properties": {"hw_wrs_live_migration_max_downtime": 10}})
++        downtime = drvr._live_migration_max_downtime(flavor, image_meta,
++                                                  instance_meta)
++        self.assertEqual(400, downtime)
++
++        image_meta = objects.ImageMeta.from_dict(
++            {"properties": {"hw_wrs_live_migration_max_downtime": 200}})
++        downtime = drvr._live_migration_max_downtime(flavor, image_meta,
++                                                  instance_meta)
++        self.assertEqual(200, downtime)
++
++        image_meta = objects.ImageMeta.from_dict({})
++        instance_meta = {"hw:wrs:live_migration_max_downtime": 400}
++        downtime = drvr._live_migration_max_downtime(flavor, image_meta,
++                                                  instance_meta)
++        self.assertEqual(400, downtime)
++
++        image_meta = objects.ImageMeta.from_dict(
++            {"properties": {"hw_wrs_live_migration_max_downtime": 200}})
++        downtime = drvr._live_migration_max_downtime(flavor, image_meta,
++                                                  instance_meta)
++        self.assertEqual(400, downtime)
++
++        flavor = objects.Flavor(extra_specs={
++            "hw:wrs:live_migration_max_downtime": 100})
++        downtime = drvr._live_migration_max_downtime(flavor, image_meta,
++                                                  instance_meta)
++        self.assertEqual(100, downtime)
++
+     @mock.patch('nova.virt.libvirt.migration.should_switch_to_postcopy')
+     @mock.patch.object(libvirt_driver.LibvirtDriver,
+                        "_is_post_copy_enabled")
+@@ -10020,6 +10078,155 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+                                              self.EXPECT_SUCCESS,
+                                              expected_switch=True)
+ 
++    def test_live_migration_completion_timeout(self):
++        self.flags(live_migration_completion_timeout=800, group='libvirt')
++
++        drvr = libvirt_driver.LibvirtDriver(fake.FakeVirtAPI(), False)
++
++        flavor = objects.Flavor(extra_specs={})
++        image_meta = objects.ImageMeta.from_dict({})
++        instance_meta = {}
++
++        timeout = drvr._live_migration_completion_timeout(flavor, image_meta,
++                                                          instance_meta)
++
++        self.assertEqual(800, timeout)
++
++    def test_live_migration_completion_timeout_from_flavor(self):
++        self.flags(live_migration_completion_timeout=800, group='libvirt')
++
++        drvr = libvirt_driver.LibvirtDriver(fake.FakeVirtAPI(), False)
++
++        flavor = objects.Flavor(extra_specs={
++            "hw:wrs:live_migration_timeout": "300"})
++        image_meta = objects.ImageMeta.from_dict({})
++        instance_meta = {}
++
++        timeout = drvr._live_migration_completion_timeout(flavor, image_meta,
++                                                          instance_meta)
++
++        self.assertEqual(300, timeout)
++
++    def test_live_migration_completion_timeout_from_image(self):
++        self.flags(live_migration_completion_timeout=800, group='libvirt')
++
++        drvr = libvirt_driver.LibvirtDriver(fake.FakeVirtAPI(), False)
++
++        flavor = objects.Flavor(extra_specs={})
++        image_meta = objects.ImageMeta.from_dict(
++            {"properties": {"hw_wrs_live_migration_timeout": "400"}})
++        instance_meta = {}
++
++        timeout = drvr._live_migration_completion_timeout(flavor, image_meta,
++                                                          instance_meta)
++
++        self.assertEqual(400, timeout)
++
++    def test_live_migration_completion_timeout_from_instance(self):
++        self.flags(live_migration_completion_timeout=800, group='libvirt')
++
++        drvr = libvirt_driver.LibvirtDriver(fake.FakeVirtAPI(), False)
++
++        flavor = objects.Flavor(extra_specs={})
++        image_meta = objects.ImageMeta.from_dict({})
++        instance_meta = {"hw:wrs:live_migration_timeout": "200"}
++
++        timeout = drvr._live_migration_completion_timeout(flavor, image_meta,
++                                                          instance_meta)
++
++        self.assertEqual(200, timeout)
++
++    def test_live_migration_completion_timeout_flavor_overwrite_image(self):
++        self.flags(live_migration_completion_timeout=800, group='libvirt')
++
++        drvr = libvirt_driver.LibvirtDriver(fake.FakeVirtAPI(), False)
++
++        flavor = objects.Flavor(extra_specs={
++            "hw:wrs:live_migration_timeout": "300"})
++        image_meta = objects.ImageMeta.from_dict(
++            {"properties": {"hw_wrs_live_migration_timeout": "400"}})
++        instance_meta = {}
++
++        timeout = drvr._live_migration_completion_timeout(flavor, image_meta,
++                                                          instance_meta)
++
++        self.assertEqual(300, timeout)
++
++    def test_live_migration_completion_timeout_image_overwrite_flavor(self):
++        self.flags(live_migration_completion_timeout=800, group='libvirt')
++
++        drvr = libvirt_driver.LibvirtDriver(fake.FakeVirtAPI(), False)
++
++        flavor = objects.Flavor(extra_specs={
++            "hw:wrs:live_migration_timeout": "300"})
++        image_meta = objects.ImageMeta.from_dict(
++            {"properties": {"hw_wrs_live_migration_timeout": "200"}})
++        instance_meta = {}
++
++        timeout = drvr._live_migration_completion_timeout(flavor, image_meta,
++                                                          instance_meta)
++
++        self.assertEqual(200, timeout)
++
++    def test_live_migration_completion_timeout_instance_overwrite_all(self):
++        self.flags(live_migration_completion_timeout=800, group='libvirt')
++
++        drvr = libvirt_driver.LibvirtDriver(fake.FakeVirtAPI(), False)
++
++        flavor = objects.Flavor(extra_specs={
++            "hw:wrs:live_migration_timeout": "300"})
++        image_meta = objects.ImageMeta.from_dict(
++            {"properties": {"hw_wrs_live_migration_timeout": "200"}})
++        instance_meta = {"hw:wrs:live_migration_timeout": "100"}
++
++        timeout = drvr._live_migration_completion_timeout(flavor, image_meta,
++                                                          instance_meta)
++
++        self.assertEqual(100, timeout)
++
++    def test_live_migration_completion_timeout_overwrite_zero(self):
++        self.flags(live_migration_completion_timeout=800, group='libvirt')
++
++        drvr = libvirt_driver.LibvirtDriver(fake.FakeVirtAPI(), False)
++
++        flavor = objects.Flavor(extra_specs={
++            "hw:wrs:live_migration_timeout": "300"})
++        image_meta = objects.ImageMeta.from_dict(
++            {"properties": {"hw_wrs_live_migration_timeout": "0"}})
++        instance_meta = {"hw:wrs:live_migration_timeout": "400"}
++
++        timeout = drvr._live_migration_completion_timeout(flavor, image_meta,
++                                                          instance_meta)
++
++        self.assertEqual(300, timeout)
++
++        flavor = objects.Flavor(extra_specs={
++            "hw:wrs:live_migration_timeout": "0"})
++        image_meta = objects.ImageMeta.from_dict(
++            {"properties": {"hw_wrs_live_migration_timeout": "200"}})
++        instance_meta = {}
++
++        timeout = drvr._live_migration_completion_timeout(flavor, image_meta,
++                                                          instance_meta)
++
++        self.assertEqual(200, timeout)
++
++    def test_live_migration_completion_timeout_invalid_value(self):
++        self.flags(live_migration_completion_timeout=800, group='libvirt')
++
++        drvr = libvirt_driver.LibvirtDriver(fake.FakeVirtAPI(), False)
++
++        flavor = objects.Flavor(extra_specs={
++            "hw:wrs:live_migration_max_downtime": "0"})
++        image_meta = objects.ImageMeta.from_dict(
++            {"properties": {"hw_wrs_live_migration_max_downtime": "0"}})
++        instance_meta = {}
++
++        timeout = drvr._live_migration_completion_timeout(flavor, image_meta,
++                                                          instance_meta)
++
++        self.assertEqual(800, timeout)
++
+     @mock.patch.object(host.Host, "get_connection")
+     @mock.patch.object(utils, "spawn")
+     @mock.patch.object(libvirt_driver.LibvirtDriver, "_live_migration_monitor")
+diff --git a/nova/tests/unit/virt/libvirt/test_migration.py b/nova/tests/unit/virt/libvirt/test_migration.py
+index 35f4458..33576ee 100644
+--- a/nova/tests/unit/virt/libvirt/test_migration.py
++++ b/nova/tests/unit/virt/libvirt/test_migration.py
+@@ -374,6 +374,12 @@ class MigrationMonitorTestCase(test.NoDBTestCase):
+         self.host = host.Host("qemu:///system")
+         self.guest = libvirt_guest.Guest(self.dom)
+ 
++    def fault_live_migration_timeout(self, timeout):
++        return "Live migration timeout after %d sec." % timeout
++
++    def fault_live_migration_stuck(self, timeout):
++        return "Live migration stuck for %d sec." % timeout
++
+     @mock.patch.object(libvirt_guest.Guest, "is_active", return_value=True)
+     def test_live_migration_find_type_active(self, mock_active):
+         self.assertEqual(migration.find_job_type(self.guest, self.instance),
+@@ -406,51 +412,57 @@ class MigrationMonitorTestCase(test.NoDBTestCase):
+ 
+     def test_live_migration_abort_stuck(self):
+         # Progress time exceeds progress timeout
+-        self.assertTrue(migration.should_abort(self.instance,
+-                                               5000,
+-                                               1000, 2000,
+-                                               4500, 9000,
+-                                               "running"))
++        self.assertEqual(migration.should_abort(self.instance,
++                                                5000,
++                                                1000, 2000,
++                                                4500, 9000,
++                                                "running"),
++                         (True, self.fault_live_migration_stuck(4000)))
+ 
+     def test_live_migration_abort_no_prog_timeout(self):
+         # Progress timeout is disabled
+-        self.assertFalse(migration.should_abort(self.instance,
++        self.assertEqual(migration.should_abort(self.instance,
+                                                 5000,
+                                                 1000, 0,
+                                                 4500, 9000,
+-                                                "running"))
++                                                "running"),
++                         (False, None))
+ 
+     def test_live_migration_abort_not_stuck(self):
+         # Progress time is less than progress timeout
+-        self.assertFalse(migration.should_abort(self.instance,
++        self.assertEqual(migration.should_abort(self.instance,
+                                                 5000,
+                                                 4500, 2000,
+                                                 4500, 9000,
+-                                                "running"))
++                                                "running"),
++                         (False, None))
+ 
+     def test_live_migration_abort_too_long(self):
+         # Elapsed time is over completion timeout
+-        self.assertTrue(migration.should_abort(self.instance,
++        self.assertEqual(migration.should_abort(self.instance,
+                                                5000,
+                                                4500, 2000,
+                                                4500, 2000,
+-                                               "running"))
++                                               "running"),
++                         (True, self.fault_live_migration_timeout(2000)))
+ 
+     def test_live_migration_abort_no_comp_timeout(self):
+         # Completion timeout is disabled
+-        self.assertFalse(migration.should_abort(self.instance,
++        self.assertEqual(migration.should_abort(self.instance,
+                                                 5000,
+                                                 4500, 2000,
+                                                 4500, 0,
+-                                                "running"))
++                                                "running"),
++                         (False, None))
+ 
+     def test_live_migration_abort_still_working(self):
+         # Elapsed time is less than completion timeout
+-        self.assertFalse(migration.should_abort(self.instance,
++        self.assertEqual(migration.should_abort(self.instance,
+                                                 5000,
+                                                 4500, 2000,
+                                                 4500, 9000,
+-                                                "running"))
++                                                "running"),
++                         (False, None))
+ 
+     def test_live_migration_postcopy_switch(self):
+         # Migration progress is not fast enough
+@@ -742,11 +754,7 @@ class MigrationMonitorTestCase(test.NoDBTestCase):
+         self.assertFalse(mock_resume.called)
+ 
+     def test_live_migration_downtime_steps(self):
+-        self.flags(live_migration_downtime=400, group='libvirt')
+-        self.flags(live_migration_downtime_steps=10, group='libvirt')
+-        self.flags(live_migration_downtime_delay=30, group='libvirt')
+-
+-        steps = migration.downtime_steps(3.0)
++        steps = migration.downtime_steps(1350, 400)
+ 
+         self.assertEqual([
+             (0, 40),
+diff --git a/nova/tests/unit/virt/test_virt_drivers.py b/nova/tests/unit/virt/test_virt_drivers.py
+index fb6bdc3..6b969d5 100644
+--- a/nova/tests/unit/virt/test_virt_drivers.py
++++ b/nova/tests/unit/virt/test_virt_drivers.py
+@@ -684,7 +684,8 @@ class _VirtDriverTestCase(_FakeDriverBackendTestCase):
+             migration=migration, bdms=[], block_migration=False,
+             serial_listen_addr='127.0.0.1')
+         self.connection.live_migration(self.ctxt, instance_ref, 'otherhost',
+-                                       lambda *a: None, lambda *a: None,
++                                       lambda *a: None,
++                                       lambda *a, **kwargs: None,
+                                        migrate_data=migrate_data)
+ 
+     @catch_notimplementederror
+diff --git a/nova/virt/libvirt/driver.py b/nova/virt/libvirt/driver.py
+index 9950a02..315d496 100644
+--- a/nova/virt/libvirt/driver.py
++++ b/nova/virt/libvirt/driver.py
+@@ -70,6 +70,7 @@ import six
+ from six.moves import range
+ 
+ from nova.api.metadata import base as instance_metadata
++from nova.api.openstack import common as apicommon
+ from nova import block_device
+ from nova.compute import power_state
+ from nova.compute import task_states
+@@ -6812,6 +6813,110 @@ class LibvirtDriver(driver.ComputeDriver):
+             device_names.append(dev.target_dev)
+         return (disk_paths, device_names)
+ 
++    @staticmethod
++    def _live_migration_max_downtime(flavor, image_meta, instance_meta):
++        """Calculate live migration downtime.
++
++        :param flavor: flavor
++        :param image_meta: image metadata
++        :param instance_meta: instance metadata
++
++        retrieve live migration downtime from flavor extra spec
++        or image properties or instance metadata.  Flavor takes priority,
++        then instance, then image.
++        """
++        downtime = image_meta.properties.get(
++            "hw_wrs_live_migration_max_downtime")
++        downtime_from_flavor = flavor.extra_specs.get(
++            "hw:wrs:live_migration_max_downtime")
++        downtime_from_instance = instance_meta.get(
++            "hw:wrs:live_migration_max_downtime")
++
++        if downtime_from_instance is not None:
++            downtime = downtime_from_instance
++
++        if downtime_from_flavor is not None:
++            downtime = downtime_from_flavor
++
++        if downtime is not None:
++            try:
++                downtime = int(downtime)
++            except ValueError:
++                LOG.warning("live_migration_max_downtime=%s is not a"
++                            " number", downtime)
++            if downtime < apicommon.LIVE_MIGRATION_MAX_DOWNTIME_MIN:
++                # Should only hit this for values in image properties since
++                # the other two are validated when they're originally set.
++                LOG.warning("live_migration_max_downtime=%s is less than "
++                            "minimum of 100, reverting to default",
++                            downtime)
++                downtime = None
++
++        if downtime is None:
++            downtime = CONF.libvirt.live_migration_downtime
++
++        return downtime
++
++    @staticmethod
++    def _live_migration_completion_timeout(flavor, image_meta, instance_meta):
++        """Calculate live migration completion timeout.
++
++        :param flavor: flavor
++        :param image_meta: image metadata
++        :param instance_meta: instance metadata
++
++        retrieve live migration timeout from flavor extra spec
++        or image metadata or instance metadata, whichever is smaller.
++        Use the timeout value as total value instead of
++        value per GB of RAM.
++        """
++        timeout_from_image = image_meta.properties.get(
++            "hw_wrs_live_migration_timeout")
++        timeout_from_flavor = flavor.extra_specs.get(
++            "hw:wrs:live_migration_timeout")
++        timeout_from_instance = instance_meta.get(
++            "hw:wrs:live_migration_timeout")
++
++        timeout = None
++        timeouts = set([])
++
++        if timeout_from_image is not None:
++            try:
++                timeouts.add(int(timeout_from_image))
++            except ValueError:
++                LOG.warning("hw_wrs_live_migration_timeout=%s is not a"
++                            " number", timeout_from_image)
++
++        if timeout_from_flavor is not None:
++            try:
++                timeouts.add(int(timeout_from_flavor))
++            except ValueError:
++                LOG.warning("hw:wrs:live_migration_timeout=%s is not a"
++                            " number", timeout_from_flavor)
++
++        if timeout_from_instance is not None:
++            try:
++                timeouts.add(int(timeout_from_instance))
++            except ValueError:
++                LOG.warning("hw:wrs:live_migration_timeout=%s is not a"
++                            " number", timeout_from_instance)
++
++        # If there's a zero timeout (which disables the completion timeout)
++        # then this will set timeout to zero.
++        if timeouts:
++            timeout = min(timeouts)
++
++        # If there's a non-zero timeout then this will set timeout to the
++        # lowest non-zero value.
++        timeouts.discard(0)
++        if timeouts:
++            timeout = min(timeouts)
++
++        if timeout is None:
++            timeout = CONF.libvirt.live_migration_completion_timeout
++
++        return timeout
++
+     def _live_migration_data_gb(self, instance, disk_paths):
+         '''Calculate total amount of data to be transferred
+ 
+@@ -6860,8 +6965,6 @@ class LibvirtDriver(driver.ComputeDriver):
+                                 migrate_data, finish_event,
+                                 disk_paths):
+         on_migration_failure = deque()
+-        data_gb = self._live_migration_data_gb(instance, disk_paths)
+-        downtime_steps = list(libvirt_migrate.downtime_steps(data_gb))
+         migration = migrate_data.migration
+         curdowntime = None
+ 
+@@ -6874,6 +6977,8 @@ class LibvirtDriver(driver.ComputeDriver):
+         progress_watermark = None
+         previous_data_remaining = -1
+         is_post_copy_enabled = self._is_post_copy_enabled(migration_flags)
++        should_abort = False
++        fault = None
+         while True:
+             info = guest.get_job_info()
+ 
+@@ -6914,12 +7019,14 @@ class LibvirtDriver(driver.ComputeDriver):
+                     progress_time = now
+ 
+                 progress_timeout = CONF.libvirt.live_migration_progress_timeout
+-                completion_timeout = int(
+-                    CONF.libvirt.live_migration_completion_timeout * data_gb)
+-                if libvirt_migrate.should_abort(instance, now, progress_time,
+-                                                progress_timeout, elapsed,
+-                                                completion_timeout,
+-                                                migration.status):
++                completion_timeout = self._live_migration_completion_timeout(
++                    instance.flavor, instance.image_meta, instance.metadata)
++                should_abort, fault = libvirt_migrate.should_abort(
++                    instance, now, progress_time,
++                    progress_timeout, elapsed,
++                    completion_timeout,
++                    migration.status)
++                if should_abort:
+                     try:
+                         guest.abort_job()
+                     except libvirt.libvirtError as e:
+@@ -6937,6 +7044,10 @@ class LibvirtDriver(driver.ComputeDriver):
+                                                             migration)
+                 previous_data_remaining = info.data_remaining
+ 
++                max_downtime = self._live_migration_max_downtime(
++                    instance.flavor, instance.image_meta, instance.metadata)
++                downtime_steps = list(libvirt_migrate.downtime_steps(
++                    completion_timeout, max_downtime))
+                 curdowntime = libvirt_migrate.update_downtime(
+                     guest, instance, curdowntime,
+                     downtime_steps, elapsed)
+@@ -6992,15 +7103,28 @@ class LibvirtDriver(driver.ComputeDriver):
+                 # Migration is all done
+                 LOG.info("Migration operation has completed",
+                          instance=instance)
+-                post_method(context, instance, dest, block_migration,
+-                            migrate_data)
++                # Run post-live-migration. Recover the VM if we hit
++                # an exception such as RPC timeout.
++                try:
++                    post_method(context, instance, dest, block_migration,
++                                migrate_data)
++                except Exception as e:
++                    LOG.error("Migration post_method failed, "
++                              "error=%(error)r",
++                              {'error': e}, instance=instance)
++                    libvirt_migrate.run_recover_tasks(self._host, guest,
++                                                      instance,
++                                                      on_migration_failure)
++                    recover_method(context, instance, dest, migrate_data,
++                                   fault=fault)
+                 break
+             elif info.type == libvirt.VIR_DOMAIN_JOB_FAILED:
+                 # Migration did not succeed
+                 LOG.error("Migration operation has aborted", instance=instance)
+                 libvirt_migrate.run_recover_tasks(self._host, guest, instance,
+                                                   on_migration_failure)
+-                recover_method(context, instance, dest, migrate_data)
++                recover_method(context, instance, dest, migrate_data,
++                               fault=fault)
+                 break
+             elif info.type == libvirt.VIR_DOMAIN_JOB_CANCELLED:
+                 # Migration was stopped by admin
+@@ -7009,7 +7133,7 @@ class LibvirtDriver(driver.ComputeDriver):
+                 libvirt_migrate.run_recover_tasks(self._host, guest, instance,
+                                                   on_migration_failure)
+                 recover_method(context, instance, dest, migrate_data,
+-                               migration_status='cancelled')
++                               migration_status='cancelled', fault=fault)
+                 break
+             else:
+                 LOG.warning("Unexpected migration job type: %d",
+diff --git a/nova/virt/libvirt/migration.py b/nova/virt/libvirt/migration.py
+index 13e84fe..8d9c012 100644
+--- a/nova/virt/libvirt/migration.py
++++ b/nova/virt/libvirt/migration.py
+@@ -273,24 +273,29 @@ def should_abort(instance, now,
+ 
+     Avoid migration to be aborted if it is running in post-copy mode
+ 
+-    :returns: True if migration should be aborted, False otherwise
++    :returns: (result, fault): result is True if migration should be aborted,
++    False otherwise; fault is the description of failure when abort
+     """
+     if migration_status == 'running (post-copy)':
+-        return False
++        return False, None
+ 
+     if (progress_timeout != 0 and
+             (now - progress_time) > progress_timeout):
+         LOG.warning("Live migration stuck for %d sec",
+                     (now - progress_time), instance=instance)
+-        return True
++        fault = "Live migration stuck for %d sec." \
++                % (now - progress_time)
++        return True, fault
+ 
+     if (completion_timeout != 0 and
+             elapsed > completion_timeout):
+         LOG.warning("Live migration not completed after %d sec",
+                     completion_timeout, instance=instance)
+-        return True
++        fault = "Live migration timeout after %d sec." \
++                % completion_timeout
++        return True, fault
+ 
+-    return False
++    return False, None
+ 
+ 
+ def should_switch_to_postcopy(memory_iteration, current_data_remaining,
+@@ -502,16 +507,16 @@ def run_recover_tasks(host, guest, instance, on_migration_failure):
+                         {"task": task}, instance=instance)
+ 
+ 
+-def downtime_steps(data_gb):
++def downtime_steps(completion_timeout, downtime):
+     '''Calculate downtime value steps and time between increases.
+ 
+-    :param data_gb: total GB of RAM and disk to transfer
+-
++    :param completion_timeout: allowed time to complete migration in secs
++    :param downtime: max allowed downtime in msecs
+     This looks at the total downtime steps and upper bound
+     downtime value and uses a linear function.
+ 
+-    For example, with 10 steps, 30 second step delay, 3 GB
+-    of RAM and 400ms target maximum downtime, the downtime will
++    For example, with 10 steps, 1350sec overall timeout,
++    and 400ms target maximum downtime, the downtime will
+     be increased every 90 seconds in the following progression:
+ 
+     -   0 seconds -> set downtime to  40ms
+@@ -529,11 +534,15 @@ def downtime_steps(data_gb):
+     This allows the guest a good chance to complete migration
+     with a small downtime value.
+     '''
+-    downtime = CONF.libvirt.live_migration_downtime
+     steps = CONF.libvirt.live_migration_downtime_steps
+-    delay = CONF.libvirt.live_migration_downtime_delay
+ 
+-    delay = int(delay * data_gb)
++    # rather than get the delay from the config option, we'll
++    # calculate it such that we ramp up to the max downtime at
++    # 2/3 of the overall live migration completion timeout
++    delay = int(completion_timeout * 2.0 / 3 / steps)
++
++    # we want the delay to be fixed, not relative to data size
++    # delay = int(delay * data_gb)
+ 
+     base = downtime / steps
+     offset = (downtime - base) / steps
+-- 
+2.7.4
+

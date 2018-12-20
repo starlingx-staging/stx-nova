@@ -1,0 +1,172 @@
+From c4b046d3047fd018a6c7cd93f3c884cbb39c2fe4 Mon Sep 17 00:00:00 2001
+From: Gerry Kopec <Gerry.Kopec@windriver.com>
+Date: Fri, 8 Jul 2016 22:46:50 -0400
+Subject: [PATCH] Add vif_model to servers schema
+
+Update api servers schema to include wrs-if:vif_model in network
+properties for api v2.19 and remove unsupported vif_models from
+VIF_MODEL_ALL list.  Api validation will now reject vif_models that are
+not supported.  Unsupported vif_models in image properties will also be
+rejected.
+
+For next rebase this commit should be merged with commits 867b623 and
+abbc4dd.
+---
+ nova/api/openstack/compute/schemas/servers.py       | 11 +++++++++++
+ nova/network/model.py                               |  8 ++++----
+ .../unit/api/openstack/compute/test_serversV21.py   | 21 +++++++++++++++++++++
+ nova/tests/unit/objects/test_fields.py              | 12 ++++++++----
+ nova/tests/unit/objects/test_objects.py             |  2 +-
+ nova/tests/unit/virt/libvirt/test_vif.py            | 11 +++++++++--
+ 6 files changed, 54 insertions(+), 11 deletions(-)
+
+diff --git a/nova/api/openstack/compute/schemas/servers.py b/nova/api/openstack/compute/schemas/servers.py
+index d857a60..aa79188 100644
+--- a/nova/api/openstack/compute/schemas/servers.py
++++ b/nova/api/openstack/compute/schemas/servers.py
+@@ -11,10 +11,18 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2016 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ import copy
+ 
+ from nova.api.validation import parameter_types
++from nova.network import model
+ 
+ 
+ base_create = {
+@@ -61,6 +69,9 @@ base_create_v20['properties']['server'][
+ base_create_v219 = copy.deepcopy(base_create)
+ base_create_v219['properties']['server'][
+     'properties']['description'] = parameter_types.description
++# add vif_model to networks properties for v2.19
++base_create_v219['properties']['server']['properties']['networks'][
++    'items']['properties']['wrs-if:vif_model'] = {'enum': model.VIF_MODEL_ALL}
+ 
+ 
+ base_update = {
+diff --git a/nova/network/model.py b/nova/network/model.py
+index a12ddf8..7582ff5 100644
+--- a/nova/network/model.py
++++ b/nova/network/model.py
+@@ -119,6 +119,10 @@ VIF_MODEL_VMXNET3 = 'vmxnet3'
+  
++# change supported vif_models from upstream
++#   removed: VIF_MODEL_NETFRONT, VIF_MODEL_SPAPR_VLAN, VIF_MODEL_VMXNET,
++#            VIF_MODEL_VMXNET3
+ VIF_MODEL_ALL = (
+     VIF_MODEL_VIRTIO,
+     VIF_MODEL_NE2K_PCI,
+@@ -126,11 +130,7 @@ VIF_MODEL_ALL = (
+     VIF_MODEL_RTL8139,
+     VIF_MODEL_E1000,
+     VIF_MODEL_E1000E,
+-    VIF_MODEL_NETFRONT,
+-    VIF_MODEL_SPAPR_VLAN,
+     VIF_MODEL_SRIOV,
+-    VIF_MODEL_VMXNET,
+-    VIF_MODEL_VMXNET3,
+ )
+ 
+diff --git a/nova/tests/unit/api/openstack/compute/test_serversV21.py b/nova/tests/unit/api/openstack/compute/test_serversV21.py
+index 0e0e999..31d369c 100644
+--- a/nova/tests/unit/api/openstack/compute/test_serversV21.py
++++ b/nova/tests/unit/api/openstack/compute/test_serversV21.py
+ class ServersControllerCreateTestWithMock(test.TestCase):
+     image_uuid = '76fa36fc-c930-4bf3-8c8a-ea2a2420deb6'
+diff --git a/nova/tests/unit/objects/test_fields.py b/nova/tests/unit/objects/test_fields.py
+index 7243491..0723f62 100644
+--- a/nova/tests/unit/objects/test_fields.py
++++ b/nova/tests/unit/objects/test_fields.py
+@@ -11,6 +11,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2016 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ import datetime
+ 
+@@ -579,20 +586,17 @@ class TestVIFModel(TestField):
+     def setUp(self):
+         super(TestVIFModel, self).setUp()
+         self.field = fields.VIFModelField()
++        # removed unspported models: netfront, spapr-vlan, vmxnet, vmxnet3
+         self.coerce_good_values = [('virtio', 'virtio'),
+                                    ('ne2k_pci', 'ne2k_pci'),
+                                    ('pcnet', 'pcnet'),
+                                    ('rtl8139', 'rtl8139'),
+                                    ('e1000', 'e1000'),
+                                    ('e1000e', 'e1000e'),
+-                                   ('netfront', 'netfront'),
+-                                   ('spapr-vlan', 'spapr-vlan'),
+                                    ('VirtualE1000', 'e1000'),
+                                    ('VirtualE1000e', 'e1000e'),
+                                    ('VirtualPCNet32', 'pcnet'),
+                                    ('VirtualSriovEthernetCard', 'sriov'),
+-                                   ('VirtualVmxnet', 'vmxnet'),
+-                                   ('VirtualVmxnet3', 'vmxnet3'),
+                                   ]
+         self.coerce_bad_values = ['acme']
+         self.to_primitive_values = self.coerce_good_values[0:1]
+diff --git a/nova/tests/unit/objects/test_objects.py b/nova/tests/unit/objects/test_objects.py
+index d063c06..d254287 100644
+--- a/nova/tests/unit/objects/test_objects.py
++++ b/nova/tests/unit/objects/test_objects.py
+@@ -1133,7 +1133,7 @@ object_data = {
+     'HyperVLiveMigrateData': '1.0-0b868dd6228a09c3f3e47016dddf6a1c',
+     'HVSpec': '1.2-db672e73304da86139086d003f3977e7',
+     'ImageMeta': '1.8-642d1b2eb3e880a367f37d72dd76162d',
+-    'ImageMetaProps': '1.12-f265fe64dbd9de4c8619df5bb1a60012',
++    'ImageMetaProps': '1.12-76a23c0e1a2f2d3dde9c1b78a5684afd',
+     'Instance': '2.1-7250f4c0dacbb7e0e9da79eac7b990c2',
+     'InstanceAction': '1.1-f9f293e526b66fca0d05c3b3a2d13914',
+     'InstanceActionEvent': '1.1-e56a64fa4710e43ef7af2ad9d6028b33',
+diff --git a/nova/tests/unit/virt/libvirt/test_vif.py b/nova/tests/unit/virt/libvirt/test_vif.py
+index 6f48247..e515735 100644
+--- a/nova/tests/unit/virt/libvirt/test_vif.py
++++ b/nova/tests/unit/virt/libvirt/test_vif.py
+@@ -11,6 +11,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2016 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ import os
+ 
+@@ -566,11 +573,11 @@ class LibvirtVifTestCase(test.NoDBTestCase):
+                        group='libvirt')
+ 
+             d = vif.LibvirtGenericVIFDriver()
++            # removed unspported model: VIF_MODEL_SPAPR_VLAN
+             supported = (network_model.VIF_MODEL_NE2K_PCI,
+                          network_model.VIF_MODEL_PCNET,
+                          network_model.VIF_MODEL_RTL8139,
+-                         network_model.VIF_MODEL_E1000,
+-                         network_model.VIF_MODEL_SPAPR_VLAN)
++                         network_model.VIF_MODEL_E1000)
+             for model in supported:
+                 image_meta = objects.ImageMeta.from_dict(
+                     {'properties': {'hw_vif_model': model}})
+-- 
+2.7.4
+

@@ -1,0 +1,1293 @@
+From 5a7201265903bcc0e9e8c7c40539089645a6f19e Mon Sep 17 00:00:00 2001
+From: Jack Ding <jack.ding@windriver.com>
+Date: Fri, 1 Sep 2017 09:48:52 -0400
+Subject: [PATCH 014/143] primary: enable pinning of virtual numa nodes
+
+This commit enables numa node pinning along with related extra specs
+validation, resource tracking, logging and unit tests.
+
+For maximum performance we may want to explicitly map the numa nodes
+of an instance to specific host numa nodes (to use advance knowledge
+of which host numa nodes are running vswitch code, for example).
+
+This commit adds support for flavor/image metadata of the form
+hw:numa_node.<virtnode>=<physnode> (for the flavor) or
+hw_numa_node.<virtnode>=<physnode> (for the image).
+
+There are some restrictions:
+- virtnode value must be less than hw:numa_nodes spec
+- If specified for any instance nodes, it must be specified for all of
+  them.
+- No two instance nodes can map to the same physical node.
+- If numa node pinning is enabled, it implies dedicated CPU resources.
+- If either the flavor or the image explicitly specifies shared CPU
+  resources, then pinning of numa nodes is not allowed.
+- Specified physnode must be less than MAX_HOST_NUMA_NODES (currently =
+  4)
+- Additional checking is also added to confirm that flavor vcpus and
+  memory_mb is divisible by hw:numa_nodes if hw:numa_cpus spec is not
+used
+
+Also adds compute per-numa node pinning and memory usage audit logs.
+This prints hypervisor per numa-node memory, and pinned vs unpinned
+pcpus.
+The following is sample format of resource logs (per numa node):
+Numa node=0; memory:  1098 MiB total,  1098 MiB avail
+Numa node=0; per-pgsize: 4K: 42 MiB total, 42 MiB avail; 2M: 1056 MiB
+total, 1056 MiB avail
+Numa node=0; cpu_usage:0.000, pcpus:4, pinned:0, shared:0.000,
+unpinned:4; pinned_cpulist:-, unpinned_cpulist:2-5
+
+Change-Id: Id17c0824a0a0b8d98d292e6d61fe5fe4738b52e9
+
+This commit is a merge of a number of R3 commits:
+5f3fb50 Enable pinning of virtual numa nodes
+10d648b Port compute per-numa node pinning and memory usage
+audit logs
+07f45a8 setting flavor extraspec NUMA_NODE
+8a57afa fix Guest NUMA Node value (pnode) validation
+635e359 Flavor extra-spec API exception errors
+
+This commit also brings in some common code used by resource tracking
+originally done in R3 commits daf786d (resource_tracker),
+56bd66e (list_to_range) and 748dcba (range_to_list)
+
+Also includes R4 commits b421cd1 and fb5ac37:
+Add unit tests for numa pinning
+
+For port to Pike,
+e608611 Nova tox add checks for upstream cpu pinning tests
+04183c0 Remove numatune memory mode so we get 'default' memory
+policy
+   This removes numatune memory mode XML domain formatting so that we
+get
+   'default' memory allocation policy for 4K memory.
+
+   This addresses out-of-memory killer scenarios that occur when
+launching
+   VMs when there is insufficient 4K memory on a numa node.
+
+   See these relate JIRAs:
+   AIO-Simplex: Out of memory killer seen after launching VM
+   SystemTest 2+2+20 - VM got stuck in resize during
+   stack-update
+
+   numatune XML for a 2 numa VM will look like this:
+   <numatune>
+     <memnode cellid='0' mode='strict' nodeset='0'/>
+     <memnode cellid='1' mode='strict' nodeset='1'/>
+   </numatune>
+
+   instead of this:
+   <numatune>
+     <memory mode='strict' nodeset='0-1'/>
+     <memnode cellid='0' mode='strict' nodeset='0'/>
+     <memnode cellid='1' mode='strict' nodeset='1'/>
+   </numatune>
+
+   The end result is that /proc/<pid>/numa_maps 4K memory policy will
+show
+   'default' instead of 'bind:<x>' for everything except qemu hugepages
+   membacking.
+
+   The numa_maps will look like this:
+   7fe3a3400000 default anon=64 dirty=64 N0=64 kernelpagesize_kB=4
+   . .
+   7fe3a5600000 default stack:219058 anon=4 dirty=4 N0=4
+   kernelpagesize_kB=4
+   . .
+   7fe3a5e00000 bind:1
+   file=/mnt/huge-2048kB/libvirt/qemu/qemu_back_mem._objects_ram-node1.JhY5SD\040(deleted)
+   \
+    huge dirty=256 mapmax=2 N1=256 kernelpagesize_kB=2048
+   . .
+   7fe3c6000000 bind:0
+   file=/mnt/huge-2048kB/libvirt/qemu/qemu_back_mem._objects_ram-node0.Z0GkXp\040(deleted)
+   \
+    huge dirty=256 mapmax=3 N0=256 kernelpagesize_kB=2048
+   . . elided
+
+__TYPE_primary
+__TAG_numa_pinning,instancenumacell,resource,scheduler
+__R4_commit_be3f026
+__R3_commit_947c503
+__TC2891,TC2892,TC2893
+---
+ nova/api/openstack/compute/flavors_extraspecs.py   |  90 ++++++++-
+ nova/api/openstack/compute/servers.py              |   3 +
+ nova/compute/flavors.py                            |   8 +-
+ nova/compute/resource_tracker.py                   |  64 +++++-
+ nova/exception.py                                  |  18 +-
+ nova/objects/image_meta.py                         |  27 ++-
+ nova/objects/instance_numa_topology.py             |  20 ++
+ .../unit/api/openstack/compute/test_serversV21.py  |   3 +
+ .../unit/objects/test_instance_numa_topology.py    |  21 ++
+ nova/tests/unit/objects/test_objects.py            |   4 +-
+ nova/tests/unit/virt/libvirt/test_config.py        |   4 +
+ nova/tests/unit/virt/libvirt/test_driver.py        |   4 +
+ nova/tests/unit/virt/test_hardware.py              | 222 ++++++++++++++++++++-
+ nova/utils.py                                      |  29 +++
+ nova/virt/hardware.py                              |  98 ++++++++-
+ nova/virt/libvirt/config.py                        |  10 +-
+ 16 files changed, 603 insertions(+), 22 deletions(-)
+
+diff --git a/nova/api/openstack/compute/flavors_extraspecs.py b/nova/api/openstack/compute/flavors_extraspecs.py
+index 88a58e8..d9fb5c3 100644
+--- a/nova/api/openstack/compute/flavors_extraspecs.py
++++ b/nova/api/openstack/compute/flavors_extraspecs.py
+@@ -13,7 +13,7 @@
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
+ #
+-# Copyright (c) 2016-2017 Wind River Systems, Inc.
++# Copyright (c) 2013-2017 Wind River Systems, Inc.
+ #
+ # The right to copy, distribute, modify, or otherwise make use
+ # of this software may be licensed only pursuant to the terms
+@@ -32,12 +32,20 @@ from nova import exception
+ from nova.i18n import _
+ from nova import objects
+ from nova.objects import fields
++from nova.objects import image_meta
+ from nova.policies import flavor_extra_specs as fes_policies
+ from nova import utils
++from nova.virt import hardware
+ 
+ from oslo_serialization import jsonutils
+ from oslo_utils import strutils
+ 
++# flavor extra specs keys needed for multiple validation routines
++CPU_POLICY_KEY = 'hw:cpu_policy'
++
++# host numa nodes
++MAX_HOST_NUMA_NODES = 4
++
+ 
+ class FlavorExtraSpecsController(wsgi.Controller):
+     """The flavor extra specs API controller for the OpenStack API."""
+@@ -56,6 +64,85 @@ class FlavorExtraSpecsController(wsgi.Controller):
+                 raise webob.exc.HTTPBadRequest(explanation=msg)
+ 
+     @staticmethod
++    def _validate_numa_node(flavor):
++        NUMA_NODES_KEY = 'hw:numa_nodes'
++        NUMA_NODE_PREFIX = 'hw:numa_node.'
++        specs = flavor.extra_specs
++        try:
++            hw_numa_nodes = int(specs.get(NUMA_NODES_KEY, 1))
++        except ValueError:
++            msg = _('hw:numa_nodes value must be an integer')
++            raise webob.exc.HTTPBadRequest(explanation=msg)
++        if hw_numa_nodes < 1:
++            msg = _('hw:numa_nodes value must be greater than 0')
++            raise webob.exc.HTTPBadRequest(explanation=msg)
++
++        for key in specs:
++            if key.startswith(NUMA_NODE_PREFIX):
++                # NUMA pinning not allowed when CPU policy is shared
++                if (specs.get(CPU_POLICY_KEY) ==
++                        fields.CPUAllocationPolicy.SHARED):
++                    msg = _('hw:numa_node not permitted when cpu policy '
++                            'is set to shared')
++                    raise webob.exc.HTTPConflict(explanation=msg)
++                suffix = key.split(NUMA_NODE_PREFIX, 1)[1]
++                try:
++                    vnode = int(suffix)
++                except ValueError:
++                    msg = _('virtual numa node number must be an integer')
++                    raise webob.exc.HTTPBadRequest(explanation=msg)
++                if vnode < 0:
++                    msg = _('virtual numa node number must be greater than or '
++                            'equal to 0')
++                    raise webob.exc.HTTPBadRequest(explanation=msg)
++                try:
++                    pnode = int(specs[key])
++                except ValueError:
++                    msg = _('%s must be an integer') % key
++                    raise webob.exc.HTTPBadRequest(explanation=msg)
++                if pnode < 0:
++                    msg = _('%s must be greater than or equal to 0') % key
++                    raise webob.exc.HTTPBadRequest(explanation=msg)
++                if pnode >= MAX_HOST_NUMA_NODES:
++                    msg = (_('%(K)s value %(P)d is not valid. It must '
++                             'be an integer from 0 to %(N)d') %
++                           {'K': key,
++                            'P': pnode,
++                            'N': MAX_HOST_NUMA_NODES - 1
++                           })
++                    raise webob.exc.HTTPBadRequest(explanation=msg)
++                if vnode >= hw_numa_nodes:
++                    msg = _('all hw:numa_node keys must use vnode id less than'
++                            ' the specified hw:numa_nodes value (%s)') \
++                        % hw_numa_nodes
++                    raise webob.exc.HTTPBadRequest(explanation=msg)
++
++        # Asymmetric NUMA topology protection
++        # Do common error check from numa_get_constraints with a clearer error
++        if hw_numa_nodes > 0 and specs.get('hw:numa_cpus.0') is None:
++            if (flavor.vcpus % hw_numa_nodes) > 0:
++                msg = _('flavor vcpus not evenly divisible by'
++                        ' the specified hw:numa_nodes value (%s)') \
++                      % hw_numa_nodes
++                raise webob.exc.HTTPConflict(explanation=msg)
++            if (flavor.memory_mb % hw_numa_nodes) > 0:
++                msg = _('flavor memory not evenly divisible by'
++                        ' the specified hw:numa_nodes value (%s) so'
++                        ' per NUMA-node values must be explicitly specified') \
++                      % hw_numa_nodes
++                raise webob.exc.HTTPConflict(explanation=msg)
++
++        # Catchall test
++        try:
++            # Check if this modified flavor would be valid assuming
++            # no image metadata.
++            hardware.numa_get_constraints(flavor, image_meta.ImageMeta(
++                    properties=image_meta.ImageMetaProps()))
++        except Exception as error:
++            msg = _('%s') % error.message
++            raise webob.exc.HTTPConflict(explanation=msg)
++
++    @staticmethod
+     def _validate_nested_vmx(flavor):
+         key = 'hw:wrs:nested_vmx'
+         specs = flavor.extra_specs
+@@ -83,6 +170,7 @@ class FlavorExtraSpecsController(wsgi.Controller):
+     # add it back in to the args.
+     def _validate_extra_specs(self, flavor):
+         self._validate_vcpu_models(flavor)
++        self._validate_numa_node(flavor)
+         self._validate_nested_vmx(flavor)
+ 
+     def _get_extra_specs(self, context, flavor_id):
+diff --git a/nova/api/openstack/compute/servers.py b/nova/api/openstack/compute/servers.py
+index a1abc37..263ca93 100644
+--- a/nova/api/openstack/compute/servers.py
++++ b/nova/api/openstack/compute/servers.py
+@@ -632,6 +632,9 @@ class ServersController(wsgi.Controller):
+                 exception.ImageNUMATopologyCPUOutOfRange,
+                 exception.ImageNUMATopologyCPUDuplicates,
+                 exception.ImageNUMATopologyCPUsUnassigned,
++                exception.ImageNUMATopologyNodesForbidden,
++                exception.ImageNUMATopologyNodesIncomplete,
++                exception.ImageNUMATopologyNodesDuplicates,
+                 exception.ImageNUMATopologyMemoryOutOfRange,
+                 exception.InvalidNUMANodesNumber,
+                 exception.InstanceGroupNotFound,
+diff --git a/nova/compute/flavors.py b/nova/compute/flavors.py
+index 281d12b..9093cb2 100644
+--- a/nova/compute/flavors.py
++++ b/nova/compute/flavors.py
+@@ -15,6 +15,12 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2013-2017 Wind River Systems, Inc.
++#
++#
++#
++#
+ 
+ """Built-in instance properties."""
+ 
+@@ -64,7 +70,7 @@ system_metadata_flavor_props = {
+ 
+ 
+ system_metadata_flavor_extra_props = [
+-    'hw:numa_cpus.', 'hw:numa_mem.',
++    'hw:numa_cpus.', 'hw:numa_mem.', 'hw:numa_node.',
+ ]
+ 
+ 
+diff --git a/nova/compute/resource_tracker.py b/nova/compute/resource_tracker.py
+index 81d8756..14a6eb7 100644
+--- a/nova/compute/resource_tracker.py
++++ b/nova/compute/resource_tracker.py
+@@ -12,6 +12,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2014-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ """
+ Track resources like memory and disk for a compute host.  Provides the
+@@ -23,6 +30,7 @@ import copy
+ 
+ from oslo_log import log as logging
+ from oslo_serialization import jsonutils
++from oslo_utils import units
+ 
+ from nova.compute import claims
+ from nova.compute import monitors
+@@ -720,8 +728,6 @@ class ResourceTracker(object):
+         dev_pools_obj = self.pci_tracker.stats.to_device_pools_obj()
+         cn.pci_device_pools = dev_pools_obj
+ 
+-        self._report_final_resource_view(nodename)
+-
+         metrics = self._get_host_metrics(context, nodename)
+         # TODO(pmurray): metrics should not be a json string in ComputeNode,
+         # but it is. This should be changed in ComputeNode
+@@ -732,6 +738,9 @@ class ResourceTracker(object):
+         LOG.debug('Compute_service record updated for %(host)s:%(node)s',
+                   {'host': self.host, 'node': nodename})
+ 
++        # move _report_final to reflect _update and metrics
++        self._report_final_resource_view(nodename)
++
+     def _get_compute_node(self, context, nodename):
+         """Returns compute node for the host and nodename."""
+         try:
+@@ -794,6 +803,7 @@ class ResourceTracker(object):
+         else:
+             tcpu = 0
+             ucpu = 0
++            LOG.audit(_("Free VCPU information unavailable"))
+         pci_stats = (list(cn.pci_device_pools) if
+             cn.pci_device_pools else [])
+         LOG.info("Final resource view: "
+@@ -814,6 +824,56 @@ class ResourceTracker(object):
+                   'used_vcpus': ucpu,
+                   'pci_stats': pci_stats})
+ 
++        # display per-numa resources
++        host_numa_topology, jsonify_result = \
++            hardware.host_topology_and_format_from_host(cn)
++        if host_numa_topology is None:
++            host_numa_topology = objects.NUMATopology(cells=[])
++
++        # display per-numa memory usage
++        for cell in host_numa_topology.cells:
++            LOG.info(
++                'Numa node=%(node)d; '
++                'memory: %(T)5d MiB total, %(A)5d MiB avail',
++                {'node': cell.id, 'T': cell.memory, 'A': cell.avail_memory})
++        for cell in host_numa_topology.cells:
++            mem = []
++            for M in cell.mempages:
++                unit = 'K'
++                size = M.size_kb
++                if M.size_kb >= units.Ki and M.size_kb < units.Mi:
++                    unit = 'M'
++                    size = M.size_kb / units.Ki
++                if M.size_kb >= units.Mi:
++                    unit = 'G'
++                    size = M.size_kb / units.Mi
++                m = '%(sz)s%(U)s: %(T).0f MiB total, %(A).0f MiB avail' % \
++                    {'sz': size, 'U': unit,
++                     'T': M.size_kb * M.total / units.Ki,
++                     'A': M.size_kb * (M.total - M.used) / units.Ki,
++                     }
++                mem.append(m)
++            LOG.info('Numa node=%(node)d; per-pgsize: %(pgsize)s',
++                     {'node': cell.id, 'pgsize': '; '.join(mem)})
++
++        # display per-numa cpu usage
++        for cell in host_numa_topology.cells:
++            cpuset = set(cell.cpuset)
++            pinned = set(cell.pinned_cpus)
++            unpinned = cpuset - pinned
++            shared = cell.cpu_usage - len(pinned)
++            LOG.info(
++                'Numa node=%(node)d; cpu_usage:%(usage).3f, pcpus:%(pcpus)d, '
++                'pinned:%(P)d, shared:%(S).3f, unpinned:%(U)d; '
++                'pinned_cpulist:%(LP)s, '
++                'unpinned_cpulist:%(LU)s',
++                {'usage': cell.cpu_usage,
++                 'node': cell.id, 'pcpus': len(cpuset),
++                 'P': len(pinned), 'S': shared, 'U': len(unpinned),
++                 'LP': utils.list_to_range(sorted(list(pinned))) or '-',
++                 'LU': utils.list_to_range(sorted(list(unpinned))) or '-',
++                 })
++
+     def _resource_change(self, compute_node):
+         """Check to see if any resources have changed."""
+         nodename = compute_node.hypervisor_hostname
+diff --git a/nova/exception.py b/nova/exception.py
+index 8233f74..6b19da9 100644
+--- a/nova/exception.py
++++ b/nova/exception.py
+@@ -14,12 +14,13 @@
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
+ #
+-# Copyright (c) 2016-2017 Wind River Systems, Inc.
++# Copyright (c) 2013-2017 Wind River Systems, Inc.
+ #
+ # The right to copy, distribute, modify, or otherwise make use
+ # of this software may be licensed only pursuant to the terms
+ # of an applicable Wind River license agreement.
+ #
++
+ """Nova base exception handling.
+ 
+ Includes decorator for re-raising Nova-type exceptions.
+@@ -1973,6 +1974,21 @@ class ImageCPUThreadPolicyForbidden(Forbidden):
+                 "override CPU thread pinning policy set against the flavor")
+ 
+ 
++class ImageNUMATopologyNodesIncomplete(Invalid):
++    msg_fmt = _("Host NUMA node mapping must be provided for all "
++                "NUMA nodes or for none of them.")
++
++
++class ImageNUMATopologyNodesDuplicates(Invalid):
++    msg_fmt = _("One or more NUMA nodes are assigned to the same host node")
++
++
++class ImageNUMATopologyNodesForbidden(Forbidden):
++    msg_fmt = _("Image property 'hw_numa_node.X' is not permitted to "
++                "override CPU pinning policy of 'shared' set against the "
++                "flavor or image.")
++
++
+ class UnsupportedPolicyException(Invalid):
+     msg_fmt = _("ServerGroup policy is not supported: %(reason)s")
+ 
+diff --git a/nova/objects/image_meta.py b/nova/objects/image_meta.py
+index 451b614..15bbd5b 100644
+--- a/nova/objects/image_meta.py
++++ b/nova/objects/image_meta.py
+@@ -12,12 +12,13 @@
+ # License for the specific language governing permissions and limitations
+ # under the License.
+ #
+-# Copyright (c) 2016-2017 Wind River Systems, Inc.
++# Copyright (c) 2013-2017 Wind River Systems, Inc.
+ #
+ # The right to copy, distribute, modify, or otherwise make use
+ # of this software may be licensed only pursuant to the terms
+ # of an applicable Wind River license agreement.
+ #
++
+ import copy
+ 
+ from oslo_utils import versionutils
+@@ -315,6 +316,10 @@ class ImageMetaProps(base.NovaObject):
+         # list value indicates the memory size of that node.
+         'hw_numa_mem': fields.ListOfIntegersField(),
+ 
++        # Each list entry corresponds to a guest NUMA node and the
++        # list value indicates the host node for that node.
++        'hw_numa_node': fields.ListOfIntegersField(),
++
+         # Generic property to specify the pointer model type.
+         'hw_pointer_model': fields.PointerModelField(),
+ 
+@@ -543,14 +548,32 @@ class ImageMetaProps(base.NovaObject):
+         if hw_numa_cpus_set:
+             self.hw_numa_cpus = hw_numa_cpus
+ 
++    # extension to set numa node in image
++    def _set_numa_node(self, image_props):
++        hw_numa_node = []
++        hw_numa_node_set = False
++        for cellid in range(ImageMetaProps.NUMA_NODES_MAX):
++            memprop = "hw_numa_node.%d" % cellid
++            if memprop not in image_props:
++                break
++            hw_numa_node.append(int(image_props[memprop]))
++            hw_numa_node_set = True
++            del image_props[memprop]
++
++        if hw_numa_node_set:
++            self.hw_numa_node = hw_numa_node
++
+     def _set_attr_from_current_names(self, image_props):
+         for key in self.fields:
+-            # The two NUMA fields need special handling to
++            # The three NUMA fields need special handling to
+             # un-stringify them correctly
+             if key == "hw_numa_mem":
+                 self._set_numa_mem(image_props)
+             elif key == "hw_numa_cpus":
+                 self._set_numa_cpus(image_props)
++            # add hw_numa_node
++            elif key == "hw_numa_node":
++                self._set_numa_node(image_props)
+             else:
+                 if key not in image_props:
+                     continue
+diff --git a/nova/objects/instance_numa_topology.py b/nova/objects/instance_numa_topology.py
+index 3872d69..d4abab8 100644
+--- a/nova/objects/instance_numa_topology.py
++++ b/nova/objects/instance_numa_topology.py
+@@ -11,6 +11,12 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2013-2017 Wind River Systems, Inc.
++#
++#
++#
++#
+ 
+ from oslo_serialization import jsonutils
+ from oslo_utils import versionutils
+@@ -31,6 +37,7 @@ class InstanceNUMACell(base.NovaObject,
+     # Version 1.2: Add cpu_pinning_raw and topology fields
+     # Version 1.3: Add cpu_policy and cpu_thread_policy fields
+     # Version 1.4: Add cpuset_reserved field
++    #              Add physnode
+     VERSION = '1.4'
+ 
+     def obj_make_compatible(self, primitive, target_version):
+@@ -48,6 +55,7 @@ class InstanceNUMACell(base.NovaObject,
+         'id': obj_fields.IntegerField(),
+         'cpuset': obj_fields.SetOfIntegersField(),
+         'memory': obj_fields.IntegerField(),
++        'physnode': obj_fields.IntegerField(nullable=True),
+         'pagesize': obj_fields.IntegerField(nullable=True),
+         'cpu_topology': obj_fields.ObjectField('VirtCPUTopology',
+                                                nullable=True),
+@@ -78,6 +86,9 @@ class InstanceNUMACell(base.NovaObject,
+         if 'cpuset_reserved' not in kwargs:
+             self.cpuset_reserved = None
+             self.obj_reset_changes(['cpuset_reserved'])
++        if 'physnode' not in kwargs:
++            self.physnode = None
++            self.obj_reset_changes(['physnode'])
+ 
+     def __len__(self):
+         return len(self.cpuset)
+@@ -138,6 +149,11 @@ class InstanceNUMACell(base.NovaObject,
+         self.cpu_pinning = {}
+         return self
+ 
++    # extension
++    @property
++    def numa_pinning_requested(self):
++        return self.physnode is not None
++
+ 
+ # TODO(berrange): Remove NovaObjectDictCompat
+ @base.NovaObjectRegistry.register
+@@ -250,3 +266,7 @@ class InstanceNUMATopology(base.NovaObject,
+         return (self.obj_attr_is_set('emulator_threads_policy')
+                 and (self.emulator_threads_policy
+                      == obj_fields.CPUEmulatorThreadsPolicy.ISOLATE))
++
++    @property
++    def numa_pinning_requested(self):
++        return all(cell.numa_pinning_requested for cell in self.cells)
+diff --git a/nova/tests/unit/api/openstack/compute/test_serversV21.py b/nova/tests/unit/api/openstack/compute/test_serversV21.py
+index 8d995e4..38ef2fb 100644
+--- a/nova/tests/unit/api/openstack/compute/test_serversV21.py
++++ b/nova/tests/unit/api/openstack/compute/test_serversV21.py
+@@ -3127,6 +3127,9 @@ class ServersControllerCreateTest(test.TestCase):
+                     exception.ImageNUMATopologyCPUOutOfRange,
+                     exception.ImageNUMATopologyCPUDuplicates,
+                     exception.ImageNUMATopologyCPUsUnassigned,
++                    exception.ImageNUMATopologyNodesForbidden,
++                    exception.ImageNUMATopologyNodesIncomplete,
++                    exception.ImageNUMATopologyNodesDuplicates,
+                     exception.ImageNUMATopologyMemoryOutOfRange]:
+             self._test_create_instance_numa_topology_wrong(exc)
+ 
+diff --git a/nova/tests/unit/objects/test_instance_numa_topology.py b/nova/tests/unit/objects/test_instance_numa_topology.py
+index d73f36a..c1ff31c 100644
+--- a/nova/tests/unit/objects/test_instance_numa_topology.py
++++ b/nova/tests/unit/objects/test_instance_numa_topology.py
+@@ -9,6 +9,12 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2013-2017 Wind River Systems, Inc.
++#
++#
++#
++#
+ 
+ import copy
+ 
+@@ -210,6 +216,21 @@ class _TestInstanceNUMATopology(object):
+                                               version_manifest=versions)
+         self.assertNotIn('cpuset_reserved', primitive)
+ 
++    # add tests for numa pinning
++    def test_numa_pinning_requested_cell(self):
++        inst_cell = objects.InstanceNUMACell(cpuset=set([0, 1, 2, 3]),
++                                             physnode=None)
++        self.assertFalse(inst_cell.numa_pinning_requested)
++        inst_cell.physnode = 0
++        self.assertTrue(inst_cell.numa_pinning_requested)
++
++    def test_numa_pinning_requested(self):
++        fake_topo_obj = copy.deepcopy(fake_obj_numa_topology)
++        self.assertFalse(fake_topo_obj.numa_pinning_requested)
++        for cell in fake_topo_obj.cells:
++            cell.physnode = cell.id
++        self.assertTrue(fake_topo_obj.numa_pinning_requested)
++
+ 
+ class TestInstanceNUMATopology(test_objects._LocalTest,
+                                _TestInstanceNUMATopology):
+diff --git a/nova/tests/unit/objects/test_objects.py b/nova/tests/unit/objects/test_objects.py
+index 713fe43..70bb71f 100644
+--- a/nova/tests/unit/objects/test_objects.py
++++ b/nova/tests/unit/objects/test_objects.py
+@@ -1106,7 +1106,7 @@ object_data = {
+     'HVSpec': '1.2-de06bcec472a2f04966b855a49c46b41',
+     'IDEDeviceBus': '1.0-29d4c9f27ac44197f01b6ac1b7e16502',
+     'ImageMeta': '1.8-642d1b2eb3e880a367f37d72dd76162d',
+-    'ImageMetaProps': '1.19-0026c9536269e84f6ad289279c403a50',
++    'ImageMetaProps': '1.19-248e4e71d64cc694b4167485a9f9b251',
+     'Instance': '2.3-4f98ab23f4b0a25fabb1040c8f5edecc',
+     'InstanceAction': '1.1-f9f293e526b66fca0d05c3b3a2d13914',
+     'InstanceActionEvent': '1.1-e56a64fa4710e43ef7af2ad9d6028b33',
+@@ -1122,7 +1122,7 @@ object_data = {
+     'InstanceList': '2.4-d2c5723da8c1d08e07cb00160edfd292',
+     'InstanceMapping': '1.0-65de80c491f54d19374703c0753c4d47',
+     'InstanceMappingList': '1.2-ee638619aa3d8a82a59c0c83bfa64d78',
+-    'InstanceNUMACell': '1.4-7c1eb9a198dee076b4de0840e45f4f55',
++    'InstanceNUMACell': '1.4-1953775b0abf5211dfcd30eda8402004',
+     'InstanceNUMATopology': '1.3-ec0030cb0402a49c96da7051c037082a',
+     'InstancePCIRequest': '1.1-b1d75ebc716cb12906d9d513890092bf',
+     'InstancePCIRequests': '1.1-65e38083177726d806684cb1cc0136d2',
+diff --git a/nova/tests/unit/virt/libvirt/test_config.py b/nova/tests/unit/virt/libvirt/test_config.py
+index 471fe9c..2e5a772 100644
+--- a/nova/tests/unit/virt/libvirt/test_config.py
++++ b/nova/tests/unit/virt/libvirt/test_config.py
+@@ -2201,7 +2201,9 @@ class LibvirtConfigGuestTest(LibvirtConfigBaseTest):
+                 <min_guarantee units="K">2970</min_guarantee>
+               </memtune>
+               <numatune>
++                <!-- we no longer emit numatune memory mode
+                 <memory mode="preferred" nodeset="0-3,8"/>
++                -->
+                 <memnode cellid="0" mode="preferred" nodeset="0-1"/>
+                 <memnode cellid="1" mode="preferred" nodeset="2-3"/>
+                 <memnode cellid="2" mode="preferred" nodeset="8"/>
+@@ -3116,7 +3118,9 @@ class LibvirtConfigGuestNUMATuneTest(LibvirtConfigBaseTest):
+         xml = obj.to_xml()
+         self.assertXmlEqual("""
+           <numatune>
++            <!-- We no longer emit numatune memory mode
+             <memory mode="strict" nodeset="0-3,8"/>
++            -->
+           </numatune>""", xml)
+ 
+     def test_config_numa_tune_memnodes(self):
+diff --git a/nova/tests/unit/virt/libvirt/test_driver.py b/nova/tests/unit/virt/libvirt/test_driver.py
+index b00f5e2..9291e85 100755
+--- a/nova/tests/unit/virt/libvirt/test_driver.py
++++ b/nova/tests/unit/virt/libvirt/test_driver.py
+@@ -8697,7 +8697,9 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+     <emulatorpin cpuset="1-3"/>
+   </cputune>
+   <numatune>
++    <!-- we no longer emit numatune memory mode
+     <memory mode="strict" nodeset="0"/>
++    -->
+     <memnode cellid="0" mode="strict" nodeset="0"/>
+   </numatune>
+   <memoryBacking>
+@@ -8745,7 +8747,9 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+     <vcpupin vcpu="3" cpuset="7"/>
+   </cputune>
+   <numatune>
++    <!-- we no longer emit numatune memory mode
+     <memory mode="strict" nodeset="1"/>
++    -->
+     <memnode cellid="0" mode="strict" nodeset="1"/>
+   </numatune>
+   <memoryBacking>
+diff --git a/nova/tests/unit/virt/test_hardware.py b/nova/tests/unit/virt/test_hardware.py
+index 1afd089..090c3c8 100644
+--- a/nova/tests/unit/virt/test_hardware.py
++++ b/nova/tests/unit/virt/test_hardware.py
+@@ -11,6 +11,12 @@
+ # WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ # License for the specific language governing permissions and limitations
+ # under the License.
++#
++# Copyright (c) 2013-2017 Wind River Systems, Inc.
++#
++#
++#
++#
+ 
+ import collections
+ import copy
+@@ -1258,7 +1264,196 @@ class NUMATopologyTest(test.NoDBTestCase):
+                             cpu_policy=fields.CPUAllocationPolicy.DEDICATED,
+                         )]),
+             },
+-
++            {
++                # Successful pinning of 2 NUMA nodes using flavor,
++                # implicit vCPU pinning.
++                "flavor": objects.Flavor(vcpus=8, memory_mb=2048, extra_specs={
++                    "hw:numa_nodes": 2, "hw:numa_node.0": 1,
++                    "hw:numa_node.1": 0
++                }),
++                "image": {
++                    "properties": {}
++                },
++                "expect": objects.InstanceNUMATopology(cells=
++                    [
++                        objects.InstanceNUMACell(
++                            id=0, cpuset=set([0, 1, 2, 3]), memory=1024,
++                            physnode=1,
++                            cpu_policy=fields.CPUAllocationPolicy.DEDICATED),
++                        objects.InstanceNUMACell(
++                            id=1, cpuset=set([4, 5, 6, 7]), memory=1024,
++                            physnode=0,
++                            cpu_policy=fields.CPUAllocationPolicy.DEDICATED)
++                    ]),
++            },
++            {
++                # Successful pinning of 2 NUMA nodes using image metadata,
++                # implicit vCPU pinning.
++                "flavor": objects.Flavor(vcpus=8, memory_mb=2048, extra_specs={
++                }),
++                "image": {
++                    "properties": {"hw_numa_nodes": 2, "hw_numa_node.0": 1,
++                                   "hw_numa_node.1": 0}
++                },
++                "expect": objects.InstanceNUMATopology(cells=
++                    [
++                        objects.InstanceNUMACell(
++                            id=0, cpuset=set([0, 1, 2, 3]), memory=1024,
++                            physnode=1,
++                            cpu_policy=fields.CPUAllocationPolicy.DEDICATED),
++                        objects.InstanceNUMACell(
++                            id=1, cpuset=set([4, 5, 6, 7]), memory=1024,
++                            physnode=0,
++                            cpu_policy=fields.CPUAllocationPolicy.DEDICATED)
++                    ]),
++            },
++            {
++                # Successful pinning of 2 NUMA nodes using flavor,
++                # explicit vCPU pinning.
++                "flavor": objects.Flavor(vcpus=8, memory_mb=2048, extra_specs={
++                    "hw:numa_nodes": 2, "hw:numa_node.0": 1,
++                    "hw:numa_node.1": 0, "hw:cpu_policy": "dedicated"
++                }),
++                "image": {
++                    "properties": {}
++                },
++                "expect": objects.InstanceNUMATopology(cells=
++                    [
++                        objects.InstanceNUMACell(
++                            id=0, cpuset=set([0, 1, 2, 3]), memory=1024,
++                            physnode=1,
++                            cpu_policy=fields.CPUAllocationPolicy.DEDICATED),
++                        objects.InstanceNUMACell(
++                            id=1, cpuset=set([4, 5, 6, 7]), memory=1024,
++                            physnode=0,
++                            cpu_policy=fields.CPUAllocationPolicy.DEDICATED)
++                    ]),
++            },
++            {
++                # Successful pinning of 2 NUMA nodes using flavor AND
++                # image metadata, explicit vCPU pinning.
++                "flavor": objects.Flavor(vcpus=8, memory_mb=2048, extra_specs={
++                    "hw:cpu_policy": "dedicated"
++                }),
++                "image": {
++                    "properties": {"hw_numa_nodes": 2, "hw_numa_node.0": 0,
++                                   "hw_numa_node.1": 1}
++                },
++                "expect": objects.InstanceNUMATopology(cells=
++                    [
++                        objects.InstanceNUMACell(
++                            id=0, cpuset=set([0, 1, 2, 3]), memory=1024,
++                            physnode=0,
++                            cpu_policy=fields.CPUAllocationPolicy.DEDICATED),
++                        objects.InstanceNUMACell(
++                            id=1, cpuset=set([4, 5, 6, 7]), memory=1024,
++                            physnode=1,
++                            cpu_policy=fields.CPUAllocationPolicy.DEDICATED)
++                    ]),
++            },
++            {
++                # Successful pinning of 2 NUMA nodes using flavor,
++                # individual nodes not specified.
++                "flavor": objects.Flavor(vcpus=8, memory_mb=2048, extra_specs={
++                    "hw:numa_nodes": 2
++                }),
++                "image": {
++                    "properties": {}
++                },
++                "expect": objects.InstanceNUMATopology(cells=
++                    [
++                        objects.InstanceNUMACell(
++                            id=0, cpuset=set([0, 1, 2, 3]), memory=1024,
++                            physnode=None,
++                            cpu_policy=None),
++                        objects.InstanceNUMACell(
++                            id=1, cpuset=set([4, 5, 6, 7]), memory=1024,
++                            physnode=None,
++                            cpu_policy=None)
++                    ]),
++            },
++            {
++                # Successful pinning of 2 NUMA nodes using image metadata,
++                # individual nodes not specified.
++                "flavor": objects.Flavor(vcpus=8, memory_mb=2048, extra_specs={
++                }),
++                "image": {
++                    "properties": {"hw_numa_nodes": 2}
++                },
++                "expect": objects.InstanceNUMATopology(cells=
++                    [
++                        objects.InstanceNUMACell(
++                            id=0, cpuset=set([0, 1, 2, 3]), memory=1024,
++                            physnode=None,
++                            cpu_policy=None),
++                        objects.InstanceNUMACell(
++                            id=1, cpuset=set([4, 5, 6, 7]), memory=1024,
++                            physnode=None,
++                            cpu_policy=None)
++                    ]),
++            },
++            {
++                # Attempted pinning of two NUMA nodes using flavor to the
++                # same physical node.
++                "flavor": objects.Flavor(vcpus=4, memory_mb=2048,
++                                         extra_specs={
++                         "hw:numa_nodes": 2, "hw:cpu_policy": "dedicated",
++                         "hw:numa_node.0": 0, "hw:numa_node.1": 0
++                 }),
++                "image": {
++                    "properties": {}
++                },
++                "expect": exception.ImageNUMATopologyNodesDuplicates,
++            },
++            {
++                # Attempted explicit pinning using flavor of only one
++                # NUMA node out of two.
++                "flavor": objects.Flavor(vcpus=4, memory_mb=2048,
++                                         extra_specs={
++                         "hw:numa_nodes": 2, "hw:cpu_policy": "dedicated",
++                         "hw:numa_node.0": 0
++                 }),
++                "image": {
++                    "properties": {}
++                },
++                "expect": exception.ImageNUMATopologyNodesIncomplete,
++            },
++            {
++                # Attempted explicit pinning using flavor with
++                # duplicate NUMA nodes.
++                "flavor": objects.Flavor(vcpus=8, memory_mb=2048, extra_specs={
++                }),
++                "image": {
++                    "properties": {"hw_numa_nodes": 2, "hw_numa_node.0": 0,
++                                   "hw_numa_node.1": 0}
++                },
++                "expect": exception.ImageNUMATopologyNodesDuplicates,
++            },
++            {
++                # Attemped pinning of NUMA nodes using both flavor and
++                # image metadata.
++                "flavor": objects.Flavor(vcpus=8, memory_mb=2048, extra_specs={
++                    "hw:numa_nodes": 2, "hw:numa_node.0": 1,
++                    "hw:numa_node.1": 0
++                }),
++                "image": {
++                    "properties": {"hw_numa_nodes": 2, "hw_numa_node.0": 1,
++                                   "hw_numa_node.1": 0}
++                },
++                "expect": exception.ImageNUMATopologyForbidden,
++            },
++            {
++                # Try to enable NUMA node pinning using flavor but vCPU
++                # sharing.
++                "flavor": objects.Flavor(vcpus=4, memory_mb=2048, extra_specs={
++                         "hw:numa_nodes": 2, "hw:cpu_policy": "shared",
++                         "hw:numa_node.0": 0, "hw:numa_node.1": 1
++                 }),
++                "image": {
++                    "properties": {}
++                },
++                "expect": exception.ImageNUMATopologyNodesForbidden,
++            },
+         ]
+ 
+         for testitem in testdata:
+@@ -1293,6 +1488,11 @@ class NUMATopologyTest(test.NoDBTestCase):
+                                      topology.cells[i].pagesize)
+                     self.assertEqual(testitem["expect"].cells[i].cpu_pinning,
+                                      topology.cells[i].cpu_pinning)
++                    #
++                    self.assertEqual(testitem["expect"].cells[i].physnode,
++                                     topology.cells[i].physnode)
++                    self.assertEqual(testitem["expect"].cells[i].cpu_policy,
++                                     topology.cells[i].cpu_policy)
+ 
+     def test_host_usage_contiguous(self):
+         hpages0_4K = objects.NUMAPagesTopology(size_kb=4, total=256, used=0)
+@@ -2433,6 +2633,8 @@ class CPUPinningCellTestCase(test.NoDBTestCase, _CPUPinningTestCaseBase):
+         self.assertInstanceCellPinned(inst_pin)
+         got_topo = objects.VirtCPUTopology(sockets=1, cores=2, threads=2)
+         self.assertEqualTopology(got_topo, inst_pin.cpu_topology)
++        got_pinning = {x: x for x in range(0, 4)}
++        self.assertEqual(got_pinning, inst_pin.cpu_pinning)
+ 
+     def test_get_pinning_require_policy_fits_w_usage(self):
+         host_pin = objects.NUMACell(
+@@ -2451,6 +2653,8 @@ class CPUPinningCellTestCase(test.NoDBTestCase, _CPUPinningTestCaseBase):
+         self.assertInstanceCellPinned(inst_pin)
+         got_topo = objects.VirtCPUTopology(sockets=1, cores=2, threads=2)
+         self.assertEqualTopology(got_topo, inst_pin.cpu_topology)
++        got_pinning = {0: 2, 1: 6, 2: 3, 3: 7}
++        self.assertEqual(got_pinning, inst_pin.cpu_pinning)
+ 
+     def test_get_pinning_host_siblings_instance_odd_fit(self):
+         host_pin = objects.NUMACell(id=0, cpuset=set([0, 1, 2, 3, 4, 5, 6, 7]),
+@@ -2464,6 +2668,8 @@ class CPUPinningCellTestCase(test.NoDBTestCase, _CPUPinningTestCaseBase):
+         self.assertInstanceCellPinned(inst_pin)
+         got_topo = objects.VirtCPUTopology(sockets=1, cores=5, threads=1)
+         self.assertEqualTopology(got_topo, inst_pin.cpu_topology)
++        got_pinning = {x: x for x in range(0, 5)}
++        self.assertEqual(got_pinning, inst_pin.cpu_pinning)
+ 
+     def test_get_pinning_host_siblings_instance_fit_optimize_threads(self):
+         host_pin = objects.NUMACell(id=0, cpuset=set([0, 1, 2, 3, 4, 5, 6, 7]),
+@@ -2477,6 +2683,8 @@ class CPUPinningCellTestCase(test.NoDBTestCase, _CPUPinningTestCaseBase):
+         self.assertInstanceCellPinned(inst_pin)
+         got_topo = objects.VirtCPUTopology(sockets=1, cores=3, threads=2)
+         self.assertEqualTopology(got_topo, inst_pin.cpu_topology)
++        got_pinning = {x: x for x in range(0, 6)}
++        self.assertEqual(got_pinning, inst_pin.cpu_pinning)
+ 
+     def test_get_pinning_host_siblings_instance_odd_fit_w_usage(self):
+         host_pin = objects.NUMACell(id=0, cpuset=set([0, 1, 2, 3, 4, 5, 6, 7]),
+@@ -2490,6 +2698,8 @@ class CPUPinningCellTestCase(test.NoDBTestCase, _CPUPinningTestCaseBase):
+         self.assertInstanceCellPinned(inst_pin)
+         got_topo = objects.VirtCPUTopology(sockets=1, cores=3, threads=1)
+         self.assertEqualTopology(got_topo, inst_pin.cpu_topology)
++        got_pinning = {0: 1, 1: 3, 2: 4}
++        self.assertEqual(got_pinning, inst_pin.cpu_pinning)
+ 
+     def test_get_pinning_host_siblings_instance_mixed_siblings(self):
+         host_pin = objects.NUMACell(id=0, cpuset=set([0, 1, 2, 3, 4, 5, 6, 7]),
+@@ -2503,6 +2713,8 @@ class CPUPinningCellTestCase(test.NoDBTestCase, _CPUPinningTestCaseBase):
+         self.assertInstanceCellPinned(inst_pin)
+         got_topo = objects.VirtCPUTopology(sockets=1, cores=4, threads=1)
+         self.assertEqualTopology(got_topo, inst_pin.cpu_topology)
++        got_pinning = {0: 3, 1: 4, 2: 6, 3: 7}
++        self.assertEqual(got_pinning, inst_pin.cpu_pinning)
+ 
+     def test_get_pinning_host_siblings_instance_odd_fit_orphan_only(self):
+         host_pin = objects.NUMACell(id=0, cpuset=set([0, 1, 2, 3, 4, 5, 6, 7]),
+@@ -2516,6 +2728,8 @@ class CPUPinningCellTestCase(test.NoDBTestCase, _CPUPinningTestCaseBase):
+         self.assertInstanceCellPinned(inst_pin)
+         got_topo = objects.VirtCPUTopology(sockets=1, cores=4, threads=1)
+         self.assertEqualTopology(got_topo, inst_pin.cpu_topology)
++        got_pinning = {0: 1, 1: 3, 2: 4, 3: 7}
++        self.assertEqual(got_pinning, inst_pin.cpu_pinning)
+ 
+     def test_get_pinning_host_siblings_large_instance_odd_fit(self):
+         host_pin = objects.NUMACell(id=0, cpuset=set([0, 1, 2, 3, 4, 5, 6, 7,
+@@ -2534,6 +2748,8 @@ class CPUPinningCellTestCase(test.NoDBTestCase, _CPUPinningTestCaseBase):
+         self.assertPinningPreferThreads(inst_pin, host_pin)
+         got_topo = objects.VirtCPUTopology(sockets=1, cores=5, threads=1)
+         self.assertEqualTopology(got_topo, inst_pin.cpu_topology)
++        got_pinning = {0: 0, 1: 8, 2: 1, 3: 9, 4: 2}
++        self.assertEqual(got_pinning, inst_pin.cpu_pinning)
+ 
+     def test_get_pinning_isolate_policy_too_few_fully_free_cores(self):
+         host_pin = objects.NUMACell(id=0, cpuset=set([0, 1, 2, 3]),
+@@ -2575,6 +2791,8 @@ class CPUPinningCellTestCase(test.NoDBTestCase, _CPUPinningTestCaseBase):
+         self.assertInstanceCellPinned(inst_pin)
+         got_topo = objects.VirtCPUTopology(sockets=1, cores=2, threads=1)
+         self.assertEqualTopology(got_topo, inst_pin.cpu_topology)
++        got_pinning = {0: 0, 1: 1}
++        self.assertEqual(got_pinning, inst_pin.cpu_pinning)
+ 
+     def test_get_pinning_isolate_policy_fits_ht_host(self):
+         host_pin = objects.NUMACell(id=0, cpuset=set([0, 1, 2, 3]),
+@@ -2590,6 +2808,8 @@ class CPUPinningCellTestCase(test.NoDBTestCase, _CPUPinningTestCaseBase):
+         self.assertInstanceCellPinned(inst_pin)
+         got_topo = objects.VirtCPUTopology(sockets=1, cores=2, threads=1)
+         self.assertEqualTopology(got_topo, inst_pin.cpu_topology)
++        got_pinning = {0: 0, 1: 2}
++        self.assertEqual(got_pinning, inst_pin.cpu_pinning)
+ 
+     def test_get_pinning_isolate_policy_fits_w_usage(self):
+         host_pin = objects.NUMACell(
+diff --git a/nova/utils.py b/nova/utils.py
+index 667476c..9a28e55 100644
+--- a/nova/utils.py
++++ b/nova/utils.py
+@@ -35,6 +35,7 @@ import tempfile
+ import time
+ 
+ import eventlet
++from itertools import groupby
+ import netaddr
+ from oslo_concurrency import lockutils
+ from oslo_concurrency import processutils
+@@ -100,6 +101,34 @@ VIM_IMAGE_ATTRIBUTES = (
+ _FILE_CACHE = {}
+ 
+ 
++# extension
++def list_to_range(input_list=None):
++    """Convert a list into a string of comma separate ranges.
++       E.g.,  [1,2,3,8,9,15] is converted to '1-3,8-9,15'
++    """
++    if input_list is None:
++        return ''
++    if len(input_list) < 3:
++        return ','.join(str(x) for x in input_list)
++    else:
++        G = (list(x) for _, x in groupby(enumerate(input_list),
++                                         lambda (i, x): i - x))
++        return ','.join(
++            '-'.join(map(str, (g[0][1], g[-1][1])[:len(g)])) for g in G)
++
++
++# extension
++def range_to_list(csv_range=None):
++    """Convert a string of comma separate ranges into an expanded list of
++       integers.  E.g., '1-3,8-9,15' is converted to [1,2,3,8,9,15]
++    """
++    if not csv_range:
++        return []
++    ranges = [(lambda L: range(L[0], L[-1] + 1))(map(int, r.split('-')))
++               for r in csv_range.split(',')]
++    return [y for x in ranges for y in x]
++
++
+ def vpn_ping(address, port, timeout=0.05, session_id=None):
+     """Sends a vpn negotiation packet and returns the server session.
+ 
+diff --git a/nova/virt/hardware.py b/nova/virt/hardware.py
+index 00fe8fb..32e6dc7 100644
+--- a/nova/virt/hardware.py
++++ b/nova/virt/hardware.py
+@@ -11,6 +11,12 @@
+ # WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ # License for the specific language governing permissions and limitations
+ # under the License.
++#
++# Copyright (c) 2013-2017 Wind River Systems, Inc.
++#
++#
++#
++#
+ 
+ import collections
+ import fractions
+@@ -997,6 +1003,11 @@ def _numa_fit_instance_cell(host_cell, instance_cell, limit_cell=None,
+                    'cpuset_reserved': cpuset_reserved})
+         return
+ 
++    # if numa pinning requested confirm correct host numa cell
++    if instance_cell.numa_pinning_requested:
++        if instance_cell.physnode != host_cell.id:
++            return None
++
+     if instance_cell.cpu_pinning_requested:
+         LOG.debug('Pinning has been requested')
+         new_instance_cell = _numa_fit_instance_cell_with_pinning(
+@@ -1163,7 +1174,7 @@ def _numa_get_mem_map_list(flavor, image_meta):
+         return flavor_mem_list
+ 
+ 
+-def _get_cpu_policy_constraints(flavor, image_meta):
++def _get_cpu_policy_constraints(flavor, image_meta, numa_topology=None):
+     """Validate and return the requested CPU policy."""
+     flavor_policy, image_policy = _get_flavor_image_meta(
+         'cpu_policy', flavor, image_meta)
+@@ -1179,6 +1190,15 @@ def _get_cpu_policy_constraints(flavor, image_meta):
+     else:
+         cpu_policy = fields.CPUAllocationPolicy.SHARED
+ 
++    # If NUMA pinning is enabled, then implicitly enable CPU pinning
++    # unless it has been explicitly disabled.
++    if numa_topology and numa_topology.cells[0].physnode is not None:
++        if (flavor_policy == fields.CPUAllocationPolicy.SHARED or
++                image_policy == fields.CPUAllocationPolicy.SHARED):
++            raise exception.ImageNUMATopologyNodesForbidden()
++        else:
++            cpu_policy = fields.CPUAllocationPolicy.DEDICATED
++
+     return cpu_policy
+ 
+ 
+@@ -1197,7 +1217,39 @@ def _get_cpu_thread_policy_constraints(flavor, image_meta):
+     return policy
+ 
+ 
+-def _numa_get_constraints_manual(nodes, flavor, cpu_list, mem_list):
++# get numa node list from hw:numa_node.X extra spec
++def _numa_get_flavor_node_map_list(flavor):
++    hw_numa_node = []
++    hw_numa_node_set = False
++    extra_specs = flavor.get("extra_specs", {})
++    for cellid in range(objects.ImageMetaProps.NUMA_NODES_MAX):
++        nodeprop = "hw:numa_node.%d" % cellid
++        if nodeprop not in extra_specs:
++            break
++        hw_numa_node.append(int(extra_specs[nodeprop]))
++        hw_numa_node_set = True
++
++    if hw_numa_node_set:
++        return hw_numa_node
++
++
++# get numa node list from flavor or image
++def _numa_get_node_map_list(flavor, image_meta):
++    flavor_node_list = _numa_get_flavor_node_map_list(flavor)
++    image_node_list = image_meta.properties.get("hw_numa_node", None)
++
++    if flavor_node_list is None:
++        return image_node_list
++    else:
++        if image_node_list is not None:
++            raise exception.ImageNUMATopologyForbidden(
++                name='hw_numa_node')
++        return flavor_node_list
++
++
++# add node_list
++def _numa_get_constraints_manual(nodes, flavor, cpu_list, mem_list,
++                                 node_list):
+     cells = []
+     totalmem = 0
+ 
+@@ -1206,6 +1258,7 @@ def _numa_get_constraints_manual(nodes, flavor, cpu_list, mem_list):
+     for node in range(nodes):
+         mem = mem_list[node]
+         cpuset = cpu_list[node]
++        physnode = node_list[node] if node_list else None
+ 
+         for cpu in cpuset:
+             if cpu > (flavor.vcpus - 1):
+@@ -1219,7 +1272,7 @@ def _numa_get_constraints_manual(nodes, flavor, cpu_list, mem_list):
+             availcpus.remove(cpu)
+ 
+         cells.append(objects.InstanceNUMACell(
+-            id=node, cpuset=cpuset, memory=mem))
++            id=node, cpuset=cpuset, memory=mem, physnode=physnode))
+         totalmem = totalmem + mem
+ 
+     if availcpus:
+@@ -1262,7 +1315,8 @@ def vcpus_realtime_topology(flavor, image):
+     return vcpus_rt
+ 
+ 
+-def _numa_get_constraints_auto(nodes, flavor):
++# add node_list
++def _numa_get_constraints_auto(nodes, flavor, node_list):
+     if ((flavor.vcpus % nodes) > 0 or
+         (flavor.memory_mb % nodes) > 0):
+         raise exception.ImageNUMATopologyAsymmetric()
+@@ -1273,9 +1327,10 @@ def _numa_get_constraints_auto(nodes, flavor):
+         mem = int(flavor.memory_mb / nodes)
+         start = node * ncpus
+         cpuset = set(range(start, start + ncpus))
++        physnode = node_list[node] if node_list else None
+ 
+         cells.append(objects.InstanceNUMACell(
+-            id=node, cpuset=cpuset, memory=mem))
++            id=node, cpuset=cpuset, memory=mem, physnode=physnode))
+ 
+     return objects.InstanceNUMATopology(cells=cells)
+ 
+@@ -1375,14 +1430,19 @@ def numa_get_constraints(flavor, image_meta):
+     pagesize = _numa_get_pagesize_constraints(
+         flavor, image_meta)
+ 
++    # Need to check if we want numa pinning since we allow
++    # pinning a single implicit numa node.
++    node_list = _numa_get_node_map_list(flavor, image_meta)
++
+     numa_topology = None
+-    if nodes or pagesize:
++    if nodes or pagesize or node_list:
+         nodes = nodes or 1
+ 
+         cpu_list = _numa_get_cpu_map_list(flavor, image_meta)
+         mem_list = _numa_get_mem_map_list(flavor, image_meta)
+ 
+-        # If one property list is specified both must be
++        # If one property list is specified for cpu/mem then both must be.
++        # The physnode is optional.
+         if ((cpu_list is None and mem_list is not None) or
+             (cpu_list is not None and mem_list is None)):
+             raise exception.ImageNUMATopologyIncomplete()
+@@ -1392,18 +1452,34 @@ def numa_get_constraints(flavor, image_meta):
+             (mem_list is not None and len(mem_list) != nodes)):
+             raise exception.ImageNUMATopologyIncomplete()
+ 
++        # Special test for numa nodes, because they can be specified
++        # independently of setting CPUs/RAM.
++        if node_list is not None and len(node_list) != nodes:
++            raise exception.ImageNUMATopologyNodesIncomplete()
++
++        # A bit of paranoia here.
++        # host nodes must be all specified or all unspecified.
++        if node_list and node_list.count(None) != len(node_list):
++            # If any are not None then they all must be.
++            if any(node is None for node in node_list):
++                raise exception.ImageNUMATopologyNodesIncomplete()
++            # Instance nodes must be pinned to separate host nodes.
++            if len(node_list) != len(set(node_list)):
++                raise exception.ImageNUMATopologyNodesDuplicates()
++
+         if cpu_list is None:
+             numa_topology = _numa_get_constraints_auto(
+-                nodes, flavor)
++                nodes, flavor, node_list)
+         else:
+             numa_topology = _numa_get_constraints_manual(
+-                nodes, flavor, cpu_list, mem_list)
++                nodes, flavor, cpu_list, mem_list, node_list)
+ 
+         # We currently support same pagesize for all cells.
+         for c in numa_topology.cells:
+             setattr(c, 'pagesize', pagesize)
+ 
+-    cpu_policy = _get_cpu_policy_constraints(flavor, image_meta)
++    cpu_policy = _get_cpu_policy_constraints(flavor, image_meta,
++                                             numa_topology=numa_topology)
+     cpu_thread_policy = _get_cpu_thread_policy_constraints(flavor, image_meta)
+     rt_mask = _get_realtime_mask(flavor, image_meta)
+     emu_thread_policy = get_emulator_threads_constraint(flavor, image_meta)
+@@ -1704,6 +1780,8 @@ def instance_topology_from_instance(instance):
+                     memory=cell['memory'],
+                     pagesize=cell.get('pagesize'),
+                     cpu_topology=cell.get('cpu_topology'),
++                    # add physnode
++                    physnode=cell.get('physnode'),
+                     cpu_pinning=cell.get('cpu_pinning_raw'),
+                     cpu_policy=cell.get('cpu_policy'),
+                     cpu_thread_policy=cell.get('cpu_thread_policy'),
+diff --git a/nova/virt/libvirt/config.py b/nova/virt/libvirt/config.py
+index a891cf9..361c22c 100644
+--- a/nova/virt/libvirt/config.py
++++ b/nova/virt/libvirt/config.py
+@@ -2006,8 +2006,14 @@ class LibvirtConfigGuestNUMATune(LibvirtConfigObject):
+     def format_dom(self):
+         root = super(LibvirtConfigGuestNUMATune, self).format_dom()
+ 
+-        if self.memory is not None:
+-            root.append(self.memory.format_dom())
++        # Do not emit numatune memory XML so we get 'default' memory
++        # allocation policy for 4K memory. The 'default' policy is "local
++        # allocation", i.e., allocate memory on the node of the CPU that
++        # triggered the allocation. If the "local node" contains no free
++        # memory, the system will attempt to allocate memory from a "near by"
++        # node.
++        # if self.memory is not None:
++        #     root.append(self.memory.format_dom())
+         for node in self.memnodes:
+             root.append(node.format_dom())
+ 
+-- 
+2.7.4
+

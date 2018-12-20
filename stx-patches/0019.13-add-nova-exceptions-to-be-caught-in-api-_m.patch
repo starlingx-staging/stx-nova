@@ -1,0 +1,70 @@
+From fec3ed3b82bab4dd3d528f09b180cdbf2628e397 Mon Sep 17 00:00:00 2001
+From: Daniel Chavolla <daniel.chavolla@windriver.com>
+Date: Tue, 30 Aug 2016 11:48:17 -0400
+Subject: [PATCH] add nova exceptions to be caught in api
+ _migrate_live and create
+
+Some exceptions raised by nova were not caught in
+ServersController.create()@nova/api/openstack/compute/servers.py
+and
+MigrateServerController._migrate_live()@
+nova/api/openstack/compute/migrate_server.py
+
+This caused the original exception message to be dropped and a generic
+"Unexpected exception in API method" error to be returned to the user.
+
+With this fix, these are the messages now returned through the CLI:
+
+[root@controller-0 images(keystone_admin)]# nova boot --image jiratest
+--flavor shared --nic net-id=945004ad-a807-437a-a37a-5db2640ebef3 jiratest
+ERROR (BadRequest): Image property 'hw_cpu_policy' is not permitted to
+override CPU pinning policy set against the flavor (HTTP 400)
+(Request-ID: req-ed3e91d0-8193-426b-977b-cfaa723b1068)
+[root@controller-0 images(keystone_admin)]#
+
+[root@controller-0 images(keystone_admin)]# nova live-migration
+9f854b37-0bd0-4769-820e-aca5918aecc9
+ERROR (BadRequest): Migration pre-check error no retry: Block live migration
+is not supported for instances with LVM backed storage. (HTTP 400)
+(Request-ID: req-2646b26c-faad-4114-b7e4-2c72d3980f04)
+[root@controller-0 images(keystone_admin)]#
+
+(cherry picked from commit 5b1da0a)
+---
+ nova/api/openstack/compute/migrate_server.py | 1 +
+ nova/api/openstack/compute/servers.py        | 7 +++++++
+ 2 files changed, 8 insertions(+)
+
+diff --git a/nova/api/openstack/compute/migrate_server.py b/nova/api/openstack/compute/migrate_server.py
+index 35f0f44..1ce6882 100644
+--- a/nova/api/openstack/compute/migrate_server.py
++++ b/nova/api/openstack/compute/migrate_server.py
+@@ -126,6 +126,7 @@ class MigrateServerController(wsgi.Controller):
+                 exception.InvalidSharedStorage,
+                 exception.HypervisorUnavailable,
+                 exception.MigrationPreCheckError,
++                exception.MigrationPreCheckErrorNoRetry,
+                 exception.LiveMigrationWithOldNovaNotSupported) as ex:
+             if async:
+                 with excutils.save_and_reraise_exception():
+diff --git a/nova/api/openstack/compute/servers.py b/nova/api/openstack/compute/servers.py
+index 2cec517..01bf444 100644
+--- a/nova/api/openstack/compute/servers.py
++++ b/nova/api/openstack/compute/servers.py
+@@ -783,6 +783,13 @@ class ServersController(wsgi.Controller):
+                 exception.PciRequestAliasNotDefined,
+                 exception.SnapshotNotFound,
+                 exception.UnableToAutoAllocateNetwork,
++                exception.ImageCPUPinningForbidden,
++                exception.ImageCPUThreadPolicyForbidden,
++                exception.MemoryPageSizeInvalid,
++                exception.MemoryPageSizeForbidden,
++                exception.RealtimeConfigurationInvalid,
++                exception.RealtimeMaskNotFoundOrInvalid,
++                exception.CPUThreadPolicyConfigurationInvalid,
+                 exception.ImageVCPUModelForbidden) as error:
+             raise exc.HTTPBadRequest(explanation=error.format_message())
+         except (exception.PortInUse,
+-- 
+2.7.4
+

@@ -1,0 +1,47 @@
+From a34d9888dea3d7237384673a9af92682220e8be1 Mon Sep 17 00:00:00 2001
+From: Chris Friesen <chris.friesen@windriver.com>
+Date: Fri, 24 Jun 2016 11:25:42 -0600
+Subject: [PATCH] Remove unneeded LVM live migration exception path
+
+The new code in mitaka already properly handles the LVM case, so
+we can remove the special-case that we did.  If we don't specify
+block migration then we must either have shared block storage,
+shared instance path, or booting from volume with no local disks.
+
+The above is true for both qcow2 and lvm, so no need to special
+case the LVM code anymore.
+
+When porting this should be merged with commit 38b78e76 to
+simplify it.
+
+Change-Id: I16063cd66e8c2782915b7d9016a35c02f4917534
+---
+ nova/virt/libvirt/driver.py | 12 ------------
+ 1 file changed, 12 deletions(-)
+
+diff --git a/nova/virt/libvirt/driver.py b/nova/virt/libvirt/driver.py
+index 66ad22c..32c1893 100644
+--- a/nova/virt/libvirt/driver.py
++++ b/nova/virt/libvirt/driver.py
+@@ -5836,18 +5836,6 @@ class LibvirtDriver(driver.ComputeDriver):
+                        "does not have a local disk.")
+             raise exception.InvalidSharedStorage(reason=reason, path=source)
+ 
+-        elif ((not dest_check_data.is_shared_block_storage) and
+-              ((CONF.libvirt.images_type == 'lvm') or
+-               (dest_check_data.image_type == 'lvm'))):
+-            # Block the case of instances with LVM backed storage on
+-            # computes. The is_shared_block_storage() check returns
+-            # True for boot by volume instances without local disks,
+-            # therefore this check will not be triggered, but any
+-            # other cases will be caught here
+-            reason = _("Live migration can not be used by an "
+-                       "instance with LVM backed storage.")
+-            raise exception.InvalidSharedStorage(reason=reason, path=source)
+-
+         # NOTE(mikal): include the instance directory name here because it
+         # doesn't yet exist on the destination but we want to force that
+         # same name to be used
+-- 
+2.7.4
+

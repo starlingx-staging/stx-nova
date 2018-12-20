@@ -1,0 +1,91 @@
+From 3ce80d4c139187510550b81f4c596c346b154981 Mon Sep 17 00:00:00 2001
+From: Gerry Kopec <Gerry.Kopec@windriver.com>
+Date: Thu, 16 Jun 2016 18:26:08 -0400
+Subject: [PATCH] Port local storage flavor extra spec to Mitaka
+
+This adds the storage extra spec 'aggregate_instance_extra_specs:storage'
+There are three valid types of storage which can be specified in a
+flavor: remote, local_lvm, and local_image (default).
+
+Ports R2 commits:
+ce30958 Enable local storage extra spec on all flavor creations
+d27ae17 Storage: Optional support for local storage with images
+cd82e85 Change local storage backend default from lvm to image
+---
+ nova/api/openstack/compute/flavor_manage.py                | 13 +++++++++++++
+ .../tests/unit/api/openstack/compute/test_flavor_manage.py | 14 ++++++++++++++
+ 2 files changed, 27 insertions(+)
+
+diff --git a/nova/api/openstack/compute/flavor_manage.py b/nova/api/openstack/compute/flavor_manage.py
+index 8f239f6..164eb61 100644
+--- a/nova/api/openstack/compute/flavor_manage.py
++++ b/nova/api/openstack/compute/flavor_manage.py
+@@ -9,6 +9,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2015-2016 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ import webob
+ 
+@@ -78,6 +85,12 @@ class FlavorManageController(wsgi.Controller):
+                                     flavorid=flavorid, swap=swap,
+                                     rxtx_factor=rxtx_factor,
+                                     is_public=is_public)
++
++            # set local storage backend default to local_image
++            flavor.extra_specs = {
++                'aggregate_instance_extra_specs:storage': 'local_image'}
++            flavor.save()
++
+             # NOTE(gmann): For backward compatibility, non public flavor
+             # access is not being added for created tenant. Ref -bug/1209101
+             req.cache_db_flavor(flavor)
+diff --git a/nova/tests/unit/api/openstack/compute/test_flavor_manage.py b/nova/tests/unit/api/openstack/compute/test_flavor_manage.py
+index 96ec213..7ca3d75 100644
+--- a/nova/tests/unit/api/openstack/compute/test_flavor_manage.py
++++ b/nova/tests/unit/api/openstack/compute/test_flavor_manage.py
+@@ -12,6 +12,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2015-2016 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ import datetime
+ 
+@@ -92,6 +99,10 @@ def fake_create(context, kwargs, projects=None):
+     return newflavor
+ 
+ 
++def fake_extra_specs_update_or_create(context, flavor_id, extra_specs):
++    pass
++
++
+ class FlavorManageTestV21(test.NoDBTestCase):
+     controller = flavormanage_v21.FlavorManageController()
+     validation_error = exception.ValidationError
+@@ -104,6 +115,9 @@ class FlavorManageTestV21(test.NoDBTestCase):
+                        fake_get_flavor_by_flavor_id)
+         self.stubs.Set(flavors, "destroy", fake_destroy)
+         self.stub_out("nova.db.flavor_create", fake_create)
++        # stub out flavor extra specs
++        self.stub_out("nova.db.flavor_extra_specs_update_or_create",
++                       fake_extra_specs_update_or_create)
+ 
+         self.request_body = {
+             "flavor": {
+-- 
+2.7.4
+

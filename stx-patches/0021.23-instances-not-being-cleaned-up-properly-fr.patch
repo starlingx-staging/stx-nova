@@ -1,0 +1,74 @@
+From 83325a942d4ec40cad79eaec5f40f1446161130a Mon Sep 17 00:00:00 2001
+From: Gerry Kopec <Gerry.Kopec@windriver.com>
+Date: Fri, 17 Jun 2016 14:59:11 -0400
+Subject: [PATCH] instances not being cleaned up properly from
+ /opt/cgcs/nova/instances/
+
+When instances are not being cleaned up properly it means that there is
+a deletion failure that could be caused by a network or NFS issue.
+The deletion of an instance happens in 'delete_instance_files()' method
+and it may fail because of the 'mv' command that moves the instance folder
+into an instance_delete folder.  Normally 'mv' command should work, but if
+there is an issue with the setup, 'mv' command may fail.
+
+So, if deletion fails, there will be some instances folder that are left
+behind but they could be deleted by periodic task - 'run_pending_deletes()'
+and 'cleanup_incomplete_migrations()' which should delete the remaining
+folders.
+
+If setup recovers, both of the periodic tasks should delete the remaining
+instances.  If setup recovers after too long time (after a period of at
+least 25 minutes), 'run_pending_deletes()' won't be able to delete instances
+left behind due to a limitation of 5 attempts.  If those attempts reached
+maximum (5), 'run_pending_deletes()' won't delete those instances.
+
+This commit fixes this issue and implements a new periodic task -
+'run_new_pending_deletes()' to run when this limitation prevents
+'run_pending_deletes()' from removing remaining folders.
+
+(cherry picked from commit ed4b40c, from commit 14e62d9)
+---
+ nova/compute/manager.py | 27 +++++++++++++++++++++++++++
+ 1 file changed, 27 insertions(+)
+
+diff --git a/nova/compute/manager.py b/nova/compute/manager.py
+index cacf5ba..412fc62 100644
+--- a/nova/compute/manager.py
++++ b/nova/compute/manager.py
+@@ -7060,6 +7060,33 @@ class ComputeManager(manager.Manager):
+                                         instance=instance)
+                         break
+ 
++    """This is a periodic task that deletes the instances
++    left behind. It deletes instances only when run_pending_deletes
++    reached maximum attempts."""
++    @periodic_task.periodic_task(spacing=CONF.instance_delete_interval)
++    def _run_new_pending_deletes(self, context):
++        """Retry any pending instance file deletes."""
++        LOG.debug('Cleaning up deleted instances')
++        filters = {'deleted': True,
++                   'soft_deleted': False,
++                   'host': CONF.host,
++                   'cleaned': False}
++        attrs = ['info_cache', 'security_groups', 'system_metadata']
++        with utils.temporary_mutation(context, read_deleted='yes'):
++            instances = objects.InstanceList.get_by_filters(
++                context, filters, expected_attrs=attrs, use_slave=True)
++        LOG.debug('There are %d instances to clean', len(instances))
++
++        for instance in instances:
++            attempts = int(instance.system_metadata.get('clean_attempts', '0'))
++            if attempts >= CONF.maximum_instance_delete_attempts:
++                success = self.driver.delete_instance_files(instance)
++
++                if success:
++                    instance.cleaned = True
++                    with utils.temporary_mutation(context, read_deleted='yes'):
++                        instance.save()
++
+     def scale_instance_cpu_down(self, context, rt, instance):
+         if instance.vcpus == instance.min_vcpus:
+             raise exception.CannotScaleBeyondLimits()
+-- 
+2.7.4
+

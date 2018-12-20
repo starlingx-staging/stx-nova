@@ -1,0 +1,2618 @@
+From a7adb83be5860a5cb9c9ae9a35daaf300ab60749 Mon Sep 17 00:00:00 2001
+From: Chris Friesen <chris.friesen@windriver.com>
+Date: Mon, 23 Jan 2017 18:47:08 -0500
+Subject: [PATCH 026/143] primary: Add support for scaling vms up/down
+
+This adds nova support for scaling the number of cpus in a vm up and
+down while the vm stays running.
+
+In order to enable this functionality, a flavor extra_specs key of
+"hw:wrs:min_vcpus" must be set with the value between 1 and the number
+of vCPUs in the flavor.  It is only valid to enable this functionality
+if the flavor has enabled dedicated CPUs.  It is also restricted to
+guests with a single NUMA node, so hw:numa_nodes cannot be set to
+greater than one.
+
+When scaling down, we'll try to ask the guest to pick a vcpu to offline.
+If they don't respond, we'll offline the highest-numbered online vCPU.
+The freed pCPU is made available to the scheduler for use by other servers.
+
+When scaling up nova will pick a suitable CPU and attempt to notify the
+guest in case they want to do anything special with the knowledge.
+
+If the CPU threading policy is set to ISOLATE and the host has
+hyperthreading enabled then we need to allocate all siblings of a
+core when scaling up, and we need to deallocate all siblings of a
+core when scaling down.  This does mean that you can have multiple
+free pCPUs and still not be able to scale an instance up because
+the free pCPUs are from different cores.
+
+Offline vCPUs are preserved as offline over start/stop, live migration,
+cold migration, and resize (subject to the usual fact that vCPUs can
+be discarded when resizing down).
+
+In Rel1 the quota was adjusted when scaling up and down.  This turns
+out to be complicated in Rel2 and later by how the quota is integrated
+into resource tracking, so getting it right for migration/evacuation/resize
+was getting complicated.
+
+Instead, we just leave the quota alone.  This means that the flavor
+max_vcpus value will be subtracted from your quota whether or not you've
+scaled down partially.
+
+This actually makes some sense--pause/suspend/stop also leave the
+quota alone, and it has the nice benefit that you will always be able
+to scale up without going over your quota.
+
+Change-Id: I3185e571952ceca6bad4030000a57dfabb6b024f
+
+This commit merges the following R3 commits:
+56bd66e Add support for scaling vms up/down
+8d24aea Port guest scale up command options change to Mitaka
+4ef4c5f Update scaling extra specs validation
+09b2963 Robustness for scaled instance claims test
+c28f2a2 Fix cpu scaling failure when hw:wrs:min_vcpus is not 1
+2a74839 prevent scaling of multi numa node guests
+f1c4b81 Properly handle scaling up ISOLATE instances
+fe098da fix pep8 test
+635e359 Flavor extra-spec API exception errors
+
+Also includes R4 commits:
+4f040ee fix race in cpu scaling
+    There is a race in the cpu scaling code between updating the instance
+    pinning info and the resource audit running and updating the host
+    numa topology.
+
+    The fix is to ensure that the instance pinning info is updated while
+    holding the COMPUTE_RESOURCE_SEMAPHORE.  This will prevent the resource
+    audit from running, removing the race.
+
+    For scaling down the fix is relatively straightforward, we just move the
+    code updating the instance numa topology down into
+    ResourceTracker.put_compat_cpu(), which already holds the semaphore.
+
+    For scaling up the changes are a bit more substantial.  We now pick the
+    vcpu to online based on the instance numa topology, then pass the vcpu
+    and vcpucell to ResourceTracker.get_compat_cpu(), where the instance
+    will be updated while holding the sema if a compatible pCPU is found.
+    This means that LibvirtDriver.scale_cpu_up() no longer needs to select
+    or return the vCPU, instead it'll be passed in.
+
+40d6caf add nova tox tests for cpu scaling
+
+For port to Newton:
+- merged R3 commit, 834ad2c Fix up DB migrations to allow for upgrade,
+  parts related to add min_vcpus and max_vcpus to instances table via
+  migrate DB version 286
+- updated wrs_server_resources extension to conform to upstream refactoring
+  of policy rules
+- upstream has eliminated dictionary compat from ComputeNode object so
+  updated all references in resource tracker scaling code to object form
+- added unit tests for resource tracker get_compat_cpu and put_compat_cpu
+
+For port to Pike:
+7dba2ec Fix scaling by retrieving rpcapi.ComputeAPI client from router
+   In Newton, nova.compute.rpcapi.ComputeAPI should get client from router
+   instead of use self.client.
+
+1fd2b16 compute_node.vcpus_used not updated with scaling
+   Issue is the current # vcpu_used is correct on instance side but is not
+   updated on host side after scaling.
+   Fix is retrieving vcpus from instance object field directly instead of
+   from flavor.
+
+6f88623 wrong number of vcpus after resize downscaled inst
+   After resize, the number of current vcpus shown by "nova show"
+   does not match actual number of vcpus online.
+   Adjust the current vcpus according to the maximum vcpus defined
+   by the new flavor. Make sure the offline cpus stay offline.
+
+4283d2b Move numa_topology formatter to utility routine
+
+__TYPE_primary
+__TAG_cpuscaling
+__R4_commit_5979b31
+__R3_commit_dc80960
+__TC2899,TC2900,TC2901,TC2902,TC2903,TC2904,TC2905,TC2906,TC2907,TC5107,TC5156,TC5157,TC5158,TC5159
+---
+ nova/api/metadata/base.py                          |  17 ++
+ nova/api/openstack/compute/extension_info.py       |   8 +
+ nova/api/openstack/compute/flavors_extraspecs.py   |  32 +++
+ nova/api/openstack/compute/routes.py               |   7 +-
+ .../compute/schemas/wrs_server_resources.py        |  29 +++
+ nova/api/openstack/compute/servers.py              |   2 +
+ nova/api/openstack/compute/wrs_server_resources.py | 127 +++++++++++
+ nova/compute/api.py                                |  52 +++++
+ nova/compute/claims.py                             |  15 ++
+ nova/compute/flavors.py                            |   2 +-
+ nova/compute/instance_actions.py                   |   8 +
+ nova/compute/manager.py                            | 120 ++++++++++-
+ nova/compute/resource_tracker.py                   | 124 ++++++++++-
+ nova/compute/rpcapi.py                             |   7 +
+ .../migrate_repo/versions/286_placeholder.py       |  22 --
+ .../migrate_repo/versions/286_wrs_db_changes.py    |  31 +++
+ nova/db/sqlalchemy/models.py                       |   4 +
+ nova/exception.py                                  |  12 ++
+ nova/objects/instance.py                           |  11 +
+ nova/objects/instance_numa_topology.py             |  29 +++
+ nova/policies/__init__.py                          |   4 +-
+ nova/policies/wrs_server_resources.py              |  43 ++++
+ nova/tests/unit/api/openstack/fakes.py             |   9 +
+ nova/tests/unit/compute/test_compute.py            |  95 ++++++++
+ nova/tests/unit/compute/test_compute_api.py        |  13 +-
+ nova/tests/unit/compute/test_compute_mgr.py        | 177 +++++++++++++++
+ nova/tests/unit/compute/test_resource_tracker.py   | 106 +++++++++
+ nova/tests/unit/db/test_migrations.py              |  23 +-
+ nova/tests/unit/fake_instance.py                   |  12 +-
+ nova/tests/unit/fake_policy.py                     |   3 +-
+ nova/tests/unit/objects/test_objects.py            |   2 +-
+ nova/tests/unit/test_metadata.py                   |   5 +-
+ nova/tests/unit/test_policy.py                     |   1 +
+ nova/tests/unit/virt/libvirt/test_driver.py        | 220 +++++++++++++++++++
+ nova/tests/unit/virt/test_hardware.py              |  39 ++++
+ nova/utils.py                                      | 103 +++++++++
+ nova/virt/driver.py                                |   8 +
+ nova/virt/hardware.py                              |  13 +-
+ nova/virt/libvirt/driver.py                        | 239 ++++++++++++++++++++-
+ nova/virt/libvirt/guest.py                         |   6 +
+ 40 files changed, 1736 insertions(+), 44 deletions(-)
+ create mode 100644 nova/api/openstack/compute/schemas/wrs_server_resources.py
+ create mode 100644 nova/api/openstack/compute/wrs_server_resources.py
+ delete mode 100644 nova/db/sqlalchemy/migrate_repo/versions/286_placeholder.py
+ create mode 100644 nova/db/sqlalchemy/migrate_repo/versions/286_wrs_db_changes.py
+ create mode 100644 nova/policies/wrs_server_resources.py
+
+diff --git a/nova/api/metadata/base.py b/nova/api/metadata/base.py
+index f83bcf8..b04d8fa 100644
+--- a/nova/api/metadata/base.py
++++ b/nova/api/metadata/base.py
+@@ -13,6 +13,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2014-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ """Instance Metadata information."""
+ 
+@@ -42,6 +49,7 @@ from nova.network.security_group import openstack_driver
+ from nova import objects
+ from nova.objects import virt_device_metadata as metadata_obj
+ from nova import utils
++from nova.virt import hardware
+ from nova.virt import netutils
+ 
+ 
+@@ -131,6 +139,7 @@ class InstanceMetadata(object):
+         instance.ec2_ids
+         instance.keypairs
+         instance.device_metadata
++        instance.numa_topology
+         instance = objects.Instance.obj_from_primitive(
+             instance.obj_to_primitive())
+ 
+@@ -219,6 +228,13 @@ class InstanceMetadata(object):
+                 network_info=network_info, context=request_context)
+         }
+ 
++        instance_numa_topology = \
++            hardware.instance_topology_from_instance(instance)
++        if instance_numa_topology is not None:
++            self.offline_cpuset = instance_numa_topology.offline_cpus
++        else:
++            self.offline_cpuset = set([])
++
+     def _route_configuration(self):
+         if self.route_configuration:
+             return self.route_configuration
+@@ -312,6 +328,7 @@ class InstanceMetadata(object):
+ 
+         if self._check_version('2008-09-01', version):
+             meta_data['instance-action'] = 'none'
++            meta_data['offline_cpuset'] = self.offline_cpuset
+ 
+         data = {'meta-data': meta_data}
+         if self.userdata_raw is not None:
+diff --git a/nova/api/openstack/compute/extension_info.py b/nova/api/openstack/compute/extension_info.py
+index 28b1d6f..77e6bfa 100644
+--- a/nova/api/openstack/compute/extension_info.py
++++ b/nova/api/openstack/compute/extension_info.py
+@@ -855,6 +855,14 @@ EXTENSION_LIST = [
+         "name": "WrsServerGroup",
+         "namespace": "http://docs.openstack.org/compute/ext/fake_xml",
+         "updated": "2014-12-03T00:00:00Z"
++    },
++    {
++        "alias": "wrs-res",
++        "description": "Adds wrs-res:vcpus and wrs-res:topology on Servers.",
++        "links": [],
++        "name": "WrsServerResources",
++        "namespace": "http://docs.openstack.org/compute/ext/fake_xml",
++        "updated": "2014-12-03T00:00:00Z"
+     }
+ ]
+ 
+diff --git a/nova/api/openstack/compute/flavors_extraspecs.py b/nova/api/openstack/compute/flavors_extraspecs.py
+index 2d92f86..fd951c1 100644
+--- a/nova/api/openstack/compute/flavors_extraspecs.py
++++ b/nova/api/openstack/compute/flavors_extraspecs.py
+@@ -120,6 +120,12 @@ class FlavorExtraSpecsController(wsgi.Controller):
+                         % hw_numa_nodes
+                     raise webob.exc.HTTPBadRequest(explanation=msg)
+ 
++        # CPU scaling doesn't currently support multiple guest NUMA nodes
++        if hw_numa_nodes > 1 and CPU_SCALING_KEY in specs:
++            msg = _('CPU scaling not supported for instances with'
++                    ' multiple NUMA nodes.')
++            raise webob.exc.HTTPConflict(explanation=msg)
++
+         # CGTS-3716 Asymmetric NUMA topology protection
+         # Do common error check from numa_get_constraints with a clearer error
+         if hw_numa_nodes > 0 and specs.get('hw:numa_cpus.0') is None:
+@@ -236,6 +242,31 @@ class FlavorExtraSpecsController(wsgi.Controller):
+                 msg = _('%(k)s is no longer supported.') % {'k': key}
+                 raise webob.exc.HTTPBadRequest(explanation=msg)
+ 
++    @staticmethod
++    def _validate_min_vcpus(flavor):
++        key = CPU_SCALING_KEY
++        specs = flavor.extra_specs
++        if key in specs:
++            if specs.get(CPU_POLICY_KEY) != \
++                    fields.CPUAllocationPolicy.DEDICATED:
++                msg = "%s is only valid when %s is %s." % \
++                      (key, CPU_POLICY_KEY,
++                            fields.CPUAllocationPolicy.DEDICATED)
++                raise webob.exc.HTTPConflict(explanation=msg)
++            try:
++                min_vcpus = int(specs[key])
++            except ValueError:
++                msg = _('%s must be an integer') % key
++                raise webob.exc.HTTPBadRequest(explanation=msg)
++            if min_vcpus < 1:
++                msg = _('%s must be greater than or equal to 1') % key
++                raise webob.exc.HTTPBadRequest(explanation=msg)
++            if min_vcpus > flavor.vcpus:
++                msg = _('%(K)s must be less than or equal to the '
++                        'flavor vcpus value of %(V)d') % \
++                        {'K': key, 'V': flavor.vcpus}
++                raise webob.exc.HTTPConflict(explanation=msg)
++
+     # extra spec sw:keys validation
+     @staticmethod
+     def _validate_sw_keys(flavor):
+@@ -280,6 +311,7 @@ class FlavorExtraSpecsController(wsgi.Controller):
+         self._validate_vcpu_models(flavor)
+         self._validate_cpu_policy(flavor)
+         self._validate_cpu_thread_policy(flavor)
++        self._validate_min_vcpus(flavor)
+         self._validate_numa_node(flavor)
+         self._validate_sw_keys(flavor)
+         self._validate_nested_vmx(flavor)
+diff --git a/nova/api/openstack/compute/routes.py b/nova/api/openstack/compute/routes.py
+index 36b8e1e..bcfc906 100644
+--- a/nova/api/openstack/compute/routes.py
++++ b/nova/api/openstack/compute/routes.py
+@@ -95,6 +95,7 @@ from nova.api.openstack.compute import virtual_interfaces
+ from nova.api.openstack.compute import volumes
+ from nova.api.openstack.compute import wrs_server_groups
+ from nova.api.openstack.compute import wrs_server_if
++from nova.api.openstack.compute import wrs_server_resources
+ from nova.api.openstack import wsgi
+ import nova.conf
+ from nova import wsgi as base_wsgi
+@@ -289,7 +290,8 @@ server_controller = functools.partial(_create_controller,
+         security_groups.SecurityGroupsOutputController,
+         server_usage.ServerUsageController,
+         wrs_server_if.WrsServerIfController,
+-        wrs_server_groups.WrsServerGroupController
++        wrs_server_groups.WrsServerGroupController,
++        wrs_server_resources.WrsServerResourcesController
+     ],
+     [
+         admin_actions.AdminActionsController,
+@@ -307,7 +309,8 @@ server_controller = functools.partial(_create_controller,
+         rescue.RescueController,
+         security_groups.SecurityGroupActionController,
+         shelve.ShelveController,
+-        suspend_server.SuspendServerController
++        suspend_server.SuspendServerController,
++        wrs_server_resources.WrsServerResourcesController
+     ]
+ )
+ 
+diff --git a/nova/api/openstack/compute/schemas/wrs_server_resources.py b/nova/api/openstack/compute/schemas/wrs_server_resources.py
+new file mode 100644
+index 0000000..348d3b1
+--- /dev/null
++++ b/nova/api/openstack/compute/schemas/wrs_server_resources.py
+@@ -0,0 +1,29 @@
++# Copyright (c) 2016-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++
++
++scale = {
++    'type': 'object',
++    'properties': {
++        'wrs-res:scale': {
++            'type': 'object',
++            'properties': {
++                'resource': {
++                    'type': 'string',
++                    'enum': ['cpu']
++                },
++                'direction': {
++                    'type': 'string',
++                    'enum': ['up', 'down']
++                }
++            },
++            'required': ['resource', 'direction'],
++            'additionalProperties': False
++        }
++    },
++    'required': ['wrs-res:scale'],
++    'additionalProperties': False
++}
+diff --git a/nova/api/openstack/compute/servers.py b/nova/api/openstack/compute/servers.py
+index 263ca93..15015b2 100644
+--- a/nova/api/openstack/compute/servers.py
++++ b/nova/api/openstack/compute/servers.py
+@@ -845,6 +845,8 @@ class ServersController(wsgi.Controller):
+         except exception.Invalid:
+             msg = _("Invalid instance image.")
+             raise exc.HTTPBadRequest(explanation=msg)
++        except exception.ResizeError as e:
++            raise exc.HTTPBadRequest(explanation=e.format_message())
+ 
+     @wsgi.response(204)
+     @extensions.expected_errors((404, 409))
+diff --git a/nova/api/openstack/compute/wrs_server_resources.py b/nova/api/openstack/compute/wrs_server_resources.py
+new file mode 100644
+index 0000000..dfa1b45
+--- /dev/null
++++ b/nova/api/openstack/compute/wrs_server_resources.py
+@@ -0,0 +1,127 @@
++#   Licensed under the Apache License, Version 2.0 (the "License"); you may
++#   not use this file except in compliance with the License. You may obtain
++#   a copy of the License at
++#
++#       http://www.apache.org/licenses/LICENSE-2.0
++#
++#   Unless required by applicable law or agreed to in writing, software
++#   distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#   WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#   License for the specific language governing permissions and limitations
++#   under the License.
++#
++# Copyright (c) 2016-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
++
++"""The Server Resources Extension."""
++
++from webob import exc
++
++from nova.api.openstack import common
++from nova.api.openstack.compute.schemas import wrs_server_resources as schema
++from nova.api.openstack import wsgi
++from nova.api import validation
++from nova import compute
++from nova import exception
++from nova.i18n import _LW
++from nova.objects import instance_numa_topology as it_obj
++from nova.policies import wrs_server_resources as wrs_res_policies
++from nova import utils
++from oslo_log import log as logging
++
++
++LOG = logging.getLogger(__name__)
++
++
++class WrsServerResourcesController(wsgi.Controller):
++    def __init__(self):
++        self.compute_api = compute.API()
++
++    def _get_server(self, context, req, instance_uuid):
++        """Utility function for looking up an instance by uuid."""
++        instance = common.get_instance(self.compute_api, context,
++                                       instance_uuid)
++        return instance
++
++    def _get_numa_topology(self, context, instance):
++        try:
++            numa_topology = it_obj.InstanceNUMATopology.get_by_instance_uuid(
++                context, instance['uuid'])
++        except exception.NumaTopologyNotFound:
++            LOG.warning(_LW("Instance does not have numa_topology"),
++                        instance=instance)
++            numa_topology = None
++
++        if not numa_topology:
++            # Print mock summary when no topology available - assume 4K pgsize
++            return (
++                'node:-, %(mem)5dMB, pgsize:%(sz)sK, vcpus:%(vcpus)s'
++                % {'mem': instance['memory_mb'],
++                   'sz': 4,
++                   'vcpus': instance['vcpus']}
++            )
++
++        return utils.format_instance_numa_topology(
++            numa_topology=numa_topology, instance=instance, delim='\n')
++
++    def _extend_server(self, context, server, instance):
++        vcpus = instance["vcpus"]
++        server["wrs-res:vcpus"] = [instance.get("min_vcpus") or vcpus,
++                                   vcpus,
++                                   instance.get("max_vcpus") or vcpus
++                                  ]
++        server["wrs-res:topology"] = self._get_numa_topology(context, instance)
++
++    def _scale(self, req, instance_id, resource, direction):
++        """Begin the scale process with given instance."""
++        context = req.environ["nova.context"]
++        context.can(wrs_res_policies.BASE_POLICY_NAME)
++        instance = self._get_server(context, req, instance_id)
++
++        try:
++            self.compute_api.scale(context, instance, resource, direction)
++        except (exception.OverQuota,
++                exception.CannotScaleBeyondLimits,
++                exception.CannotOfflineCpu,
++                exception.InstanceScalingError) as scale_error:
++            raise exc.HTTPBadRequest(explanation=scale_error.message)
++        except exception.InstanceInvalidState as state_error:
++            common.raise_http_conflict_for_instance_invalid_state(
++                                            state_error, 'scale', instance_id)
++
++    @wsgi.extends
++    def show(self, req, resp_obj, id):
++        context = req.environ['nova.context']
++        if context.can(wrs_res_policies.BASE_POLICY_NAME, fatal=False):
++            server = resp_obj.obj['server']
++            db_instance = req.get_db_instance(server['id'])
++            # server['id'] is guaranteed to be in the cache due to
++            # the core API adding it in its 'show' method.
++            self._extend_server(context, server, db_instance)
++
++    @wsgi.extends
++    def detail(self, req, resp_obj):
++        context = req.environ['nova.context']
++        if context.can(wrs_res_policies.BASE_POLICY_NAME, fatal=False):
++            servers = list(resp_obj.obj['servers'])
++            for server in servers:
++                db_instance = req.get_db_instance(server['id'])
++                # server['id'] is guaranteed to be in the cache due to
++                # the core API adding it in its 'detail' method.
++                self._extend_server(context, server, db_instance)
++
++    @wsgi.response(202)
++    @wsgi.action('wrs-res:scale')
++    @validation.schema(schema.scale)
++    def _action_scale(self, req, id, body):
++        """Scales a given instance resource up or down.
++
++        Validation is done via the specified schema.
++        """
++        direction = body["wrs-res:scale"]["direction"]
++        resource = body["wrs-res:scale"]["resource"]
++        return self._scale(req, id, resource, direction)
+diff --git a/nova/compute/api.py b/nova/compute/api.py
+index 570e287..b6e5ec2 100644
+--- a/nova/compute/api.py
++++ b/nova/compute/api.py
+@@ -857,6 +857,7 @@ class API(base.Base):
+             'instance_type_id': instance_type['id'],
+             'memory_mb': instance_type['memory_mb'],
+             'vcpus': instance_type['vcpus'],
++            'max_vcpus': instance_type['vcpus'],
+             'root_gb': instance_type['root_gb'],
+             'ephemeral_gb': instance_type['ephemeral_gb'],
+             'display_name': display_name,
+@@ -875,6 +876,13 @@ class API(base.Base):
+             'numa_topology': numa_topology,
+             'system_metadata': system_metadata}
+ 
++        # Get min_vcpus from flavor if possible
++        try:
++            base_options['min_vcpus'] = \
++                instance_type['extra_specs']['hw:wrs:min_vcpus']
++        except KeyError:
++            base_options['min_vcpus'] = base_options['vcpus']
++
+         options_from_image = self._inherit_properties_from_image(
+                 boot_meta, auto_disk_config)
+ 
+@@ -3273,6 +3281,31 @@ class API(base.Base):
+                                          current_instance_type,
+                                          new_instance_type)
+ 
++        # Various sanity checks for resizing scaled-down instances
++        if not same_instance_type and instance.numa_topology is not None:
++            new_min_vcpus = \
++                new_instance_type['extra_specs'].get('hw:wrs:min_vcpus')
++            if new_min_vcpus:
++                # The new flavor specifies min_vcpus, make sure we can
++                # satisfy it given that when resizing a scaled-down instance
++                # any cpus that are scaled down will stay scaled down.
++                # (Unless we resize down and they get removed.)
++                new_flavor_cpus = set(range(new_instance_type['vcpus']))
++                # This is a difference of sets, not normal subtraction.
++                new_online_cpus = (new_flavor_cpus -
++                                   instance.numa_topology.offline_cpus)
++                if len(new_online_cpus) < int(new_min_vcpus):
++                    reason = _("Unable to resize, wouldn't meet new min_vcpus."
++                               " Scale up and try again or adjust min_vcpus.")
++                    raise exception.ResizeError(reason=reason)
++            else:
++                # New flavor doesn't support CPU scaling, make sure we're not
++                # currently scaled-down.
++                if len(instance.numa_topology.offline_cpus) > 0:
++                    reason = _("Unable to resize to non-scalable flavor with "
++                               "scaled-down vCPUs.  Scale up and retry.")
++                    raise exception.ResizeError(reason=reason)
++
+         instance.task_state = task_states.RESIZE_PREP
+         instance.progress = 0
+         instance.update(extra_instance_updates)
+@@ -3321,6 +3354,25 @@ class API(base.Base):
+                 request_spec=request_spec)
+ 
+     @check_instance_lock
++    @check_instance_cell
++    @check_instance_state(vm_state=[vm_states.ACTIVE], task_state=[None])
++    def scale(self, context, instance, resource, direction):
++        """Scale a running instance up or down.
++
++        This will dynamically add/remove resources (cpu only for now)
++        to/from a running instance.
++        """
++
++        if resource == 'cpu':
++            if ((direction == 'up' and instance.vcpus == instance.max_vcpus) or
++               (direction == 'down' and instance.vcpus == instance.min_vcpus)):
++                raise exception.CannotScaleBeyondLimits()
++
++        self._record_action_start(context, instance, instance_actions.SCALE)
++        self.compute_rpcapi.scale_instance(context, instance,
++                                           resource, direction)
++
++    @check_instance_lock
+     @check_instance_state(vm_state=[vm_states.ACTIVE, vm_states.STOPPED,
+                                     vm_states.PAUSED, vm_states.SUSPENDED])
+     def shelve(self, context, instance, clean_shutdown=True):
+diff --git a/nova/compute/claims.py b/nova/compute/claims.py
+index 1fad801..5f429e5 100644
+--- a/nova/compute/claims.py
++++ b/nova/compute/claims.py
+@@ -226,6 +226,21 @@ class Claim(NopClaim):
+                     return (_("Requested instance NUMA topology cannot fit "
+                           "the given host NUMA topology"))
+             elif instance_topology:
++                # Adjust the claimed pCPUs to handle scaled-down instances
++                # Catch exceptions here so that claims will return with
++                # fail message when there is an underlying pinning issue.
++                try:
++                    orig_instance_topology = \
++                        hardware.instance_topology_from_instance(self.instance)
++                    if orig_instance_topology is not None:
++                        offline_cpus = orig_instance_topology.offline_cpus
++                        instance_topology.set_cpus_offline(offline_cpus)
++                except Exception as e:
++                    LOG.error('Cannot query offline_cpus from requested '
++                              'instance NUMA topology, err=%(err)s',
++                              {'err': e}, self.instance)
++                    return (_('Cannot query offline cpus from requested '
++                              'instance NUMA topology'))
+                 self.claimed_numa_topology = instance_topology
+ 
+     def _test(self, type_, unit, total, used, requested, limit):
+diff --git a/nova/compute/flavors.py b/nova/compute/flavors.py
+index 9093cb2..773c77e 100644
+--- a/nova/compute/flavors.py
++++ b/nova/compute/flavors.py
+@@ -70,7 +70,7 @@ system_metadata_flavor_props = {
+ 
+ 
+ system_metadata_flavor_extra_props = [
+-    'hw:numa_cpus.', 'hw:numa_mem.', 'hw:numa_node.',
++    'hw:numa_cpus.', 'hw:numa_mem.', 'hw:numa_node.', 'hw:wrs:min_vcpus'
+ ]
+ 
+ 
+diff --git a/nova/compute/instance_actions.py b/nova/compute/instance_actions.py
+index 2faf1c4..5f9a3b5 100644
+--- a/nova/compute/instance_actions.py
++++ b/nova/compute/instance_actions.py
+@@ -12,6 +12,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2014-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ """Possible actions on an instance.
+ 
+@@ -60,3 +67,4 @@ TRIGGER_CRASH_DUMP = 'trigger_crash_dump'
+ # is used for tracking this asynchronous operation so the user/admin can know
+ # when it is done in case they need/want to reboot the guest operating system.
+ EXTEND_VOLUME = 'extend_volume'
++SCALE = 'scale'
+diff --git a/nova/compute/manager.py b/nova/compute/manager.py
+index 048bf65..8571095 100644
+--- a/nova/compute/manager.py
++++ b/nova/compute/manager.py
+@@ -104,6 +104,7 @@ from nova.virt import block_device as driver_block_device
+ from nova.virt import configdrive
+ from nova.virt import driver
+ from nova.virt import event as virtevent
++from nova.virt import hardware
+ from nova.virt import storage_users
+ from nova.virt import virtapi
+ from nova.volume import cinder
+@@ -4187,9 +4188,23 @@ class ComputeManager(manager.Manager):
+ 
+     @staticmethod
+     def _set_instance_info(instance, instance_type):
++        # Handle resizing of an instance with scaled-down CPUs
++        numa_topology = instance.numa_topology
++        if numa_topology is not None:
++            # find offline_cpus that are in the range of new instance_type
++            offline_cpus = [i for i in numa_topology.offline_cpus
++                            if i < instance_type.vcpus]
++            num_offline_cpus = len(offline_cpus)
++        else:
++            num_offline_cpus = 0
++        instance.max_vcpus = instance_type.vcpus
++        instance.min_vcpus = \
++            instance_type.extra_specs.get('hw:wrs:min_vcpus',
++                                          instance_type.vcpus)
++
+         instance.instance_type_id = instance_type.id
+         instance.memory_mb = instance_type.memory_mb
+-        instance.vcpus = instance_type.vcpus
++        instance.vcpus = instance_type.vcpus - num_offline_cpus
+         instance.root_gb = instance_type.root_gb
+         instance.ephemeral_gb = instance_type.ephemeral_gb
+         instance.flavor = instance_type
+@@ -7463,6 +7478,109 @@ class ComputeManager(manager.Manager):
+                                         instance=instance)
+                         break
+ 
++    def scale_instance_cpu_down(self, context, rt, instance, nodename):
++        if instance.vcpus == instance.min_vcpus:
++            raise exception.CannotScaleBeyondLimits()
++
++        # tell hypervisor to remove a cpu from the instance
++        vcpu, pcpu = self.driver.scale_cpu_down(context, instance)
++
++        vcpu0_cell, vcpu0_phys = hardware.instance_vcpu_to_pcpu(instance, 0)
++        vcpu_cell, phys_cpu = hardware.instance_vcpu_to_pcpu(instance, vcpu)
++
++        # Okay, we found phys_cpu, do a basic sanity check
++        if pcpu != phys_cpu:
++            LOG.error(_('Per instance topology, vcpu %(vcpu)d is '
++                        'mapped to pcpu %(phys_cpu)d, not '
++                        'pcpu %(pcpu)d'),
++                      {'vcpu': vcpu, 'phys_cpu': phys_cpu,
++                       'pcpu': pcpu}, instance=instance)
++            pcpu = phys_cpu
++        if pcpu == vcpu0_phys:
++            LOG.error(_('Per instance topology, vcpu %(vcpu)d is '
++                        'mapped same as vcpu0'),
++                      {'vcpu': vcpu}, instance=instance)
++
++        # Update the instance/host resource tracking while holding semaphore
++        rt.put_compat_cpu(instance, pcpu, vcpu_cell, vcpu, vcpu0_phys,
++                          nodename)
++
++    def scale_instance_cpu_up(self, context, rt, instance, nodename):
++        # Get lowest index offline vCPU for the instance.
++        try:
++            offline_cpus = instance.numa_topology.offline_cpus
++            vcpu = min(offline_cpus)
++        except ValueError:
++            # This shouldn't happen.
++            LOG.error('Unable to find vcpu to online.  Offline cpus: %s',
++                      offline_cpus, instance=instance)
++            raise exception.InstanceScalingError()
++
++        vcpu0_cell, vcpu0_phys = hardware.instance_vcpu_to_pcpu(instance, 0)
++        vcpu_cell, phys_cpu = hardware.instance_vcpu_to_pcpu(instance, vcpu)
++        # Okay, we found phys_cpu, do a basic sanity check
++        if phys_cpu != vcpu0_phys:
++            LOG.error(_('Per instance topology, vcpu %(vcpu)d is '
++                        'mapped to pcpu %(phys_cpu)d, not '
++                        'pcpu %(pcpu)d'),
++                      {'vcpu': vcpu, 'phys_cpu': phys_cpu,
++                       'pcpu': vcpu0_phys}, instance=instance)
++
++        pcpu = None
++        try:
++            # Update the instance/host resource tracking while holding sema
++            pcpu = rt.get_compat_cpu(instance, vcpu_cell, vcpu, nodename)
++        except Exception:
++            # In this case we probably haven't modified the host/instance info
++            # yet so we don't need to call rt.put_compat_cpu().
++            with excutils.save_and_reraise_exception():
++                # unable to obtain suitable CPU
++                LOG.exception("Unable to scale up instance, "
++                              "can't allocate CPU.")
++
++        try:
++            # Attempt to do scale up
++            self.driver.scale_cpu_up(context, instance, pcpu, vcpu)
++        except Exception:
++            # If scale up fails, return cpu to resource tracking
++            with excutils.save_and_reraise_exception():
++                LOG.exception("Unable to scale up instance, "
++                              "problem affining CPU.")
++                rt.put_compat_cpu(
++                    instance, pcpu, vcpu_cell, vcpu, vcpu0_phys, nodename)
++
++    @messaging.expected_exceptions(exception.InstanceScalingError,
++                                   exception.CannotOfflineCpu,
++                                   NotImplementedError)
++    @wrap_exception()
++    @wrap_instance_event(prefix='compute')
++    @wrap_instance_fault
++    def scale_instance(self, context, instance, resource, direction):
++        """Scale a running instance up or down.
++
++        This will dynamically add/remove resources (cpu only for now)
++        to/from a running instance.
++        """
++        # LOG.audit(_('Attempting to scale %(resource)s %(direction)'),
++        #     {'resource': resource, 'direction': direction},
++        #     context=context, instance=instance)
++
++        @utils.synchronized(instance.uuid)
++        def do_scale():
++            if resource == 'cpu':
++                if direction == 'down':
++                    self.scale_instance_cpu_down(
++                        context, rt, instance, self.host)
++                else:
++                    self.scale_instance_cpu_up(
++                        context, rt, instance, self.host)
++
++        rt = self._get_resource_tracker()
++        do_scale()
++
++        # do a resource audit so the scheduler knows about the change
++        rt.update_available_resource(context.elevated(), self.host)
++
+     @messaging.expected_exceptions(exception.InstanceQuiesceNotSupported,
+                                    exception.QemuGuestAgentNotEnabled,
+                                    exception.NovaException,
+diff --git a/nova/compute/resource_tracker.py b/nova/compute/resource_tracker.py
+index 845d87a..3d454c7 100644
+--- a/nova/compute/resource_tracker.py
++++ b/nova/compute/resource_tracker.py
+@@ -147,6 +147,126 @@ class ResourceTracker(object):
+         self.cpu_allocation_ratio = CONF.cpu_allocation_ratio
+         self.disk_allocation_ratio = CONF.disk_allocation_ratio
+ 
++    def _get_compat_cpu(self, instance, resources):
++        """Helper function to reserve a pcpu from the host
++
++        Search for an unpinned cpu on the same numa node as what the instance
++        is already using.  Use node of vcpu0 for now, will have to get fancier
++        to deal with shared platform CPU, HT siblings, and multi-numa-node
++        instances.
++        """
++        vcpu0_cell, vcpu0_phys = hardware.instance_vcpu_to_pcpu(instance, 0)
++        host_numa_topology, jsonify_result = \
++            hardware.host_topology_and_format_from_host(resources)
++
++        for cell in host_numa_topology.cells:
++            if vcpu0_phys in cell.cpuset:
++                host_has_threads = (cell.siblings and
++                                    len(cell.siblings[0]) > 1)
++                if (host_has_threads and vcpu0_cell.cpu_thread_policy ==
++                        fields.CPUThreadAllocationPolicy.ISOLATE):
++                    # We need to allocate a set of matched sibling threads,
++                    # and we don't know how many siblings are on a core.
++                    # Also, cell.free_siblings can have empty sets or sets
++                    # with not all siblings free, we need to filter them out.
++                    num_sibs = len(cell.siblings[0])
++                    free_siblings = [sibs for sibs in cell.free_siblings if
++                                     len(sibs) == num_sibs]
++                    if not free_siblings:
++                        raise exception.ComputeResourcesUnavailable(
++                            reason="no free siblings available on NUMA node")
++                    try:
++                        siblings = min(free_siblings)
++                        pcpu = min(siblings)
++                    except ValueError:
++                        # Shouldn't happen given above check of free_siblings
++                        raise exception.ComputeResourcesUnavailable(
++                            reason="unable to find free sibling cpu "
++                                   "on NUMA node")
++                    # Update the host numa topology
++                    cell.pin_cpus(siblings)
++                    cell.cpu_usage += len(siblings)
++                    resources.vcpus_used += len(siblings)
++                else:
++                    if cell.avail_cpus < 1:
++                        raise exception.ComputeResourcesUnavailable(
++                            reason="no free pcpu available on NUMA node")
++                    try:
++                        pcpu = min(cell.free_cpus)
++                    except ValueError:
++                        # Shouldn't happen given the above check of avail_cpus
++                        raise exception.ComputeResourcesUnavailable(
++                            reason="unable to find free cpu on NUMA node")
++                    # Update the host numa topology
++                    cell.pin_cpus(set([pcpu]))
++                    cell.cpu_usage += 1
++                    resources.vcpus_used += 1
++
++                if jsonify_result:
++                    resources.numa_topology = host_numa_topology._to_json()
++                return pcpu
++        err = (_("Couldn't find host numa node containing pcpu %d") %
++                 vcpu0_phys)
++        raise exception.InternalError(message=err)
++
++    def _put_compat_cpu(self, instance, pcpu, resources):
++        """Helper function to return a pcpu back to the host """
++        host_numa_topology, jsonify_result = \
++            hardware.host_topology_and_format_from_host(resources)
++        for cell in host_numa_topology.cells:
++            if pcpu in cell.pinned_cpus:
++                thread_policy_is_isolate = (
++                    instance.numa_topology.cells[0].cpu_thread_policy ==
++                    fields.CPUThreadAllocationPolicy.ISOLATE)
++                # Don't assume we know how many siblings are on a core.
++                host_has_threads = (cell.siblings and
++                                    len(cell.siblings[0]) > 1)
++                if (host_has_threads and thread_policy_is_isolate):
++                    cell.unpin_cpus_with_siblings(set([pcpu]))
++                    cell.cpu_usage -= len(cell.siblings[0])
++                    resources.vcpus_used -= len(cell.siblings[0])
++                else:
++                    cell.unpin_cpus(set([pcpu]))
++                    cell.cpu_usage -= 1
++                    resources.vcpus_used -= 1
++                if jsonify_result:
++                    resources.numa_topology = host_numa_topology._to_json()
++                return
++        err = (_("Couldn't find host numa node containing pcpu %d") % pcpu)
++        raise exception.InternalError(message=err)
++
++    @utils.synchronized(COMPUTE_RESOURCE_SEMAPHORE)
++    def get_compat_cpu(self, instance, vcpu_cell, vcpu, nodename):
++        # We hold the semaphore here so we don't race against the
++        # resource audit.
++
++        # Find pcpu and update the CPU usage on the host.
++        cn = self.compute_nodes[nodename]
++        pcpu = self._get_compat_cpu(instance, cn)
++
++        # Update the instance CPU pinning to map the vcpu to the pcpu
++        vcpu_cell.pin(vcpu, pcpu)
++        instance.vcpus += 1
++        instance.save()
++
++        return pcpu
++
++    @utils.synchronized(COMPUTE_RESOURCE_SEMAPHORE)
++    def put_compat_cpu(self, instance, cpu, vcpu_cell, vcpu, vcpu0_phys,
++                       nodename):
++        # We hold the semaphore here so we don't race against the
++        # resource audit.
++
++        # Update the instance NUMA cell CPU pinning to map the vcpu
++        # to the same pCPU as vcpu0.
++        vcpu_cell.pin(vcpu, vcpu0_phys)
++        instance.vcpus -= 1
++        instance.save()
++
++        # Now update the CPU usage on the host
++        cn = self.compute_nodes[nodename]
++        self._put_compat_cpu(instance, cpu, cn)
++
+     @utils.synchronized(COMPUTE_RESOURCE_SEMAPHORE)
+     def instance_claim(self, context, instance, nodename, limits=None):
+         """Indicate that some resources are needed for an upcoming compute
+@@ -1465,7 +1585,9 @@ class ResourceTracker(object):
+         usage = {}
+         if isinstance(object_or_dict, objects.Instance):
+             usage = {'memory_mb': object_or_dict.flavor.memory_mb,
+-                     'vcpus': object_or_dict.flavor.vcpus,
++                     # get vcpus from instance object directly so that
++                     # it reflects actual used vcpus after scaling
++                     'vcpus': object_or_dict.vcpus,
+                      'root_gb': object_or_dict.root_gb,
+                      'ephemeral_gb': object_or_dict.flavor.ephemeral_gb,
+                      'numa_topology': object_or_dict.numa_topology}
+diff --git a/nova/compute/rpcapi.py b/nova/compute/rpcapi.py
+index 0bdd989..fb7c7cb 100644
+--- a/nova/compute/rpcapi.py
++++ b/nova/compute/rpcapi.py
+@@ -1170,6 +1170,13 @@ class ComputeAPI(object):
+                 block_device_mapping=block_device_mapping, node=node,
+                 limits=limits)
+ 
++    def scale_instance(self, ctxt, instance, resource, direction):
++        version = '4.0'
++        cctxt = self.router.client(ctxt).prepare(
++                server=_compute_host(None, instance), version=version)
++        return cctxt.call(ctxt, 'scale_instance', instance=instance,
++                   resource=resource, direction=direction)
++
+     def quiesce_instance(self, ctxt, instance):
+         version = '4.0'
+         cctxt = self.router.client(ctxt).prepare(
+diff --git a/nova/db/sqlalchemy/migrate_repo/versions/286_placeholder.py b/nova/db/sqlalchemy/migrate_repo/versions/286_placeholder.py
+deleted file mode 100644
+index b088f20..0000000
+--- a/nova/db/sqlalchemy/migrate_repo/versions/286_placeholder.py
++++ /dev/null
+@@ -1,22 +0,0 @@
+-#    Licensed under the Apache License, Version 2.0 (the "License"); you may
+-#    not use this file except in compliance with the License. You may obtain
+-#    a copy of the License at
+-#
+-#         http://www.apache.org/licenses/LICENSE-2.0
+-#
+-#    Unless required by applicable law or agreed to in writing, software
+-#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+-#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+-#    License for the specific language governing permissions and limitations
+-#    under the License.
+-
+-# This is a placeholder for Kilo backports.
+-# Do not use this number for new Liberty work.  New work starts after
+-# all the placeholders.
+-#
+-# See this for more information:
+-# http://lists.openstack.org/pipermail/openstack-dev/2013-March/006827.html
+-
+-
+-def upgrade(migrate_engine):
+-    pass
+diff --git a/nova/db/sqlalchemy/migrate_repo/versions/286_wrs_db_changes.py b/nova/db/sqlalchemy/migrate_repo/versions/286_wrs_db_changes.py
+new file mode 100644
+index 0000000..fe59774
+--- /dev/null
++++ b/nova/db/sqlalchemy/migrate_repo/versions/286_wrs_db_changes.py
+@@ -0,0 +1,31 @@
++#
++# Copyright (c) 2013-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
++
++from sqlalchemy import Table, MetaData, Column, Integer
++
++# Database changes
++# -- add per-instance min_vcpus, max_vcpus
++
++
++def upgrade(migrate_engine):
++    meta = MetaData()
++    meta.bind = migrate_engine
++
++    # Adding min_vcpus/max_vcpus to instances table
++    instances = Table('instances', meta, autoload=True)
++    min_vcpus = Column('min_vcpus', Integer())
++    max_vcpus = Column('max_vcpus', Integer())
++    if not hasattr(instances.c, 'min_vcpus'):
++        instances.create_column(min_vcpus)
++    if not hasattr(instances.c, 'max_vcpus'):
++        instances.create_column(max_vcpus)
++    shadow_instances = Table('shadow_instances', meta, autoload=True)
++    if not hasattr(shadow_instances.c, 'min_vcpus'):
++        shadow_instances.create_column(min_vcpus.copy())
++    if not hasattr(shadow_instances.c, 'max_vcpus'):
++        shadow_instances.create_column(max_vcpus.copy())
+diff --git a/nova/db/sqlalchemy/models.py b/nova/db/sqlalchemy/models.py
+index 1d62f02..f9e720f 100644
+--- a/nova/db/sqlalchemy/models.py
++++ b/nova/db/sqlalchemy/models.py
+@@ -358,6 +358,10 @@ class Instance(BASE, NovaBase, models.SoftDeleteMixin):
+     # Records whether an instance has been deleted from disk
+     cleaned = Column(Integer, default=0)
+ 
++    # vm scaling
++    min_vcpus = Column(Integer)
++    max_vcpus = Column(Integer)
++
+ 
+ class InstanceInfoCache(BASE, NovaBase, models.SoftDeleteMixin):
+     """Represents a cache of information about an instance
+diff --git a/nova/exception.py b/nova/exception.py
+index 9eee04d..cabc4c8 100644
+--- a/nova/exception.py
++++ b/nova/exception.py
+@@ -1335,6 +1335,10 @@ class PasteAppNotFound(NovaException):
+     msg_fmt = _("Could not load paste app '%(name)s' from %(path)s")
+ 
+ 
++class CannotScaleBeyondLimits(NovaException):
++    msg_fmt = _("When scaling, cannot scale beyond limits!")
++
++
+ class CannotResizeToSameFlavor(NovaException):
+     msg_fmt = _("When resizing, instances must change flavor!")
+ 
+@@ -2010,6 +2014,14 @@ class ImageNUMATopologyNodesForbidden(Forbidden):
+                 "flavor or image.")
+ 
+ 
++class InstanceScalingError(NovaException):
++    msg_fmt = _("Problem scaling instance as requested")
++
++
++class CannotOfflineCpu(NovaException):
++    msg_fmt = _("Cpu %(cpu)s is already offline or out of range.")
++
++
+ class UnsupportedPolicyException(Invalid):
+     msg_fmt = _("ServerGroup policy is not supported: %(reason)s")
+ 
+diff --git a/nova/objects/instance.py b/nova/objects/instance.py
+index 145ee8a..0c11bdc 100644
+--- a/nova/objects/instance.py
++++ b/nova/objects/instance.py
+@@ -11,6 +11,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2014-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ import contextlib
+ 
+@@ -198,6 +205,10 @@ class Instance(base.NovaPersistentObject, base.NovaObject,
+ 
+         'cleaned': fields.BooleanField(default=False),
+ 
++        # vm scaling
++        'min_vcpus': fields.IntegerField(nullable=True),
++        'max_vcpus': fields.IntegerField(nullable=True),
++
+         'pci_devices': fields.ObjectField('PciDeviceList', nullable=True),
+         'numa_topology': fields.ObjectField('InstanceNUMATopology',
+                                             nullable=True),
+diff --git a/nova/objects/instance_numa_topology.py b/nova/objects/instance_numa_topology.py
+index d4abab8..18c3cc9 100644
+--- a/nova/objects/instance_numa_topology.py
++++ b/nova/objects/instance_numa_topology.py
+@@ -270,3 +270,32 @@ class InstanceNUMATopology(base.NovaObject,
+     @property
+     def numa_pinning_requested(self):
+         return all(cell.numa_pinning_requested for cell in self.cells)
++
++    def vcpu_to_pcpu(self, vcpu):
++        for cell in self.cells:
++            if vcpu in cell.cpu_pinning.keys():
++                return cell, cell.cpu_pinning[vcpu]
++        raise KeyError('Unable to find pCPU for vCPU %d' % vcpu)
++
++    @property
++    def offline_cpus(self):
++        offline_cpuset = set()
++        if not self.cpu_pinning_requested:
++            return offline_cpuset
++        # The offline vCPUs will be pinned the same as vCPU0
++        vcpu0_cell, vcpu0_phys = self.vcpu_to_pcpu(0)
++        for cell in self.cells:
++            for vcpu in cell.cpuset:
++                if vcpu != 0 and cell.cpu_pinning[vcpu] == vcpu0_phys:
++                    offline_cpuset |= {vcpu}
++        return offline_cpuset
++
++    def set_cpus_offline(self, offline_cpus):
++        if not self.cpu_pinning_requested:
++            return
++        # The offline vCPUs will be pinned the same as vCPU0
++        vcpu0_cell, vcpu0_phys = self.vcpu_to_pcpu(0)
++        for cell in self.cells:
++            for vcpu in cell.cpuset:
++                if vcpu in offline_cpus:
++                    cell.pin(vcpu, vcpu0_phys)
+diff --git a/nova/policies/__init__.py b/nova/policies/__init__.py
+index 4c9662f..485e290 100644
+--- a/nova/policies/__init__.py
++++ b/nova/policies/__init__.py
+@@ -96,6 +96,7 @@ from nova.policies import volumes
+ from nova.policies import volumes_attachments
+ from nova.policies import wrs_server_groups
+ from nova.policies import wrs_server_if
++from nova.policies import wrs_server_resources
+ 
+ 
+ def list_rules():
+@@ -175,5 +176,6 @@ def list_rules():
+         volumes.list_rules(),
+         volumes_attachments.list_rules(),
+         wrs_server_if.list_rules(),
+-        wrs_server_groups.list_rules()
++        wrs_server_groups.list_rules(),
++        wrs_server_resources.list_rules()
+     )
+diff --git a/nova/policies/wrs_server_resources.py b/nova/policies/wrs_server_resources.py
+new file mode 100644
+index 0000000..b243746
+--- /dev/null
++++ b/nova/policies/wrs_server_resources.py
+@@ -0,0 +1,43 @@
++#
++# Copyright (c) 2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
++
++from oslo_policy import policy
++
++from nova.policies import base
++
++
++BASE_POLICY_NAME = 'os_compute_api:wrs-res'
++
++
++wrs_res_policies = [
++    policy.DocumentedRuleDefault(
++        BASE_POLICY_NAME,
++        base.RULE_ADMIN_OR_OWNER,
++"""Add wrs-res:vcpus, wrs-res:topology attribute in the server response.
++This check is performed only after the check
++'os_compute_api:servers:show' for GET /servers/{id} and
++'os_compute_api:servers:detail' for GET /servers/detail passes""",
++        [
++            {
++                'method': 'GET',
++                'path': '/servers/{id}'
++            },
++            {
++                'method': 'GET',
++                'path': '/servers/detail'
++            },
++            {
++                'method': 'POST',
++                'path': '/servers/{server_id}/action (wrs-res:scale)'
++            }
++        ]),
++]
++
++
++def list_rules():
++    return wrs_res_policies
+diff --git a/nova/tests/unit/api/openstack/fakes.py b/nova/tests/unit/api/openstack/fakes.py
+index fdea6dd..e009646 100644
+--- a/nova/tests/unit/api/openstack/fakes.py
++++ b/nova/tests/unit/api/openstack/fakes.py
+@@ -12,6 +12,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2014-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ import datetime
+ 
+@@ -508,6 +515,8 @@ def stub_instance(id=1, user_id=None, project_id=None, host=None,
+         "power_state": power_state,
+         "memory_mb": memory_mb,
+         "vcpus": vcpus,
++        "min_vcpus": vcpus,
++        "max_vcpus": vcpus,
+         "root_gb": root_gb,
+         "ephemeral_gb": ephemeral_gb,
+         "ephemeral_key_uuid": None,
+diff --git a/nova/tests/unit/compute/test_compute.py b/nova/tests/unit/compute/test_compute.py
+index 3a1d691..d3dd82e 100644
+--- a/nova/tests/unit/compute/test_compute.py
++++ b/nova/tests/unit/compute/test_compute.py
+@@ -312,6 +312,7 @@ class BaseTestCase(test.TestCase):
+         inst.flavor = flavor
+         inst.old_flavor = None
+         inst.new_flavor = None
++        inst.max_vcpus = flavor.vcpus
+         if params:
+             inst.flavor.update(params.pop('flavor', {}))
+             inst.root_gb = inst.flavor.get('root_gb', 0)
+@@ -1795,6 +1796,10 @@ class ComputeTestCase(BaseTestCase,
+         params = {"flavor": {"memory_mb": 10, "root_gb": 1,
+                              "ephemeral_gb": 1, "vcpus": 2}}
+         instance = self._create_fake_instance_obj(params)
++
++        # rt._get_usage_dict(): get vcpus from instance object directly
++        instance.vcpus = 2
++
+         self.compute.build_and_run_instance(self.context, instance, {}, {},
+                 filter_properties, block_device_mapping=[])
+ 
+@@ -1805,6 +1810,8 @@ class ComputeTestCase(BaseTestCase,
+         params = {"flavor": {"memory_mb": 10, "root_gb": 1,
+                              "ephemeral_gb": 1, "vcpus": 1}}
+         instance = self._create_fake_instance_obj(params)
++        instance.vcpus = 1
++
+         self.compute.build_and_run_instance(self.context, instance, {}, {},
+                 filter_properties, block_device_mapping=[])
+ 
+@@ -1820,6 +1827,7 @@ class ComputeTestCase(BaseTestCase,
+         params = {"flavor": {"memory_mb": 10, "root_gb": 1,
+                              "ephemeral_gb": 1, "vcpus": 2}}
+         instance = self._create_fake_instance_obj(params)
++        instance.vcpus = 2
+ 
+         limits = {'vcpu': 3}
+         self.compute.build_and_run_instance(self.context, instance, {}, {},
+@@ -4997,6 +5005,93 @@ class ComputeTestCase(BaseTestCase,
+         self.assertEqual(new_flavor['ephemeral_gb'], instance.ephemeral_gb)
+         self.assertEqual(new_flavor['id'], instance.instance_type_id)
+ 
++    # Resize a downscaled instance to a scalable flavor with maximum cpus
++    # less than currently running. Offline ones should stay offline.
++    @mock.patch.object(objects.instance_numa_topology.InstanceNUMATopology,
++                       'offline_cpus', new_callable=mock.PropertyMock)
++    def test_set_instance_info_resize_downscaled_inst_downwards(
++            self, mock_offline_cpus):
++        old_flavor_name = 'm1.xlarge'  # vcpus=8
++        new_flavor_name = 'm1.medium'  # vcpus=2
++        instance = self._create_fake_instance_obj(type_name=old_flavor_name)
++        # scale down the instance with 8 cpus to 3
++        instance.max_vcpus = 8
++        instance.vcpus = 3
++        instance.numa_topology = objects.InstanceNUMATopology()
++        mock_offline_cpus.return_value = [3, 4, 5, 6, 7]
++
++        new_flavor = flavors.get_flavor_by_name(new_flavor_name)
++
++        self.compute._set_instance_info(instance, new_flavor.obj_clone())
++        # active vcpus is adjusted downwards to the new flavor
++        self.assertEqual(2, instance.max_vcpus)
++        self.assertEqual(2, instance.vcpus)
++
++    # Resize a downscaled instance to a scalable flavor with maximum cpus
++    # more than currently running. Offline ones should stay offline.
++    @mock.patch.object(objects.instance_numa_topology.InstanceNUMATopology,
++                       'offline_cpus', new_callable=mock.PropertyMock)
++    def test_set_instance_info_resize_downscaled_inst_upwards(
++            self, mock_offline_cpus):
++        old_flavor_name = 'm1.xlarge'  # vcpus=8
++        new_flavor_name = 'm1.large'   # vcpus=4
++        instance = self._create_fake_instance_obj(type_name=old_flavor_name)
++        # scale down the instance with 8 cpus to 3
++        instance.max_vcpus = 8
++        instance.vcpus = 3
++        instance.numa_topology = objects.InstanceNUMATopology()
++        mock_offline_cpus.return_value = [3, 4, 5, 6, 7]
++
++        new_flavor = flavors.get_flavor_by_name(new_flavor_name)
++
++        self.compute._set_instance_info(instance, new_flavor.obj_clone())
++        self.assertEqual(4, instance.max_vcpus)
++        self.assertEqual(3, instance.vcpus)
++
++    # Resize a downscaled instance to a scalable flavor with maximum cpus
++    # more than that of the current flavor. Offline ones should stay offline.
++    @mock.patch.object(objects.instance_numa_topology.InstanceNUMATopology,
++                       'offline_cpus', new_callable=mock.PropertyMock)
++    def test_set_instance_info_resize_downscaled_inst_upwards2(
++            self, mock_offline_cpus):
++        old_flavor_name = 'm1.large'   # vcpus=4
++        new_flavor_name = 'm1.xlarge'  # vcpus=8
++        instance = self._create_fake_instance_obj(type_name=old_flavor_name)
++        # scale down the instance with 4 cpus to 3
++        instance.max_vcpus = 4
++        instance.vcpus = 3
++        instance.numa_topology = objects.InstanceNUMATopology()
++        mock_offline_cpus.return_value = [3]
++
++        new_flavor = flavors.get_flavor_by_name(new_flavor_name)
++
++        self.compute._set_instance_info(instance, new_flavor.obj_clone())
++        # active vcpus is adjusted downwards to the new flavor
++        self.assertEqual(8, instance.max_vcpus)
++        self.assertEqual(7, instance.vcpus)
++
++    # Resize a downscaled instance in which not all offline cpus are from
++    # highest vcpu#.The offline cpus should stay offline.
++    @mock.patch.object(objects.instance_numa_topology.InstanceNUMATopology,
++                       'offline_cpus', new_callable=mock.PropertyMock)
++    def test_set_instance_info_resize_downscaled_inst_irregular(
++            self, mock_offline_cpus):
++        old_flavor_name = 'm1.xlarge'  # vcpus=8
++        new_flavor_name = 'm1.large'   # vcpus=4
++        instance = self._create_fake_instance_obj(type_name=old_flavor_name)
++        # scale down the instance with 8 cpus to 3
++        instance.max_vcpus = 8
++        instance.vcpus = 3
++        instance.numa_topology = objects.InstanceNUMATopology()
++        mock_offline_cpus.return_value = [1, 2, 5, 6, 7]
++
++        new_flavor = flavors.get_flavor_by_name(new_flavor_name)
++
++        self.compute._set_instance_info(instance, new_flavor.obj_clone())
++        self.assertEqual(4, instance.max_vcpus)
++        # only vcpus [0, 3] are online
++        self.assertEqual(2, instance.vcpus)
++
+     def test_rebuild_instance_notification(self):
+         # Ensure notifications on instance migrate/resize.
+         old_time = datetime.datetime(2012, 4, 1)
+diff --git a/nova/tests/unit/compute/test_compute_api.py b/nova/tests/unit/compute/test_compute_api.py
+index 46db66c..7792fc5 100644
+--- a/nova/tests/unit/compute/test_compute_api.py
++++ b/nova/tests/unit/compute/test_compute_api.py
+@@ -10,6 +10,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2014-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ """Unit tests for compute API."""
+ 
+@@ -106,11 +113,12 @@ class _ComputeAPIUnitTestMixIn(object):
+                   'created_at': datetime.datetime(2012, 1, 19, 18,
+                                                   49, 30, 877329),
+                   'updated_at': None,
++                  'extra_specs': {'foo': 'bar'},
+                  }
+         if updates:
+             flavor.update(updates)
+         return objects.Flavor._from_db_object(self.context, objects.Flavor(),
+-                                              flavor)
++                                       flavor, expected_attrs=['extra_specs'])
+ 
+     def _create_instance_obj(self, params=None, flavor=None):
+         """Create a test instance."""
+@@ -142,6 +150,8 @@ class _ComputeAPIUnitTestMixIn(object):
+         instance.ami_launch_index = 0
+         instance.memory_mb = 0
+         instance.vcpus = 0
++        instance.max_vcpus = instance.vcpus
++        instance.min_vcpus = instance.vcpus
+         instance.root_gb = 0
+         instance.ephemeral_gb = 0
+         instance.architecture = fields_obj.Architecture.X86_64
+@@ -154,6 +164,7 @@ class _ComputeAPIUnitTestMixIn(object):
+         instance.info_cache = objects.InstanceInfoCache()
+         instance.flavor = flavor
+         instance.old_flavor = instance.new_flavor = None
++        instance.numa_topology = None
+ 
+         if params:
+             instance.update(params)
+diff --git a/nova/tests/unit/compute/test_compute_mgr.py b/nova/tests/unit/compute/test_compute_mgr.py
+index 38e3d3b..701dda5 100644
+--- a/nova/tests/unit/compute/test_compute_mgr.py
++++ b/nova/tests/unit/compute/test_compute_mgr.py
+@@ -28,6 +28,7 @@ from cursive import exception as cursive_exception
+ import ddt
+ from eventlet import event as eventlet_event
+ import mock
++from mox3 import mox
+ import netaddr
+ import oslo_messaging as messaging
+ from oslo_serialization import jsonutils
+@@ -88,6 +89,7 @@ class ComputeManagerUnitTestCase(test.NoDBTestCase):
+         self.compute = manager.ComputeManager()
+         self.context = context.RequestContext(fakes.FAKE_USER_ID,
+                                               fakes.FAKE_PROJECT_ID)
++        self.node = 'fake-node'
+ 
+         self.useFixture(fixtures.SpawnIsSynchronousFixture())
+         self.useFixture(fixtures.EventReporterStub())
+@@ -4248,6 +4250,181 @@ class ComputeManagerUnitTestCase(test.NoDBTestCase):
+                 mock.call(self.context, inst_obj, 'fake-mini',
+                           action='soft_delete', phase='end')])
+ 
++    # 
++    @mock.patch.object(manager.compute.resource_tracker.ResourceTracker,
++                       'update_available_resource')
++    @mock.patch.object(manager.ComputeManager, '_get_resource_tracker')
++    @mock.patch.object(nova.compute.manager.ComputeManager,
++                       'scale_instance_cpu_down')
++    def test_scale_instance_down(self, mock_scale_down, mock_get_rt,
++                                     mock_update_resource):
++        instance = fake_instance.fake_instance_obj(
++            self.context, vm_state=vm_states.ACTIVE)
++        self.compute.scale_instance(self.context, instance, 'cpu', 'down')
++        mock_scale_down.assert_has_calls([
++            mock.call(self.context, mock.ANY, instance, self.compute.host)
++        ])
++
++    # 
++    @mock.patch.object(manager.compute.resource_tracker.ResourceTracker,
++                       'update_available_resource')
++    @mock.patch.object(manager.ComputeManager, '_get_resource_tracker')
++    @mock.patch.object(nova.compute.manager.ComputeManager,
++                       'scale_instance_cpu_up')
++    def test_scale_instance_up(self, mock_scale_up, mock_get_rt,
++                                     mock_update_resource):
++        instance = fake_instance.fake_instance_obj(
++            self.context, vm_state=vm_states.ACTIVE)
++        self.compute.scale_instance(self.context, instance, 'cpu', 'up')
++        mock_scale_up.assert_has_calls([
++            mock.call(self.context, mock.ANY, instance, self.compute.host)
++        ])
++
++    # 
++    def test_scale_instance_cpu_down_hit_limit(self):
++        instance = fake_instance.fake_instance_obj(
++            self.context, vcpus=2, min_vcpus=2)
++        self.assertRaises(exception.CannotScaleBeyondLimits,
++                          self.compute.scale_instance_cpu_down,
++                          self.context, mock.ANY, instance, self.compute.host)
++
++    def _do_test_scale_instance_cpu_down(self, vcpu_cell, vcpu, pcpu,
++                                         pcpu_topology, expect):
++        """base function to test cpu scale down
++
++        :param vcpu_cell: InstanceNUMACell from which vcpu to be ping down
++        :param vcpu: vcpu to ping down, chosen by hypervisor and guest.
++        :param pcpu: pcpu mapped to vcpu per hypervisor
++        :param pcpu_topology: pcpu mapped to vcpu per instance topology
++        """
++        instance = fake_instance.fake_instance_obj(
++            self.context, vcpus=vcpu_cell.vcpus, min_vcpus=vcpu_cell.min_vcpus)
++        fake_rt = fake_resource_tracker.FakeResourceTracker(self.compute.host,
++                    self.compute.driver)
++        fake_rt.compute_nodes[self.compute.host] = mock.ANY
++        self.compute._resource_tracker = fake_rt
++
++        self.mox.StubOutWithMock(self.compute.driver, 'scale_cpu_down')
++        self.mox.StubOutWithMock(hardware, 'instance_vcpu_to_pcpu')
++        self.mox.StubOutWithMock(instance, 'save')
++        self.mox.StubOutWithMock(
++            manager.compute.resource_tracker.ResourceTracker,
++            '_put_compat_cpu')
++
++        self.compute.driver.scale_cpu_down(self.context, instance).AndReturn(
++            (vcpu, pcpu))
++        hardware.instance_vcpu_to_pcpu(instance, 0).AndReturn(
++            (mock.ANY, 0))
++        hardware.instance_vcpu_to_pcpu(instance, vcpu).AndReturn(
++            (vcpu_cell, pcpu_topology))
++        instance.save()
++
++        # product code makes sure pcpu_topology is used when there is mismatch
++        fake_rt._put_compat_cpu(instance, pcpu_topology, mock.ANY)
++        self.mox.ReplayAll()
++
++        self.compute.scale_instance_cpu_down(
++            self.context, fake_rt, instance, self.compute.host)
++        self.assertEqual(expect['vcpus'], instance.vcpus)
++        self.assertEqual(expect['cpu_pinning'], vcpu_cell.cpu_pinning)
++
++    # pcpu mismatch between nova and hypervisor
++    def test_scale_instance_cpu_down_pcpu_topology_mismatch(self):
++
++        vcpu_cell = objects.InstanceNUMACell(
++            id=0, memory=2048,
++            cpuset=set([0, 1, 2, 3, 4]),
++            cpu_pinning={0: 0, 1: 11, 2: 12, 3: 13, 4: 14},
++            vcpus=5, min_vcpus=2)
++
++        expect = {'cpu_pinning': {0: 0, 1: 11, 2: 12, 3: 13, 4: 0},
++                  'vcpus': 4}
++
++        self._do_test_scale_instance_cpu_down(vcpu_cell=vcpu_cell,
++                                         vcpu=4, pcpu=15,
++                                         pcpu_topology= 14,
++                                         expect=expect)
++
++    # pcpu mismatch between nova and hypervisor. Nova shows
++    # the cpu already offline.
++    def test_scale_instance_cpu_down_pcpu_mapped_to_vcpu0(self):
++
++        vcpu_cell = objects.InstanceNUMACell(
++            id=0, memory=2048,
++            cpuset=set([0, 1, 2, 3, 4]),
++            cpu_pinning={0: 0, 1: 11, 2: 12, 3: 13, 4: 0},
++            vcpus=5, min_vcpus=2)
++
++        expect = {'cpu_pinning': {0: 0, 1: 11, 2: 12, 3: 13, 4: 0},
++                  'vcpus': 4}
++
++        self._do_test_scale_instance_cpu_down(vcpu_cell=vcpu_cell,
++                                         vcpu=4, pcpu=14,
++                                         pcpu_topology= 0,
++                                         expect=expect)
++
++    def _do_test_scale_instance_cpu_up(self, vcpu_cell, pcpu,
++                                       pcpu_topology, expect):
++        """base function to test cpu scale up
++
++        :param vcpu_cell: InstanceNUMACell from which vcpu to be ping up
++        :param pcpu: pcpu reserved by resource tracker to ping up
++        :param pcpu_topology: pcpu mapped to vcpu per instance topology.
++                              In norminal scenario this should be the pcpu
++                              pinned to vcpu0
++        """
++
++        instance = fake_instance.fake_instance_obj(
++            self.context, vcpus=vcpu_cell.vcpus, min_vcpus=vcpu_cell.min_vcpus)
++        instance.numa_topology = objects.InstanceNUMATopology(
++            cells=[vcpu_cell])
++
++        fake_rt = fake_resource_tracker.FakeResourceTracker(self.compute.host,
++                    self.compute.driver)
++        fake_rt.compute_nodes[self.compute.host] = mock.ANY
++        self.compute._resource_tracker = fake_rt
++
++        self.mox.StubOutWithMock(hardware, 'instance_vcpu_to_pcpu')
++        self.mox.StubOutWithMock(
++            manager.compute.resource_tracker.ResourceTracker,
++            '_get_compat_cpu')
++        self.mox.StubOutWithMock(instance, 'save')
++        self.mox.StubOutWithMock(self.compute.driver, 'scale_cpu_up')
++
++        hardware.instance_vcpu_to_pcpu(instance, 0).AndReturn(
++            (mock.ANY, 0))
++        hardware.instance_vcpu_to_pcpu(instance, mox.IgnoreArg()).AndReturn(
++            (vcpu_cell, pcpu_topology))
++        fake_rt._get_compat_cpu(instance, mox.IgnoreArg()).AndReturn(pcpu)
++        instance.save()
++        self.compute.driver.scale_cpu_up(
++            self.context, instance, pcpu, mox.IgnoreArg())
++        self.mox.ReplayAll()
++
++        self.compute.scale_instance_cpu_up(
++            self.context, fake_rt, instance, self.compute.host)
++        self.assertEqual(expect['vcpus'], instance.vcpus)
++        self.assertEqual(expect['cpu_pinning'], vcpu_cell.cpu_pinning)
++
++    # 
++    @mock.patch.object(objects.instance_numa_topology.InstanceNUMATopology,
++                       'offline_cpus', new_callable=mock.PropertyMock)
++    def test_scale_instance_cpu_up(self, mock_offline_cpus):
++
++        vcpu_cell = objects.InstanceNUMACell(
++            id=0, memory=2048,
++            cpuset=set([0, 1, 2, 3, 4]),
++            cpu_pinning={0: 0, 1: 11, 2: 12, 3: 0, 4: 0},
++            vcpus=3, min_vcpus=2)
++
++        expect = {'cpu_pinning': {0: 0, 1: 11, 2: 12, 3: 13, 4: 0},
++                  'vcpus': 4}
++        mock_offline_cpus.return_value = [3, 4]
++        self._do_test_scale_instance_cpu_up(vcpu_cell=vcpu_cell,
++                                            pcpu=13,
++                                            pcpu_topology= 0,
++                                            expect=expect)
++
+ 
+ class ComputeManagerBuildInstanceTestCase(test.NoDBTestCase):
+     def setUp(self):
+diff --git a/nova/tests/unit/compute/test_resource_tracker.py b/nova/tests/unit/compute/test_resource_tracker.py
+index 117aee5..bb4842a 100644
+--- a/nova/tests/unit/compute/test_resource_tracker.py
++++ b/nova/tests/unit/compute/test_resource_tracker.py
+@@ -2722,3 +2722,109 @@ class OverCommitTestCase(BaseTestCase):
+     def test_disk_allocation_ratio_none_negative(self):
+         self.assertRaises(ValueError,
+                           CONF.set_default, 'disk_allocation_ratio', -1.0)
++
++
++# add testcases for get_compat_cpu and put_compat_cpu
++class TestCPUScaling(BaseTestCase):
++    def setUp(self):
++        super(TestCPUScaling, self).setUp()
++        self._setup_rt()
++        self.host = _COMPUTE_NODE_FIXTURES[0].obj_clone()
++        self.instance = _INSTANCE_FIXTURES[0].obj_clone()
++        self.rt.compute_nodes[_NODENAME] = self.host
++
++    def test_get_compat_cpu(self):
++        numa_topology_obj = objects.NUMATopology(cells=[
++            objects.NUMACell(id=0, cpuset=set([0, 1, 2, 3]), memory=512,
++                             memory_usage=0, cpu_usage=2, mempages=[],
++                             siblings=[], pinned_cpus=set([0, 1]))])
++        self.host.numa_topology = numa_topology_obj._to_json()
++        self.host.vcpus_used = 2
++        self.instance.numa_topology = objects.InstanceNUMATopology(
++                cells=[objects.InstanceNUMACell(id=0, memory=0,
++                    cpuset=set([0, 1, 2]), cpu_pinning={0: 0, 1: 1, 2: 0})])
++        with mock.patch.object(self.instance, 'save'):
++            pcpu = self.rt.get_compat_cpu(
++                self.instance, self.instance.numa_topology.cells[0], 2,
++                _NODENAME)
++        result_numa_topology_obj = objects.NUMATopology.obj_from_db_obj(
++                                   self.host.numa_topology)
++        self.assertEqual(pcpu, 2)
++        self.assertEqual(self.host.vcpus_used, 3)
++        self.assertEqual(result_numa_topology_obj.cells[0].cpu_usage, 3)
++        self.assertEqual(len(result_numa_topology_obj.cells[0].pinned_cpus), 3)
++        self.assertEqual(
++                   self.instance.numa_topology.cells[0].cpu_pinning[2], 2)
++
++    def test_get_compat_cpu_with_isolate(self):
++        numa_topology_obj = objects.NUMATopology(cells=[
++            objects.NUMACell(id=0, cpuset=set([0, 1, 2, 3]), memory=512,
++                             memory_usage=0, cpu_usage=2, mempages=[],
++                             siblings=[set([0, 1]), set([2, 3])],
++                             pinned_cpus=set([0, 1]))])
++        self.host.numa_topology = numa_topology_obj._to_json()
++        self.host.vcpus_used = 2
++        self.instance.numa_topology = objects.InstanceNUMATopology(
++                cells=[objects.InstanceNUMACell(id=0, memory=0,
++                    cpuset=set([0, 1]), cpu_pinning={0: 0, 1: 0},
++                    cpu_thread_policy=
++                             obj_fields.CPUThreadAllocationPolicy.ISOLATE)])
++        with mock.patch.object(self.instance, 'save'):
++            pcpu = self.rt.get_compat_cpu(self.instance,
++                                          self.instance.numa_topology.cells[0],
++                                          1, _NODENAME)
++        result_numa_topology_obj = objects.NUMATopology.obj_from_db_obj(
++                                   self.host.numa_topology)
++        self.assertEqual(pcpu, 2)
++        self.assertEqual(self.host.vcpus_used, 4)
++        self.assertEqual(result_numa_topology_obj.cells[0].cpu_usage, 4)
++        self.assertEqual(len(result_numa_topology_obj.cells[0].pinned_cpus), 4)
++        self.assertEqual(
++                   self.instance.numa_topology.cells[0].cpu_pinning[1], 2)
++
++    def test_put_compat_cpu(self):
++        numa_topology_obj = objects.NUMATopology(cells=[
++            objects.NUMACell(id=0, cpuset=set([0, 1, 2, 3]), memory=512,
++                             memory_usage=0, cpu_usage=3, mempages=[],
++                             siblings=[], pinned_cpus=set([0, 1, 2]))])
++        self.host.numa_topology = numa_topology_obj._to_json()
++        self.host.vcpus_used = 3
++        self.instance.numa_topology = objects.InstanceNUMATopology(
++                cells=[objects.InstanceNUMACell(id=0, memory=0,
++                    cpuset=set([0, 1, 2]), cpu_pinning={0: 0, 1: 1, 2: 2})])
++        with mock.patch.object(self.instance, 'save'):
++            self.rt.put_compat_cpu(self.instance, 2,
++                                   self.instance.numa_topology.cells[0],
++                                   2, 0, _NODENAME)
++        result_numa_topology_obj = objects.NUMATopology.obj_from_db_obj(
++                                   self.host.numa_topology)
++        self.assertEqual(self.host.vcpus_used, 2)
++        self.assertEqual(result_numa_topology_obj.cells[0].cpu_usage, 2)
++        self.assertEqual(len(result_numa_topology_obj.cells[0].pinned_cpus), 2)
++        self.assertEqual(
++                   self.instance.numa_topology.cells[0].cpu_pinning[2], 0)
++
++    def test_put_compat_cpu_with_isolate(self):
++        numa_topology_obj = objects.NUMATopology(cells=[
++            objects.NUMACell(id=0, cpuset=set([0, 1, 2, 3]), memory=512,
++                             memory_usage=0, cpu_usage=4, mempages=[],
++                             siblings=[set([0, 1]), set([2, 3])],
++                             pinned_cpus=set([0, 1, 2, 3]))])
++        self.host.numa_topology = numa_topology_obj._to_json()
++        self.host.vcpus_used = 4
++        self.instance.numa_topology = objects.InstanceNUMATopology(
++                cells=[objects.InstanceNUMACell(id=0, memory=0,
++                    cpuset=set([0, 1]), cpu_pinning={0: 0, 1: 2},
++                    cpu_thread_policy =
++                                obj_fields.CPUThreadAllocationPolicy.ISOLATE)])
++        with mock.patch.object(self.instance, 'save'):
++            self.rt.put_compat_cpu(self.instance, 2,
++                                   self.instance.numa_topology.cells[0],
++                                   1, 0, _NODENAME)
++        result_numa_topology_obj = objects.NUMATopology.obj_from_db_obj(
++                                   self.host.numa_topology)
++        self.assertEqual(self.host.vcpus_used, 2)
++        self.assertEqual(result_numa_topology_obj.cells[0].cpu_usage, 2)
++        self.assertEqual(len(result_numa_topology_obj.cells[0].pinned_cpus), 2)
++        self.assertEqual(
++                   self.instance.numa_topology.cells[0].cpu_pinning[1], 0)
+diff --git a/nova/tests/unit/db/test_migrations.py b/nova/tests/unit/db/test_migrations.py
+index 3dc758d..cfe487d 100644
+--- a/nova/tests/unit/db/test_migrations.py
++++ b/nova/tests/unit/db/test_migrations.py
+@@ -178,7 +178,7 @@ class NovaMigrationsCheckers(test_migrations.ModelsMigrationsSync,
+         havana_placeholders = list(range(217, 227))
+         icehouse_placeholders = list(range(235, 244))
+         juno_placeholders = list(range(255, 265))
+-        kilo_placeholders = list(range(281, 291))
++        kilo_placeholders = list(range(281, 286))
+         liberty_placeholders = list(range(303, 313))
+         mitaka_placeholders = list(range(320, 330))
+         newton_placeholders = list(range(335, 345))
+@@ -723,6 +723,27 @@ class NovaMigrationsCheckers(test_migrations.ModelsMigrationsSync,
+         key_pairs = oslodbutils.get_table(engine, 'key_pairs')
+         self.assertFalse(key_pairs.c.name.nullable)
+ 
++    def _check_286(self, engine, data):
++        # Make sure we have the column
++        self.assertColumnExists(engine, 'instances', 'min_vcpus')
++        self.assertColumnExists(engine, 'instances', 'max_vcpus')
++
++    def _check_287(self, engine, data):
++        # Placeholder
++        pass
++
++    def _check_288(self, engine, data):
++        # Placeholder
++        pass
++
++    def _check_289(self, engine, data):
++        # Placeholder
++        pass
++
++    def _check_290(self, engine, data):
++        # Placeholder
++        pass
++
+     def _check_291(self, engine, data):
+         # NOTE(danms): This is a dummy migration that just does a consistency
+         # check
+diff --git a/nova/tests/unit/fake_instance.py b/nova/tests/unit/fake_instance.py
+index 934fdd2..d7f9a4d 100644
+--- a/nova/tests/unit/fake_instance.py
++++ b/nova/tests/unit/fake_instance.py
+@@ -11,6 +11,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2014-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ import datetime
+ 
+@@ -76,7 +83,10 @@ def fake_db_instance(**updates):
+                   'device_metadata': None,
+                  },
+         'tags': [],
+-        'services': []
++        'services': [],
++        # 
++        'min_vcpus': None,
++        'max_vcpus': None
+         }
+ 
+     for name, field in objects.Instance.fields.items():
+diff --git a/nova/tests/unit/fake_policy.py b/nova/tests/unit/fake_policy.py
+index 5197807..896c550 100644
+--- a/nova/tests/unit/fake_policy.py
++++ b/nova/tests/unit/fake_policy.py
+@@ -135,6 +135,7 @@ policy_data = """
+     "os_compute_api:server-metadata:show": "",
+     "os_compute_api:server-metadata:index": "",
+     "os_compute_api:wrs-if": "",
+-    "os_compute_api:wrs-sg": ""
++    "os_compute_api:wrs-sg": "",
++    "os_compute_api:wrs-res": ""
+ }
+ """
+diff --git a/nova/tests/unit/objects/test_objects.py b/nova/tests/unit/objects/test_objects.py
+index b5bae25..cdfb20b 100644
+--- a/nova/tests/unit/objects/test_objects.py
++++ b/nova/tests/unit/objects/test_objects.py
+@@ -1107,7 +1107,7 @@ object_data = {
+     'IDEDeviceBus': '1.0-29d4c9f27ac44197f01b6ac1b7e16502',
+     'ImageMeta': '1.8-642d1b2eb3e880a367f37d72dd76162d',
+     'ImageMetaProps': '1.19-248e4e71d64cc694b4167485a9f9b251',
+-    'Instance': '2.3-4f98ab23f4b0a25fabb1040c8f5edecc',
++    'Instance': '2.3-9b20afdc7f46ea0d83f9f0fb4a01f02d',
+     'InstanceAction': '1.1-f9f293e526b66fca0d05c3b3a2d13914',
+     'InstanceActionEvent': '1.1-e56a64fa4710e43ef7af2ad9d6028b33',
+     'InstanceActionEventList': '1.1-13d92fb953030cdbfee56481756e02be',
+diff --git a/nova/tests/unit/test_metadata.py b/nova/tests/unit/test_metadata.py
+index ca847ec..b9093d1 100644
+--- a/nova/tests/unit/test_metadata.py
++++ b/nova/tests/unit/test_metadata.py
+@@ -94,7 +94,10 @@ def fake_inst_obj(context):
+         default_swap_device=None,
+         system_metadata={},
+         security_groups=objects.SecurityGroupList(),
+-        availability_zone='fake-az')
++        availability_zone='fake-az',
++        numa_topology=objects.InstanceNUMATopology(
++            cells=[objects.InstanceNUMACell(
++                id=1, cpuset=set([1, 2]), memory=512)]))
+     inst.keypairs = objects.KeyPairList(objects=[
+             fake_keypair_obj(inst.key_name, inst.key_data)])
+ 
+diff --git a/nova/tests/unit/test_policy.py b/nova/tests/unit/test_policy.py
+index 4932bc4..44745f9 100644
+--- a/nova/tests/unit/test_policy.py
++++ b/nova/tests/unit/test_policy.py
+@@ -455,6 +455,7 @@ class RealRolePolicyTestCase(test.NoDBTestCase):
+ "os_compute_api:os-availability-zone:list",
+ "os_compute_api:wrs-if",
+ "os_compute_api:wrs-sg",
++"os_compute_api:wrs-res",
+ )
+ 
+         self.non_admin_only_rules = (
+diff --git a/nova/tests/unit/virt/libvirt/test_driver.py b/nova/tests/unit/virt/libvirt/test_driver.py
+index 32a9478..db2c73d 100755
+--- a/nova/tests/unit/virt/libvirt/test_driver.py
++++ b/nova/tests/unit/virt/libvirt/test_driver.py
+@@ -535,6 +535,12 @@ class FakeVirtDomain(object):
+     def isPersistent(self):
+         return True
+ 
++    def vcpus(self):
++        pass
++
++    def pinVcpuFlags(self, vcpu, pcpu, mask):
++        pass
++
+ 
+ class CacheConcurrencyTestCase(test.NoDBTestCase):
+     def setUp(self):
+@@ -19767,3 +19773,217 @@ class LVMSnapshotTests(_BaseSnapshotTests):
+     def test_qcow2(self):
+         self.flags(snapshot_image_format='qcow2', group='libvirt')
+         self._test_lvm_snapshot('qcow2')
++
++
++class CPUScalingTests(test.NoDBTestCase):
++
++    ERR_SCALE_DOWN_VCPU_OUT_OF_RANGE = 1
++    ERR_SCALE_DOWN_VCPU_ALREADY_OFFLINE = 2
++    ERR_SCALE_DOWN_VCPU_UNABLE_TO_FIND = 3
++
++    def setUp(self):
++        super(CPUScalingTests, self).setUp()
++        self.context = context.get_admin_context()
++        self.useFixture(fakelibvirt.FakeLibvirtFixture())
++        self.drvr = libvirt_driver.LibvirtDriver(fake.FakeVirtAPI(), False)
++        self.useFixture(fixtures.MonkeyPatch(
++            'nova.virt.libvirt.driver.libvirt_utils',
++            fake_libvirt_utils))
++
++    def tearDown(self):
++        super(CPUScalingTests, self).tearDown()
++
++    def _do_test_scale_cpu_down(self, virt_cpu, cpuinfo, cpumap, expect):
++        """base function to test cpu scale down
++
++        :param virt_cpu: vcpu to pin down, chosen by hypervisor and guest.
++        :param cpuinfo: returned by dom.vcpus()
++        :param cpumap: returned by dom.vcpus()
++        """
++
++        instance = fake_instance.fake_instance_obj(
++            self.context, vcpus=5, min_vcpus=2)
++
++        domain = FakeVirtDomain(fake_xml="")
++
++        self.mox.StubOutWithMock(self.drvr._host, 'get_domain')
++        self.mox.StubOutWithMock(domain, 'vcpus')
++        self.mox.StubOutWithMock(libvirt_driver, 'cpu_scale_down_helper')
++
++        self.drvr._host.get_domain(instance).AndReturn(domain)
++        domain.vcpus().AndReturn((cpuinfo, cpumap))
++        libvirt_driver.cpu_scale_down_helper(instance).AndReturn(virt_cpu)
++        self.mox.ReplayAll()
++
++        if expect == self.ERR_SCALE_DOWN_VCPU_OUT_OF_RANGE or \
++                        expect == self.ERR_SCALE_DOWN_VCPU_ALREADY_OFFLINE:
++            self.assertRaises(exception.CannotOfflineCpu,
++                              self.drvr.scale_cpu_down,
++                              self.context, instance)
++            return
++        elif expect == self.ERR_SCALE_DOWN_VCPU_UNABLE_TO_FIND:
++            self.assertRaises(exception.InstanceScalingError,
++                              self.drvr.scale_cpu_down,
++                              self.context, instance)
++            return
++        (vcpu, phys_cpu) = self.drvr.scale_cpu_down(self.context, instance)
++        self.assertEqual(expect['virt_cpu'], vcpu)
++        self.assertEqual(expect['phys_cpu'], phys_cpu)
++
++    # scale down the last pcpu
++    def test_scale_cpu_down(self):
++
++        cpuinfo = [(0, 1, 10000000000L, 1), (1, 1, 10000000000L, 2),
++                   (2, 1, 10000000000L, 3), (3, 1, 10000000000L, 4),
++                   (4, 1, 10000000000L, 5)]
++        cpumap = [(False, True, False, False, False, False),
++                  (False, False, True, False, False, False),
++                  (False, False, False, True, False, False),
++                  (False, False, False, False, True, False),
++                  (False, False, False, False, False, True)]
++
++        expect = {'virt_cpu': 4, 'phys_cpu': 5}
++
++        self._do_test_scale_cpu_down(virt_cpu=4, cpuinfo=cpuinfo,
++                                   cpumap=cpumap, expect=expect)
++
++    # vcpu selected by guest to offline is out of range
++    def test_scale_cpu_down_out_of_range(self):
++
++        cpuinfo = [(0, 1, 10000000000L, 1), (1, 1, 10000000000L, 2),
++                   (2, 1, 10000000000L, 3), (3, 1, 10000000000L, 4),
++                   (4, 1, 10000000000L, 5)]
++        cpumap = [(False, True, False, False, False, False),
++                  (False, False, True, False, False, False),
++                  (False, False, False, True, False, False),
++                  (False, False, False, False, True, False),
++                  (False, False, False, False, False, True)]
++
++        expect = self.ERR_SCALE_DOWN_VCPU_OUT_OF_RANGE
++        self._do_test_scale_cpu_down(virt_cpu=5, cpuinfo=cpuinfo,
++                                     cpumap=cpumap, expect=expect)
++
++    # vcpu selected by guest is already offline
++    def test_scale_cpu_down_already_offline(self):
++
++        cpuinfo = [(0, 1, 10000000000L, 1), (1, 1, 10000000000L, 2),
++                   (2, 1, 10000000000L, 3), (3, 1, 10000000000L, 4),
++                   (4, 1, 10000000000L, 5)]
++        cpumap = [(False, True, False, False, False, False),
++                  (False, False, True, False, False, False),
++                  (False, False, False, True, False, False),
++                  (False, False, False, False, True, False),
++                  (False, True, False, False, False, False)]
++
++        expect = self.ERR_SCALE_DOWN_VCPU_ALREADY_OFFLINE
++        self._do_test_scale_cpu_down(virt_cpu=4, cpuinfo=cpuinfo,
++                                     cpumap=cpumap, expect=expect)
++
++    # vcpu selected by guest is none or no response from guest
++    def test_scale_cpu_down_guest_select_none(self):
++
++        cpuinfo = [(0, 1, 10000000000L, 1), (1, 1, 10000000000L, 2),
++                   (2, 1, 10000000000L, 3), (3, 1, 10000000000L, 4),
++                   (4, 1, 10000000000L, 5)]
++        cpumap = [(False, True, False, False, False, False),
++                  (False, False, True, False, False, False),
++                  (False, False, False, True, False, False),
++                  (False, True, False, False, False, False),
++                  (False, True, False, False, False, False)]
++
++        expect = {'virt_cpu': 2, 'phys_cpu': 3}
++        self._do_test_scale_cpu_down(virt_cpu=None, cpuinfo=cpuinfo,
++                                     cpumap=cpumap, expect=expect)
++
++    # unable to find vcpu to offline
++    def test_scale_cpu_down_unable_to_find_offline(self):
++
++        cpuinfo = [(0, 1, 10000000000L, 1), (1, 1, 10000000000L, 2),
++                   (2, 1, 10000000000L, 3), (3, 1, 10000000000L, 4),
++                   (4, 1, 10000000000L, 5)]
++        cpumap = [(False, True, False, False, False, False),
++                  (False, True, False, False, False, False),
++                  (False, True, False, False, False, False),
++                  (False, True, False, False, False, False),
++                  (False, True, False, False, False, False)]
++
++        expect = self.ERR_SCALE_DOWN_VCPU_UNABLE_TO_FIND
++        self._do_test_scale_cpu_down(virt_cpu=None, cpuinfo=cpuinfo,
++                                     cpumap=cpumap, expect=expect)
++
++    def _do_test_scale_cpu_up(self, vcpu, pcpu, cpuinfo, cpumap, cpumap_new,
++                              expect):
++        """base function to test cpu scale up
++
++        :param vcpu: vcpu to pin up
++        :param pcpu: pcpu to pin up
++        :param cpuinfo: returned by dom.vcpus()
++        :param cpumap: cpumap before scale up
++        :param cpumap_new: capu map after scale up
++        """
++
++        instance = fake_instance.fake_instance_obj(
++            self.context, vcpus=5, min_vcpus=2)
++        domain = FakeVirtDomain(fake_xml="")
++
++        with test.nested(
++            mock.patch.object(self.drvr._host, 'get_domain'),
++            mock.patch.object(domain, 'vcpus'),
++            mock.patch.object(domain, 'pinVcpuFlags'),
++            mock.patch.object(libvirt_driver, 'cpu_scale_up_helper')
++        ) as (mock_get_domain, mock_vcpus, mock_pinVcpuFlags,
++              mock_cpu_scale_up_helper):
++            mock_get_domain.return_value = domain
++            mock_vcpus.side_effect = [(cpuinfo, cpumap), (cpuinfo, cpumap_new)]
++
++            self.drvr.scale_cpu_up(self.context, instance, pcpu, vcpu)
++            mock_pinVcpuFlags.assert_called_once_with(
++                vcpu, cpumap_new[vcpu], mock.ANY)
++            mock_cpu_scale_up_helper.assert_called_once_with(
++                instance, vcpu, expect['online_vcpulist'])
++
++    # scale up the last pcpu
++    def test_scale_cpu_up(self):
++
++        cpuinfo = [(0, 1, 10000000000L, 1), (1, 1, 10000000000L, 2),
++                   (2, 1, 10000000000L, 3), (3, 1, 10000000000L, 4),
++                   (4, 1, 10000000000L, 5)]
++        cpumap = [(False, True, False, False, False, False),
++                  (False, False, True, False, False, False),
++                  (False, False, False, True, False, False),
++                  (False, False, False, False, True, False),
++                  (False, True, False, False, False, False)]
++
++        cpumap_new = [(False, True, False, False, False, False),
++                      (False, False, True, False, False, False),
++                      (False, False, False, True, False, False),
++                      (False, False, False, False, True, False),
++                      (False, False, False, False, False, True)]
++        expect = {'online_vcpulist': [0, 1, 2, 3, 4]}
++
++        self._do_test_scale_cpu_up(vcpu=4, pcpu=5, cpuinfo=cpuinfo,
++                                   cpumap=cpumap, cpumap_new=cpumap_new,
++                                   expect=expect)
++
++    # pin up the second last pcpu
++    def test_scale_cpu_up_2(self):
++
++        cpuinfo = [(0, 1, 10000000000L, 1), (1, 1, 10000000000L, 2),
++                   (2, 1, 10000000000L, 3), (3, 1, 10000000000L, 4),
++                   (4, 1, 10000000000L, 5)]
++        cpumap = [(False, True, False, False, False, False),
++                  (False, False, True, False, False, False),
++                  (False, False, False, True, False, False),
++                  (False, True, False, False, False, False),
++                  (False, True, False, False, False, False)]
++
++        cpumap_new = [(False, True, False, False, False, False),
++                      (False, False, True, False, False, False),
++                      (False, False, False, True, False, False),
++                      (False, False, False, False, True, False),
++                      (False, True, False, False, False, False)]
++        expect = {'online_vcpulist': [0, 1, 2, 3]}
++
++        self._do_test_scale_cpu_up(vcpu=3, pcpu=4, cpuinfo=cpuinfo,
++                                   cpumap=cpumap, cpumap_new=cpumap_new,
++                                   expect=expect)
+diff --git a/nova/tests/unit/virt/test_hardware.py b/nova/tests/unit/virt/test_hardware.py
+index 090c3c8..d117fcb 100644
+--- a/nova/tests/unit/virt/test_hardware.py
++++ b/nova/tests/unit/virt/test_hardware.py
+@@ -3146,6 +3146,45 @@ class CPUSReservedCellTestCase(test.NoDBTestCase):
+         inst_cell = self._test_reserved(reserved=2)
+         self.assertIsNone(inst_cell)
+ 
++    # Instance with offline cpus
++    def test_cpu_pinning_usage_from_instances_with_offline_cpus(self):
++        host_pin = objects.NUMATopology(
++                cells=[objects.NUMACell(id=0, cpuset=set([0, 1, 2, 3, 4]),
++                                        memory=4096, cpu_usage=0,
++                                        memory_usage=0, siblings=[],
++                                        mempages=[], pinned_cpus=set([]))])
++        inst_pin = objects.InstanceNUMATopology(
++                cells=[objects.InstanceNUMACell(
++                    cpuset=set([0, 1, 2, 3, 4]), id=0, memory=2048,
++                    cpu_pinning={0: 0, 1: 1, 2: 2, 3: 0, 4: 0},
++                    cpu_policy=fields.CPUAllocationPolicy.DEDICATED)])
++
++        host_pin = hw.numa_usage_from_instances(
++                host_pin, [inst_pin])
++        self.assertEqual(set([0, 1, 2]),
++                         host_pin.cells[0].pinned_cpus)
++        self.assertEqual(host_pin.cells[0].cpu_usage, 3)
++
++    # Instance with offline cpus, free=True
++    def test_cpu_pinning_usage_from_instances_free_with_offline_cpus(self):
++        host_pin = objects.NUMATopology(
++            cells=[objects.NUMACell(id=0, cpuset=set([0, 1, 2, 3]),
++                                    memory=4096, cpu_usage=0, memory_usage=0,
++                                    siblings=[], mempages=[],
++                                    pinned_cpus=set([0, 1, 3]))])
++        inst_pin_1 = objects.InstanceNUMATopology(
++            cells=[objects.InstanceNUMACell(
++                cpuset=set([0]), memory=1024, cpu_pinning={0: 1}, id=0,
++                cpu_policy=fields.CPUAllocationPolicy.DEDICATED)])
++        inst_pin_2 = objects.InstanceNUMATopology(
++            cells=[objects.InstanceNUMACell(
++                cpuset=set([0, 1, 2, 3]), memory=1024, id=0,
++                cpu_pinning={0: 0, 1: 3, 2: 0, 3: 0},
++                cpu_policy=fields.CPUAllocationPolicy.DEDICATED)])
++        host_pin = hw.numa_usage_from_instances(
++                host_pin, [inst_pin_1, inst_pin_2], free=True)
++        self.assertEqual(set(), host_pin.cells[0].pinned_cpus)
++
+ 
+ class CPURealtimeTestCase(test.NoDBTestCase):
+     def test_success_flavor(self):
+diff --git a/nova/utils.py b/nova/utils.py
+index ae07215..c32d434 100644
+--- a/nova/utils.py
++++ b/nova/utils.py
+@@ -140,6 +140,109 @@ def range_to_list(csv_range=None):
+     return [y for x in ranges for y in x]
+ 
+ 
++# extension
++def format_instance_numa_topology(numa_topology=None, instance=None,
++                                  delim='\n'):
++    """Returns True if the instance is in one of the resizing states.
++
++    :param numa_topology: `nova.objects.InstanceNUMATopology` object
++    :param instance: `nova.objects.Instance` object
++    :param delim: string delimiter between Numa Cells
++    """
++    if numa_topology is None:
++        return ''
++
++    sz_1M = 1024
++    sz_1G = 1024 * 1024
++
++    # Create a summary line per numa cell. Print known information only.
++    topology = []
++    for cell in numa_topology.cells:
++        cell_str = 'node:%s' % (cell.id)
++
++        if cell.memory > 0:
++            cell_str += ', %5dMB' % (cell.memory)
++
++        if cell.pagesize <= 0:
++            cell.pagesize = 4  # assume 4K pages
++        if cell.pagesize > 0 and cell.pagesize < sz_1M:
++            cell_str += ', pgsize:%sK' % (cell.pagesize)
++        if cell.pagesize >= sz_1M and cell.pagesize < sz_1G:
++            cell_str += ', pgsize:%sM' % (int(cell.pagesize / sz_1M))
++        if cell.pagesize >= sz_1G:
++            cell_str += ', pgsize:%sG' % (int(cell.pagesize / sz_1G))
++
++        try:
++            sockets = cell.cpu_topology.sockets
++            cores = cell.cpu_topology.cores
++            threads = cell.cpu_topology.threads
++            cell_str += (', %(S)ss,%(C)sc,%(T)st' %
++                         {'S': sockets, 'C': cores, 'T': threads}
++                         )
++        except Exception as ex:
++            if cell.cpu_topology is not None:
++                LOG.error(_LE('cannot get cell.cpu_topology field, '
++                              'error = %(err)s'), {'err': ex})
++
++        if len(cell.cpuset) > 0:
++            cpuset = list_to_range(list(cell.cpuset))
++        else:
++            cpuset = '-'
++
++        try:
++            if cell.cpu_pinning:
++                vcpus = cell.cpu_pinning.keys() or []
++                pinned = cell.cpu_pinning.values() or []
++                if vcpus:
++                    cell_str += ', vcpus:%s' % (
++                        list_to_range(vcpus)
++                    )
++                if pinned:
++                    cell_str += ', pcpus:%s' % (
++                        list_to_range(pinned)
++                    )
++            else:
++                if instance is not None and instance['launched_at'] is None:
++                    cell_str += ', vcpus:%s, unallocated' % (cpuset)
++                else:
++                    cell_str += ', vcpus:%s' % (cpuset)
++        except Exception:
++            cell_str += ', vcpus:%s' % (cpuset)
++
++        try:
++            if cell.shared_vcpu is not None:
++                cell_str += ', shared_vcpu:%s' % (cell.shared_vcpu)
++        except Exception:
++            pass
++
++        if len(cell.siblings) > 0:
++            cell_str += ', siblings:%s' % (
++                ','.join('{' + list_to_range(list(S)) + '}'
++                         for S in cell.siblings)
++            )
++
++        try:
++            if cell.cpu_policy is not None:
++                cell_str += ', pol:%s' % (cell.cpu_policy[:3])
++                try:
++                    if cell.cpu_thread_policy is not None:
++                        cell_str += ', thr:%s' % (
++                            cell.cpu_thread_policy[:3])
++                    else:
++                        # None and 'prefer' have same behaviour in Mitaka.
++                        cell_str += ', thr:pre'
++                except Exception:
++                    pass
++            else:
++                cell_str += ', pol:sha'
++        except Exception:
++            pass
++
++        topology.append(cell_str)
++
++    return '%s' % (delim.join(topology))
++
++
+ def vpn_ping(address, port, timeout=0.05, session_id=None):
+     """Sends a vpn negotiation packet and returns the server session.
+ 
+diff --git a/nova/virt/driver.py b/nova/virt/driver.py
+index 17ea01f..50e9b02 100644
+--- a/nova/virt/driver.py
++++ b/nova/virt/driver.py
+@@ -1624,6 +1624,14 @@ class ComputeDriver(object):
+         """
+         return instance.get('host')
+ 
++    def scale_cpu_down(self, context, instance):
++        """Hot-remove a cpu from an instance."""
++        raise NotImplementedError()
++
++    def scale_cpu_up(self, context, instance, pcpu, vcpu):
++        """Hot-add a cpu to an instance."""
++        raise NotImplementedError()
++
+     def destroy_name(self, instance_name):
+         """Destroy an instance domain if we only know 'name' and not the full
+         instance (i.e., we lost instance object and it is not in Database).
+diff --git a/nova/virt/hardware.py b/nova/virt/hardware.py
+index 7b5b427..ae9e144 100644
+--- a/nova/virt/hardware.py
++++ b/nova/virt/hardware.py
+@@ -1726,7 +1726,14 @@ def numa_usage_from_instances(host, instances, free=False):
+                 if instancecell.id == hostcell.id:
+                     memory_usage = (
+                             memory_usage + sign * instancecell.memory)
+-                    cpu_usage_diff = len(instancecell.cpuset)
++                    # If we can we want to use the number of unique pcpus since
++                    # it will factor in scaled-down CPUs.  On initial creation
++                    # however we may not have that info so use cpuset instead.
++                    if instancecell.cpu_pinning is not None:
++                        cpu_usage_diff = \
++                            len(set(instancecell.cpu_pinning.values()))
++                    else:
++                        cpu_usage_diff = len(instancecell.cpuset)
+                     if (instancecell.cpu_thread_policy ==
+                             fields.CPUThreadAllocationPolicy.ISOLATE and
+                             hostcell.siblings):
+@@ -1913,3 +1920,7 @@ def get_host_numa_usage_from_instance(host, instance, free=False,
+             updated_numa_topology = updated_numa_topology._to_json()
+ 
+     return updated_numa_topology
++
++
++def instance_vcpu_to_pcpu(instance, vcpu):
++    return instance.numa_topology.vcpu_to_pcpu(vcpu)
+diff --git a/nova/virt/libvirt/driver.py b/nova/virt/libvirt/driver.py
+index 2e0e763..5238f1a 100644
+--- a/nova/virt/libvirt/driver.py
++++ b/nova/virt/libvirt/driver.py
+@@ -43,6 +43,7 @@ import mmap
+ import operator
+ import os
+ import shutil
++import subprocess
+ import tempfile
+ import time
+ import uuid
+@@ -300,6 +301,94 @@ PERF_EVENTS_CPU_FLAG_MAPPING = {'cmt': 'cmt',
+                                }
+ 
+ 
++def guest_scale_helper(cmd_scale_helper, expiry, instance):
++    # It would be more elegant to set up a timer and then call the helper and
++    # cancel the timer if it completes in time.  Unfortunately I don't have
++    # time to sort out the interactions with eventlet/greenthreads currently.
++    rc = None
++    try:
++        proc = subprocess.Popen(cmd_scale_helper)
++        rc = None
++        while rc is None:
++            rc = proc.poll()
++            if rc is None:
++                if time.time() < expiry:
++                    greenthread.sleep(1)
++                else:
++                    proc.kill()
++                    LOG.error(_('Timed out waiting for response in '
++                                'guest_scale_helper'), instance=instance)
++                    break
++    except OSError as ex:
++        LOG.exception('Unable to run command "%(cmd)s": %(err)s',
++                      {'cmd': cmd_scale_helper, 'err': ex})
++    except Exception:
++        pass
++
++    # By convention, an rc of 255 means that the helper ran into a random error
++    # and an rc of 254 means that the helper timed out waiting for a response.
++    # Negative rc means the helper was killed by a signal
++    if rc == 255:
++        LOG.error('Error in guest_scale_helper', instance=instance)
++    elif rc == 254:
++        LOG.error('guest_scale_helper timed out waiting for response',
++                  instance=instance)
++    elif rc and rc < 0:
++        LOG.error('guest_scale_helper killed by signal',
++                  instance=instance)
++
++    if rc < 0 or rc > 200:
++        rc = None
++
++    return rc
++
++
++def cpu_scale_up_helper(instance, cpu, online_vcpulist):
++    """Call out to a helper process running on the host that can pass data
++       up to the guest and receive information back
++    """
++    timeout_ms = 10000
++    expiry = time.time() + timeout_ms / 1000.0
++
++    # Convert online_vcpulist to a string so that it can be passed as a single
++    # parameter
++    online_vcpus = str(online_vcpulist).replace(" ", "")
++
++    cmd_scale_helper = ['guest_scale_helper', '--instance_name',
++                       instance["name"], '--timeout', str(timeout_ms - 500),
++                       '--cpu_add', str(cpu), online_vcpus]
++
++    rc = guest_scale_helper(cmd_scale_helper, expiry, instance)
++
++    if rc is not None and rc != cpu:
++        LOG.error(_('Unexpected return code %(rc)d from guest_scale_helper, '
++                    'expected %(cpu)d'),
++                  {'rc': rc, 'cpu': cpu}, instance=instance)
++    return rc
++
++
++def cpu_scale_down_helper(instance):
++    """Call out to a helper process running on the host that can pass data
++       up to the guest and receive information back
++    """
++    timeout_ms = 10000
++    expiry = time.time() + timeout_ms / 1000.0
++    cmd_scale_helper = ['guest_scale_helper', '--instance_name',
++                       instance["name"], '--timeout', str(timeout_ms - 500),
++                       '--cpu_del']
++
++    rc = guest_scale_helper(cmd_scale_helper, expiry, instance)
++    if rc <= 0:
++        rc = None
++
++    if rc is not None and not ((rc > 0) and (rc < instance['max_vcpus'])):
++        LOG.error(_('Unexpected return code %(rc)d from guest_scale_helper, '
++                    'expected between 1 and %(vcpus)d'),
++                  {'rc': rc, 'vcpus': instance['max_vcpus']},
++                  instance=instance)
++    return rc
++
++
+ class LibvirtDriver(driver.ComputeDriver):
+     capabilities = {
+         "has_imagecache": True,
+@@ -5051,7 +5140,7 @@ class LibvirtDriver(driver.ComputeDriver):
+             self._set_qemu_guest_agent(guest, flavor, instance, image_meta)
+             self._set_qemu_guest_heartbeat(guest, flavor, instance)
+ 
+-        self._set_server_group_msg(guest, flavor, instance)
++        self._set_cgcs_msg(guest, flavor, instance)
+ 
+         self._guest_add_pci_devices(guest, instance)
+ 
+@@ -5534,6 +5623,8 @@ class LibvirtDriver(driver.ComputeDriver):
+ 
+         :returns: The total number of vcpu(s) that are currently being used.
+ 
++        Note that as a special case for cpu scaling, vcpus that are affined
++        the same as vcpu0 are not counted.
+         """
+ 
+         total = 0
+@@ -5564,8 +5655,11 @@ class LibvirtDriver(driver.ComputeDriver):
+         # vCPU count, as the least worst value.
+         for guest in self._host.list_guests():
+             try:
+-                vcpus = guest.get_vcpus_info()
+-                total += len(list(vcpus))
++                vcpu_maps = guest.get_vcpus_map()
++                if vcpu_maps is not None:
++                    for vcpumap in vcpu_maps:
++                        if vcpumap is vcpu_maps[0] or vcpumap != vcpu_maps[0]:
++                            total += 1
+             except libvirt.libvirtError:
+                 total += 1
+             # NOTE(gtt116): give other tasks a chance.
+@@ -8460,6 +8554,132 @@ class LibvirtDriver(driver.ComputeDriver):
+         return fs_type in [disk_api.FS_FORMAT_EXT2, disk_api.FS_FORMAT_EXT3,
+                            disk_api.FS_FORMAT_EXT4, disk_api.FS_FORMAT_XFS]
+ 
++    def scale_cpu_down(self, context, instance):
++        """Hot-remove a cpu from an instance."""
++        phys_cpu = None
++
++        LOG.info('Attempting to query guest on which vcpu to offline',
++                 instance=instance)
++
++        # Upcall into guest to select which vcpu to remove
++        # After this, the guest shouldn't be using it anymore.
++        virt_cpu = cpu_scale_down_helper(instance)
++        LOG.info('Guest chose vcpu %s to offline',
++                 virt_cpu, instance=instance)
++
++        dom = self._host.get_domain(instance)
++        (cpuinfo, cpumap) = dom.vcpus()
++
++        # We have a complication.  When running under qemu it appears that
++        # at least the highest-numbered vcpu (and possibly others) are
++        # affected by setting emulatorpin, so they end up with an affinity
++        # of multiple cpus.  Since cpuinfo only gives the currently-in-use
++        # phys cpu, we need to use cpumap instead.
++
++        if virt_cpu is not None:
++            # The guest has picked a vcpu, try to use it.
++            if virt_cpu > len(cpumap) - 1:
++                LOG.error('vcpu %(vcpu)d selected by guest to offline is '
++                          'out of range, guest only has %(num)d vcpus',
++                          {'vcpu': virt_cpu, 'num': len(cpumap)},
++                          instance=instance)
++                raise exception.CannotOfflineCpu(cpu=virt_cpu)
++            elif cpumap[virt_cpu] == cpumap[0]:
++                # Whoops, the guest picked a vcpu that is already offline
++                # from our perspective.
++                LOG.error('Guest chose vcpu %d to offline, '
++                          'but it is already offline',
++                          virt_cpu, instance=instance)
++                raise exception.CannotOfflineCpu(cpu=virt_cpu)
++
++        if virt_cpu is None:
++            # Pick a vcpu to remove.  Use the highest numbered
++            # vcpu that is currently pinned different from vcpu0.
++            for x in range(len(cpumap) - 1, 0, -1):
++                if cpumap[x] != cpumap[0]:
++                    virt_cpu = x
++                    LOG.info('Host chose vcpu %d to offline',
++                             virt_cpu, instance=instance)
++                    break
++
++        if virt_cpu is None:
++            LOG.error('Unable to find vcpu to offline. cpumap: %s',
++                      cpumap, instance=instance)
++            raise exception.InstanceScalingError()
++
++        # Map the virt_cpu to a phys_cpu
++        # Find the highest phys cpu the virt cpu can run on.
++        # (Could possibly just look it up in the instance topology too.)
++        for x in range(len(cpumap[virt_cpu]) - 1, 0, -1):
++            if cpumap[virt_cpu][x]:
++                phys_cpu = x
++                break
++
++        if phys_cpu is None:
++            LOG.error('Unable to map vcpu %(vcpu)d to phys cpu.  '
++                      'cpumap: %(cpumap)s',
++                      {'vcpu': virt_cpu, 'cpumap': cpumap}, instance=instance)
++        else:
++            LOG.info('Freeing up phys cpu %d', phys_cpu,
++                     instance=instance)
++
++        # For simplicity, pin it the same as vcpu0.
++        dom.pinVcpuFlags(virt_cpu, cpumap[0],
++                    libvirt.VIR_DOMAIN_AFFECT_LIVE |
++                    libvirt.VIR_DOMAIN_AFFECT_CONFIG)
++
++        # Pin the emulator to the same as vCPU0
++        # dom.pinEmulator(cpumap[0],
++        #                libvirt.VIR_DOMAIN_AFFECT_LIVE |
++        #                libvirt.VIR_DOMAIN_AFFECT_CONFIG)
++
++        # Return the physical cpu index
++        return virt_cpu, phys_cpu
++
++    def scale_cpu_up(self, context, instance, pcpu, vcpu):
++        """Hot-add a cpu to an instance."""
++        dom = self._host.get_domain(instance)
++        (cpuinfo, cpumap) = dom.vcpus()
++
++        LOG.info('Attempting to hot-add phys cpu %(pcpu)d as virt cpu '
++                 '%(vcpu)d', {'pcpu': pcpu, 'vcpu': vcpu},
++                 instance=instance)
++
++        # Make a cpumap of the new cpu
++        new_cpumap = [False] * len(cpumap[0])
++        new_cpumap[pcpu] = True
++        new_cpumap = tuple(new_cpumap)
++
++        dom.pinVcpuFlags(vcpu, new_cpumap, libvirt.VIR_DOMAIN_AFFECT_LIVE |
++                    libvirt.VIR_DOMAIN_AFFECT_CONFIG)
++
++        (cpuinfo, cpumap) = dom.vcpus()
++
++        # Pin the emulator to the same as vCPU0
++        # This is causing problems, its' been filed as a bug.
++        # May not be needed anymore in any case, should see if still getting
++        # virtualbox behaviour where calling vcpupin changes emulatorpin.
++        # dom.pinEmulator(cpumap[0],
++        #                libvirt.VIR_DOMAIN_AFFECT_LIVE |
++        #                libvirt.VIR_DOMAIN_AFFECT_CONFIG)
++
++        # Generate the online vcpu list for the guest
++        # vCPU0 is always online.
++        online_vcpulist = [0]
++        for x in range(1, len(cpumap)):
++            if cpumap[x] != cpumap[0]:
++                online_vcpulist.append(x)
++
++        # Upcall into guest to tell it about the new cpu.
++        LOG.info('Attempting to notify guest of vcpu going online',
++                 instance=instance)
++        try:
++            cpu_scale_up_helper(instance, vcpu, online_vcpulist)
++        except Exception:
++            # Ignore problems here.
++            # We've already done the actual physical pinning.
++            pass
++
+     def destroy_name(self, instance_name):
+         """Destroy a domain by name.
+ 
+@@ -8527,14 +8747,15 @@ class LibvirtDriver(driver.ComputeDriver):
+             # Heartbeat explicitly disabled
+             LOG.info("Guest Heartbeat Disabled", instance=instance)
+ 
+-    def _set_server_group_msg(self, guest, flavor, instance):
+-        # support server group messaging
+-        # Set up virtio channel for cgcs messaging
+-        if strutils.bool_from_string(flavor.extra_specs.get(
+-                'sw:wrs:srv_grp_messaging', 'false')):
++    def _set_cgcs_msg(self, guest, flavor, instance):
++        # Set up virtio channel for cgcs messaging
++        srv_grp_messaging = strutils.bool_from_string(flavor.extra_specs.get(
++                'sw:wrs:srv_grp_messaging', 'false'))
++        cpu_scaling = flavor.extra_specs.get('hw:wrs:min_vcpus', None)
++        if cpu_scaling or srv_grp_messaging:
+             wrs_msg = vconfig.LibvirtConfigGuestChannel()
+             wrs_msg.type = "unix"
+             wrs_msg.target_name = "cgcs.messaging"
+             wrs_msg.source_path = ("/var/lib/libvirt/qemu/%s.%s.sock" %
+-                                ("cgcs.messaging", instance['name']))
++                                ("cgcs.messaging", instance.name))
+             guest.add_device(wrs_msg)
+diff --git a/nova/virt/libvirt/guest.py b/nova/virt/libvirt/guest.py
+index f8d83b0..7e767ac 100755
+--- a/nova/virt/libvirt/guest.py
++++ b/nova/virt/libvirt/guest.py
+@@ -295,6 +295,12 @@ class Guest(object):
+             yield VCPUInfo(
+                 id=vcpu[0], cpu=vcpu[3], state=vcpu[1], time=vcpu[2])
+ 
++    def get_vcpus_map(self):
++        """Returns virtual cpu map information of guest."""
++        vcpus = self._domain.vcpus()
++        if vcpus is not None and len(vcpus) > 1:
++            return vcpus[1]
++
+     def delete_configuration(self, support_uefi=False):
+         """Undefines a domain from hypervisor."""
+         try:
+-- 
+2.7.4
+

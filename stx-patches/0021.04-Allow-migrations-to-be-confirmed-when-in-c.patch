@@ -1,0 +1,58 @@
+From c9e9ccd091b38f57dee7c9657f82d39c968ec834 Mon Sep 17 00:00:00 2001
+From: Bart Wensley <barton.wensley@windriver.com>
+Date: Fri, 22 Jan 2016 08:45:28 -0500
+Subject: [PATCH] Allow migrations to be confirmed when in confirming state
+
+The confirm_resize API in nova/compute/api.py sets the migration
+status to "confirming" before sending the RPC to nova-compute. If
+nova-compute doesn't process the RPC, the instance is stuck in this
+state - both the revert_resize and confirm_resize APIs only look
+for migrations with the "finished" status and raise a
+MigrationNotFound exception if no migration is found. Since this
+migration is in the "confirming" state, we raise the exception,
+which results in the "Instance has not been resized" error being
+returned to the caller.
+
+To allow the migration to be confirmed after the compute node
+recovers, the confirm_resize handler will be changed to allow
+migrations in the "confirming" state. On the target compute node
+the actual confirmation is synchronized by instance.uuid, so
+there should be no race conditions, and confirm_resize already
+handles the "migration is already confirmed" case, which is used
+by _confirm_resize_on_deleting().
+
+(cherry picked from commit caa39e8)
+---
+ nova/compute/api.py | 16 ++++++++++++++--
+ 1 file changed, 14 insertions(+), 2 deletions(-)
+
+diff --git a/nova/compute/api.py b/nova/compute/api.py
+index 13c0e3d..6df2cd0 100644
+--- a/nova/compute/api.py
++++ b/nova/compute/api.py
+@@ -2884,8 +2884,20 @@ class API(base.Base):
+         """Confirms a migration/resize and deletes the 'old' instance."""
+         elevated = context.elevated()
+         if migration is None:
+-            migration = objects.Migration.get_by_instance_and_status(
+-                elevated, instance.uuid, 'finished')
++            # Look for migrations in confirming state as well as finished to
++            # handle cases where the confirm did not complete (eg. because
++            # the compute node went away during the confirm).
++            for status in ('finished', 'confirming'):
++                try:
++                    migration = objects.Migration.get_by_instance_and_status(
++                        elevated, instance.uuid, status)
++                    break
++                except exception.MigrationNotFoundByStatus:
++                    pass
++
++            if migration is None:
++                raise exception.MigrationNotFoundByStatus(
++                    instance_id=instance.uuid, status='finished|confirming')
+ 
+         # reserve quota only for any decrease in resource usage
+         deltas = compute_utils.downsize_quota_delta(context, instance)
+-- 
+2.7.4
+

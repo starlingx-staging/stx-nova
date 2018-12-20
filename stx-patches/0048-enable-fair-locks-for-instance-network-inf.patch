@@ -1,0 +1,153 @@
+From 21dc9e608449937ba85538f616d550f6c17063d6 Mon Sep 17 00:00:00 2001
+From: Chris Friesen <chris.friesen@windriver.com>
+Date: Wed, 24 May 2017 18:54:13 -0600
+Subject: [PATCH 048/143] enable fair locks for instance network
+ info cache
+
+We've hit cases where the post-live-migration code on the dest is
+blocked on the 'refresh_cache-%s' lock because it's being hogged
+by the code processing incoming external events.  (Specifically
+when there are many vifs in a live-migrating instance.)
+
+In TiC oslo_concurrency now supports the option of "fair" locks,
+so we convert to using them for this specific code path.
+
+In the future we may want to enable fair locks more generally.
+
+__TYPE_single
+__TAG_livemigration
+__R4_commit_d86494f
+---
+ nova/network/base_api.py                  | 13 +++++++++++--
+ nova/tests/unit/network/test_api.py       | 12 ++++++++++++
+ nova/tests/unit/network/test_neutronv2.py | 18 +++++++++++++++++-
+ 3 files changed, 40 insertions(+), 3 deletions(-)
+
+diff --git a/nova/network/base_api.py b/nova/network/base_api.py
+index 46710e7..e2a26f6 100644
+--- a/nova/network/base_api.py
++++ b/nova/network/base_api.py
+@@ -84,7 +84,8 @@ def refresh_cache(f):
+             msg = _('instance is a required argument to use @refresh_cache')
+             raise Exception(msg)
+ 
+-        with lockutils.lock('refresh_cache-%s' % instance.uuid):
++        # enable fair option
++        with lockutils.lock('refresh_cache-%s' % instance.uuid, fair=True):
+             # We need to call the wrapped function with the lock held to ensure
+             # that it can call _get_instance_nw_info safely.
+             res = f(self, context, *args, **kwargs)
+@@ -259,7 +260,15 @@ class NetworkAPI(base.Base):
+ 
+     def get_instance_nw_info(self, context, instance, **kwargs):
+         """Returns all network info related to an instance."""
+-        with lockutils.lock('refresh_cache-%s' % instance.uuid):
++
++        # this is a terrible hack to work around the fact that tox
++        # installs oslo_concurrency via pip from vanilla servers.
++        try:
++            cachelock = lockutils.lock('refresh_cache-%s' % instance.uuid,
++                                       fair=True)
++        except TypeError:
++            cachelock = lockutils.lock('refresh_cache-%s' % instance.uuid)
++        with cachelock:
+             result = self._get_instance_nw_info(context, instance, **kwargs)
+             # NOTE(comstud): Don't update API cell with new info_cache every
+             # time we pull network info for an instance.  The periodic healing
+diff --git a/nova/tests/unit/network/test_api.py b/nova/tests/unit/network/test_api.py
+index 3425fac..344d40d 100644
+--- a/nova/tests/unit/network/test_api.py
++++ b/nova/tests/unit/network/test_api.py
+@@ -20,6 +20,8 @@ import itertools
+ import uuid
+ 
+ import mock
++from oslo_concurrency import lockutils
++import threading
+ 
+ from nova.compute import flavors
+ from nova import context
+@@ -59,6 +61,11 @@ class ApiTestCase(test.TestCase):
+         self.context = context.RequestContext('fake-user',
+                                               fakes.FAKE_PROJECT_ID)
+ 
++        # stub out lockutils.lock since it does not have 'fair' option
++        def fake_lock(target, fair=None):
++            return threading.Semaphore()
++        self.stubs.Set(lockutils, 'lock', fake_lock)
++
+     @mock.patch('nova.objects.NetworkList.get_all')
+     def test_get_all(self, mock_get_all):
+         mock_get_all.return_value = mock.sentinel.get_all
+@@ -571,6 +578,11 @@ class TestUpdateInstanceCache(test.NoDBTestCase):
+         self.nw_json = fields.NetworkModel.to_primitive(self, 'network_info',
+                                                         self.nw_info)
+ 
++        # stub out lockutils.lock since it does not have 'fair' option
++        def fake_lock(target, fair=None):
++            return threading.Semaphore()
++        self.stubs.Set(lockutils, 'lock', fake_lock)
++
+     def test_update_nw_info_none(self, db_mock, api_mock):
+         api_mock._get_instance_nw_info.return_value = self.nw_info
+         info_cache = copy.deepcopy(fake_info_cache)
+diff --git a/nova/tests/unit/network/test_neutronv2.py b/nova/tests/unit/network/test_neutronv2.py
+index 18bb5bc..2370ba9 100644
+--- a/nova/tests/unit/network/test_neutronv2.py
++++ b/nova/tests/unit/network/test_neutronv2.py
+@@ -32,6 +32,7 @@ from mox3 import mox
+ import netaddr
+ from neutronclient.common import exceptions
+ from neutronclient.v2_0 import client
++from oslo_concurrency import lockutils
+ from oslo_config import cfg
+ from oslo_config import fixture as config_fixture
+ from oslo_policy import policy as oslo_policy
+@@ -40,6 +41,7 @@ from oslo_utils import timeutils
+ import requests_mock
+ import six
+ from six.moves import range
++import threading
+ 
+ from nova.compute import flavors
+ from nova import context
+@@ -835,6 +837,14 @@ class TestNeutronv2Base(test.TestCase):
+ 
+ class TestNeutronv2(TestNeutronv2Base):
+ 
++    def setUp(self):
++        super(TestNeutronv2, self).setUp()
++
++        # stub out lockutils.lock since it does not have 'fair' option
++        def fake_lock(target, fair=None):
++            return threading.Semaphore()
++        self.stubs.Set(lockutils, 'lock', fake_lock)
++
+     def test_get_instance_nw_info_1(self):
+         # Test to get one port in one network and subnet.
+         neutronapi.get_client(mox.IgnoreArg(),
+@@ -3288,6 +3298,11 @@ class TestNeutronv2WithMock(test.TestCase):
+             'fake-user', 'fake-project',
+             auth_token='bff4a5a6b9eb4ea2a6efec6eefb77936')
+ 
++        # stub out lockutils.lock since it does not have 'fair' option
++        def fake_lock(target, fair=None):
++            return threading.Semaphore()
++        self.stubs.Set(lockutils, 'lock', fake_lock)
++
+     @mock.patch('nova.network.neutronv2.api.API._show_port')
+     def test_deferred_ip_port_deferred_allocation(self, mock_show):
+         port = {'network_id': 'my_netid1',
+@@ -3310,7 +3325,8 @@ class TestNeutronv2WithMock(test.TestCase):
+         mock_lock.side_effect = test.TestingException
+         self.assertRaises(test.TestingException,
+                           api.get_instance_nw_info, 'context', instance)
+-        mock_lock.assert_called_once_with('refresh_cache-%s' % instance.uuid)
++        mock_lock.assert_called_once_with('refresh_cache-%s' % instance.uuid,
++                                          fair=True)
+ 
+     @mock.patch('nova.network.neutronv2.api.LOG')
+     def test_get_instance_nw_info_verify_duplicates_ignored(self, mock_log):
+-- 
+2.7.4
+

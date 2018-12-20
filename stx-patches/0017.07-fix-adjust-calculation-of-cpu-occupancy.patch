@@ -1,0 +1,63 @@
+From 78762e1d94703d6ef152bf6c40c4d1a686e6ff93 Mon Sep 17 00:00:00 2001
+From: Daniel Chavolla <daniel.chavolla@windriver.com>
+Date: Wed, 10 May 2017 13:17:27 -0400
+Subject: [PATCH] adjust calculation of cpu occupancy
+
+In the platform monitor's cpu occupancy calculation routine,
+the logic for choosing lines based on the presence of a specific
+cpu name in it was not accurate. It was choosing extra lines
+and therefore adding occupancy from non-platform cpus.
+
+For example, if cpu1 is a platform cpu, it would choose all
+the following lines in proc/schedstat as they matched 'cpu1':
+
+cpu1 0 0 0 0 0 0 101920340824374 19863905255447 1486302993
+cpu10 0 0 0 0 0 0 6939575785 1886301491 133656
+cpu11 0 0 0 0 0 0 3309793326 1203366013 140528
+cpu12 0 0 0 0 0 0 3198253435 31466834 148483
+cpu13 0 0 0 0 0 0 3021202354 12655120 143642
+cpu14 0 0 0 0 0 0 2772543047 6482698 137409
+cpu15 0 0 0 0 0 0 2871132103 10819193 140292
+cpu16 0 0 0 0 0 0 2769910401 8320187 137275
+cpu17 0 0 0 0 0 0 2548093014 5693430 132445
+cpu18 0 0 0 0 0 0 2494607133 4544469 130798
+cpu19 0 0 0 0 0 0 2519943183 4726818 131781
+---
+ nova/compute/monitors/platform/platform_monitor.py | 8 ++++----
+ 1 file changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/nova/compute/monitors/platform/platform_monitor.py b/nova/compute/monitors/platform/platform_monitor.py
+index be4234f..d48b926 100644
+--- a/nova/compute/monitors/platform/platform_monitor.py
++++ b/nova/compute/monitors/platform/platform_monitor.py
+@@ -168,10 +168,10 @@ class PlatformMonitor(base.MonitorBase):
+             try:
+                 with open(PROC_SCHEDSTAT) as f:
+                     for line in f:
+-                        l = [x for x in cpus if x in line]
++                        sp = line.split()
++                        l = [x for x in cpus if x == sp[0]]
+                         if l:
+                             cpu = l[0]
+-                            sp = line.split()
+                             t1[cpu] = int(sp[7])
+             except Exception as e:
+                 LOG.error(_LE('parsing %(file)s: error=%(err)s'),
+@@ -181,12 +181,12 @@ class PlatformMonitor(base.MonitorBase):
+             try:
+                 with open(PROC_STAT) as f:
+                     for line in f:
+-                        l = [x for x in cpus if x in line]
++                        sp = line.split()
++                        l = [x for x in cpus if x == sp[0]]
+                         if l:
+                             # total cputime excluding idle and iowait
+                             # cpu<x> user nice sys idle iowt hirq sirq steal
+                             cpu = l[0]
+-                            sp = line.split()
+                             user = int(sp[1])
+                             nice = int(sp[2])
+                             sys = int(sp[3])
+-- 
+2.7.4
+

@@ -1,0 +1,581 @@
+From 4aa92aeee84a899ecae7db2d54a7be73fdf5db5f Mon Sep 17 00:00:00 2001
+From: Sahid Orentino Ferdjaoui <sahid.ferdjaoui@redhat.com>
+Date: Wed, 6 Jul 2016 04:25:55 -0400
+Subject: [PATCH 011/143] libvirt: live-migrate updates NUMA and cpus in the
+ XML
+
+This patch builds upon previous work done around properly setting the
+NUMA topology data when the instance changes host (either via evacuate
+or live-migrate).
+
+In live migrate case for libvirt, since there is no re-spawn, we need
+to update the instance XML before calling either migrateToURI2 or
+migrateToURI3. Previously this was not done, and the result was that
+live-migrating instance that has NUMA properties would either work by
+accident but really break any policy that was set when the instance was
+spawned, or the instance would fail to start on the target host.
+
+Since now we have proper claims for resources as part of the
+live-migration, it is possible to use the claimed data to update the
+running instance's XML and pass it on.
+
+Change-Id: Ibb2d8caf9898dd776c2b1d3f15a0d81cbf222363
+Co-Authored-By: Sahid Ferdjaoui <sahid.ferdjaoui@redhat.com>
+Co-Authored-By: Pawel Koniszewski <pawel.koniszewski@intel.com>
+Related-bug: #1417667
+Closes-bug: #1289064
+Related-bug: #1496135
+
+This is the third in a series of three backports to Pike to give
+proper tracking of pinned cpus over live migration. Change was cherry
+picked from upstream review https://review.openstack.org/#/c/286744/34
+
+__TYPE_upstream
+__TAG_livemigration,resource
+__R4_commit_048ec0a
+__R3_commit_5ba31ec
+__TC6521
+---
+ nova/tests/unit/virt/libvirt/test_driver.py    | 222 ++++++++++++++++++++++---
+ nova/tests/unit/virt/libvirt/test_migration.py |  21 ++-
+ nova/virt/libvirt/driver.py                    |   7 +-
+ nova/virt/libvirt/migration.py                 |  63 ++++++-
+ 4 files changed, 278 insertions(+), 35 deletions(-)
+
+diff --git a/nova/tests/unit/virt/libvirt/test_driver.py b/nova/tests/unit/virt/libvirt/test_driver.py
+index b1f38c6..a886d47 100755
+--- a/nova/tests/unit/virt/libvirt/test_driver.py
++++ b/nova/tests/unit/virt/libvirt/test_driver.py
+@@ -8057,7 +8057,9 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+                 'instance', data, block_device_info=bdi))
+         self.assertEqual(0, mock_get_instance_disk_info.call_count)
+ 
+-    def test_live_migration_update_graphics_xml(self):
++    @mock.patch.object(libvirt_driver.LibvirtDriver, '_get_guest_cpu_config',
++                       return_value=None)
++    def test_live_migration_update_graphics_xml(self, mock_cpu_config):
+         self.compute = manager.ComputeManager()
+         instance_dict = dict(self.test_instance)
+         instance_dict.update({'host': 'fake',
+@@ -8074,6 +8076,7 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+                     "<listen address='{spice}'/>"
+                     "</graphics>"
+                     "</devices>"
++                    "<vcpu>1</vcpu>"
+                     "</domain>")
+ 
+         initial_xml = xml_tmpl.format(vnc='1.2.3.4',
+@@ -8220,7 +8223,10 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+                              migrate_data, guest, []))
+             mupdate.assert_called_once_with(
+                 guest, migrate_data, libvirt_migrate.DriverInterface(
+-                    drvr._get_volume_config))
++                    drvr._get_volume_config,
++                    drvr._get_guest_numa_config,
++                    drvr._get_guest_memory_backing_config,
++                    drvr._get_guest_cpu_config), instance_ref)
+ 
+     def test_live_migration_with_valid_target_connect_addr(self):
+         self.compute = manager.ComputeManager()
+@@ -8271,7 +8277,8 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+                 miguri='tcp://127.0.0.2',
+                 dxml=mupdate(), flags=0, bandwidth=0)
+ 
+-    def test_update_volume_xml(self):
++    @mock.patch.object(objects.ImageMeta, "from_instance")
++    def test_update_volume_xml(self, mock_image_meta):
+         drvr = libvirt_driver.LibvirtDriver(fake.FakeVirtAPI(), False)
+ 
+         initial_xml = self.device_xml_tmpl.format(
+@@ -8309,6 +8316,9 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+         conf.source_path = bdmi.connection_info['data'].get('device_path')
+ 
+         guest = libvirt_guest.Guest(mock.MagicMock())
++        instance = fake_instance.fake_instance_obj(self.context)
++        mock_image_meta.return_value = objects.ImageMetaProps.from_dict({})
++        instance.numa_topology = None
+         with test.nested(
+                 mock.patch.object(drvr, '_get_volume_config',
+                                   return_value=conf),
+@@ -8317,7 +8327,10 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+             config = libvirt_migrate.get_updated_guest_xml(guest,
+                             objects.LibvirtLiveMigrateData(bdms=[bdmi]),
+                             libvirt_migrate.DriverInterface(
+-                                drvr._get_volume_config))
++                                drvr._get_volume_config,
++                                drvr._get_guest_numa_config,
++                                drvr._get_guest_memory_backing_config,
++                                drvr._get_guest_cpu_config), instance)
+             parser = etree.XMLParser(remove_blank_text=True)
+             config = etree.fromstring(config, parser)
+             target_xml = etree.fromstring(target_xml, parser)
+@@ -8407,7 +8420,8 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+             self.assertEqual('tcp://%s' % dest, result)
+             self.assertIsInstance(result, str)
+ 
+-    def test_update_volume_xml_no_serial(self):
++    @mock.patch.object(objects.ImageMeta, "from_instance")
++    def test_update_volume_xml_no_serial(self, mock_image_meta):
+         drvr = libvirt_driver.LibvirtDriver(fake.FakeVirtAPI(), False)
+ 
+         xml_tmpl = """
+@@ -8461,18 +8475,26 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+         conf.source_type = "block"
+         conf.source_path = bdmi.connection_info['data'].get('device_path')
+ 
++        instance = fake_instance.fake_instance_obj(self.context)
++        instance.numa_topology = None
++        mock_image_meta.return_value = objects.ImageMeta.from_dict({})
+         guest = libvirt_guest.Guest(mock.MagicMock())
+         with test.nested(
+                 mock.patch.object(drvr, '_get_volume_config',
+                                   return_value=conf),
+                 mock.patch.object(guest, 'get_xml_desc',
+                                   return_value=initial_xml)):
+-            config = libvirt_migrate.get_updated_guest_xml(guest,
+-                objects.LibvirtLiveMigrateData(bdms=[bdmi]),
+-                drvr)
++            config = libvirt_migrate.get_updated_guest_xml(
++                guest, objects.LibvirtLiveMigrateData(bdms=[bdmi]),
++                libvirt_migrate.DriverInterface(
++                    drvr._get_volume_config,
++                    drvr._get_guest_numa_config,
++                    drvr._get_guest_memory_backing_config,
++                    drvr._get_guest_cpu_config), instance)
+             self.assertEqual(target_xml, config)
+ 
+-    def test_update_volume_xml_no_connection_info(self):
++    @mock.patch.object(objects.ImageMeta, "from_instance")
++    def test_update_volume_xml_no_connection_info(self, mock_image_meta):
+         drvr = libvirt_driver.LibvirtDriver(fake.FakeVirtAPI(), False)
+         initial_xml = self.device_xml_tmpl.format(
+             device_path='/dev/disk/by-path/'
+@@ -8491,6 +8513,9 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+                                                  format='qcow')
+         bdmi.connection_info = {}
+         conf = vconfig.LibvirtConfigGuestDisk()
++        instance = fake_instance.fake_instance_obj(self.context)
++        instance.numa_topology = None
++        mock_image_meta.return_value = objects.ImageMetaProps.from_dict({})
+         guest = libvirt_guest.Guest(mock.MagicMock())
+         with test.nested(
+                 mock.patch.object(drvr, '_get_volume_config',
+@@ -8500,17 +8525,33 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+             config = libvirt_migrate.get_updated_guest_xml(
+                 guest,
+                 objects.LibvirtLiveMigrateData(bdms=[bdmi]),
+-                drvr)
++                libvirt_migrate.DriverInterface(
++                    drvr._get_volume_config,
++                    drvr._get_guest_numa_config,
++                    drvr._get_guest_memory_backing_config,
++                    drvr._get_guest_cpu_config), instance)
+             self.assertEqual(target_xml, config)
+ 
++    @mock.patch.object(libvirt_driver.LibvirtDriver, '_get_guest_cpu_config',
++                       return_value=None)
++    @mock.patch.object(objects.ImageMeta, "from_instance")
+     @mock.patch.object(libvirt_driver.LibvirtDriver,
+                        '_get_serial_ports_from_guest')
+     @mock.patch.object(fakelibvirt.virDomain, "migrateToURI2")
+     @mock.patch.object(fakelibvirt.virDomain, "XMLDesc")
+     def test_live_migration_update_serial_console_xml(self, mock_xml,
+-                                                      mock_migrate, mock_get):
++                                                      mock_migrate,
++                                                      mock_get_serial_ports,
++                                                      mock_image_meta,
++                                                      mock_cpu_config):
+         self.compute = manager.ComputeManager()
+-        instance_ref = self.test_instance
++        inst_dict = self.test_instance
++        instance_ref = fake_instance.fake_instance_obj(self.context,
++                                                       **inst_dict)
++        instance_ref.numa_topology = None
++        image_meta = objects.ImageMeta()
++        image_meta_props = objects.ImageMetaProps()
++        image_meta.properties = image_meta_props
+ 
+         xml_tmpl = ("<domain type='kvm'>"
+                     "<devices>"
+@@ -8519,6 +8560,7 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+                     "<target type='serial' port='0'/>"
+                     "</console>"
+                     "</devices>"
++                    "<vcpu>1</vcpu>"
+                     "</domain>")
+ 
+         initial_xml = xml_tmpl.format(addr='9.0.0.1', port='10100')
+@@ -8529,6 +8571,7 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+         # Preparing mocks
+         mock_xml.return_value = initial_xml
+         mock_migrate.side_effect = fakelibvirt.libvirtError("ERR")
++        mock_image_meta.return_value = image_meta
+ 
+         # start test
+         bandwidth = CONF.libvirt.live_migration_bandwidth
+@@ -8580,6 +8623,121 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+                           self.context, instance_ref, 'dest',
+                           False, migrate_data, guest, [])
+ 
++    @mock.patch.object(objects.ImageMeta, "from_instance")
++    @mock.patch.object(fakelibvirt.virDomain, "migrateToURI2")
++    @mock.patch.object(fakelibvirt.virDomain, "XMLDesc")
++    @mock.patch.object(libvirt_driver.LibvirtDriver, "_get_host_numa_topology")
++    @mock.patch.object(libvirt_driver.LibvirtDriver, "_has_numa_support",
++                       return_value=True)
++    def test_live_migration_update_numa_xml(self, mock_numa_support,
++                                            mock_host_numa, mock_xml,
++                                            mock_migrate, mock_image_meta):
++        xml_old = """<domain type="kvm">
++  <memory unit="KiB">4194304</memory>
++  <vcpu cpuset="1-4">4</vcpu>
++  <cputune>
++    <vcpupin vcpu="0" cpuset="0"/>
++    <vcpupin vcpu="1" cpuset="1"/>
++    <vcpupin vcpu="2" cpuset="2"/>
++    <vcpupin vcpu="3" cpuset="3"/>
++    <emulatorpin cpuset="1-3"/>
++  </cputune>
++  <numatune>
++    <memory mode="strict" nodeset="0"/>
++    <memnode cellid="0" mode="strict" nodeset="0"/>
++  </numatune>
++  <memoryBacking>
++    <hugepages>
++      <page size="1" unit="G" nodeset="0"/>
++    </hugepages>
++    <nosharepages/>
++  </memoryBacking>
++  <cpu mode="host-model" match="exact">
++    <topology sockets="1" cores="1" threads="1"/>
++    <numa>
++      <cell id="0" cpus="0-3" memory="4194304" memAccess="shared"/>
++    </numa>
++  </cpu>
++</domain>"""
++
++        instance_topology = objects.InstanceNUMATopology(
++            cells=[
++                objects.InstanceNUMACell(
++                    id=1, cpuset=set([0, 1, 2, 3]), memory=4096,
++                    cpu_policy=fields.CPUAllocationPolicy.DEDICATED,
++                    cpu_pinning={0: 4, 1: 5, 2: 6, 3: 7},
++                    pagesize=2048)])
++
++        host_topology = objects.NUMATopology(
++            cells = [objects.NUMACell(
++                id=0, cpuset=set([0, 1, 2, 3]), memory=1024, mempages=[
++                    objects.NUMAPagesTopology(size_kb=4, total=256, used=0),
++                    objects.NUMAPagesTopology(size_kb=2048, total=512, used=0)
++                ], siblings=[], pinned_cpus=set([])),
++            objects.NUMACell(
++                id=1, cpuset=set([4, 5, 6, 7]), memory=1024, mempages=[
++                    objects.NUMAPagesTopology(size_kb=4, total=256, used=0),
++                    objects.NUMAPagesTopology(size_kb=2048, total=512, used=0)
++                ], siblings=[], pinned_cpus=set([]))])
++
++        xml_new = """<domain type="kvm">
++  <memory unit="KiB">4194304</memory>
++  <vcpu>4</vcpu>
++  <cputune>
++    <emulatorpin cpuset="4-7"/>
++    <vcpupin vcpu="0" cpuset="4"/>
++    <vcpupin vcpu="1" cpuset="5"/>
++    <vcpupin vcpu="2" cpuset="6"/>
++    <vcpupin vcpu="3" cpuset="7"/>
++  </cputune>
++  <numatune>
++    <memory mode="strict" nodeset="1"/>
++    <memnode cellid="0" mode="strict" nodeset="1"/>
++  </numatune>
++  <memoryBacking>
++    <hugepages>
++      <page size="2048" nodeset="0" unit="KiB"/>
++    </hugepages>
++  </memoryBacking>
++  <cpu mode="host-model" match="exact">
++    <topology sockets="4" cores="1" threads="1"/>
++    <numa>
++      <cell id="0" cpus="0-3" memory="4194304" memAccess="shared"/>
++    </numa>
++  </cpu>
++</domain>"""
++
++        migrate_data = objects.LibvirtLiveMigrateData(
++            graphics_listen_addr_vnc=None,
++            graphics_listen_addr_spice=None,
++            serial_listen_addr=None,
++            target_connect_addr=None,
++            block_migration=False,
++            bdms=[])
++
++        instance = fake_instance.fake_instance_obj(self.context)
++        image_meta = objects.ImageMeta()
++        image_meta_props = objects.ImageMetaProps()
++        image_meta.properties = image_meta_props
++        instance.numa_topology = instance_topology
++        instance.flavor.vcpus = 4
++        dom = fakelibvirt.virDomain
++
++        mock_xml.return_value = xml_old
++        mock_host_numa.return_value = host_topology
++        mock_image_meta.return_value = image_meta
++
++        def assertDomainXML(destination, dxml, flags, bandwidth, miguri):
++            self.assertThat(xml_new, matchers.XMLMatches(dxml))
++
++        mock_migrate.side_effect = assertDomainXML
++
++        guest = libvirt_guest.Guest(dom)
++        drvr = libvirt_driver.LibvirtDriver(fake.FakeVirtAPI(), False)
++        drvr._live_migration_operation(self.context, instance, 'dest', False,
++                                       migrate_data, guest, [])
++        self.assertTrue(mock_migrate.called)
++
+     @mock.patch.object(host.Host, 'has_min_version', return_value=True)
+     @mock.patch.object(fakelibvirt.virDomain, "migrateToURI3")
+     @mock.patch('nova.virt.libvirt.migration.get_updated_guest_xml',
+@@ -8716,7 +8874,10 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+             drvr._live_migration_uri('dest'),
+             params=params, flags=expected_flags)
+ 
+-    def test_live_migration_raises_exception(self):
++    @mock.patch.object(libvirt_migrate, 'get_updated_guest_xml')
++    @mock.patch.object(objects.ImageMeta, "from_instance")
++    def test_live_migration_raises_exception(
++            self, mock_image_meta, mock_updated_guest_xml):
+         # Confirms recover method is called when exceptions are raised.
+         # Preparing data
+         self.compute = manager.ComputeManager()
+@@ -8729,18 +8890,8 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+         drvr = libvirt_driver.LibvirtDriver(fake.FakeVirtAPI(), False)
+ 
+         # Preparing mocks
+-        vdmock = self.mox.CreateMock(fakelibvirt.virDomain)
+-        guest = libvirt_guest.Guest(vdmock)
+-        self.mox.StubOutWithMock(vdmock, "migrateToURI2")
+-        _bandwidth = CONF.libvirt.live_migration_bandwidth
+-        vdmock.XMLDesc(flags=fakelibvirt.VIR_DOMAIN_XML_MIGRATABLE
+-        ).AndReturn(FakeVirtDomain().XMLDesc(flags=0))
+-        vdmock.migrateToURI2(drvr._live_migration_uri('dest'),
+-                             miguri=None,
+-                             dxml=mox.IgnoreArg(),
+-                             flags=mox.IgnoreArg(),
+-                             bandwidth=_bandwidth).AndRaise(
+-                                     fakelibvirt.libvirtError('ERR'))
++        test_mock = mock.MagicMock()
++        guest = libvirt_guest.Guest(test_mock)
+ 
+         # start test
+         migrate_data = objects.LibvirtLiveMigrateData(
+@@ -8750,12 +8901,31 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+             target_connect_addr=None,
+             bdms=[],
+             block_migration=False)
+-        self.mox.ReplayAll()
++        instance_ref.numa_topology = None
++        mock_image_meta.return_value = objects.ImageMeta.from_dict({})
++
++        drvr = libvirt_driver.LibvirtDriver(fake.FakeVirtAPI(), False)
++        guest = mock.Mock(spec=libvirt_guest.Guest)
++
++        # Preparing mocks
++        guest.migrate.side_effect = fakelibvirt.libvirtError("ERR")
++
++        # start test
+         self.assertRaises(fakelibvirt.libvirtError,
+                           drvr._live_migration_operation,
+                           self.context, instance_ref, 'dest',
+                           False, migrate_data, guest, [])
+ 
++        mock_updated_guest_xml.assert_called_once_with(
++            guest, migrate_data, mock.ANY, instance_ref)
++        guest.migrate.assert_called_once_with(
++            drvr._live_migration_uri('dest'),
++            flags=mox.IgnoreArg(),
++            domain_xml=mox.IgnoreArg(),
++            bandwidth=mox.IgnoreArg(),
++            migrate_uri=mox.IgnoreArg(),
++            params=mox.IgnoreArg())
++
+         self.assertEqual(vm_states.ACTIVE, instance_ref.vm_state)
+         self.assertEqual(power_state.RUNNING, instance_ref.power_state)
+ 
+diff --git a/nova/tests/unit/virt/libvirt/test_migration.py b/nova/tests/unit/virt/libvirt/test_migration.py
+index 5cd54c2..35f4458 100644
+--- a/nova/tests/unit/virt/libvirt/test_migration.py
++++ b/nova/tests/unit/virt/libvirt/test_migration.py
+@@ -91,23 +91,28 @@ class UtilityMigrationTestCase(test.NoDBTestCase):
+         self.assertEqual([], ports)
+ 
+     @mock.patch('lxml.etree.tostring')
++    @mock.patch.object(migration, '_update_numa_xml')
+     @mock.patch.object(migration, '_update_perf_events_xml')
+     @mock.patch.object(migration, '_update_graphics_xml')
+     @mock.patch.object(migration, '_update_serial_xml')
+     @mock.patch.object(migration, '_update_volume_xml')
+     def test_get_updated_guest_xml(
+             self, mock_volume, mock_serial, mock_graphics,
+-            mock_perf_events_xml, mock_tostring):
++            mock_perf_events_xml, mock_numa, mock_tostring):
+         data = objects.LibvirtLiveMigrateData()
+         mock_guest = mock.Mock(spec=libvirt_guest.Guest)
+-        driver = mock.MagicMock()
++        driver_interface = mock.Mock(spec=migration.DriverInterface)
++        instance = mock.Mock(spec=objects.Instance)
++
+         mock_guest.get_xml_desc.return_value = '<domain></domain>'
+ 
+-        migration.get_updated_guest_xml(mock_guest, data, driver)
++        migration.get_updated_guest_xml(mock_guest, data, driver_interface,
++                                        instance)
+         mock_graphics.assert_called_once_with(mock.ANY, data)
+         mock_serial.assert_called_once_with(mock.ANY, data)
+-        mock_volume.assert_called_once_with(mock.ANY, data, driver)
++        mock_volume.assert_called_once_with(mock.ANY, data, driver_interface)
+         mock_perf_events_xml.assert_called_once_with(mock.ANY, data)
++        mock_numa.assert_called_once_with(mock.ANY, driver_interface, instance)
+         self.assertEqual(1, mock_tostring.called)
+ 
+     def test_update_serial_xml_serial(self):
+@@ -236,7 +241,7 @@ class UtilityMigrationTestCase(test.NoDBTestCase):
+         conf.source_path = bdm.connection_info['data'].get('device_path')
+ 
+         driver_interface = migration.DriverInterface(
+-            mock.MagicMock(return_value=conf))
++            mock.MagicMock(return_value=conf), None, None, None)
+         doc = etree.fromstring(xml)
+         res = etree.tostring(migration._update_volume_xml(
+             doc, data, driver_interface))
+@@ -304,6 +309,12 @@ class UtilityMigrationTestCase(test.NoDBTestCase):
+     </perf>
+ </domain>"""))
+ 
++    def test_update_numa_xml(self):
++        # XML update for NUMA topology is closely related to libvirt
++        # driver. See virt/libvirt/test_driver.py,
++        # test_live_migration_update_numa_xml.
++        pass
++
+ 
+ class MigrationMonitorTestCase(test.NoDBTestCase):
+     def setUp(self):
+diff --git a/nova/virt/libvirt/driver.py b/nova/virt/libvirt/driver.py
+index 4350dd0..e657ced 100644
+--- a/nova/virt/libvirt/driver.py
++++ b/nova/virt/libvirt/driver.py
+@@ -6380,9 +6380,12 @@ class LibvirtDriver(driver.ComputeDriver):
+                 # recalculated NUMA/CPU pinning information that is stored in
+                 # MigrationContext on the Instance
+                 driver_interface = libvirt_migrate.DriverInterface(
+-                    self._get_volume_config)
++                    self._get_volume_config,
++                    self._get_guest_numa_config,
++                    self._get_guest_memory_backing_config,
++                    self._get_guest_cpu_config)
+                 new_xml_str = libvirt_migrate.get_updated_guest_xml(
+-                    guest, migrate_data, driver_interface)
++                    guest, migrate_data, driver_interface, instance)
+             if self._host.has_min_version(
+                     MIN_LIBVIRT_BLOCK_LM_WITH_VOLUMES_VERSION):
+                 params = {
+diff --git a/nova/virt/libvirt/migration.py b/nova/virt/libvirt/migration.py
+index d42a787..13e84fe 100644
+--- a/nova/virt/libvirt/migration.py
++++ b/nova/virt/libvirt/migration.py
+@@ -21,6 +21,10 @@ from collections import deque
+ from collections import namedtuple
+ from lxml import etree
+ from oslo_log import log as logging
++import six
++
++from nova import objects
++from nova.virt import hardware
+ 
+ from nova.compute import power_state
+ import nova.conf
+@@ -35,7 +39,10 @@ CONF = nova.conf.CONF
+ libvirt = None
+ 
+ DriverInterface = namedtuple(
+-    'DriverInterface', ['get_volume_config', ])
++    'DriverInterface', ['get_volume_config',
++                        'get_guest_numa_config',
++                        'get_guest_memory_backing_config',
++                        'get_guest_cpu_config', ])
+ 
+ 
+ def graphics_listen_addrs(migrate_data):
+@@ -79,12 +86,13 @@ def serial_listen_ports(migrate_data):
+     return ports
+ 
+ 
+-def get_updated_guest_xml(guest, migrate_data, driver_interface):
++def get_updated_guest_xml(guest, migrate_data, driver_interface, instance):
+     xml_doc = etree.fromstring(guest.get_xml_desc(dump_migratable=True))
+     xml_doc = _update_graphics_xml(xml_doc, migrate_data)
+     xml_doc = _update_serial_xml(xml_doc, migrate_data)
+     xml_doc = _update_volume_xml(xml_doc, migrate_data, driver_interface)
+     xml_doc = _update_perf_events_xml(xml_doc, migrate_data)
++    xml_doc = _update_numa_xml(xml_doc, driver_interface, instance)
+     return etree.tostring(xml_doc)
+ 
+ 
+@@ -532,3 +540,54 @@ def downtime_steps(data_gb):
+ 
+     for i in range(steps + 1):
+         yield (int(delay * i), int(base + offset * i))
++
++
++def _update_numa_xml(xml_doc, driver_interface, instance):
++    image_meta = objects.ImageMeta.from_instance(instance)
++    # FIXME(ndipanov): This is not correct - we need to get the
++    # vcpu_pin_set from the destination host, however in the (presumably
++    # common) case when these are the same on both - this should be fine
++    allowed_cpus = hardware.get_vcpu_pin_set()
++    # TODO(sahid/cfriesen): If the destination has more numa nodes than the
++    # source then this could cause problems due to the loop over topology.cells
++    # where "topology" is for the source host.
++    numa_config = driver_interface.get_guest_numa_config(
++        instance.numa_topology, instance.flavor, allowed_cpus, image_meta)
++    if numa_config[1] is None:
++        # Quit early if the instance does not provide numa topology.
++        return xml_doc
++    membacking = driver_interface.get_guest_memory_backing_config(
++        instance.numa_topology, numa_config.numatune, instance.flavor)
++    cpu = driver_interface.get_guest_cpu_config(
++        instance.flavor, image_meta, numa_config.numaconfig,
++        instance.numa_topology)
++
++    # We need to treat cpuset slightly differently - it's just an
++    # attribute on the vcpu element, which we expect is always there
++    vcpu = xml_doc.find('./vcpu')
++    new_vcpu = etree.Element("vcpu")
++    new_vcpu.text = six.text_type(instance.flavor.vcpus)
++    if numa_config.cpuset:
++        new_vcpu.set("cpuset",
++                     hardware.format_cpu_spec(numa_config.cpuset))
++    if vcpu is not None:
++        xml_doc.remove(vcpu)
++    xml_doc.append(new_vcpu)
++
++    def replace_from_config(tag, config):
++        """Replace a top level node with xml generated by config """
++        elem = xml_doc.find('./' + tag)
++        if elem is not None:
++            xml_doc.remove(elem)
++        if config:
++            new_elem = config.format_dom()
++            xml_doc.append(new_elem)
++
++    replace = [('cputune', numa_config.cputune),
++               ('numatune', numa_config.numatune),
++               ('memoryBacking', membacking),
++               ('cpu', cpu)]
++    for tag, config in replace:
++        replace_from_config(tag, config)
++
++    return xml_doc
+-- 
+2.7.4
+

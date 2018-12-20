@@ -1,0 +1,190 @@
+From 05c6b34a87404548a27aac5ced498adf3b2afe07 Mon Sep 17 00:00:00 2001
+From: Jack Ding <jack.ding@windriver.com>
+Date: Fri, 1 Sep 2017 09:48:15 -0400
+Subject: [PATCH 013/143] Drop support for forced hosts for live migrate
+
+Drop support for forced destinations to make sure we always go through
+scheduler when live migrate.
+
+Nova scheduler will skip evaluation of filters in the case where there
+are forced_hosts or forced_nodes.  This occurs if one specifies the
+destination host as a boot option. eg,
+nova boot --availability-zone nova:compute-x ,
+and assuming sufficient priviledge in /etc/nova/policy.json .
+
+This update ensures that scheduler filters are always evaluated,
+so we prevent launch of VMs on hosts that do not support them.
+e.g., make sure host has sufficient: network provider, PCI device,
+NUMA topology, etc.
+
+Previous title "primary: Do not bypass scheduler when using forced hosts
+or live migrate".
+
+__TYPE_single
+__TAG_scheduler,livemigration
+__R4_commit_4267231
+__R3_commit_2378241
+__TC6549
+---
+ nova/compute/api.py                           |  4 ++++
+ nova/conductor/tasks/live_migrate.py          | 12 ++++++++++--
+ nova/tests/unit/compute/test_compute.py       |  3 +++
+ nova/tests/unit/compute/test_compute_api.py   | 18 +++++++++++++++---
+ nova/tests/unit/compute/test_compute_cells.py |  8 +++++++-
+ 5 files changed, 39 insertions(+), 6 deletions(-)
+
+diff --git a/nova/compute/api.py b/nova/compute/api.py
+index cdde5ad..0543550 100644
+--- a/nova/compute/api.py
++++ b/nova/compute/api.py
+@@ -3937,6 +3937,10 @@ class API(base.Base):
+             # to them, we need to support the old way
+             request_spec = None
+ 
++        # drop support for forced destinations to make sure we always go
++        # through scheduler
++        force = False
++
+         # NOTE(sbauza): Force is a boolean by the new related API version
+         if force is False and host_name:
+             nodes = objects.ComputeNodeList.get_all_by_host(context, host_name)
+diff --git a/nova/conductor/tasks/live_migrate.py b/nova/conductor/tasks/live_migrate.py
+index 18a5714..41dd0bf 100644
+--- a/nova/conductor/tasks/live_migrate.py
++++ b/nova/conductor/tasks/live_migrate.py
+@@ -82,6 +82,13 @@ class LiveMigrationTask(base.TaskBase):
+                 self.scheduler_client.reportclient, self.instance,
+                 source_node, dest_node)
+ 
++        # Log live migration
++        LOG.info("Live migrating instance %(inst_uuid)s: "
++                 "source:%(source)s dest:%(dest)s",
++                 {'inst_uuid': self.instance['uuid'],
++                  'source': self.source,
++                  'dest': self.destination})
++
+         # TODO(johngarbutt) need to move complexity out of compute manager
+         # TODO(johngarbutt) disk_over_commit?
+         return self.compute_rpcapi.live_migration(self.context,
+@@ -313,8 +320,9 @@ class LiveMigrationTask(base.TaskBase):
+                 self._call_livem_checks_on_host(host, limits=limits)
+             except (exception.Invalid,
+                     exception.MigrationPreCheckError) as e:
+-                LOG.debug("Skipping host: %(host)s because: %(e)s",
+-                    {"host": host, "e": e})
++                # Change this from 'debug' log to 'info', we need this.
++                LOG.info("Skipping host: %(host)s because: %(e)s",
++                         {"host": host, "e": e})
+                 attempted_hosts.append(host)
+                 # The scheduler would have created allocations against the
+                 # selected destination host in Placement, so we need to remove
+diff --git a/nova/tests/unit/compute/test_compute.py b/nova/tests/unit/compute/test_compute.py
+index 326e0a4..810219c 100644
+--- a/nova/tests/unit/compute/test_compute.py
++++ b/nova/tests/unit/compute/test_compute.py
+@@ -10687,6 +10687,9 @@ class ComputeAPITestCase(BaseTestCase):
+                     host='fake_dest_host',
+                     hypervisor_hostname='fake_dest_node')])
+ 
++            # drop support for forced destinations to make sure we always
++            # go through scheduler
++            force = False
+             self.compute_api.live_migrate(self.context, instance,
+                                           block_migration=True,
+                                           disk_over_commit=True,
+diff --git a/nova/tests/unit/compute/test_compute_api.py b/nova/tests/unit/compute/test_compute_api.py
+index da9eefa..8ec7b80 100644
+--- a/nova/tests/unit/compute/test_compute_api.py
++++ b/nova/tests/unit/compute/test_compute_api.py
+@@ -2114,18 +2114,24 @@ class _ComputeAPIUnitTestMixIn(object):
+         instance = self._create_instance_obj(params=paused_state)
+         self._live_migrate_instance(instance)
+ 
++    @mock.patch.object(objects.ComputeNodeList, 'get_all_by_host')
+     @mock.patch.object(compute_utils, 'add_instance_fault_from_exc')
+     @mock.patch.object(objects.RequestSpec, 'get_by_instance_uuid')
+     @mock.patch.object(objects.InstanceAction, 'action_start')
+     @mock.patch.object(objects.Instance, 'save')
+     def test_live_migrate_messaging_timeout(self, _save, _action, get_spec,
+-                                            add_instance_fault_from_exc):
++                                            add_instance_fault_from_exc,
++                                            get_all_by_host):
+         instance = self._create_instance_obj()
+         if self.cell_type == 'api':
+             api = self.compute_api.cells_rpcapi
+         else:
+             api = conductor.api.ComputeTaskAPI
+ 
++        get_all_by_host.return_value = objects.ComputeNodeList(
++            objects=[objects.ComputeNode(
++                host='fake_dest_host',
++                hypervisor_hostname='fake_dest_node')])
+         with mock.patch.object(api, 'live_migrate_instance',
+                                side_effect=oslo_exceptions.MessagingTimeout):
+             self.assertRaises(oslo_exceptions.MessagingTimeout,
+@@ -2138,10 +2144,12 @@ class _ComputeAPIUnitTestMixIn(object):
+                 instance,
+                 mock.ANY)
+ 
++    @mock.patch.object(objects.ComputeNodeList, 'get_all_by_host')
+     @mock.patch.object(objects.RequestSpec, 'get_by_instance_uuid')
+     @mock.patch.object(objects.Instance, 'save')
+     @mock.patch.object(objects.InstanceAction, 'action_start')
+-    def _live_migrate_instance(self, instance, _save, _action, get_spec):
++    def _live_migrate_instance(self, instance, _save, _action, get_spec,
++                               get_all_by_host):
+         # TODO(gilliard): This logic is upside-down (different
+         # behaviour depending on which class this method is mixed-into. Once
+         # we have cellsv2 we can remove this kind of logic from this test
+@@ -2151,6 +2159,10 @@ class _ComputeAPIUnitTestMixIn(object):
+             api = conductor.api.ComputeTaskAPI
+         fake_spec = objects.RequestSpec()
+         get_spec.return_value = fake_spec
++        get_all_by_host.return_value = objects.ComputeNodeList(
++            objects=[objects.ComputeNode(
++                host='fake_dest_host',
++                hypervisor_hostname='fake_dest_node')])
+         with mock.patch.object(api, 'live_migrate_instance') as task:
+             self.compute_api.live_migrate(self.context, instance,
+                                           block_migration=True,
+@@ -2158,7 +2170,7 @@ class _ComputeAPIUnitTestMixIn(object):
+                                           host_name='fake_dest_host')
+             self.assertEqual(task_states.MIGRATING, instance.task_state)
+             task.assert_called_once_with(self.context, instance,
+-                                         'fake_dest_host',
++                                         None,
+                                          block_migration=True,
+                                          disk_over_commit=True,
+                                          request_spec=fake_spec,
+diff --git a/nova/tests/unit/compute/test_compute_cells.py b/nova/tests/unit/compute/test_compute_cells.py
+index ff82bf6..efda4d8 100644
+--- a/nova/tests/unit/compute/test_compute_cells.py
++++ b/nova/tests/unit/compute/test_compute_cells.py
+@@ -672,10 +672,12 @@ class CellsConductorAPIRPCRedirect(test.NoDBTestCase):
+         self.compute_api.resize(self.context, instance)
+         self.assertTrue(self.cells_rpcapi.resize_instance.called)
+ 
++    @mock.patch.object(objects.ComputeNodeList, 'get_all_by_host')
+     @mock.patch.object(objects.RequestSpec, 'get_by_instance_uuid')
+     @mock.patch.object(compute_api.API, '_record_action_start')
+     @mock.patch.object(objects.Instance, 'save')
+-    def test_live_migrate_instance(self, instance_save, _record, _get_spec):
++    def test_live_migrate_instance(self, instance_save, _record, _get_spec,
++                                   get_all_by_host):
+         orig_system_metadata = {}
+         instance = fake_instance.fake_instance_obj(self.context,
+                 vm_state=vm_states.ACTIVE, cell_name='fake-cell',
+@@ -683,6 +685,10 @@ class CellsConductorAPIRPCRedirect(test.NoDBTestCase):
+                 system_metadata=orig_system_metadata,
+                 expected_attrs=['system_metadata'])
+ 
++        get_all_by_host.return_value = objects.ComputeNodeList(
++            objects=[objects.ComputeNode(
++                host='fake_dest_host',
++                hypervisor_hostname='fake_dest_node')])
+         self.compute_api.live_migrate(self.context, instance,
+                 True, True, 'fake_dest_host')
+ 
+-- 
+2.7.4
+

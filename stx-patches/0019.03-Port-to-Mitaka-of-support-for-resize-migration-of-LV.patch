@@ -1,0 +1,203 @@
+From 38b78e76a506f83ae7638d36fa670a1f402c6d8f Mon Sep 17 00:00:00 2001
+From: Daniel Chavolla <daniel.chavolla@windriver.com>
+Date: Mon, 13 Jun 2016 15:51:32 -0400
+Subject: [PATCH] Port to Mitaka of support for resize/migration of LVM-backed
+ instances
+
+This commit completes the porting to Mitaka for this suppot. It removes
+the checks that prevented LVM backed instances from resizing, and fixes
+related tox testcases
+
+The following commits are ported:
+
+commit dabd6bb70ebb0fda201303276d27ee2848f7c256:
+Adjust LVM migration checks
+commit c4144a00b88a3b88cfac0fc821cc77fcaf581ece:
+Fix lvm resize related tox unit tests
+commit 631993e74307072ae86994af8da5def82951953d:
+Fix for invalid dest_check_data key
+---
+ nova/compute/manager.py                     |  5 ---
+ nova/tests/unit/virt/libvirt/test_driver.py | 61 ++++++++++++++++++++++++++++-
+ nova/virt/libvirt/driver.py                 | 29 +++++++++++---
+ 3 files changed, 83 insertions(+), 12 deletions(-)
+
+diff --git a/nova/compute/manager.py b/nova/compute/manager.py
+index 985b52d..3334649 100644
+--- a/nova/compute/manager.py
++++ b/nova/compute/manager.py
+@@ -3841,11 +3841,6 @@ class ComputeManager(manager.Manager):
+                                   instance_type, quotas,
+                                   request_spec, filter_properties,
+                                   node, clean_shutdown)
+-            # NOTE(dgenin): This is thrown in LibvirtDriver when the
+-            #               instance to be migrated is backed by LVM.
+-            #               Remove when LVM migration is implemented.
+-            except exception.MigrationPreCheckError:
+-                raise
+             except Exception:
+                 # try to re-schedule the resize elsewhere:
+                 exc_info = sys.exc_info()
+diff --git a/nova/tests/unit/virt/libvirt/test_driver.py b/nova/tests/unit/virt/libvirt/test_driver.py
+index dbad07b..82e8b7d 100644
+--- a/nova/tests/unit/virt/libvirt/test_driver.py
++++ b/nova/tests/unit/virt/libvirt/test_driver.py
+@@ -13907,6 +13907,14 @@ class LibvirtDriverTestCase(test.NoDBTestCase):
+ 
+         return jsonutils.dumps(disk_info)
+ 
++    @staticmethod
++    def _disk_info_lvm():
++        disk_info = [{'type': 'raw', 'path': '/dev/vg/1234_disk',
++                      'disk_size': '83886080'},
++                     {'type': 'raw', 'path': '/dev/vg/1234_disk.local',
++                      'disk_size': '83886080'}]
++        return jsonutils.dumps(disk_info)
++
+     def test_migrate_disk_and_power_off_exception(self):
+         """Test for nova.virt.libvirt.libvirt_driver.LivirtConnection
+         .migrate_disk_and_power_off.
+@@ -14085,6 +14093,47 @@ class LibvirtDriverTestCase(test.NoDBTestCase):
+         self.assertFalse(self.copy_or_move_swap_called)
+         self.assertEqual(disk_info, out)
+ 
++    def _test_migrate_disk_and_power_off_resize_lvm(self, expected_exc):
++        """Test for nova.virt.libvirt.libvirt_driver.LibvirtConnection
++        .migrate_disk_and_power_off.
++        """
++        disk_info = self._disk_info_lvm()
++
++        def fake_get_instance_disk_info(instance, xml=None,
++                                        block_device_info=None):
++            return disk_info
++
++        def fake_destroy(instance):
++            pass
++
++        def fake_get_host_ip_addr():
++            return '10.0.0.1'
++
++        def fake_execute(*args, **kwargs):
++            pass
++
++        self.stubs.Set(self.drvr, 'get_instance_disk_info',
++                       fake_get_instance_disk_info)
++        self.stubs.Set(self.drvr, '_destroy', fake_destroy)
++        self.stubs.Set(self.drvr, 'get_host_ip_addr',
++                       fake_get_host_ip_addr)
++
++        ins_ref = self._create_instance()
++        flavor = {'root_gb': 10, 'ephemeral_gb': 20}
++        flavor_obj = objects.Flavor(**flavor)
++
++        # dest is different host case
++        out = self.drvr.migrate_disk_and_power_off(
++            context.get_admin_context(), ins_ref, '10.0.0.2',
++            flavor_obj, None)
++        self.assertEqual(out, disk_info)
++
++        # dest is same host case
++        out = self.drvr.migrate_disk_and_power_off(
++            context.get_admin_context(), ins_ref, '10.0.0.1',
++            flavor_obj, None)
++        self.assertEqual(out, disk_info)
++
+     def _test_migrate_disk_and_power_off_resize_check(self, expected_exc):
+         """Test for nova.virt.libvirt.libvirt_driver.LibvirtConnection
+         .migrate_disk_and_power_off.
+@@ -14100,6 +14149,9 @@ class LibvirtDriverTestCase(test.NoDBTestCase):
+         def fake_get_host_ip_addr():
+             return '10.0.0.1'
+ 
++        def fake_execute(*args, **kwargs):
++            pass
++
+         self.stubs.Set(self.drvr, 'get_instance_disk_info',
+                        fake_get_instance_disk_info)
+         self.stubs.Set(self.drvr, '_destroy', fake_destroy)
+@@ -14110,7 +14162,6 @@ class LibvirtDriverTestCase(test.NoDBTestCase):
+         flavor = {'root_gb': 10, 'ephemeral_gb': 20}
+         flavor_obj = objects.Flavor(**flavor)
+ 
+-        # Migration is not implemented for LVM backed instances
+         self.assertRaises(expected_exc,
+               self.drvr.migrate_disk_and_power_off,
+               None, ins_ref, '10.0.0.1', flavor_obj, None)
+@@ -14165,10 +14216,16 @@ class LibvirtDriverTestCase(test.NoDBTestCase):
+         def fake_execute(*args, **kwargs):
+             pass
+ 
++        def fake_get_volume_vg(path):
++            return path.split('/')[1]
++
+         self.stubs.Set(utils, 'execute', fake_execute)
++        self.stubs.Set(nova.virt.libvirt.storage.lvm,
++                       'get_volume_vg',
++                       fake_get_volume_vg)
+ 
+         expected_exc = exception.InstanceFaultRollback
+-        self._test_migrate_disk_and_power_off_resize_check(expected_exc)
++        self._test_migrate_disk_and_power_off_resize_lvm(expected_exc)
+ 
+     def test_migrate_disk_and_power_off_resize_cannot_ssh(self):
+         def fake_execute(*args, **kwargs):
+diff --git a/nova/virt/libvirt/driver.py b/nova/virt/libvirt/driver.py
+index 61ebd1d..ea4578a 100644
+--- a/nova/virt/libvirt/driver.py
++++ b/nova/virt/libvirt/driver.py
+@@ -5794,6 +5794,18 @@ class LibvirtDriver(driver.ComputeDriver):
+                        "does not have a local disk.")
+             raise exception.InvalidSharedStorage(reason=reason, path=source)
+ 
++        elif ((not dest_check_data.is_shared_block_storage) and
++              ((CONF.libvirt.images_type == 'lvm') or
++               (dest_check_data.image_type == 'lvm'))):
++            # Block the case of instances with LVM backed storage on
++            # computes. The is_shared_block_storage() check returns
++            # True for boot by volume instances without local disks,
++            # therefore this check will not be triggered, but any
++            # other cases will be caught here
++            reason = _("Live migration can not be used by an "
++                       "instance with LVM backed storage.")
++            raise exception.InvalidSharedStorage(reason=reason, path=source)
++
+         # NOTE(mikal): include the instance directory name here because it
+         # doesn't yet exist on the destination but we want to force that
+         # same name to be used
+@@ -5823,9 +5835,15 @@ class LibvirtDriver(driver.ComputeDriver):
+             return True
+ 
+         if (dest_check_data.is_shared_instance_path and
+-                self.image_backend.backend().is_file_in_instance_path()):
++                self.image_backend.backend().is_file_in_instance_path() and
++                CONF.libvirt.images_type != 'lvm'):
+             # NOTE(angdraug): file based image backends (Raw, Qcow2)
+             # place block device files under the instance path
++
++            # Add an additional check to see if local disks are backed
++            # by lvm. These are not shared, so fail this check. Below
++            # we will allow instances backed by volume but without
++            # local disks to pass.
+             return True
+ 
+         if (dest_check_data.is_volume_backed and
+@@ -7393,11 +7411,12 @@ class LibvirtDriver(driver.ComputeDriver):
+ 
+         disk_info = jsonutils.loads(disk_info_text)
+ 
++        # allow migration of LVM backed instances
+         # NOTE(dgenin): Migration is not implemented for LVM backed instances.
+-        if CONF.libvirt.images_type == 'lvm' and not booted_from_volume:
+-            reason = _("Migration is not supported for LVM backed instances")
+-            raise exception.InstanceFaultRollback(
+-                exception.MigrationPreCheckError(reason=reason))
++        # if CONF.libvirt.images_type == 'lvm' and not booted_from_volume:
++        #     reason = _("Migration is not supported for LVM backed instances")
++        #     raise exception.InstanceFaultRollback(
++        #         exception.MigrationPreCheckError(reason=reason))
+ 
+         # copy disks to destination
+         # rename instance dir to +_resize at first for using
+-- 
+2.7.4
+

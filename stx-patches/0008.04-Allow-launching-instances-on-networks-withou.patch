@@ -1,0 +1,197 @@
+From 9e50c9bb6f47b6ddebc748bdd0981c1c7f5f35a3 Mon Sep 17 00:00:00 2001
+From: Joseph Richard <Joseph.Richard@windriver.com>
+Date: Thu, 23 Mar 2017 10:58:04 -0400
+Subject: [PATCH] Allow launching instances on networks without
+ subnets
+
+This commit removes two checks in nova that prevent launching an instance on
+a network that does not have subnets.
+This commit also removes test cases that are dependent on exceptions being
+raised when launching instances on networks without subnets.
+---
+ nova/network/neutronv2/api.py             | 24 +-------
+ nova/tests/unit/network/test_neutronv2.py | 98 -------------------------------
+ 2 files changed, 1 insertion(+), 121 deletions(-)
+
+diff --git a/nova/network/neutronv2/api.py b/nova/network/neutronv2/api.py
+index 68f9459..08428eb 100644
+--- a/nova/network/neutronv2/api.py
++++ b/nova/network/neutronv2/api.py
+@@ -770,16 +770,7 @@ class API(base_api.NetworkAPI):
+             try:
+                 port_security_enabled = network.get(
+                     'port_security_enabled', True)
+-                if port_security_enabled:
+-                    if not network.get('subnets'):
+-                        # Neutron can't apply security groups to a port
+-                        # for a network without L3 assignments.
+-                        LOG.debug('Network with port security enabled does '
+-                                  'not have subnets so security groups '
+-                                  'cannot be applied: %s',
+-                                  network, instance=instance)
+-                        raise exception.SecurityGroupCannotBeApplied()
+-                else:
++                if not port_security_enabled:
+                     if security_group_ids:
+                         # We don't want to apply security groups on port
+                         # for a network defined with
+@@ -1597,14 +1588,6 @@ class API(base_api.NetworkAPI):
+                                            neutron_client=neutron)
+                     if port.get('device_id', None):
+                         raise exception.PortInUse(port_id=request.port_id)
+-                    deferred_ip = port.get('ip_allocation') == 'deferred'
+-                    # NOTE(carl_baldwin) A deferred IP port doesn't have an
+-                    # address here. If it fails to get one later when nova
+-                    # updates it with host info, Neutron will error which
+-                    # raises an exception.
+-                    if not deferred_ip and not port.get('fixed_ips'):
+-                        raise exception.PortRequiresFixedIP(
+-                            port_id=request.port_id)
+                     request.network_id = port['network_id']
+                 else:
+                     ports_needed_per_instance += 1
+@@ -1639,11 +1622,6 @@ class API(base_api.NetworkAPI):
+                     context, context.project_id, net_ids_requested,
+                     neutron=neutron)
+ 
+-                for net in nets:
+-                    if not net.get('subnets'):
+-                        raise exception.NetworkRequiresSubnet(
+-                            network_uuid=net['id'])
+-
+                 if len(nets) != len(net_ids_requested):
+                     requested_netid_set = set(net_ids_requested)
+                     returned_netid_set = set([net['id'] for net in nets])
+diff --git a/nova/tests/unit/network/test_neutronv2.py b/nova/tests/unit/network/test_neutronv2.py
+index f586d2b..dca9d79 100644
+--- a/nova/tests/unit/network/test_neutronv2.py
++++ b/nova/tests/unit/network/test_neutronv2.py
+@@ -1248,17 +1248,6 @@ class TestNeutronv2(TestNeutronv2Base):
+         self._allocate_for_instance(net_idx=3,
+                                     requested_networks=requested_networks)
+ 
+-    def test_allocate_for_instance_with_no_subnet_defined(self):
+-        # net_id=4 does not specify subnet and does not set the option
+-        # port_security_disabled to True, so Neutron will not been
+-        # able to associate the default security group to the port
+-        # requested to be created. We expect an exception to be
+-        # raised.
+-        neutronapi.get_client(mox.IgnoreArg()).AndReturn(self.moxed_client)
+-        self.assertRaises(exception.SecurityGroupCannotBeApplied,
+-                          self._allocate_for_instance, net_idx=4,
+-                          _break='post_list_extensions')
+-
+     def test_allocate_for_instance_with_invalid_network_id(self):
+         requested_networks = objects.NetworkRequestList(
+             objects=[objects.NetworkRequest(
+@@ -1912,37 +1901,6 @@ class TestNeutronv2(TestNeutronv2Base):
+                           api.validate_networks,
+                           self.context, requested_networks, 1)
+ 
+-    def test_validate_networks_port_no_subnet_id(self):
+-        port_a = self.port_data3[0]
+-        port_a['device_id'] = None
+-        port_a['device_owner'] = None
+-
+-        requested_networks = objects.NetworkRequestList(
+-            objects=[objects.NetworkRequest(port_id=port_a['id'])])
+-        neutronapi.get_client(mox.IgnoreArg()).AndReturn(self.moxed_client)
+-        self.moxed_client.show_port(port_a['id']).AndReturn({'port': port_a})
+-
+-        self.mox.ReplayAll()
+-
+-        api = neutronapi.API()
+-        self.assertRaises(exception.PortRequiresFixedIP,
+-                          api.validate_networks,
+-                          self.context, requested_networks, 1)
+-
+-    def test_validate_networks_no_subnet_id(self):
+-        requested_networks = objects.NetworkRequestList(
+-            objects=[objects.NetworkRequest(network_id='his_netid4')])
+-        ids = ['his_netid4']
+-        neutronapi.get_client(mox.IgnoreArg()).AndReturn(self.moxed_client)
+-        self.moxed_client.list_networks(
+-            id=mox.SameElementsAs(ids)).AndReturn(
+-                {'networks': self.nets4})
+-        self.mox.ReplayAll()
+-        api = neutronapi.API()
+-        self.assertRaises(exception.NetworkRequiresSubnet,
+-                          api.validate_networks,
+-                          self.context, requested_networks, 1)
+-
+     def test_validate_networks_ports_in_same_network_enable(self):
+         # Verify that duplicateNetworks exception is not thrown when ports
+         # on same duplicate network are passed to validate_networks.
+@@ -3211,22 +3169,6 @@ class TestNeutronv2WithMock(test.TestCase):
+             auth_token='bff4a5a6b9eb4ea2a6efec6eefb77936')
+ 
+     @mock.patch('nova.network.neutronv2.api.API._show_port')
+-    def test_deferred_ip_port_immediate_allocation(self, mock_show):
+-        port = {'network_id': 'my_netid1',
+-                'device_id': None,
+-                'id': uuids.port,
+-                'fixed_ips': [],  # no fixed ip
+-                'ip_allocation': 'immediate', }
+-
+-        mock_show.return_value = port
+-
+-        requested_networks = objects.NetworkRequestList(
+-            objects=[objects.NetworkRequest(port_id=port['id'])])
+-        self.assertRaises(exception.PortRequiresFixedIP,
+-                          self.api.validate_networks,
+-                          self.context, requested_networks, 1)
+-
+-    @mock.patch('nova.network.neutronv2.api.API._show_port')
+     def test_deferred_ip_port_deferred_allocation(self, mock_show):
+         port = {'network_id': 'my_netid1',
+                 'device_id': None,
+@@ -5298,46 +5240,6 @@ class TestAllocateForInstance(test.NoDBTestCase):
+             mock_client.delete_port.call_args_list)
+         self.assertEqual(3, mock_client.create_port.call_count)
+ 
+-    def test_create_ports_for_instance_with_cleanup_after_sg_failure(self):
+-        api = neutronapi.API()
+-        ordered_networks = [
+-            objects.NetworkRequest(network_id=uuids.net1),
+-            objects.NetworkRequest(network_id=uuids.net2),
+-            objects.NetworkRequest(network_id=uuids.net3)
+-        ]
+-        nets = {
+-            uuids.net1: {"id": uuids.net1, "port_security_enabled": False},
+-            uuids.net2: {"id": uuids.net2, "port_security_enabled": False},
+-            uuids.net3: {"id": uuids.net3, "port_security_enabled": True}
+-        }
+-        mock_client = mock.Mock()
+-        mock_client.create_port.side_effect = [
+-            {"port": {"id": uuids.port1}},
+-            {"port": {"id": uuids.port2}}
+-        ]
+-
+-        self.assertRaises(exception.SecurityGroupCannotBeApplied,
+-            api._create_ports_for_instance,
+-            self.context, self.instance, ordered_networks, nets,
+-            mock_client, None)
+-
+-        self.assertEqual([mock.call(uuids.port1), mock.call(uuids.port2)],
+-            mock_client.delete_port.call_args_list)
+-        self.assertEqual(2, mock_client.create_port.call_count)
+-
+-    def test_create_ports_for_instance_raises_subnets_missing(self):
+-        api = neutronapi.API()
+-        ordered_networks = [objects.NetworkRequest(network_id=uuids.net)]
+-        nets = {uuids.net: {"id": uuids.net, "port_security_enabled": True}}
+-        mock_client = mock.Mock()
+-
+-        self.assertRaises(exception.SecurityGroupCannotBeApplied,
+-            api._create_ports_for_instance,
+-            self.context, self.instance,
+-            ordered_networks, nets, mock_client, None)
+-
+-        self.assertFalse(mock_client.create_port.called)
+-
+     def test_create_ports_for_instance_raises_security_off(self):
+         api = neutronapi.API()
+         ordered_networks = [objects.NetworkRequest(network_id=uuids.net)]
+-- 
+2.7.4
+

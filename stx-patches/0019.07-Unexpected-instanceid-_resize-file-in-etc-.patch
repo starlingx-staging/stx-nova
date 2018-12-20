@@ -1,0 +1,85 @@
+From 3b9ed908a2f719af53de50530aecee91e94e713d Mon Sep 17 00:00:00 2001
+From: "Elena. Taivan" <etaivan@windriver.com>
+Date: Wed, 17 Feb 2016 10:10:58 +0200
+Subject: [PATCH] Unexpected <instanceid>_resize file in
+ /etc/nova/instances
+
+There is a high probability that a _del/_res file will be left behind
+if an instance is evacuated during a resize operation.
+
+_cleanup_left_files() deletes the left behind files from the
+/etc/nova/instances directory.
+
+Change-Id: I5831e7c0f61df9a456a19fa6e387494146e73f97
+
+(cherry picked from commit 14d7a60)
+---
+ nova/compute/manager.py | 45 +++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 45 insertions(+)
+
+diff --git a/nova/compute/manager.py b/nova/compute/manager.py
+index 986aebb..a4813b8 100644
+--- a/nova/compute/manager.py
++++ b/nova/compute/manager.py
+@@ -37,6 +37,7 @@ import binascii
+ import contextlib
+ import functools
+ import inspect
++import os
+ import sys
+ import time
+ import traceback
+@@ -6822,6 +6823,50 @@ class ComputeManager(manager.Manager):
+ 
+         self.driver.manage_image_cache(context, filtered_instances)
+ 
++    """There is a high probability that a _del/_res file will be left behind
++    if an instance is evacuated during a resize operation.
++    _cleanup_left_files deletes the left behind files
++    from /etc/nova/instances folder."""
++    @periodic_task.periodic_task(spacing=CONF.instance_delete_interval)
++    def _cleanup_left_files(self, context):
++        inst_path = CONF.instances_path
++        for inst_dir, inst_list, file_list in os.walk(inst_path):
++            for inst_file in inst_list:
++                # find _resize/_del instance files
++                if "_resize" in inst_file or \
++                   "_del" in inst_file:
++                    # Instance uuid has 36 characters.
++                    # When an instance is created, in /etc/nova/instances
++                    # that instance has its own folder named with the
++                    # instance's uuid. Because the instance uuid may have
++                    # only 36 characters it's easy to extract the instance
++                    # uuid from _del/_res folder: first 36 characters represent
++                    # the uuid of the instance.
++                    uuid = inst_file[0:36]
++                    with utils.temporary_mutation(context,
++                                                  read_deleted='yes'):
++                        instance = objects.Instance.get_by_uuid(context, uuid)
++                        # if instance is resizing, _resize file
++                        # should not be deleted
++                        if (instance.task_state in [task_states.MIGRATING,
++                                                task_states.RESIZE_MIGRATING,
++                                                task_states.RESIZE_MIGRATED,
++                                                task_states.RESIZE_FINISH,
++                                                task_states.RESIZE_PREP,
++                                                task_states.RESIZE_REVERTING]
++                                or instance.vm_state in [vm_states.RESIZED]):
++                            continue
++                        # if instance is in deleted/active/error state
++                        # and there are some left behind files,
++                        # these files will be deleted
++                        if instance.vm_state in ['deleted',
++                                             'active', 'error']:
++                            instance_dir = os.path.join(inst_path, inst_file)
++                            utils.execute('rm', '-rf', instance_dir,
++                                          delay_on_retry=True, attempts=5)
++                            self.driver._cleanup_lvm(instance,
++                                         preserve_disk_filter="Non-Resize")
++
+     @periodic_task.periodic_task(spacing=CONF.instance_delete_interval)
+     def _run_pending_deletes(self, context):
+         """Retry any pending instance file deletes."""
+-- 
+2.7.4
+

@@ -1,0 +1,48 @@
+From d492ff3c223e4bd1317b971f7068577e2c10a7a9 Mon Sep 17 00:00:00 2001
+From: Gerry Kopec <Gerry.Kopec@windriver.com>
+Date: Mon, 13 Feb 2017 15:17:52 -0500
+Subject: [PATCH] handle None value for connection_info when migrate
+
+Add a check for bdm.connection_info before calling jsonutils.loads to get
+rid off the following exception when detach valumes during migration:
+  TypeError("%s can't be decoded" % type(text))
+
+(cherry picked from commit 6831462)
+
+For port to Newton, upstream has moved call to jsonutils.loads so have
+to apply the fix in a couple places.
+---
+ nova/compute/manager.py | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/nova/compute/manager.py b/nova/compute/manager.py
+index d2ce483..3d267bf 100644
+--- a/nova/compute/manager.py
++++ b/nova/compute/manager.py
+@@ -5063,7 +5063,10 @@ class ComputeManager(manager.Manager):
+                 self.notifier.info(context, 'volume.usage',
+                                    compute_utils.usage_volume_info(vol_usage))
+ 
+-        connection_info = jsonutils.loads(bdm.connection_info)
++        if bdm.connection_info is not None:
++            connection_info = jsonutils.loads(bdm.connection_info)
++        else:
++            connection_info = {}
+         connector = self.driver.get_volume_connector(instance)
+         if CONF.host == instance.host:
+             # Only attempt to detach and disconnect from the volume if the
+@@ -5282,7 +5285,10 @@ class ComputeManager(manager.Manager):
+         try:
+             bdm = objects.BlockDeviceMapping.get_by_volume_and_instance(
+                     context, volume_id, instance.uuid)
+-            connection_info = jsonutils.loads(bdm.connection_info)
++            if bdm.connection_info is not None:
++                connection_info = jsonutils.loads(bdm.connection_info)
++            else:
++                connection_info = {}
+             self._driver_detach_volume(context, instance, bdm, connection_info)
+             connector = self.driver.get_volume_connector(instance)
+             self.volume_api.terminate_connection(context, volume_id, connector)
+-- 
+2.7.4
+

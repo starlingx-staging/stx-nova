@@ -1,0 +1,579 @@
+From 909931e0dd98126fd9c47ae9a6432b1649eb91cd Mon Sep 17 00:00:00 2001
+From: Joseph Richard <Joseph.Richard@windriver.com>
+Date: Mon, 28 Nov 2016 15:24:04 -0500
+Subject: [PATCH 042/143] Add wrs-if:vif_model to interface-attach
+ REST API
+
+Allow wrs-if:vif_model do be specified at the command line.  Unless attaching
+a port which already has wrs-if:vif_model set, this argument is mandatory.
+
+b326df1 Reorder steps in detach_device
+   This commit changes the order of the steps in detach_device, switching
+   from unplugging from vswitch and then detaching from libvirt, to detaching
+   from libvirt, and then unplugging for vswitch.  This new order mirrors the
+   order used in attach_interface.
+   This is necessary to deal with a detach failures when using the vhost-user
+   driver, which were caused from the vhost-user driver attempting to notify
+   vswitch, and the waiting for a response.  This would hang due to the port
+   not existing in vswitch.
+
+fc1fc34 Validate that interface attach and detach operations are legal
+   This commit adds validation for interface attach and detach operations.
+   Specifically, it validates that 1 <= number_of_vnics <= MAXIMUM_VNICS holds,
+   even when interfaces are attached and detached.
+   As well, this commit adds validation that any interface being attached to an
+   instance is for a tenant network whose providernet is on that instance's host.
+
+44b94ad Use port vif_model if exists when attaching port to running instance
+   When attaching an interface to a running instance, if networking is defined by
+   a port id, then if wrs-binding:vif_model is set on the specified port, that
+   value is used as the vif_model for the NIC.  However, if the vif_model is also
+   specified in the attach command, then precedence will be given to that value.
+
+15087f5 Fix interface hotplugging in Newton rebase
+   This commit fixes errors that were introduced in the Newton rebase, which
+   were a result of changes to info_cache contents, as well as change to the
+   Aggregate API.
+
+a9e4c62 Validate vif_model for interface hotplugging
+   This commit introduces validation that the vif_model specified for an
+   interface-attach operation is one of the supported models.
+   VIF_MODEL_HOTPLUGGABLE = (
+       VIF_MODEL_VIRTIO,
+       VIF_MODEL_RTL8139,
+       VIF_MODEL_E1000,
+       VIF_MODEL_AVP,
+   )
+
+db2c1b3 Display correct exception for invalid vif_model
+   This commit fixes the error message displayed when a request is rejected
+   due to an invalid vif_model being specified.
+
+1fb66ec Permit all interfaces to be detachable from a VM
+   When heat stack-update does a VM REPLACE, it creates a new VM and
+   detaches all ports from the old VM and attaches them to the new VM.
+   Needed to remove the validation code that prevented all interfaces from
+   being detachable.
+
+__TYPE_primary
+__TAG_interface-attach
+__R4_commit_dea0693
+__R3_commit_d73e36d
+---
+ nova/api/openstack/compute/attach_interfaces.py    | 62 +++++++++++++++++++++-
+ .../openstack/compute/schemas/attach_interfaces.py |  8 +++
+ nova/api/validation/parameter_types.py             |  5 ++
+ nova/compute/api.py                                |  4 +-
+ nova/compute/manager.py                            |  4 +-
+ nova/compute/rpcapi.py                             |  3 +-
+ nova/network/api.py                                | 10 +++-
+ nova/network/base_api.py                           | 10 +++-
+ nova/network/model.py                              |  8 +++
+ .../openstack/compute/test_attach_interfaces.py    | 24 ++++++---
+ nova/tests/unit/compute/test_compute.py            | 12 +++--
+ nova/tests/unit/compute/test_compute_api.py        |  5 +-
+ nova/tests/unit/compute/test_rpcapi.py             |  5 +-
+ nova/virt/libvirt/driver.py                        |  6 ++-
+ 14 files changed, 141 insertions(+), 25 deletions(-)
+
+diff --git a/nova/api/openstack/compute/attach_interfaces.py b/nova/api/openstack/compute/attach_interfaces.py
+index c772f9e..c8d93e2 100644
+--- a/nova/api/openstack/compute/attach_interfaces.py
++++ b/nova/api/openstack/compute/attach_interfaces.py
+@@ -12,6 +12,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2016-2017 Wind River Systems, Inc.
++#
++#
++#
++#
+ 
+ """The instance interfaces extension."""
+ 
+@@ -20,6 +27,7 @@ from webob import exc
+ 
+ from nova.api.openstack import common
+ from nova.api.openstack.compute.schemas import attach_interfaces
++from nova.api.openstack.compute import wrs_server_if
+ from nova.api.openstack import extensions
+ from nova.api.openstack import wsgi
+ from nova.api import validation
+@@ -27,6 +35,9 @@ from nova import compute
+ from nova import exception
+ from nova.i18n import _
+ from nova import network
++from nova.network import model as network_model
++from nova.network.neutronv2 import api as neutronapi
++from nova import objects
+ from nova.policies import attach_interfaces as ai_policies
+ 
+ 
+@@ -112,11 +123,13 @@ class InterfaceAttachmentController(wsgi.Controller):
+         port_id = None
+         req_ip = None
+         tag = None
++        vif_model = None
+         if body:
+             attachment = body['interfaceAttachment']
+             network_id = attachment.get('net_id', None)
+             port_id = attachment.get('port_id', None)
+             tag = attachment.get('tag', None)
++            vif_model = attachment.get('wrs-if:vif_model')
+             try:
+                 req_ip = attachment['fixed_ips'][0]['ip_address']
+             except Exception:
+@@ -130,15 +143,62 @@ class InterfaceAttachmentController(wsgi.Controller):
+             raise exc.HTTPBadRequest(explanation=msg)
+ 
+         instance = common.get_instance(self.compute_api, context, server_id)
++
+         try:
++            if hasattr(instance, 'info_cache'):
++                instance_nic_count = len(instance.info_cache.network_info)
++                if instance_nic_count >= wrs_server_if.MAXIMUM_VNICS:
++                    msg = _("Already at %(max)d configured NICs, "
++                            "which is the maximum amount supported") % {
++                                "max": wrs_server_if.MAXIMUM_VNICS,
++                           }
++                    raise exc.HTTPBadRequest(explanation=msg)
++            if hasattr(instance, 'host'):
++                physkey = 'provider:physical_network'
++                aggr_list = objects.AggregateList.get_by_metadata_key(
++                    context, physkey, hosts=set([instance.host])
++                )
++                providernet_list = []
++                for aggr_entry in aggr_list:
++                    providernet_list.append(aggr_entry.metadata[physkey])
++
++                neutron = neutronapi.get_client(context, admin=True)
++                temp_network_id = None
++                if port_id:
++                    port = neutron.show_port(port_id)['port']
++                    temp_network_id = port.get('network_id')
++                    if not vif_model:
++                        vif_model = port.get('wrs-binding:vif_model')
++                else:
++                    temp_network_id = network_id
++                network = neutron.show_network(temp_network_id)['network']
++                providernet = network[physkey]
++                providernet_on_host = (providernet in providernet_list)
++                if not providernet_on_host:
++                    msg = _("Providernet %(pnet)s not on instance's "
++                            "host %(host)s") % {
++                                "pnet": providernet,
++                                "host": instance.host,
++                            }
++                    raise exc.HTTPBadRequest(explanation=msg)
++            if not vif_model:
++                vif_model = network_model.VIF_MODEL_VIRTIO
++            elif vif_model not in network_model.VIF_MODEL_HOTPLUGGABLE:
++                msg = _("Interface attach not supported for vif_model "
++                        "%(vif_model)s. Must be one of %(valid_vifs)s.") % {
++                            'vif_model': vif_model,
++                            'valid_vifs': network_model.VIF_MODEL_HOTPLUGGABLE,
++                        }
++                raise exception.InvalidInput(msg)
+             vif = self.compute_api.attach_interface(context,
+-                instance, network_id, port_id, req_ip, tag=tag)
++                instance, network_id, port_id, req_ip, vif_model, tag=tag)
+         except (exception.InterfaceAttachFailedNoNetwork,
+                 exception.NetworkAmbiguous,
+                 exception.NoMoreFixedIps,
+                 exception.PortNotUsable,
+                 exception.AttachInterfaceNotSupported,
+                 exception.SecurityGroupCannotBeApplied,
++                exception.InvalidInput,
+                 exception.TaggedAttachmentNotSupported) as e:
+             raise exc.HTTPBadRequest(explanation=e.format_message())
+         except (exception.InstanceIsLocked,
+diff --git a/nova/api/openstack/compute/schemas/attach_interfaces.py b/nova/api/openstack/compute/schemas/attach_interfaces.py
+index 1c06887..fa90318 100644
+--- a/nova/api/openstack/compute/schemas/attach_interfaces.py
++++ b/nova/api/openstack/compute/schemas/attach_interfaces.py
+@@ -11,6 +11,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2016-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ import copy
+ 
+@@ -40,6 +47,7 @@ create = {
+                         'additionalProperties': False,
+                     },
+                 },
++                'wrs-if:vif_model': parameter_types.vif_model,
+             },
+             'additionalProperties': False,
+         },
+diff --git a/nova/api/validation/parameter_types.py b/nova/api/validation/parameter_types.py
+index 5055409..d4ee75b 100644
+--- a/nova/api/validation/parameter_types.py
++++ b/nova/api/validation/parameter_types.py
+@@ -358,6 +358,11 @@ network_port_id = {
+ }
+ 
+ 
++vif_model = {
++    'type': 'string',
++}
++
++
+ admin_password = {
+     # NOTE: admin_password is the admin password of a server
+     # instance, and it is not stored into nova's data base.
+diff --git a/nova/compute/api.py b/nova/compute/api.py
+index 7c48c2f..b6a3c4a 100644
+--- a/nova/compute/api.py
++++ b/nova/compute/api.py
+@@ -4034,11 +4034,11 @@ class API(base.Base):
+                                     vm_states.STOPPED],
+                           task_state=[None])
+     def attach_interface(self, context, instance, network_id, port_id,
+-                         requested_ip, tag=None):
++                         requested_ip, vif_model, tag=None):
+         """Use hotplug to add an network adapter to an instance."""
+         return self.compute_rpcapi.attach_interface(context,
+             instance=instance, network_id=network_id, port_id=port_id,
+-            requested_ip=requested_ip, tag=tag)
++            requested_ip=requested_ip, vif_model=vif_model, tag=tag)
+ 
+     @check_instance_lock
+     @check_instance_state(vm_state=[vm_states.ACTIVE, vm_states.PAUSED,
+diff --git a/nova/compute/manager.py b/nova/compute/manager.py
+index 699364e..1280df3 100644
+--- a/nova/compute/manager.py
++++ b/nova/compute/manager.py
+@@ -5565,7 +5565,7 @@ class ComputeManager(manager.Manager):
+     @wrap_exception()
+     @wrap_instance_fault
+     def attach_interface(self, context, instance, network_id, port_id,
+-                         requested_ip, tag=None):
++                         requested_ip, vif_model=None, tag=None):
+         """Use hotplug to add an network adapter to an instance."""
+         if not self.driver.capabilities['supports_attach_interface']:
+             raise exception.AttachInterfaceNotSupported(
+@@ -5577,7 +5577,7 @@ class ComputeManager(manager.Manager):
+         bind_host_id = self.driver.network_binding_host_id(context, instance)
+         network_info = self.network_api.allocate_port_for_instance(
+             context, instance, port_id, network_id, requested_ip,
+-            bind_host_id=bind_host_id, tag=tag)
++            bind_host_id=bind_host_id, vif_model=vif_model, tag=tag)
+         if len(network_info) != 1:
+             LOG.error('allocate_port_for_instance returned %(ports)s '
+                       'ports', {'ports': len(network_info)})
+diff --git a/nova/compute/rpcapi.py b/nova/compute/rpcapi.py
+index fb7c7cb..6dccbb1 100644
+--- a/nova/compute/rpcapi.py
++++ b/nova/compute/rpcapi.py
+@@ -434,9 +434,10 @@ class ComputeAPI(object):
+                    instance=instance, network_id=network_id)
+ 
+     def attach_interface(self, ctxt, instance, network_id, port_id,
+-                         requested_ip, tag=None):
++                         requested_ip, vif_model=None, tag=None):
+         kw = {'instance': instance, 'network_id': network_id,
+               'port_id': port_id, 'requested_ip': requested_ip,
++              'vif_model': vif_model,
+               'tag': tag}
+         version = '4.16'
+ 
+diff --git a/nova/network/api.py b/nova/network/api.py
+index 663e53f..d5a4b3e 100644
+--- a/nova/network/api.py
++++ b/nova/network/api.py
+@@ -15,6 +15,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2016-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ from oslo_config import cfg
+ from oslo_log import log as logging
+@@ -301,7 +308,8 @@ class API(base_api.NetworkAPI):
+     # NOTE(danms): Here for neutron compatibility
+     def allocate_port_for_instance(self, context, instance, port_id,
+                                    network_id=None, requested_ip=None,
+-                                   bind_host_id=None, tag=None):
++                                   bind_host_id=None, vif_model=None,
++                                   tag=None):
+         raise NotImplementedError()
+ 
+     # NOTE(danms): Here for neutron compatibility
+diff --git a/nova/network/base_api.py b/nova/network/base_api.py
+index 27a9cbb..46710e7 100644
+--- a/nova/network/base_api.py
++++ b/nova/network/base_api.py
+@@ -12,6 +12,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2016-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ import functools
+ import inspect
+@@ -216,7 +223,8 @@ class NetworkAPI(base.Base):
+ 
+     def allocate_port_for_instance(self, context, instance, port_id,
+                                    network_id=None, requested_ip=None,
+-                                   bind_host_id=None, tag=None):
++                                   bind_host_id=None, vif_model=None,
++                                   tag=None):
+         """Allocate port for instance."""
+         raise NotImplementedError()
+ 
+diff --git a/nova/network/model.py b/nova/network/model.py
+index 0760e9f..b560c63 100644
+--- a/nova/network/model.py
++++ b/nova/network/model.py
+@@ -165,6 +165,14 @@ LEGACY_EXPOSED_VIF_TYPES = (
+     VIF_TYPE_VIF,
+ )
+ 
++# vif_models that support interface attach/detach operations
++VIF_MODEL_HOTPLUGGABLE = (
++    VIF_MODEL_VIRTIO,
++    VIF_MODEL_RTL8139,
++    VIF_MODEL_E1000,
++    VIF_MODEL_AVP,
++)
++
+ # Constant for max length of network interface names
+ # eg 'bridge' in the Network class or 'devname' in
+ # the VIF class
+diff --git a/nova/tests/unit/api/openstack/compute/test_attach_interfaces.py b/nova/tests/unit/api/openstack/compute/test_attach_interfaces.py
+index 3b13cd7..7417cca 100644
+--- a/nova/tests/unit/api/openstack/compute/test_attach_interfaces.py
++++ b/nova/tests/unit/api/openstack/compute/test_attach_interfaces.py
+@@ -12,6 +12,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2016-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ import mock
+ from webob import exc
+@@ -83,7 +90,8 @@ def fake_show_port(context, port_id, **kwargs):
+ 
+ 
+ def fake_attach_interface(self, context, instance, network_id, port_id,
+-                          requested_ip='192.168.1.3', tag=None):
++                          requested_ip='192.168.1.3', vif_model=None,
++                          tag=None):
+     if not network_id:
+         # if no network_id is given when add a port to an instance, use the
+         # first default network.
+@@ -222,7 +230,7 @@ class InterfaceAttachTestsV21(test.NoDBTestCase):
+ 
+     def test_attach_interface_instance_locked(self):
+         def fake_attach_interface_to_locked_server(self, context,
+-            instance, network_id, port_id, requested_ip, tag=None):
++            instance, network_id, port_id, requested_ip, vif_model, tag=None):
+             raise exception.InstanceIsLocked(instance_uuid=FAKE_UUID1)
+ 
+         self.stub_out('nova.compute.api.API.attach_interface',
+@@ -355,7 +363,7 @@ class InterfaceAttachTestsV21(test.NoDBTestCase):
+                           body=body)
+         ctxt = self.req.environ['nova.context']
+         attach_mock.assert_called_once_with(ctxt, fake_instance, None,
+-                                            None, None, tag=None)
++                                            None, None, 'virtio', tag=None)
+         get_mock.assert_called_once_with(ctxt, FAKE_UUID1,
+                                          expected_attrs=None)
+ 
+@@ -374,7 +382,7 @@ class InterfaceAttachTestsV21(test.NoDBTestCase):
+                           body=body)
+         ctxt = self.req.environ['nova.context']
+         attach_mock.assert_called_once_with(ctxt, fake_instance, None,
+-                                            None, None, tag=None)
++                                            None, None, 'virtio', tag=None)
+         get_mock.assert_called_once_with(ctxt, FAKE_UUID1,
+                                          expected_attrs=None)
+ 
+@@ -394,7 +402,7 @@ class InterfaceAttachTestsV21(test.NoDBTestCase):
+                           body=body)
+         ctxt = self.req.environ['nova.context']
+         attach_mock.assert_called_once_with(ctxt, fake_instance, None,
+-                                            None, None, tag=None)
++                                            None, None, 'virtio', tag=None)
+         get_mock.assert_called_once_with(ctxt, FAKE_UUID1,
+                                          expected_attrs=None)
+ 
+@@ -410,7 +418,7 @@ class InterfaceAttachTestsV21(test.NoDBTestCase):
+                           self.req, FAKE_UUID1, body={})
+         ctxt = self.req.environ['nova.context']
+         attach_mock.assert_called_once_with(ctxt, fake_instance, None,
+-                                            None, None, tag=None)
++                                            None, None, 'virtio', tag=None)
+         get_mock.assert_called_once_with(ctxt, FAKE_UUID1,
+                                          expected_attrs=None)
+ 
+@@ -429,7 +437,7 @@ class InterfaceAttachTestsV21(test.NoDBTestCase):
+                           body=body)
+         ctxt = self.req.environ['nova.context']
+         attach_mock.assert_called_once_with(ctxt, fake_instance, None,
+-                                            None, None, tag=None)
++                                            None, None, 'virtio', tag=None)
+         get_mock.assert_called_once_with(ctxt, FAKE_UUID1,
+                                          expected_attrs=None)
+ 
+@@ -446,7 +454,7 @@ class InterfaceAttachTestsV21(test.NoDBTestCase):
+                           self.req, FAKE_UUID1, body={})
+         ctxt = self.req.environ['nova.context']
+         attach_mock.assert_called_once_with(ctxt, fake_instance, None,
+-                                            None, None, tag=None)
++                                            None, None, 'virtio', tag=None)
+         get_mock.assert_called_once_with(ctxt, FAKE_UUID1,
+                                          expected_attrs=None)
+ 
+diff --git a/nova/tests/unit/compute/test_compute.py b/nova/tests/unit/compute/test_compute.py
+index 2ccee72..d97230f 100644
+--- a/nova/tests/unit/compute/test_compute.py
++++ b/nova/tests/unit/compute/test_compute.py
+@@ -10176,17 +10176,19 @@ class ComputeAPITestCase(BaseTestCase):
+         mock_allocate = mock.Mock(return_value=nwinfo)
+         self.compute.network_api.allocate_port_for_instance = mock_allocate
+ 
++        vif_model = None
+         with mock.patch.dict(self.compute.driver.capabilities,
+                              supports_attach_interface=True):
+             vif = self.compute.attach_interface(self.context,
+                                                 instance,
+                                                 network_id,
+                                                 port_id,
+-                                                req_ip)
++                                                req_ip,
++                                                vif_model)
+         self.assertEqual(vif['id'], network_id)
+         mock_allocate.assert_called_once_with(
+             self.context, instance, port_id, network_id, req_ip,
+-            bind_host_id='fake-host', tag=None)
++            bind_host_id='fake-host', vif_model=vif_model, tag=None)
+         return nwinfo, port_id
+ 
+     def test_interface_tagged_attach(self):
+@@ -10213,7 +10215,7 @@ class ComputeAPITestCase(BaseTestCase):
+         self.assertEqual(vif['id'], network_id)
+         mock_allocate.assert_called_once_with(
+             self.context, instance, port_id, network_id, req_ip,
+-            bind_host_id='fake-host', tag='foo')
++            bind_host_id='fake-host', vif_model=None, tag='foo')
+         return nwinfo, port_id
+ 
+     def test_tagged_attach_interface_raises(self):
+@@ -10239,6 +10241,7 @@ class ComputeAPITestCase(BaseTestCase):
+         network_id = nwinfo[0]['network']['id']
+         port_id = nwinfo[0]['id']
+         req_ip = '1.2.3.4'
++        vif_model = None
+ 
+         with test.nested(
+             mock.patch.object(self.compute.driver, 'attach_interface'),
+@@ -10254,10 +10257,11 @@ class ComputeAPITestCase(BaseTestCase):
+             mock_attach.side_effect = exception.NovaException("attach_failed")
+             self.assertRaises(exception.InterfaceAttachFailed,
+                               self.compute.attach_interface, self.context,
+-                              instance, network_id, port_id, req_ip)
++                              instance, network_id, port_id, req_ip, vif_model)
+             mock_allocate.assert_called_once_with(self.context, instance,
+                                                   network_id, port_id, req_ip,
+                                                   bind_host_id='fake-host',
++                                                  vif_model=vif_model,
+                                                   tag=None)
+             mock_deallocate.assert_called_once_with(self.context, instance,
+                                                     port_id)
+diff --git a/nova/tests/unit/compute/test_compute_api.py b/nova/tests/unit/compute/test_compute_api.py
+index 01a43c3..d276681 100644
+--- a/nova/tests/unit/compute/test_compute_api.py
++++ b/nova/tests/unit/compute/test_compute_api.py
+@@ -5321,10 +5321,11 @@ class ComputeAPIUnitTestCase(_ComputeAPIUnitTestMixIn, test.NoDBTestCase):
+     def test_tagged_interface_attach(self, mock_attach):
+         instance = self._create_instance_obj()
+         self.compute_api.attach_interface(self.context, instance, None, None,
+-                                          None, tag='foo')
++                                          None, None, tag='foo')
+         mock_attach.assert_called_with(self.context, instance=instance,
+                                        network_id=None, port_id=None,
+-                                       requested_ip=None, tag='foo')
++                                       requested_ip=None, vif_model=None,
++                                       tag='foo')
+ 
+ 
+ class ComputeAPIAPICellUnitTestCase(_ComputeAPIUnitTestMixIn,
+diff --git a/nova/tests/unit/compute/test_rpcapi.py b/nova/tests/unit/compute/test_rpcapi.py
+index 79b37da..7d75c49 100644
+--- a/nova/tests/unit/compute/test_rpcapi.py
++++ b/nova/tests/unit/compute/test_rpcapi.py
+@@ -206,7 +206,7 @@ class ComputeRpcAPITestCase(test.NoDBTestCase):
+         self._test_compute_api('attach_interface', 'call',
+                 instance=self.fake_instance_obj, network_id='id',
+                 port_id='id2', version='4.16', requested_ip='192.168.1.50',
+-                tag='foo')
++                vif_model=None, tag='foo')
+ 
+     def test_attach_interface_raises(self):
+         ctxt = context.RequestContext('fake_user', 'fake_project')
+@@ -257,7 +257,8 @@ class ComputeRpcAPITestCase(test.NoDBTestCase):
+                                           instance=instance,
+                                           network_id='fake_network',
+                                           port_id='fake_port',
+-                                          requested_ip='fake_requested_ip')
++                                          requested_ip='fake_requested_ip',
++                                          vif_model=None)
+ 
+     def test_attach_volume(self):
+         self._test_compute_api('attach_volume', 'cast',
+diff --git a/nova/virt/libvirt/driver.py b/nova/virt/libvirt/driver.py
+index 9c0f772..49adbc0 100644
+--- a/nova/virt/libvirt/driver.py
++++ b/nova/virt/libvirt/driver.py
+@@ -1671,7 +1671,6 @@ class LibvirtDriver(driver.ComputeDriver):
+                                          CONF.libvirt.virt_type, self._host)
+         interface = guest.get_interface_by_cfg(cfg)
+         try:
+-            self.vif_driver.unplug(instance, vif)
+             # NOTE(mriedem): When deleting an instance and using Neutron,
+             # we can be racing against Neutron deleting the port and
+             # sending the vif-deleted event which then triggers a call to
+@@ -1691,6 +1690,11 @@ class LibvirtDriver(driver.ComputeDriver):
+                 guest.get_interface_by_cfg, cfg, self._host,
+                 alternative_device_name=self.vif_driver.get_vif_devname(vif))
+             wait_for_detach()
++
++            # Do detach before unplug to avoid timeout notifying vswitch.
++            # This mirrors the order when attaching an interface.
++            self.vif_driver.unplug(instance, vif)
++
+         except exception.DeviceDetachFailed:
+             # We failed to detach the device even with the retry loop, so let's
+             # dump some debug information to the logs before raising back up.
+-- 
+2.7.4
+

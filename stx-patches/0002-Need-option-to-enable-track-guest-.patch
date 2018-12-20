@@ -1,0 +1,80 @@
+From 79da449256d373b064550d44d9e2560a2ebcead4 Mon Sep 17 00:00:00 2001
+From: Daniel Chavolla <daniel.chavolla@windriver.com>
+Date: Wed, 30 Nov 2016 15:00:55 -0500
+Subject: [PATCH 002/143] Need option to enable track="guest" for RTC clock
+
+Need option to enable track="guest" for RTC clock, required for successful
+migrations of Windows guests
+
+Windows guests require a couple of things to be in place in order for live
+migrations to work correctly.
+ The first is the use of the KVM hyperv clock, which can be enabled by setting
+    os_type="windows" in the image metadata.
+ The second is to set the RTC track property to "guest", such that when QEMU
+    instantiates the Windows guest, it adds 'clock=vm' to the -rtc line
+    for example:
+    -rtc base=utc,clock=vm,driftfix=slew
+
+tox test case test_get_guest_config_clock_timer_track() was added
+to verify timer.track is properly set to "guest" when
+os_type is set to "windows"
+
+__TYPE_upstreamable
+__TAG_windows,rtc
+__R4_commit_2a6dc55
+__R3_commit_85ad96d
+---
+ nova/tests/unit/virt/libvirt/test_driver.py | 23 +++++++++++++++++++++++
+ nova/virt/libvirt/driver.py                 |  2 ++
+ 2 files changed, 25 insertions(+)
+
+diff --git a/nova/tests/unit/virt/libvirt/test_driver.py b/nova/tests/unit/virt/libvirt/test_driver.py
+index fb8201d..633a299 100755
+--- a/nova/tests/unit/virt/libvirt/test_driver.py
++++ b/nova/tests/unit/virt/libvirt/test_driver.py
+@@ -3152,6 +3152,29 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+         self.assertTrue(drvr._wants_hugepages(host_topology,
+                                               instance_topology))
+ 
++    def test_get_guest_config_clock_timer_track(self):
++        self.flags(virt_type='kvm', group='libvirt')
++        drvr = libvirt_driver.LibvirtDriver(fake.FakeVirtAPI(), True)
++        instance_ref = objects.Instance(**self.test_instance)
++        image_meta = objects.ImageMeta.from_dict(self.test_image_meta)
++        disk_info = blockinfo.get_disk_info(CONF.libvirt.virt_type,
++                                            instance_ref,
++                                            image_meta)
++        cfg = drvr._get_guest_config(instance_ref, [], image_meta, disk_info)
++        self.assertIsInstance(cfg.clock,
++                              vconfig.LibvirtConfigGuestClock)
++        self.assertEqual(cfg.clock.timers[1].name, "rtc")
++        self.assertEqual(cfg.clock.timers[1].tickpolicy, "catchup")
++        self.assertIsNone(cfg.clock.timers[1].track)
++
++        instance_ref['os_type'] = 'windows'
++        cfg = drvr._get_guest_config(instance_ref, [], image_meta, disk_info)
++        self.assertIsInstance(cfg.clock,
++                              vconfig.LibvirtConfigGuestClock)
++        self.assertEqual(cfg.clock.timers[1].name, "rtc")
++        self.assertEqual(cfg.clock.timers[1].tickpolicy, "catchup")
++        self.assertEqual(cfg.clock.timers[1].track, "guest")
++
+     def test_get_guest_config_clock(self):
+         self.flags(virt_type='kvm', group='libvirt')
+         drvr = libvirt_driver.LibvirtDriver(fake.FakeVirtAPI(), True)
+diff --git a/nova/virt/libvirt/driver.py b/nova/virt/libvirt/driver.py
+index 3b9ecbd..aa8fe3d 100644
+--- a/nova/virt/libvirt/driver.py
++++ b/nova/virt/libvirt/driver.py
+@@ -4306,6 +4306,8 @@ class LibvirtDriver(driver.ComputeDriver):
+         tmrtc = vconfig.LibvirtConfigGuestTimer()
+         tmrtc.name = "rtc"
+         tmrtc.tickpolicy = "catchup"
++        if (os_type == 'windows'):
++            tmrtc.track = "guest"
+ 
+         clk.add_timer(tmpit)
+         clk.add_timer(tmrtc)
+-- 
+2.7.4
+

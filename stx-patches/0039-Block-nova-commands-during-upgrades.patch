@@ -1,0 +1,723 @@
+From 6274fc7e5814dd72e96edabf5ae36c8b7314a805 Mon Sep 17 00:00:00 2001
+From: Jerry Sun <jerry.sun@windriver.com>
+Date: Fri, 21 Oct 2016 15:55:42 -0400
+Subject: [PATCH 039/143] Block nova commands during upgrades
+
+Blocked nova commands during upgrades.
+Allow everything necessary for the upgrade itself, and things that might
+reasonably be done by already-running Heat stacks.
+
+(cherry picked from R3 commits 3361c93 and 755541f)
+
+For port to Newton, added blocking of new server-tag update (aka add/set)
+and delete commands which were introduced upstream.
+
+__TYPE_primary
+__TAG_upgrade,api,block
+__R4_commit_7ec601c
+__R3_commit_4ea0851
+---
+ nova/api/openstack/compute/admin_actions.py        |  1 +
+ nova/api/openstack/compute/admin_password.py       |  1 +
+ nova/api/openstack/compute/agents.py               |  3 +++
+ nova/api/openstack/compute/attach_interfaces.py    |  2 ++
+ nova/api/openstack/compute/cloudpipe.py            |  2 ++
+ nova/api/openstack/compute/create_backup.py        |  1 +
+ nova/api/openstack/compute/deferred_delete.py      |  1 +
+ nova/api/openstack/compute/fixed_ips.py            |  2 ++
+ nova/api/openstack/compute/flavor_access.py        |  2 ++
+ nova/api/openstack/compute/flavor_manage.py        |  2 ++
+ nova/api/openstack/compute/flavors_extraspecs.py   |  3 +++
+ nova/api/openstack/compute/floating_ip_dns.py      |  4 ++++
+ nova/api/openstack/compute/floating_ips_bulk.py    |  2 ++
+ nova/api/openstack/compute/image_metadata.py       |  4 ++++
+ nova/api/openstack/compute/images.py               |  1 +
+ nova/api/openstack/compute/keypairs.py             |  6 ++++++
+ nova/api/openstack/compute/lock_server.py          |  1 +
+ nova/api/openstack/compute/multinic.py             |  2 ++
+ nova/api/openstack/compute/networks.py             |  2 ++
+ nova/api/openstack/compute/networks_associate.py   |  3 +++
+ nova/api/openstack/compute/quota_classes.py        |  1 +
+ nova/api/openstack/compute/quota_sets.py           |  2 ++
+ .../compute/security_group_default_rules.py        |  2 ++
+ nova/api/openstack/compute/security_groups.py      |  7 +++++++
+ nova/api/openstack/compute/server_groups.py        |  3 +++
+ nova/api/openstack/compute/server_password.py      |  1 +
+ nova/api/openstack/compute/server_tags.py          |  4 ++++
+ nova/api/openstack/extensions.py                   | 24 ++++++++++++++++++++++
+ 28 files changed, 89 insertions(+)
+
+diff --git a/nova/api/openstack/compute/admin_actions.py b/nova/api/openstack/compute/admin_actions.py
+index b258e86..6fd1384 100644
+--- a/nova/api/openstack/compute/admin_actions.py
++++ b/nova/api/openstack/compute/admin_actions.py
+@@ -35,6 +35,7 @@ class AdminActionsController(wsgi.Controller):
+         super(AdminActionsController, self).__init__(*args, **kwargs)
+         self.compute_api = compute.API()
+ 
++    @extensions.block_during_upgrade()
+     @wsgi.response(202)
+     @extensions.expected_errors((404, 409))
+     @wsgi.action('resetNetwork')
+diff --git a/nova/api/openstack/compute/admin_password.py b/nova/api/openstack/compute/admin_password.py
+index 09054e2..4a84890 100644
+--- a/nova/api/openstack/compute/admin_password.py
++++ b/nova/api/openstack/compute/admin_password.py
+@@ -34,6 +34,7 @@ class AdminPasswordController(wsgi.Controller):
+     # TODO(eliqiao): Here should be 204(No content) instead of 202 by v2.1+
+     # microversions because the password has been changed when returning
+     # a response.
++    @extensions.block_during_upgrade()
+     @wsgi.action('changePassword')
+     @wsgi.response(202)
+     @extensions.expected_errors((400, 404, 409, 501))
+diff --git a/nova/api/openstack/compute/agents.py b/nova/api/openstack/compute/agents.py
+index 489c85a..cc44b78 100644
+--- a/nova/api/openstack/compute/agents.py
++++ b/nova/api/openstack/compute/agents.py
+@@ -69,6 +69,7 @@ class AgentController(wsgi.Controller):
+ 
+         return {'agents': agents}
+ 
++    @extensions.block_during_upgrade()
+     @extensions.expected_errors((400, 404))
+     @validation.schema(schema.update)
+     def update(self, req, id, body):
+@@ -112,6 +113,7 @@ class AgentController(wsgi.Controller):
+     # TODO(oomichi): Here should be 204(No Content) instead of 200 by v2.1
+     # +microversions because the resource agent has been deleted completely
+     # when returning a response.
++    @extensions.block_during_upgrade()
+     @extensions.expected_errors((400, 404))
+     @wsgi.response(200)
+     def delete(self, req, id):
+@@ -133,6 +135,7 @@ class AgentController(wsgi.Controller):
+     # TODO(oomichi): Here should be 201(Created) instead of 200 by v2.1
+     # +microversions because the creation of a resource agent finishes
+     # when returning a response.
++    @extensions.block_during_upgrade()
+     @extensions.expected_errors((400, 409))
+     @wsgi.response(200)
+     @validation.schema(schema.create)
+diff --git a/nova/api/openstack/compute/attach_interfaces.py b/nova/api/openstack/compute/attach_interfaces.py
+index c36c057..c772f9e 100644
+--- a/nova/api/openstack/compute/attach_interfaces.py
++++ b/nova/api/openstack/compute/attach_interfaces.py
+@@ -98,6 +98,7 @@ class InterfaceAttachmentController(wsgi.Controller):
+         return {'interfaceAttachment': _translate_interface_attachment_view(
+                 port_info['port'])}
+ 
++    @extensions.block_during_upgrade()
+     @extensions.expected_errors((400, 404, 409, 500, 501))
+     @validation.schema(attach_interfaces.create, '2.0', '2.48')
+     @validation.schema(attach_interfaces.create_v249, '2.49')
+@@ -156,6 +157,7 @@ class InterfaceAttachmentController(wsgi.Controller):
+ 
+         return self.show(req, server_id, vif['id'])
+ 
++    @extensions.block_during_upgrade()
+     @wsgi.response(202)
+     @extensions.expected_errors((404, 409, 501))
+     def delete(self, req, server_id, id):
+diff --git a/nova/api/openstack/compute/cloudpipe.py b/nova/api/openstack/compute/cloudpipe.py
+index ddc6e34..c4439bc 100644
+--- a/nova/api/openstack/compute/cloudpipe.py
++++ b/nova/api/openstack/compute/cloudpipe.py
+@@ -23,6 +23,7 @@ from nova.api.openstack import wsgi
+ class CloudpipeController(wsgi.Controller):
+     """Handle creating and listing cloudpipe instances."""
+ 
++    @extensions.block_during_upgrade()
+     @extensions.expected_errors((410))
+     def create(self, req, body):
+         """Create a new cloudpipe instance, if none exists.
+@@ -36,6 +37,7 @@ class CloudpipeController(wsgi.Controller):
+         """List running cloudpipe instances."""
+         raise exc.HTTPGone()
+ 
++    @extensions.block_during_upgrade()
+     @extensions.expected_errors(410)
+     def update(self, req, id, body):
+         """Configure cloudpipe parameters for the project."""
+diff --git a/nova/api/openstack/compute/create_backup.py b/nova/api/openstack/compute/create_backup.py
+index 4f59dd3..1253c7c 100644
+--- a/nova/api/openstack/compute/create_backup.py
++++ b/nova/api/openstack/compute/create_backup.py
+@@ -31,6 +31,7 @@ class CreateBackupController(wsgi.Controller):
+         super(CreateBackupController, self).__init__(*args, **kwargs)
+         self.compute_api = compute.API()
+ 
++    @extensions.block_during_upgrade()
+     @wsgi.response(202)
+     @extensions.expected_errors((400, 403, 404, 409))
+     @wsgi.action('createBackup')
+diff --git a/nova/api/openstack/compute/deferred_delete.py b/nova/api/openstack/compute/deferred_delete.py
+index cf14e9b..fddf91b 100644
+--- a/nova/api/openstack/compute/deferred_delete.py
++++ b/nova/api/openstack/compute/deferred_delete.py
+@@ -30,6 +30,7 @@ class DeferredDeleteController(wsgi.Controller):
+         super(DeferredDeleteController, self).__init__(*args, **kwargs)
+         self.compute_api = compute.API()
+ 
++    @extensions.block_during_upgrade()
+     @wsgi.response(202)
+     @extensions.expected_errors((403, 404, 409))
+     @wsgi.action('restore')
+diff --git a/nova/api/openstack/compute/fixed_ips.py b/nova/api/openstack/compute/fixed_ips.py
+index 1814f04..53ad7a8 100644
+--- a/nova/api/openstack/compute/fixed_ips.py
++++ b/nova/api/openstack/compute/fixed_ips.py
+@@ -75,6 +75,7 @@ class FixedIPController(wsgi.Controller):
+         return fixed_ip_info
+ 
+     @wsgi.Controller.api_version("2.1", MAX_PROXY_API_SUPPORT_VERSION)
++    @extensions.block_during_upgrade()
+     @wsgi.response(202)
+     @extensions.expected_errors((400, 404))
+     @validation.schema(fixed_ips.reserve)
+@@ -86,6 +87,7 @@ class FixedIPController(wsgi.Controller):
+         return self._set_reserved(context, id, True)
+ 
+     @wsgi.Controller.api_version("2.1", MAX_PROXY_API_SUPPORT_VERSION)
++    @extensions.block_during_upgrade()
+     @wsgi.response(202)
+     @extensions.expected_errors((400, 404))
+     @validation.schema(fixed_ips.unreserve)
+diff --git a/nova/api/openstack/compute/flavor_access.py b/nova/api/openstack/compute/flavor_access.py
+index b591212..dcf8edb 100644
+--- a/nova/api/openstack/compute/flavor_access.py
++++ b/nova/api/openstack/compute/flavor_access.py
+@@ -87,6 +87,7 @@ class FlavorActionController(wsgi.Controller):
+ 
+             self._extend_flavor(resp_obj.obj['flavor'], db_flavor)
+ 
++    @extensions.block_during_upgrade()
+     @extensions.expected_errors((400, 403, 404, 409))
+     @wsgi.action("addTenantAccess")
+     @validation.schema(flavor_access.add_tenant_access)
+@@ -112,6 +113,7 @@ class FlavorActionController(wsgi.Controller):
+             raise webob.exc.HTTPConflict(explanation=err.format_message())
+         return _marshall_flavor_access(flavor)
+ 
++    @extensions.block_during_upgrade()
+     @extensions.expected_errors((400, 403, 404))
+     @wsgi.action("removeTenantAccess")
+     @validation.schema(flavor_access.remove_tenant_access)
+diff --git a/nova/api/openstack/compute/flavor_manage.py b/nova/api/openstack/compute/flavor_manage.py
+index e4635bd..8e66824 100644
+--- a/nova/api/openstack/compute/flavor_manage.py
++++ b/nova/api/openstack/compute/flavor_manage.py
+@@ -49,6 +49,7 @@ class FlavorManageController(wsgi.Controller):
+     # NOTE(oomichi): Return 202 for backwards compatibility but should be
+     # 204 as this operation complete the deletion of aggregate resource and
+     # return no response body.
++    @extensions.block_during_upgrade()
+     @wsgi.response(202)
+     @extensions.expected_errors((404))
+     @wsgi.action("delete")
+@@ -72,6 +73,7 @@ class FlavorManageController(wsgi.Controller):
+ 
+     # NOTE(oomichi): Return 200 for backwards compatibility but should be 201
+     # as this operation complete the creation of flavor resource.
++    @extensions.block_during_upgrade()
+     @wsgi.action("create")
+     @extensions.expected_errors((400, 409))
+     @validation.schema(flavor_manage.create_v20, '2.0', '2.0')
+diff --git a/nova/api/openstack/compute/flavors_extraspecs.py b/nova/api/openstack/compute/flavors_extraspecs.py
+index 2013dc5..1d0aefe 100644
+--- a/nova/api/openstack/compute/flavors_extraspecs.py
++++ b/nova/api/openstack/compute/flavors_extraspecs.py
+@@ -399,6 +399,7 @@ class FlavorExtraSpecsController(wsgi.Controller):
+     # NOTE(gmann): Here should be 201 instead of 200 by v2.1
+     # +microversions because the flavor extra specs has been created
+     # completely when returning a response.
++    @extensions.block_during_upgrade()
+     @extensions.expected_errors((400, 404, 409))
+     @validation.schema(flavors_extraspecs.create)
+     def create(self, req, flavor_id, body):
+@@ -418,6 +419,7 @@ class FlavorExtraSpecsController(wsgi.Controller):
+             raise webob.exc.HTTPNotFound(explanation=e.format_message())
+         return body
+ 
++    @extensions.block_during_upgrade()
+     @extensions.expected_errors((400, 404, 409))
+     @validation.schema(flavors_extraspecs.update)
+     def update(self, req, flavor_id, id, body):
+@@ -456,6 +458,7 @@ class FlavorExtraSpecsController(wsgi.Controller):
+     # NOTE(gmann): Here should be 204(No Content) instead of 200 by v2.1
+     # +microversions because the flavor extra specs has been deleted
+     # completely when returning a response.
++    @extensions.block_during_upgrade()
+     @extensions.expected_errors((400, 404, 409))
+     def delete(self, req, flavor_id, id):
+         """Deletes an existing extra spec."""
+diff --git a/nova/api/openstack/compute/floating_ip_dns.py b/nova/api/openstack/compute/floating_ip_dns.py
+index 3e2d432..0fef257 100644
+--- a/nova/api/openstack/compute/floating_ip_dns.py
++++ b/nova/api/openstack/compute/floating_ip_dns.py
+@@ -106,6 +106,7 @@ class FloatingIPDNSDomainController(wsgi.Controller):
+         return _translate_domain_entries_view(domainlist)
+ 
+     @wsgi.Controller.api_version("2.1", MAX_PROXY_API_SUPPORT_VERSION)
++    @extensions.block_during_upgrade()
+     @extensions.expected_errors((400, 501))
+     @validation.schema(floating_ip_dns.domain_entry_update)
+     def update(self, req, id, body):
+@@ -142,6 +143,7 @@ class FloatingIPDNSDomainController(wsgi.Controller):
+                                              area_name: area})
+ 
+     @wsgi.Controller.api_version("2.1", MAX_PROXY_API_SUPPORT_VERSION)
++    @extensions.block_during_upgrade()
+     @extensions.expected_errors((404, 501))
+     @wsgi.response(202)
+     def delete(self, req, id):
+@@ -205,6 +207,7 @@ class FloatingIPDNSEntryController(wsgi.Controller):
+         return _translate_dns_entry_view(entry)
+ 
+     @wsgi.Controller.api_version("2.1", MAX_PROXY_API_SUPPORT_VERSION)
++    @extensions.block_during_upgrade()
+     @extensions.expected_errors(501)
+     @validation.schema(floating_ip_dns.dns_entry_update)
+     def update(self, req, domain_id, id, body):
+@@ -237,6 +240,7 @@ class FloatingIPDNSEntryController(wsgi.Controller):
+                                           'domain': domain})
+ 
+     @wsgi.Controller.api_version("2.1", MAX_PROXY_API_SUPPORT_VERSION)
++    @extensions.block_during_upgrade()
+     @extensions.expected_errors((404, 501))
+     @wsgi.response(202)
+     def delete(self, req, domain_id, id):
+diff --git a/nova/api/openstack/compute/floating_ips_bulk.py b/nova/api/openstack/compute/floating_ips_bulk.py
+index ea973b9..72e2209 100644
+--- a/nova/api/openstack/compute/floating_ips_bulk.py
++++ b/nova/api/openstack/compute/floating_ips_bulk.py
+@@ -84,6 +84,7 @@ class FloatingIPBulkController(wsgi.Controller):
+         return floating_ip_info
+ 
+     @wsgi.Controller.api_version("2.1", MAX_PROXY_API_SUPPORT_VERSION)
++    @extensions.block_during_upgrade()
+     @extensions.expected_errors((400, 409))
+     @validation.schema(floating_ips_bulk.create)
+     def create(self, req, body):
+@@ -113,6 +114,7 @@ class FloatingIPBulkController(wsgi.Controller):
+                                                "interface": interface}}
+ 
+     @wsgi.Controller.api_version("2.1", MAX_PROXY_API_SUPPORT_VERSION)
++    @extensions.block_during_upgrade()
+     @extensions.expected_errors((400, 404))
+     @validation.schema(floating_ips_bulk.delete)
+     def update(self, req, id, body):
+diff --git a/nova/api/openstack/compute/image_metadata.py b/nova/api/openstack/compute/image_metadata.py
+index b66e82d..99b1a78 100644
+--- a/nova/api/openstack/compute/image_metadata.py
++++ b/nova/api/openstack/compute/image_metadata.py
+@@ -62,6 +62,7 @@ class ImageMetadataController(wsgi.Controller):
+             raise exc.HTTPNotFound()
+ 
+     @wsgi.Controller.api_version("2.1", MAX_IMAGE_META_PROXY_API_VERSION)
++    @extensions.block_during_upgrade()
+     @extensions.expected_errors((400, 403, 404))
+     @validation.schema(image_metadata.create)
+     def create(self, req, image_id, body):
+@@ -79,6 +80,7 @@ class ImageMetadataController(wsgi.Controller):
+         return dict(metadata=image['properties'])
+ 
+     @wsgi.Controller.api_version("2.1", MAX_IMAGE_META_PROXY_API_VERSION)
++    @extensions.block_during_upgrade()
+     @extensions.expected_errors((400, 403, 404))
+     @validation.schema(image_metadata.update)
+     def update(self, req, image_id, id, body):
+@@ -102,6 +104,7 @@ class ImageMetadataController(wsgi.Controller):
+         return dict(meta=meta)
+ 
+     @wsgi.Controller.api_version("2.1", MAX_IMAGE_META_PROXY_API_VERSION)
++    @extensions.block_during_upgrade()
+     @extensions.expected_errors((400, 403, 404))
+     @validation.schema(image_metadata.update_all)
+     def update_all(self, req, image_id, body):
+@@ -118,6 +121,7 @@ class ImageMetadataController(wsgi.Controller):
+         return dict(metadata=metadata)
+ 
+     @wsgi.Controller.api_version("2.1", MAX_IMAGE_META_PROXY_API_VERSION)
++    @extensions.block_during_upgrade()
+     @extensions.expected_errors((403, 404))
+     @wsgi.response(204)
+     def delete(self, req, image_id, id):
+diff --git a/nova/api/openstack/compute/images.py b/nova/api/openstack/compute/images.py
+index 44c5e0c..6d83ffa 100644
+--- a/nova/api/openstack/compute/images.py
++++ b/nova/api/openstack/compute/images.py
+@@ -94,6 +94,7 @@ class ImagesController(wsgi.Controller):
+         return self._view_builder.show(req, image)
+ 
+     @wsgi.Controller.api_version("2.1", MAX_PROXY_API_SUPPORT_VERSION)
++    @extensions.block_during_upgrade()
+     @extensions.expected_errors((403, 404))
+     @wsgi.response(204)
+     def delete(self, req, id):
+diff --git a/nova/api/openstack/compute/keypairs.py b/nova/api/openstack/compute/keypairs.py
+index 63a7a4e..6adc536 100644
+--- a/nova/api/openstack/compute/keypairs.py
++++ b/nova/api/openstack/compute/keypairs.py
+@@ -56,6 +56,7 @@ class KeypairController(wsgi.Controller):
+ 
+     @wsgi.Controller.api_version("2.10")
+     @wsgi.response(201)
++    @extensions.block_during_upgrade()
+     @extensions.expected_errors((400, 403, 409))
+     @validation.schema(keypairs.create_v210)
+     def create(self, req, body):
+@@ -75,6 +76,7 @@ class KeypairController(wsgi.Controller):
+ 
+     @wsgi.Controller.api_version("2.2", "2.9")  # noqa
+     @wsgi.response(201)
++    @extensions.block_during_upgrade()
+     @extensions.expected_errors((400, 403, 409))
+     @validation.schema(keypairs.create_v22)
+     def create(self, req, body):
+@@ -95,6 +97,7 @@ class KeypairController(wsgi.Controller):
+         return self._create(req, body, type=True)
+ 
+     @wsgi.Controller.api_version("2.1", "2.1")  # noqa
++    @extensions.block_during_upgrade()
+     @extensions.expected_errors((400, 403, 409))
+     @validation.schema(keypairs.create_v20, "2.0", "2.0")
+     @validation.schema(keypairs.create, "2.1", "2.1")
+@@ -149,6 +152,7 @@ class KeypairController(wsgi.Controller):
+     @wsgi.Controller.api_version("2.1", "2.1")
+     @validation.query_schema(keypairs.delete_query_schema_v20)
+     @wsgi.response(202)
++    @extensions.block_during_upgrade()
+     @extensions.expected_errors(404)
+     def delete(self, req, id):
+         self._delete(req, id)
+@@ -156,6 +160,7 @@ class KeypairController(wsgi.Controller):
+     @wsgi.Controller.api_version("2.2", "2.9")    # noqa
+     @validation.query_schema(keypairs.delete_query_schema_v20)
+     @wsgi.response(204)
++    @extensions.block_during_upgrade()
+     @extensions.expected_errors(404)
+     def delete(self, req, id):
+         self._delete(req, id)
+@@ -163,6 +168,7 @@ class KeypairController(wsgi.Controller):
+     @wsgi.Controller.api_version("2.10")    # noqa
+     @validation.query_schema(keypairs.delete_query_schema_v210)
+     @wsgi.response(204)
++    @extensions.block_during_upgrade()
+     @extensions.expected_errors(404)
+     def delete(self, req, id):
+         # handle optional user-id for admin only
+diff --git a/nova/api/openstack/compute/lock_server.py b/nova/api/openstack/compute/lock_server.py
+index ed616a5..e878304 100644
+--- a/nova/api/openstack/compute/lock_server.py
++++ b/nova/api/openstack/compute/lock_server.py
+@@ -25,6 +25,7 @@ class LockServerController(wsgi.Controller):
+         super(LockServerController, self).__init__(*args, **kwargs)
+         self.compute_api = compute.API()
+ 
++    @extensions.block_during_upgrade()
+     @wsgi.response(202)
+     @extensions.expected_errors(404)
+     @wsgi.action('lock')
+diff --git a/nova/api/openstack/compute/multinic.py b/nova/api/openstack/compute/multinic.py
+index 41c1c3b..c293c69 100644
+--- a/nova/api/openstack/compute/multinic.py
++++ b/nova/api/openstack/compute/multinic.py
+@@ -35,6 +35,7 @@ class MultinicController(wsgi.Controller):
+         self.compute_api = compute.API()
+ 
+     @wsgi.Controller.api_version("2.1", "2.43")
++    @extensions.block_during_upgrade()
+     @wsgi.response(202)
+     @wsgi.action('addFixedIp')
+     @extensions.expected_errors((400, 404))
+@@ -54,6 +55,7 @@ class MultinicController(wsgi.Controller):
+             raise exc.HTTPBadRequest(explanation=e.format_message())
+ 
+     @wsgi.Controller.api_version("2.1", "2.43")
++    @extensions.block_during_upgrade()
+     @wsgi.response(202)
+     @wsgi.action('removeFixedIp')
+     @extensions.expected_errors((400, 404))
+diff --git a/nova/api/openstack/compute/networks.py b/nova/api/openstack/compute/networks.py
+index e1621e8..7e276de 100644
+--- a/nova/api/openstack/compute/networks.py
++++ b/nova/api/openstack/compute/networks.py
+@@ -121,6 +121,7 @@ class NetworkController(wsgi.Controller):
+         return {'network': network_dict(context, network)}
+ 
+     @wsgi.Controller.api_version("2.1", MAX_PROXY_API_SUPPORT_VERSION)
++    @extensions.block_during_upgrade()
+     @wsgi.response(202)
+     @extensions.expected_errors((404, 409))
+     def delete(self, req, id):
+@@ -136,6 +137,7 @@ class NetworkController(wsgi.Controller):
+             raise exc.HTTPNotFound(explanation=msg)
+ 
+     @wsgi.Controller.api_version("2.1", MAX_PROXY_API_SUPPORT_VERSION)
++    @extensions.block_during_upgrade()
+     @extensions.expected_errors((400, 409, 501))
+     @validation.schema(schema.create)
+     def create(self, req, body):
+diff --git a/nova/api/openstack/compute/networks_associate.py b/nova/api/openstack/compute/networks_associate.py
+index 530c4ca..c95b013 100644
+--- a/nova/api/openstack/compute/networks_associate.py
++++ b/nova/api/openstack/compute/networks_associate.py
+@@ -32,6 +32,7 @@ class NetworkAssociateActionController(wsgi.Controller):
+         self.network_api = network_api or network.API()
+ 
+     @wsgi.Controller.api_version("2.1", MAX_PROXY_API_SUPPORT_VERSION)
++    @extensions.block_during_upgrade()
+     @wsgi.action("disassociate_host")
+     @wsgi.response(202)
+     @extensions.expected_errors((404, 501))
+@@ -47,6 +48,7 @@ class NetworkAssociateActionController(wsgi.Controller):
+             common.raise_feature_not_supported()
+ 
+     @wsgi.Controller.api_version("2.1", MAX_PROXY_API_SUPPORT_VERSION)
++    @extensions.block_during_upgrade()
+     @wsgi.action("disassociate_project")
+     @wsgi.response(202)
+     @extensions.expected_errors((404, 501))
+@@ -62,6 +64,7 @@ class NetworkAssociateActionController(wsgi.Controller):
+             common.raise_feature_not_supported()
+ 
+     @wsgi.Controller.api_version("2.1", MAX_PROXY_API_SUPPORT_VERSION)
++    @extensions.block_during_upgrade()
+     @wsgi.action("associate_host")
+     @wsgi.response(202)
+     @extensions.expected_errors((404, 501))
+diff --git a/nova/api/openstack/compute/quota_classes.py b/nova/api/openstack/compute/quota_classes.py
+index 2752385..b926f98 100644
+--- a/nova/api/openstack/compute/quota_classes.py
++++ b/nova/api/openstack/compute/quota_classes.py
+@@ -77,6 +77,7 @@ class QuotaClassSetsController(wsgi.Controller):
+         values = QUOTAS.get_class_quotas(context, id)
+         return self._format_quota_set(id, values, req)
+ 
++    @extensions.block_during_upgrade()
+     @extensions.expected_errors(400)
+     @validation.schema(quota_classes.update, "2.0", "2.49")
+     @validation.schema(quota_classes.update_v250, "2.50")
+diff --git a/nova/api/openstack/compute/quota_sets.py b/nova/api/openstack/compute/quota_sets.py
+index 6327004..de19aba 100644
+--- a/nova/api/openstack/compute/quota_sets.py
++++ b/nova/api/openstack/compute/quota_sets.py
+@@ -130,6 +130,7 @@ class QuotaSetsController(wsgi.Controller):
+             filtered_quotas=filtered_quotas)
+ 
+     @wsgi.Controller.api_version("2.1", MAX_PROXY_API_SUPPORT_VERSION)
++    @extensions.block_during_upgrade()
+     @extensions.expected_errors(400)
+     @validation.schema(quota_sets.update)
+     def update(self, req, id, body):
+@@ -236,6 +237,7 @@ class QuotaSetsController(wsgi.Controller):
+     # TODO(oomichi): Here should be 204(No Content) instead of 202 by v2.1
+     # +microversions because the resource quota-set has been deleted completely
+     # when returning a response.
++    @extensions.block_during_upgrade()
+     @extensions.expected_errors(())
+     @wsgi.response(202)
+     def delete(self, req, id):
+diff --git a/nova/api/openstack/compute/security_group_default_rules.py b/nova/api/openstack/compute/security_group_default_rules.py
+index b4b6a8b..4b10508 100644
+--- a/nova/api/openstack/compute/security_group_default_rules.py
++++ b/nova/api/openstack/compute/security_group_default_rules.py
+@@ -33,6 +33,7 @@ class SecurityGroupDefaultRulesController(sg.SecurityGroupControllerBase,
+             openstack_driver.get_openstack_security_group_driver())
+ 
+     @wsgi.Controller.api_version("2.1", MAX_PROXY_API_SUPPORT_VERSION)
++    @extensions.block_during_upgrade()
+     @extensions.expected_errors((400, 409, 501))
+     def create(self, req, body):
+         context = req.environ['nova.context']
+@@ -90,6 +91,7 @@ class SecurityGroupDefaultRulesController(sg.SecurityGroupControllerBase,
+         return {"security_group_default_rule": fmt_rule}
+ 
+     @wsgi.Controller.api_version("2.1", MAX_PROXY_API_SUPPORT_VERSION)
++    @extensions.block_during_upgrade()
+     @extensions.expected_errors((400, 404, 501))
+     @wsgi.response(204)
+     def delete(self, req, id):
+diff --git a/nova/api/openstack/compute/security_groups.py b/nova/api/openstack/compute/security_groups.py
+index 22027f0..a89cfb8 100644
+--- a/nova/api/openstack/compute/security_groups.py
++++ b/nova/api/openstack/compute/security_groups.py
+@@ -143,6 +143,7 @@ class SecurityGroupController(SecurityGroupControllerBase, wsgi.Controller):
+                                                               security_group)}
+ 
+     @wsgi.Controller.api_version("2.1", MAX_PROXY_API_SUPPORT_VERSION)
++    @extensions.block_during_upgrade()
+     @extensions.expected_errors((400, 404))
+     @wsgi.response(202)
+     def delete(self, req, id):
+@@ -182,6 +183,7 @@ class SecurityGroupController(SecurityGroupControllerBase, wsgi.Controller):
+                             key=lambda k: (k['tenant_id'], k['name'])))}
+ 
+     @wsgi.Controller.api_version("2.1", MAX_PROXY_API_SUPPORT_VERSION)
++    @extensions.block_during_upgrade()
+     @extensions.expected_errors((400, 403))
+     def create(self, req, body):
+         """Creates a new security group."""
+@@ -207,6 +209,7 @@ class SecurityGroupController(SecurityGroupControllerBase, wsgi.Controller):
+                                                               group_ref)}
+ 
+     @wsgi.Controller.api_version("2.1", MAX_PROXY_API_SUPPORT_VERSION)
++    @extensions.block_during_upgrade()
+     @extensions.expected_errors((400, 404))
+     def update(self, req, id, body):
+         """Update a security group."""
+@@ -244,6 +247,7 @@ class SecurityGroupRulesController(SecurityGroupControllerBase,
+                                    wsgi.Controller):
+ 
+     @wsgi.Controller.api_version("2.1", MAX_PROXY_API_SUPPORT_VERSION)
++    @extensions.block_during_upgrade()
+     @extensions.expected_errors((400, 403, 404))
+     def create(self, req, body):
+         context = _authorize_context(req)
+@@ -319,6 +323,7 @@ class SecurityGroupRulesController(SecurityGroupControllerBase,
+                                         cidr, ip_protocol, from_port, to_port)
+ 
+     @wsgi.Controller.api_version("2.1", MAX_PROXY_API_SUPPORT_VERSION)
++    @extensions.block_during_upgrade()
+     @extensions.expected_errors((400, 404, 409))
+     @wsgi.response(202)
+     def delete(self, req, id):
+@@ -396,6 +401,7 @@ class SecurityGroupActionController(wsgi.Controller):
+         instance = common.get_instance(self.compute_api, context, id)
+         method(context, instance, group_name)
+ 
++    @extensions.block_during_upgrade()
+     @extensions.expected_errors((400, 404, 409))
+     @wsgi.response(202)
+     @wsgi.action('addSecurityGroup')
+@@ -416,6 +422,7 @@ class SecurityGroupActionController(wsgi.Controller):
+                 exception.SecurityGroupExistsForInstance) as exp:
+             raise exc.HTTPBadRequest(explanation=exp.format_message())
+ 
++    @extensions.block_during_upgrade()
+     @extensions.expected_errors((400, 404, 409))
+     @wsgi.response(202)
+     @wsgi.action('removeSecurityGroup')
+diff --git a/nova/api/openstack/compute/server_groups.py b/nova/api/openstack/compute/server_groups.py
+index 7d408e4..17f9684 100644
+--- a/nova/api/openstack/compute/server_groups.py
++++ b/nova/api/openstack/compute/server_groups.py
+@@ -132,6 +132,7 @@ class ServerGroupController(wsgi.Controller):
+             raise webob.exc.HTTPNotFound(explanation=e.format_message())
+         return {'server_group': self._format_server_group(context, sg, req)}
+ 
++    @extensions.block_during_upgrade()
+     @wsgi.response(204)
+     @extensions.expected_errors((400, 404))
+     def delete(self, req, id):
+@@ -168,6 +169,7 @@ class ServerGroupController(wsgi.Controller):
+         return {'server_groups': result}
+ 
+     @wsgi.Controller.api_version("2.1")
++    @extensions.block_during_upgrade()
+     @extensions.expected_errors((400, 403))
+     @validation.schema(schema.create, "2.0", "2.14")
+     @validation.schema(schema.create_v215, "2.15")
+@@ -219,6 +221,7 @@ class ServerGroupController(wsgi.Controller):
+ 
+     # extension
+     @wsgi.Controller.api_version("2.25")
++    @extensions.block_during_upgrade()
+     @extensions.expected_errors((400, 404))
+     @wsgi.action("set_metadata")
+     @validation.schema(schema.set_meta, "2.25")
+diff --git a/nova/api/openstack/compute/server_password.py b/nova/api/openstack/compute/server_password.py
+index 4d9e25c..5219e0a 100644
+--- a/nova/api/openstack/compute/server_password.py
++++ b/nova/api/openstack/compute/server_password.py
+@@ -37,6 +37,7 @@ class ServerPasswordController(wsgi.Controller):
+         passw = password.extract_password(instance)
+         return {'password': passw or ''}
+ 
++    @extensions.block_during_upgrade()
+     @extensions.expected_errors(404)
+     @wsgi.response(204)
+     def clear(self, req, server_id):
+diff --git a/nova/api/openstack/compute/server_tags.py b/nova/api/openstack/compute/server_tags.py
+index 25413b6..3bc0c76 100644
+--- a/nova/api/openstack/compute/server_tags.py
++++ b/nova/api/openstack/compute/server_tags.py
+@@ -100,6 +100,7 @@ class ServerTagsController(wsgi.Controller):
+         return {'tags': _get_tags_names(tags)}
+ 
+     @wsgi.Controller.api_version("2.26")
++    @extensions.block_during_upgrade()
+     @extensions.expected_errors((400, 404, 409))
+     @validation.schema(schema.update)
+     def update(self, req, server_id, id, body):
+@@ -152,6 +153,7 @@ class ServerTagsController(wsgi.Controller):
+         return response
+ 
+     @wsgi.Controller.api_version("2.26")
++    @extensions.block_during_upgrade()
+     @extensions.expected_errors((400, 404, 409))
+     @validation.schema(schema.update_all)
+     def update_all(self, req, server_id, body):
+@@ -176,6 +178,7 @@ class ServerTagsController(wsgi.Controller):
+         return {'tags': _get_tags_names(tags)}
+ 
+     @wsgi.Controller.api_version("2.26")
++    @extensions.block_during_upgrade()
+     @wsgi.response(204)
+     @extensions.expected_errors((404, 409))
+     def delete(self, req, server_id, id):
+@@ -200,6 +203,7 @@ class ServerTagsController(wsgi.Controller):
+             context, instance, service="nova-api")
+ 
+     @wsgi.Controller.api_version("2.26")
++    @extensions.block_during_upgrade()
+     @wsgi.response(204)
+     @extensions.expected_errors((404, 409))
+     def delete_all(self, req, server_id):
+diff --git a/nova/api/openstack/extensions.py b/nova/api/openstack/extensions.py
+index 8dbb1b6..4ca1bc5 100644
+--- a/nova/api/openstack/extensions.py
++++ b/nova/api/openstack/extensions.py
+@@ -24,10 +24,12 @@ import webob.dec
+ import webob.exc
+ 
+ from nova.api.openstack import wsgi
++import nova.conf
+ from nova import exception
+ from nova.i18n import _
+ 
+ LOG = logging.getLogger(__name__)
++CONF = nova.conf.CONF
+ 
+ 
+ class ExtensionDescriptor(object):
+@@ -370,3 +372,25 @@ def expected_errors(errors):
+         return wrapped
+ 
+     return decorator
++
++
++# extension
++def block_during_upgrade():
++    """Decorator for v2.1 API methods which blocks commands during upgrade
++    """
++    def decorator(f):
++        @functools.wraps(f)
++        def wrapped(*args, **kwargs):
++            # current check for upgrades is to check if upgrade_levels
++            # is not None. During an upgrade, we put nova in
++            # compatibility mode. This will put something like "kilo"
++            # in CONF.upgrade_levels.compute
++            if CONF.upgrade_levels.compute is not None:
++                msg = "This command is not available during upgrades"
++                LOG.warning(msg + ", name = " + str(f.__name__) +
++                            ", module =  " + str(f.__module__))
++                raise webob.exc.HTTPBadRequest(explanation=msg)
++            return f(*args, **kwargs)
++
++        return wrapped
++    return decorator
+-- 
+2.7.4
+

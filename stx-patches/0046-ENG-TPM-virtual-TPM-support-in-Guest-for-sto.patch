@@ -1,0 +1,206 @@
+From 0c3e28f914eed0904cc067737704742f661c451e Mon Sep 17 00:00:00 2001
+From: Kristine Bujold <kristine.bujold@windriver.com>
+Date: Wed, 19 Apr 2017 14:56:17 -0400
+Subject: [PATCH 046/143] ENG: TPM: virtual TPM support in Guest, for
+ storage of secrets in TPM - Part 1
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- Nova changes for new Boolean flavour "sw:wrs:vtpm". When the flavour is set this must be added to the instance's XML.
+
+    <qemu:commandline xmlns:qemu="http://libvirt.org/schemas/domain/qemu/1.0">
+    <qemu:arg value="-device"/>
+    <qemu:arg value="tpm-tis,tpmdev=tpm-tpm0,id=tpm0"/>
+    <qemu:arg value="-bios"/>
+    <qemu:arg value="/guest/bios.bin"/>
+    <qemu:arg value="-tpmdev"/>
+    <qemu:arg value="cuse-tpm,id=tpm-tpm0,path=/dev/<device-name>,cancel-path=/dev/null"/>
+    </qemu:commandline>
+
+- Nova changes to allow the copying of the TPM NVData during cold migration to the destination node. The Guest’s TPM NVData will be stored under /etc/nova/instances/<guest uuid><instance_device_name>/data/
+
+     e.g. /etc/nova/instances/d75684dc-6d13-4d6a-8e41-324597430589/vtpm-instance-000000ef/data/
+
+e486b1d ENG: TPM: virtual TPM support in Guest
+   - Changed the xml config location of the tpm seabios
+
+752c118 vTPM module package upversion
+   Seatbios used by VM has been uprev-ed from 1.10.2-1 to 1.10.2-3.
+   The older version (tpm-seabios) has been removed.
+
+__TYPE_primary
+__TAG_tpm,security
+__R4_commit_2bb3532
+---
+ nova/api/openstack/compute/flavors_extraspecs.py |  2 +-
+ nova/virt/libvirt/driver.py                      | 19 +++++++++--
+ nova/virt/wrs/libvirt/config.py                  | 42 ++++++++++++++++++++++++
+ nova/virt/wrs/libvirt/driver.py                  | 13 ++++++++
+ 4 files changed, 73 insertions(+), 3 deletions(-)
+
+diff --git a/nova/api/openstack/compute/flavors_extraspecs.py b/nova/api/openstack/compute/flavors_extraspecs.py
+index 1d0aefe..f8a9589 100644
+--- a/nova/api/openstack/compute/flavors_extraspecs.py
++++ b/nova/api/openstack/compute/flavors_extraspecs.py
+@@ -284,7 +284,7 @@ class FlavorExtraSpecsController(wsgi.Controller):
+     @staticmethod
+     def _validate_sw_keys(flavor):
+         keys = ['sw:wrs:auto_recovery', 'sw:wrs:srv_grp_messaging',
+-                'sw:wrs:guest:heartbeat']
++                'sw:wrs:guest:heartbeat', 'sw:wrs:vtpm']
+         specs = flavor.extra_specs
+         for key in keys:
+             if key in specs:
+diff --git a/nova/virt/libvirt/driver.py b/nova/virt/libvirt/driver.py
+index c61afc6..8b4b71c 100644
+--- a/nova/virt/libvirt/driver.py
++++ b/nova/virt/libvirt/driver.py
+@@ -5339,7 +5339,7 @@ class LibvirtDriver(driver.ComputeDriver):
+                                       context)
+         xml = conf.to_xml()
+ 
+-        LOG.debug('End _get_guest_xml xml=%(xml)s',
++        LOG.info('End _get_guest_xml xml=%(xml)s',
+                   {'xml': xml}, instance=instance)
+         return xml
+ 
+@@ -8026,7 +8026,7 @@ class LibvirtDriver(driver.ComputeDriver):
+                                    flavor, network_info,
+                                    block_device_info=None,
+                                    timeout=0, retry_interval=0):
+-        LOG.debug("Starting migrate_disk_and_power_off",
++        LOG.info("Starting migrate_disk_and_power_off",
+                    instance=instance)
+ 
+         ephemerals = driver.block_device_info_get_ephemerals(block_device_info)
+@@ -8144,6 +8144,21 @@ class LibvirtDriver(driver.ComputeDriver):
+                                          dst_disk_info_path,
+                                          host=dest, on_execute=on_execute,
+                                          on_completion=on_completion)
++
++            # If the VMs has a vtpm flavour then we need to migrate its
++            # vTPM data. This will be located under
++            #   inst_base/vtpm-<instance name>
++            # We copy this whole directory to the destination node.
++            vtpm_files = os.path.join(inst_base_resize, 'vtpm*')
++            for vtpm_file in glob.iglob(vtpm_files):
++                LOG.info("Moving the vTPM data %s", vtpm_file)
++                if os.path.isdir(vtpm_file):
++                    src_vtpm_files = os.path.join(inst_base_resize, vtpm_file)
++                    libvirt_utils.copy_image(src_vtpm_files,
++                                             inst_base,
++                                             host=dest, on_execute=on_execute,
++                                             on_completion=on_completion)
++
+         except Exception:
+             with excutils.save_and_reraise_exception():
+                 self._cleanup_remote_migration(dest, inst_base,
+diff --git a/nova/virt/wrs/libvirt/config.py b/nova/virt/wrs/libvirt/config.py
+index 6595315..be51690 100644
+--- a/nova/virt/wrs/libvirt/config.py
++++ b/nova/virt/wrs/libvirt/config.py
+@@ -81,6 +81,42 @@ class LibvirtConfigGuestAvpDevice(LibvirtConfigGuestQemuRawDevice):
+         return super(LibvirtConfigGuestAvpDevice, self).format_dom()
+ 
+ 
++class LibvirtConfigGuestvTPMDevice(LibvirtConfigGuestQemuRawDevice):
++    """Configuration object which can be used to specify the QEMU configuration
++    for vTPM. See example below.
++
++    <qemu:commandline xmlns:qemu="http://libvirt.org/schemas/domain/qemu/1.0">
++    <qemu:arg value="-device"/>
++    <qemu:arg value="tpm-tis,tpmdev=tpm-tpm0,id=tpm0"/>
++    <qemu:arg value="-bios"/>
++    <qemu:arg value="bios.bin"/>
++    <qemu:arg value="-tpmdev"/>
++    <qemu:arg value="cuse-tpm,id=tpm-tpm0,path=/dev/<device-name>,
++                                                      cancel-path=/dev/null"/>
++    </qemu:commandline>
++
++    """
++
++    def __init__(self, **kwargs):
++        super(LibvirtConfigGuestvTPMDevice, self).__init__(**kwargs)
++        self.instance_name = None
++
++    def format_dom(self):
++        self.add_argument("-device")
++        self.add_argument("tpm-tis,tpmdev=tpm-tpm0,id=tpm0")
++
++        self.add_argument("-bios")
++        self.add_argument("/usr/share/seabios/bios-256k.bin")
++
++        self.add_argument("-tpmdev")
++        value = "{}{}{}".format(
++            "cuse-tpm,id=tpm-tpm0,path=/dev/vtpm-", self.instance_name,
++            ",cancel-path=/dev/null")
++        self.add_argument(value)
++
++        return super(LibvirtConfigGuestvTPMDevice, self).format_dom()
++
++
+ class LibvirtConfigGuestDpdkOptions(config.LibvirtConfigObject):
+     """Configuration object which can be used to specify QEMU DPDK launch
+        parameters.
+@@ -148,6 +184,7 @@ class LibvirtConfigGuest(LibvirtConfigWrapper):
+             if isinstance(device, LibvirtConfigGuestQemuRawDevice):
+                 self.devices.remove(device)
+                 self.raw_devices.append(device)
++        self.tpm_qemu = None
+ 
+     def _format_dpdk_options(self, root):
+         if self.dpdk:
+@@ -158,8 +195,13 @@ class LibvirtConfigGuest(LibvirtConfigWrapper):
+         for dev in self.raw_devices:
+             root.append(dev.format_dom())
+ 
++    def _format_tpm_qemu_options(self, root):
++        if self.tpm_qemu:
++            root.append(self.tpm_qemu.format_dom())
++
+     def format_dom(self):
+         root = super(LibvirtConfigGuest, self).format_dom()
+         self._format_dpdk_options(root)
+         self._format_qemu_raw_devices(root)
++        self._format_tpm_qemu_options(root)
+         return root
+diff --git a/nova/virt/wrs/libvirt/driver.py b/nova/virt/wrs/libvirt/driver.py
+index c11fc2f..942e613 100644
+--- a/nova/virt/wrs/libvirt/driver.py
++++ b/nova/virt/wrs/libvirt/driver.py
+@@ -12,6 +12,7 @@ from nova.objects import fields
+ from nova.virt.libvirt import driver
+ from nova.virt.wrs.libvirt import config as wrs_config
+ from nova.virt.wrs.libvirt import vif as wrs_vif
++from oslo_utils import strutils
+ 
+ CONF = nova.conf.CONF
+ 
+@@ -42,6 +43,11 @@ class LibvirtDriver(driver.LibvirtDriver):
+         dpdk.cpu_list = info.get('cpu', '0')
+         return dpdk
+ 
++    def _get_guest_config_tpm_qemu(self, instance_name):
++        tpm_qemu = wrs_config.LibvirtConfigGuestvTPMDevice()
++        tpm_qemu.instance_name = instance_name
++        return tpm_qemu
++
+     def _get_guest_config(self, instance, network_info, image_meta,
+                           disk_info, rescue=None, block_device_info=None,
+                           context=None):
+@@ -59,4 +65,11 @@ class LibvirtDriver(driver.LibvirtDriver):
+                                       fields.Architecture.X86_64):
+                 guest.dpdk = self._get_guest_config_dpdk()
+ 
++            # Get the vTPM flavour
++            vtpm = instance.flavor.extra_specs.get('sw:wrs:vtpm')
++            do_vtpm = strutils.bool_from_string(vtpm)
++
++            if do_vtpm:
++                # vTPM flavour is set, setup the qemu tpm arguments
++                guest.tpm_qemu = self._get_guest_config_tpm_qemu(instance.name)
+         return guest
+-- 
+2.7.4
+

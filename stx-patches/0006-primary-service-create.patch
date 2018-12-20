@@ -1,0 +1,204 @@
+From 2eab8447df40bc06206597fc28bd887e17aa3782 Mon Sep 17 00:00:00 2001
+From: Gerry Kopec <Gerry.Kopec@windriver.com>
+Date: Wed, 11 Jan 2017 19:39:55 -0500
+Subject: [PATCH 006/143] primary: service create
+
+Enable capability to create a disabled compute service.
+
+Add "service create" operation to REST API
+
+This adds a "create" operation to the "os-services" REST API.  Currently
+this is only supported for the "nova-compute" service, and it simply
+causes an entry for the new host to be added to the services table in
+the database.
+
+This is useful so that we can add the new compute node to the provider
+network host aggregate before the nova-compute service actually starts
+running (which is when the database entry would normally be created).
+
+The new api is called by mtcClient.
+
+__TYPE_primary
+__TAG_critical,service
+__R4_commit_b3a4132
+__R3_commit_bfefb65
+---
+ nova/api/openstack/compute/services.py             | 46 ++++++++++++++++++++++
+ nova/compute/api.py                                | 29 ++++++++++++++
+ .../unit/api/openstack/compute/test_services.py    | 25 ++++++++++++
+ 3 files changed, 100 insertions(+)
+
+diff --git a/nova/api/openstack/compute/services.py b/nova/api/openstack/compute/services.py
+index c911ced..ea4e68c 100644
+--- a/nova/api/openstack/compute/services.py
++++ b/nova/api/openstack/compute/services.py
+@@ -11,9 +11,17 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2013-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ from oslo_utils import strutils
+ from oslo_utils import uuidutils
++import six
+ import webob.exc
+ 
+ from nova.api.openstack import api_version_request
+@@ -239,6 +247,41 @@ class ServiceController(wsgi.Controller):
+ 
+         return {'services': _services}
+ 
++    # extension - service create
++    def _create(self, body, context):
++        """Create a service on a host. Simply causes an entry for the new host
++        to be added to the services table in the database.
++        """
++        if 'host' not in body:
++            msg = "Missing host field"
++            raise webob.exc.HTTPUnprocessableEntity(explanation=msg)
++
++        if 'binary' not in body:
++            msg = "Missing binary field"
++            raise webob.exc.HTTPUnprocessableEntity(explanation=msg)
++
++        if body['binary'] != "nova-compute":
++            msg = _('Service creation only supported for nova-compute')
++            raise webob.exc.HTTPUnprocessableEntity(explanation=msg)
++
++        host = body['host']
++        binary = body['binary']
++        try:
++            self.host_api.service_create(context, host, binary)
++            pass
++        except Exception as e:
++            raise webob.exc.HTTPInternalServerError(
++                explanation=six.text_type(e))
++
++        ret_value = {
++            'service': {
++                'binary': 'nova-compute',
++                'host': host,
++                'status': "created",
++            },
++        }
++        return ret_value
++
+     @wsgi.Controller.api_version('2.1', '2.52')
+     @extensions.expected_errors((400, 404))
+     @validation.schema(services.service_update, '2.0', '2.10')
+@@ -257,6 +300,9 @@ class ServiceController(wsgi.Controller):
+         else:
+             actions = self.actions
+ 
++        # extension - add service create to update actions
++        actions["create"] = self._create
++
+         return self._perform_action(req, id, body, actions)
+ 
+     @wsgi.Controller.api_version(UUID_FOR_ID_MIN_VERSION)  # noqa F811
+diff --git a/nova/compute/api.py b/nova/compute/api.py
+index 3eeeb69..27ddbf6 100644
+--- a/nova/compute/api.py
++++ b/nova/compute/api.py
+@@ -15,6 +15,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2013-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ """Handles all requests relating to compute resources (e.g. guest VMs,
+ networking and storage of VMs, and compute hosts on which they run)."""
+@@ -4502,6 +4509,28 @@ class HostAPI(base.Base):
+         return self._service_update(context, host_name, binary,
+                                     params_to_update)
+ 
++    # extension
++    def service_create(self, context, host, binary):
++        """Create the specified binary on the specified host.  Currently
++         only used to force the creation of the nova-compute database
++         entry so that other stuff can find it.
++         """
++        if binary == 'nova-compute':
++            try:
++                compute_service = objects.Service(context)
++                # Set the fields like _create_service_ref() in nova/service.py
++                # but with the service disabled since it's not running.
++                compute_service.host = host
++                compute_service.binary = binary
++                compute_service.topic = 'compute'
++                compute_service.report_count = 0
++                compute_service.disabled = True
++                compute_service.create()
++            except (exception.ServiceBinaryExists,
++                    exception.ServiceTopicExists):
++                # Not an error if the service exists already.
++                pass
++
+     def _service_delete(self, context, service_id):
+         """Performs the actual Service deletion operation."""
+         try:
+diff --git a/nova/tests/unit/api/openstack/compute/test_services.py b/nova/tests/unit/api/openstack/compute/test_services.py
+index 297178d..4dc2443 100644
+--- a/nova/tests/unit/api/openstack/compute/test_services.py
++++ b/nova/tests/unit/api/openstack/compute/test_services.py
+@@ -11,6 +11,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2013-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ 
+ import copy
+@@ -606,6 +613,15 @@ class ServicesTestV21(test.TestCase):
+         req = FakeRequestWithHostService()
+         self.assertRaises(self.service_is_up_exc, self.controller.index, req)
+ 
++    # extension - test update create for api v2.1
++    #                - currently works but may be restricted later
++    def test_services_update_create(self):
++        req = FakeRequest()
++        body = {'host': 'host1', 'binary': 'nova-compute'}
++        with mock.patch.object(self.controller.host_api, 'service_create'):
++            res_dict = self.controller.update(req, "create", body=body)
++            self.assertEqual(res_dict['service']['status'], 'created')
++
+ 
+ class ServicesTestV211(ServicesTestV21):
+     wsgi_api_version = '2.11'
+@@ -917,6 +933,15 @@ class ServicesTestV211(ServicesTestV21):
+         self.assertRaises(exception.ValidationError,
+             self.controller.update, req, 'force-down', body=req_body)
+ 
++    # extension - test update create for api v2.1
++    #                - currently works but may be restricted later
++    def test_services_update_create(self):
++        req = FakeRequest()
++        body = {'host': 'host1', 'binary': 'nova-compute'}
++        with mock.patch.object(self.controller.host_api, 'service_create'):
++            res_dict = self.controller.update(req, "create", body=body)
++            self.assertEqual(res_dict['service']['status'], 'created')
++
+ 
+ class ServicesTestV252(ServicesTestV211):
+     """This is a boundary test to ensure that 2.52 behaves the same as 2.11."""
+-- 
+2.7.4
+

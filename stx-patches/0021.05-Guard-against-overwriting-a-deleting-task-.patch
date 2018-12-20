@@ -1,0 +1,163 @@
+From 80c46e5993ed381554698e75745668e30f69c230 Mon Sep 17 00:00:00 2001
+From: Hans Lindgren <hanlind@kth.se>
+Date: Sat, 5 Mar 2016 15:31:53 +0100
+Subject: [PATCH] Guard against overwriting a deleting task state
+
+This is a backport of an upstream commit under review at:
+https://review.openstack.org/#/c/288933/5
+The original commit message follows below.
+
+The following reviews try to fix bugs where a deleting task state
+gets overwritten due to racing instance.save() operations in the
+ongoing task being interrupted by a instance delete operation.
+
+https://review.openstack.org/245038
+https://review.openstack.org/276783
+
+The same race conditon exist in many other places where task_state
+is being updated without setting expected_task_state to guard against
+these bad state changes.
+
+A way to solve this is to enforce some rules in the db api to not
+allow certain task state changes when a deleting state is involved.
+
+A positive side-effect of this is that instance deletes are detected
+faster by running tasks due to the UnexpectedDeletingTaskStateError
+exception being raised.
+
+Change-Id: I8e7e3861c971d8571096600414869f374741e7b8
+Closes-Bug: #1512563
+Closes-Bug: #1542039
+
+(cherry picked from commit 895e4a8)
+---
+ nova/compute/manager.py                     |  4 ++--
+ nova/db/sqlalchemy/api.py                   | 20 +++++++++++++++++---
+ nova/tests/unit/compute/test_compute_mgr.py | 14 ++++++++++++++
+ nova/tests/unit/db/test_db_api.py           | 24 ++++++++++++++++++++++++
+ 4 files changed, 57 insertions(+), 5 deletions(-)
+
+diff --git a/nova/compute/manager.py b/nova/compute/manager.py
+index 1a41d05..c67ba09 100644
+--- a/nova/compute/manager.py
++++ b/nova/compute/manager.py
+@@ -2392,7 +2392,6 @@ class ComputeManager(manager.Manager):
+                                 system_meta)
+ 
+     @wrap_exception()
+-    @reverts_task_state
+     @wrap_instance_event(prefix='compute')
+     @wrap_instance_fault
+     def terminate_instance(self, context, instance, bdms, reservations):
+@@ -2430,7 +2429,8 @@ class ComputeManager(manager.Manager):
+                 with excutils.save_and_reraise_exception():
+                     LOG.exception(_LE('Setting instance vm_state to ERROR'),
+                                   instance=instance)
+-                    self._set_instance_obj_error_state(context, instance)
++                    self._set_instance_obj_error_state(context, instance,
++                                                       clean_task_state=True)
+ 
+         do_terminate_instance(instance, bdms)
+ 
+diff --git a/nova/db/sqlalchemy/api.py b/nova/db/sqlalchemy/api.py
+index bbdc40a..276eee8 100644
+--- a/nova/db/sqlalchemy/api.py
++++ b/nova/db/sqlalchemy/api.py
+@@ -2707,10 +2707,21 @@ def _instance_update(context, instance_uuid, values, expected, original=None):
+         _validate_unique_server_name(context, values['hostname'])
+ 
+     compare = models.Instance(uuid=instance_uuid, **expected)
++    query = model_query(context, models.Instance, project_only=True)
++
++    # Make sure we do not accidentally overwrite a deleting task state.
++    # Setting vm_state to DELETED or ERROR however is always allowed.
++    if values.get('vm_state') not in (vm_states.DELETED, vm_states.ERROR):
++        overwrite_condition = ('task_state' in values and
++                               'task_state' not in expected and
++                               values['task_state'] != task_states.DELETING)
++        if overwrite_condition:
++            query = query.filter(or_(
++                models.Instance.task_state != task_states.DELETING,
++                models.Instance.task_state == null()))
++
+     try:
+-        instance_ref = model_query(context, models.Instance,
+-                                   project_only=True).\
+-                       update_on_match(compare, 'uuid', values)
++        instance_ref = query.update_on_match(compare, 'uuid', values)
+     except update_match.NoRowsMatched:
+         # Update failed. Try to find why and raise a specific error.
+ 
+@@ -2741,6 +2752,9 @@ def _instance_update(context, instance_uuid, values, expected, original=None):
+                 conflicts_expected[field] = expected_values
+                 conflicts_actual[field] = actual
+ 
++        if original.task_state == task_states.DELETING:
++            conflicts_actual['task_state'] = original.task_state
++
+         # Exception properties
+         exc_props = {
+             'instance_uuid': instance_uuid,
+diff --git a/nova/tests/unit/compute/test_compute_mgr.py b/nova/tests/unit/compute/test_compute_mgr.py
+index e805cb5..6208780 100755
+--- a/nova/tests/unit/compute/test_compute_mgr.py
++++ b/nova/tests/unit/compute/test_compute_mgr.py
+@@ -3244,6 +3244,20 @@ class ComputeManagerUnitTestCase(test.NoDBTestCase):
+         mock_delete_instance.assert_called_once_with(
+             self.context, instance, bdms, mock.ANY)
+ 
++    def test_terminate_instance_sets_error_state_on_failure(self):
++        instance = fake_instance.fake_instance_obj(self.context)
++        with test.nested(
++            mock.patch.object(self.compute, '_delete_instance'),
++            mock.patch.object(self.compute, '_set_instance_obj_error_state'),
++            mock.patch.object(compute_utils, 'add_instance_fault_from_exc')
++        ) as (mock_delete_instance, mock_set_error_state, mock_add_fault):
++            mock_delete_instance.side_effect = test.TestingException
++            self.assertRaises(test.TestingException,
++                              self.compute.terminate_instance,
++                              self.context, instance, [], [])
++            mock_set_error_state.assert_called_once_with(
++                self.context, instance, clean_task_state=True)
++
+     @mock.patch.object(nova.compute.manager.ComputeManager,
+                        '_notify_about_instance_usage')
+     def test_trigger_crash_dump(self, notify_mock):
+diff --git a/nova/tests/unit/db/test_db_api.py b/nova/tests/unit/db/test_db_api.py
+index 72f1528..dcf4751 100644
+--- a/nova/tests/unit/db/test_db_api.py
++++ b/nova/tests/unit/db/test_db_api.py
+@@ -2784,6 +2784,30 @@ class InstanceTestCase(test.TestCase, ModelsObjectComparatorMixin):
+                     db.instance_update, self.ctxt, instance['uuid'],
+                     {'host': 'h1', 'expected_vm_state': ('spam', 'bar')})
+ 
++    def test_instance_update_cannot_overwrite_deleting_task_state(self):
++        instance = self.create_instance_with_args(
++            task_state=task_states.DELETING)
++        self.assertRaises(exception.UnexpectedDeletingTaskStateError,
++                    db.instance_update, self.ctxt, instance['uuid'],
++                    {'task_state': 'foo'})
++
++    def test_instance_update_can_set_deleting_task_state(self):
++        instance = self.create_instance_with_args(
++            task_state=task_states.DELETING)
++        db.instance_update(self.ctxt, instance['uuid'],
++                           {'task_state': task_states.DELETING})
++
++    def test_instance_update_can_overwrite_deleting_task_state_on_delete(self):
++        instance = self.create_instance_with_args(
++            task_state=task_states.DELETING)
++        db.instance_update(self.ctxt, instance['uuid'],
++                           {'task_state': None, 'vm_state': vm_states.DELETED})
++
++    def test_instance_update_can_overwrite_none_task_state(self):
++        instance = self.create_instance_with_args(task_state=None)
++        db.instance_update(self.ctxt, instance['uuid'],
++                           {'task_state': 'foo'})
++
+     def test_instance_update_with_instance_uuid(self):
+         # test instance_update() works when an instance UUID is passed.
+         ctxt = context.get_admin_context()
+-- 
+2.7.4
+

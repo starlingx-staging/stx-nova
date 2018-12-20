@@ -1,0 +1,40 @@
+From 4b6bbe41937a7995e36d0dd5bb1619340103e265 Mon Sep 17 00:00:00 2001
+From: Gerry Kopec <Gerry.Kopec@windriver.com>
+Date: Tue, 28 Jun 2016 17:17:33 -0400
+Subject: [PATCH] Cleanup of RBD backed instance info on resize reverts
+
+When cold migrations are reverted we must delete the instance
+directories on the destination host as /etc/nova/instances is local to
+the compute and not shared between computes.
+
+Add a an additional check to enable delete_instance_files(). Currently
+there is an underlying assumption that if we have shared storage then we
+also have shared instance file storage. This is an invalid assumption
+for TiS as we have shared instance storage with RBD and localized
+instance file storage (/etc/nova/instances) per compute.
+
+Port of commit commit be63734 to Mitaka
+
+(cherry picked from commit 3520a0d)
+---
+ nova/virt/libvirt/driver.py | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/nova/virt/libvirt/driver.py b/nova/virt/libvirt/driver.py
+index 4ab221b..b6b85cb 100644
+--- a/nova/virt/libvirt/driver.py
++++ b/nova/virt/libvirt/driver.py
+@@ -1000,7 +1000,9 @@ class LibvirtDriver(driver.ComputeDriver):
+         is_shared_block_storage = False
+         if migrate_data and 'is_shared_block_storage' in migrate_data:
+             is_shared_block_storage = migrate_data.is_shared_block_storage
+-        if destroy_disks or is_shared_block_storage:
++        if (destroy_disks or is_shared_block_storage or
++            (migrate_data is None and
++             CONF.libvirt.images_type == 'rbd')):
+             attempts = int(instance.system_metadata.get('clean_attempts',
+                                                         '0'))
+             success = self.delete_instance_files(instance)
+-- 
+2.7.4
+

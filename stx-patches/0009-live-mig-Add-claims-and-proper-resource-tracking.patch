@@ -1,0 +1,1365 @@
+From dd540aed1cf013e8a361097d0076b51f6a1501b7 Mon Sep 17 00:00:00 2001
+From: Nikola Dipanov <ndipanov@redhat.com>
+Date: Fri, 21 Oct 2016 14:41:06 +0200
+Subject: [PATCH 009/143] live-mig: Add claims and proper resource tracking
+
+This patch adds the claims mechanism to the live migration control flow.
+There are several points that are worth noting about this (somewhat
+beefy) patch.
+
+ * Adds migration object, and other scheduler related data to the
+   check_can_live_migrate_destination which is where the claim happens.
+   Since the claim logic updates the migration record with the target
+   host, we remove this update from the conductor.
+
+   The claim happens on the first call to the destination node. It is
+   worth noting that in case the destination was specified when live
+   migration API was called, no claims will happen.
+ * We do not drop the claim at any point - this could be improved in a
+   future patch, but was left out to keep this patch easier to review.
+ * Makes sure that we apply the migration context after a successful
+   live migration, and that we drop it upon failure.
+ * Makes sure that the migration record status is updated in failure
+   and success scenarios, as this is necessary for correct resource
+   tracking
+ * We can now track live migration records in the resource tracker so we
+   remove the check that would skip them when updating resources.
+ * Currently missing (in libvirt's case) is applying the migration
+   context to the xml we pass to the migrateToURI2 API call.
+   This makes this no more broken than it was before, and is addressed
+   in a follow-up patch
+
+Change-Id: Ie80983bb8ce4c8ad1a5761f29140da8a970a29d3
+Co-Authored-By: Sylvain Bauza <sbauza@redhat.com>
+Co-Authored-By: Sahid Ferdjaoui <sahid.ferdjaoui@redhat.com>
+Co-Authored-By: Pawel Koniszewski <pawel.koniszewski@intel.com>
+Partial-bug: 1417667
+Partial-bug: 1289064
+
+This is the first in a series of three backports to Pike to give
+proper tracking of pinned cpus over live migration. Change was cherry
+picked from upstream review https://review.openstack.org/#/c/244489/61
+
+Changes to merge with Pike for WRS:
+- left compute manager target messaging version as 4.17 as we don't
+  want to bump this
+- added COMPUTE_RESOURCE_SEMAPHORE decorator to live_migration_claim
+  as we did this in Mitaka and it's already flagged in upstream review
+- kept rpcapi version of check_can_live_migrate_destination at 4.11
+  (vs. 4.18) as R3/Mitaka supports migration and limits parameters
+
+__TYPE_upstream
+__TAG_livemigration,resource
+__R4_commit_b89d6e2
+__R3_commit_0154967
+__TC6491
+---
+ nova/compute/manager.py                            | 102 +++++++---
+ nova/compute/resource_tracker.py                   |  22 +-
+ nova/compute/rpcapi.py                             |  40 +++-
+ nova/conductor/tasks/live_migrate.py               |  27 ++-
+ nova/objects/service.py                            |  10 +-
+ nova/tests/unit/compute/test_compute.py            |  38 +++-
+ nova/tests/unit/compute/test_compute_mgr.py        | 226 +++++++++++++++++----
+ nova/tests/unit/compute/test_resource_tracker.py   |  33 ---
+ nova/tests/unit/compute/test_rpcapi.py             |  39 +++-
+ .../unit/conductor/tasks/test_live_migrate.py      |  99 +++++----
+ nova/virt/libvirt/driver.py                        |   3 +
+ 11 files changed, 469 insertions(+), 170 deletions(-)
+
+diff --git a/nova/compute/manager.py b/nova/compute/manager.py
+index 28393bb..925154a 100644
+--- a/nova/compute/manager.py
++++ b/nova/compute/manager.py
+@@ -5372,7 +5372,8 @@ class ComputeManager(manager.Manager):
+     @wrap_instance_event(prefix='compute')
+     @wrap_instance_fault
+     def check_can_live_migrate_destination(self, ctxt, instance,
+-                                           block_migration, disk_over_commit):
++                                           block_migration, disk_over_commit,
++                                           migration=None, limits=None):
+         """Check if it is possible to execute live migration.
+ 
+         This runs checks on the destination host, and then calls
+@@ -5384,11 +5385,35 @@ class ComputeManager(manager.Manager):
+                                 if None, calculate it in driver
+         :param disk_over_commit: if true, allow disk over commit
+                                  if None, ignore disk usage checking
++        :param migration: the migration object that tracks data about this
++                          migration
++        :param limits: objects.Limits instance that the scheduler
++                               returned when this host was chosen
+         :returns: a dict containing migration info
+         """
+-        return self._do_check_can_live_migrate_destination(ctxt, instance,
+-                                                            block_migration,
+-                                                            disk_over_commit)
++        scheduled_node = None
++        try:
++            compute_node = self._get_compute_info(ctxt, self.host)
++            scheduled_node = compute_node.hypervisor_hostname
++        except exception.ComputeHostNotFound:
++            LOG.exception('Failed to get compute_info for %s',
++                          self.host)
++
++        if scheduled_node is not None and migration is not None:
++            rt = self._get_resource_tracker()
++            live_mig_claim = rt.live_migration_claim
++        else:
++            live_mig_claim = claims.NopClaim
++        try:
++            with live_mig_claim(ctxt, instance, scheduled_node,
++                                migration, limits=limits):
++                return self._do_check_can_live_migrate_destination(
++                    ctxt, instance, block_migration, disk_over_commit)
++        except exception.ComputeResourcesUnavailable as e:
++            LOG.debug("Could not claim resources for live migrating the "
++                      "instance to this host. Not enough resources available.",
++                      instance=instance)
++            raise exception.MigrationPreCheckError(reason=e.format_message())
+ 
+     def _do_check_can_live_migrate_destination(self, ctxt, instance,
+                                                block_migration,
+@@ -5477,12 +5502,13 @@ class ComputeManager(manager.Manager):
+                      context, instance, "live_migration.pre.start",
+                      network_info=network_info)
+ 
+-        migrate_data = self.driver.pre_live_migration(context,
+-                                       instance,
+-                                       block_device_info,
+-                                       network_info,
+-                                       disk,
+-                                       migrate_data)
++        with instance.mutated_migration_context():
++            migrate_data = self.driver.pre_live_migration(context,
++                                           instance,
++                                           block_device_info,
++                                           network_info,
++                                           disk,
++                                           migrate_data)
+         LOG.debug('driver pre_live_migration data is %s', migrate_data)
+ 
+         # NOTE(tr3buchet): setup networks on destination host
+@@ -5552,10 +5578,11 @@ class ComputeManager(manager.Manager):
+             migrate_data.migration = migration
+         LOG.debug('live_migration data is %s', migrate_data)
+         try:
+-            self.driver.live_migration(context, instance, dest,
+-                                       self._post_live_migration,
+-                                       self._rollback_live_migration,
+-                                       block_migration, migrate_data)
++            with instance.mutated_migration_context():
++                self.driver.live_migration(context, instance, dest,
++                                           self._post_live_migration,
++                                           self._rollback_live_migration,
++                                           block_migration, migrate_data)
+         except Exception:
+             LOG.exception('Live migration failed.', instance=instance)
+             with excutils.save_and_reraise_exception():
+@@ -5832,11 +5859,19 @@ class ComputeManager(manager.Manager):
+         #                  plug_vifs
+         self.network_api.setup_networks_on_host(context, instance,
+                                                          self.host)
+-        migration = {'source_compute': instance.host,
+-                     'dest_compute': self.host, }
+-        self.network_api.migrate_instance_finish(context,
+-                                                 instance,
+-                                                 migration)
++        # TODO(ndipanov): We should be passing the migration over RPC here
++        # instead to reduce number of DB calls
++        try:
++            migration = objects.Migration.get_by_instance_and_status(
++                context, instance.uuid, 'running')
++        except exception.MigrationNotFoundByStatus:
++            LOG.warning("No migration record found for this instance "
++                        "during post_live_migrate routine",
++                        instance=instance)
++            migration = None
++        self.network_api.migrate_instance_finish(
++            context, instance,
++            {'source_compute': instance.host, 'dest_compute': self.host, })
+ 
+         network_info = self.network_api.get_instance_nw_info(context, instance)
+         self._notify_about_instance_usage(
+@@ -5846,12 +5881,15 @@ class ComputeManager(manager.Manager):
+                                                                  instance)
+ 
+         try:
+-            self.driver.post_live_migration_at_destination(
+-                context, instance, network_info, block_migration,
+-                block_device_info)
++            with instance.mutated_migration_context():
++                self.driver.post_live_migration_at_destination(
++                    context, instance, network_info, block_migration,
++                    block_device_info)
++                migration_status = 'finished'
+         except Exception:
+             with excutils.save_and_reraise_exception():
+                 instance.vm_state = vm_states.ERROR
++                migration_status = 'failed'
+                 LOG.error('Unexpected error during post live migration at '
+                           'destination host.', instance=instance)
+         finally:
+@@ -5865,12 +5903,19 @@ class ComputeManager(manager.Manager):
+             except exception.ComputeHostNotFound:
+                 LOG.exception('Failed to get compute_info for %s', self.host)
+             finally:
++                # TODO(pkoniszewski): instance.save() is not a single atomic
++                # transaction, therefore, resource audit on the source side
++                # might see an instance with updated, e.g., numa_topology, but
++                # the old host/node.
++                instance.apply_migration_context()
+                 instance.host = self.host
+                 instance.power_state = current_power_state
+                 instance.task_state = None
+                 instance.node = node_name
+                 instance.progress = 0
+                 instance.save(expected_task_state=task_states.MIGRATING)
++                instance.drop_migration_context()
++                self._set_migration_status(migration, migration_status)
+ 
+         # NOTE(tr3buchet): tear down networks on source host
+         self.network_api.setup_networks_on_host(context, instance,
+@@ -6000,9 +6045,16 @@ class ComputeManager(manager.Manager):
+                 migrate_data = \
+                     migrate_data_obj.LiveMigrateData.detect_implementation(
+                         migrate_data)
+-            self.driver.rollback_live_migration_at_destination(
+-                context, instance, network_info, block_device_info,
+-                destroy_disks=destroy_disks, migrate_data=migrate_data)
++            with instance.mutated_migration_context():
++                self.driver.rollback_live_migration_at_destination(
++                    context, instance, network_info, block_device_info,
++                    destroy_disks=destroy_disks, migrate_data=migrate_data)
++            # TODO(ndipanov): We should drop the claim here too, as we are
++            # currently "leaking" resources, but only until the next run of the
++            # update_available_resource periodic task, since we error the
++            # migration. For that, we need to be passing migration objects over
++            # RPC
++            instance.drop_migration_context()
+ 
+         self._notify_about_instance_usage(
+                         context, instance, "live_migration.rollback.dest.end",
+diff --git a/nova/compute/resource_tracker.py b/nova/compute/resource_tracker.py
+index ab3e497..81d8756 100644
+--- a/nova/compute/resource_tracker.py
++++ b/nova/compute/resource_tracker.py
+@@ -71,15 +71,6 @@ def _instance_in_resize_state(instance):
+     return False
+ 
+ 
+-def _is_trackable_migration(migration):
+-    # Only look at resize/migrate migration and evacuation records
+-    # NOTE(danms): RT should probably examine live migration
+-    # records as well and do something smart. However, ignore
+-    # those for now to avoid them being included in below calculations.
+-    return migration.migration_type in ('resize', 'migration',
+-                                        'evacuation')
+-
+-
+ def _normalize_inventory_from_cn_obj(inv_data, cn):
+     """Helper function that injects various information from a compute node
+     object into the inventory dict returned from the virt driver's
+@@ -231,6 +222,16 @@ class ResourceTracker(object):
+         return claim
+ 
+     @utils.synchronized(COMPUTE_RESOURCE_SEMAPHORE)
++    def live_migration_claim(self, context, instance, nodename, migration=None,
++                             limits=None):
++        """Create a claim for a live_migration operation."""
++        instance_type = instance.flavor
++        image_meta = objects.ImageMeta.from_instance(instance)
++        return self._move_claim(context, instance, instance_type, nodename,
++                                move_type='live-migration', limits=limits,
++                                image_meta=image_meta, migration=migration)
++
++    @utils.synchronized(COMPUTE_RESOURCE_SEMAPHORE)
+     def rebuild_claim(self, context, instance, nodename, limits=None,
+                       image_meta=None, migration=None):
+         """Create a claim for a rebuild operation."""
+@@ -888,9 +889,6 @@ class ResourceTracker(object):
+         """Update usage for a single migration.  The record may
+         represent an incoming or outbound migration.
+         """
+-        if not _is_trackable_migration(migration):
+-            return
+-
+         uuid = migration.instance_uuid
+         LOG.info("Updating from migration %s", uuid)
+ 
+diff --git a/nova/compute/rpcapi.py b/nova/compute/rpcapi.py
+index a7fb674..e1ba84c 100644
+--- a/nova/compute/rpcapi.py
++++ b/nova/compute/rpcapi.py
+@@ -10,7 +10,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
+-
++#
++# Copyright (c) 2016-2017 Wind River Systems, Inc.
++#
++# The right to copy, distribute, modify, or otherwise make use
++# of this software may be licensed only pursuant to the terms
++# of an applicable Wind River license agreement.
++#
+ """
+ Client side of the compute RPC API.
+ """
+@@ -328,6 +334,10 @@ class ComputeAPI(object):
+         * 4.15 - Add tag argument to reserve_block_device_name()
+         * 4.16 - Add tag argument to attach_interface()
+         * 4.17 - Add new_attachment_id to swap_volume.
++        live migrate resource tracking was backported to R3 Mitaka so
++        we'll set this to 4.11
++        * 4.11 - Add migration and limits arguments to
++                 check_can_live_migrate_destination
+     '''
+ 
+     VERSION_ALIASES = {
+@@ -458,9 +468,29 @@ class ComputeAPI(object):
+                    instance=instance, diff=diff)
+ 
+     def check_can_live_migrate_destination(self, ctxt, instance, destination,
+-                                           block_migration, disk_over_commit):
++                                           block_migration, disk_over_commit,
++                                           migration=None, limits=None):
++        # upstream proposed change has this set to 4.14, but we already
++        # backported a version of this to R3/Mitaka so the added parameters
++        # migration & limits are supported with 4.11.
+         version = '4.11'
+         client = self.router.client(ctxt)
++        kw = {'instance': instance,
++              'block_migration': block_migration,
++              'disk_over_commit': disk_over_commit,
++              'migration': migration,
++              'limits': limits}
++        if not client.can_send_version(version):
++            # would not expect to see this case as R3/Mitaka supports
++            # version 4.11
++            # NOTE(ndipanov): If we are talking to an older compute node that
++            # will not do the claim properly, we need to update the migration
++            # record in the conductor (that is to say - here)
++            if migration:
++                migration.dest_compute = destination
++                migration.save()
++            kw.pop('migration')
++            kw.pop('limits')
+         if not client.can_send_version(version):
+             # NOTE(eliqiao): This is a new feature that is only available
+             # once all compute nodes support at least version 4.11.
+@@ -471,12 +501,8 @@ class ComputeAPI(object):
+                 raise exception.LiveMigrationWithOldNovaNotSupported()
+             else:
+                 version = '4.0'
+-
+         cctxt = client.prepare(server=destination, version=version)
+-        result = cctxt.call(ctxt, 'check_can_live_migrate_destination',
+-                            instance=instance,
+-                            block_migration=block_migration,
+-                            disk_over_commit=disk_over_commit)
++        result = cctxt.call(ctxt, 'check_can_live_migrate_destination', **kw)
+         if isinstance(result, migrate_data_obj.LiveMigrateData):
+             return result
+         elif result:
+diff --git a/nova/conductor/tasks/live_migrate.py b/nova/conductor/tasks/live_migrate.py
+index a5b1ddf..0fb7d74 100644
+--- a/nova/conductor/tasks/live_migrate.py
++++ b/nova/conductor/tasks/live_migrate.py
+@@ -33,6 +33,7 @@ class LiveMigrationTask(base.TaskBase):
+                  servicegroup_api, scheduler_client, request_spec=None):
+         super(LiveMigrationTask, self).__init__(context, instance)
+         self.destination = destination
++        self.sched_limits = None
+         self.block_migration = block_migration
+         self.disk_over_commit = disk_over_commit
+         self.migration = migration
+@@ -53,9 +54,7 @@ class LiveMigrationTask(base.TaskBase):
+             # wants the scheduler to pick a destination host, or a host was
+             # specified but is not forcing it, so they want the scheduler
+             # filters to run on the specified host, like a scheduler hint.
+-            self.destination = self._find_destination()
+-            self.migration.dest_compute = self.destination
+-            self.migration.save()
++            self.destination, self.sched_limits = self._find_destination()
+         else:
+             # This is the case that the user specified the 'force' flag when
+             # live migrating with a specific destination host so the scheduler
+@@ -120,7 +119,8 @@ class LiveMigrationTask(base.TaskBase):
+         self._check_destination_has_enough_memory()
+         source_node, dest_node = self._check_compatible_with_source_hypervisor(
+             self.destination)
+-        self._call_livem_checks_on_host(self.destination)
++        self._call_livem_checks_on_host(self.destination,
++                                        limits=self.sched_limits)
+         # Make sure the forced destination host is in the same cell that the
+         # instance currently lives in.
+         # NOTE(mriedem): This can go away if/when the forced destination host
+@@ -184,11 +184,12 @@ class LiveMigrationTask(base.TaskBase):
+             raise exception.DestinationHypervisorTooOld()
+         return source_info, destination_info
+ 
+-    def _call_livem_checks_on_host(self, destination):
++    def _call_livem_checks_on_host(self, destination, limits=None):
+         try:
+             self.migrate_data = self.compute_rpcapi.\
+                 check_can_live_migrate_destination(self.context, self.instance,
+-                    destination, self.block_migration, self.disk_over_commit)
++                    destination, self.block_migration, self.disk_over_commit,
++                    migration=self.migration, limits=limits)
+         except messaging.MessagingTimeout:
+             msg = _("Timeout while checking if we can live migrate to host: "
+                     "%s") % destination
+@@ -263,7 +264,7 @@ class LiveMigrationTask(base.TaskBase):
+                 cell=cell_mapping)
+ 
+         request_spec.ensure_project_id(self.instance)
+-        host = None
++        host = limits = None
+         while host is None:
+             self._check_not_over_max_retries(attempted_hosts)
+             request_spec.ignore_hosts = attempted_hosts
+@@ -271,6 +272,7 @@ class LiveMigrationTask(base.TaskBase):
+                 hoststate = self.scheduler_client.select_destinations(
+                     self.context, request_spec, [self.instance.uuid])[0]
+                 host = hoststate['host']
++                limits = hoststate['limits']
+             except messaging.RemoteError as ex:
+                 # TODO(ShaoHe Feng) There maybe multi-scheduler, and the
+                 # scheduling algorithm is R-R, we can let other scheduler try.
+@@ -281,8 +283,11 @@ class LiveMigrationTask(base.TaskBase):
+                     reason=six.text_type(ex))
+             try:
+                 self._check_compatible_with_source_hypervisor(host)
+-                self._call_livem_checks_on_host(host)
+-            except (exception.Invalid, exception.MigrationPreCheckError) as e:
++                # NOTE(ndipanov): We don't need to pass the node as it's not
++                # relevant for drivers that support live migration
++                self._call_livem_checks_on_host(host, limits=limits)
++            except (exception.Invalid,
++                    exception.MigrationPreCheckError) as e:
+                 LOG.debug("Skipping host: %(host)s because: %(e)s",
+                     {"host": host, "e": e})
+                 attempted_hosts.append(host)
+@@ -290,8 +295,8 @@ class LiveMigrationTask(base.TaskBase):
+                 # selected destination host in Placement, so we need to remove
+                 # those before moving on.
+                 self._remove_host_allocations(host, hoststate['nodename'])
+-                host = None
+-        return host
++                host = limits = None
++        return host, limits
+ 
+     def _remove_host_allocations(self, host, node):
+         """Removes instance allocations against the given host from Placement
+diff --git a/nova/objects/service.py b/nova/objects/service.py
+index ff90589..a00f64b 100644
+--- a/nova/objects/service.py
++++ b/nova/objects/service.py
+@@ -11,7 +11,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
+-
++#
++# Copyright (c) 2016-2017 Wind River Systems, Inc.
++#
++# The right to copy, distribute, modify, or otherwise make use
++# of this software may be licensed only pursuant to the terms
++# of an applicable Wind River license agreement.
++#
+ from oslo_log import log as logging
+ from oslo_utils import uuidutils
+ from oslo_utils import versionutils
+@@ -113,6 +119,8 @@ SERVICE_VERSION_HISTORY = (
+     # Version 22: A marker for the behaviour change of auto-healing code on the
+     # compute host regarding allocations against an instance
+     {'compute_rpc': '4.17'},
++    # Also changes to check_can_live_migrate_destination signature since
++    # we didn't want to bump the version.
+ )
+ 
+ 
+diff --git a/nova/tests/unit/compute/test_compute.py b/nova/tests/unit/compute/test_compute.py
+index 8021f42..326e0a4 100644
+--- a/nova/tests/unit/compute/test_compute.py
++++ b/nova/tests/unit/compute/test_compute.py
+@@ -17,6 +17,7 @@
+ #    under the License.
+ """Tests for compute service."""
+ 
++import contextlib
+ import datetime
+ from itertools import chain
+ import operator
+@@ -5908,6 +5909,13 @@ class ComputeTestCase(BaseTestCase,
+ 
+         # creating instance testdata
+         instance = self._create_fake_instance_obj({'host': 'dummy'})
++
++        @contextlib.contextmanager
++        def fake_cm():
++            yield
++
++        instance.mutated_migration_context = mock.MagicMock(
++            side_effect=fake_cm)
+         c = context.get_admin_context()
+         nw_info = fake_network.fake_get_instance_nw_info(self)
+         fake_notifier.NOTIFICATIONS = []
+@@ -5939,6 +5947,7 @@ class ComputeTestCase(BaseTestCase,
+         mock_ensure.assert_called_once_with(test.MatchType(objects.Instance),
+                                             nw_info)
+         mock_setup.assert_called_once_with(c, instance, self.compute.host)
++        instance.mutated_migration_context.assert_called_once_with()
+ 
+         # cleanup
+         db.instance_destroy(c, instance['uuid'])
+@@ -5992,7 +6001,7 @@ class ComputeTestCase(BaseTestCase,
+         mock_get_uuid.return_value = fake_bdms
+ 
+         # start test
+-        migration = objects.Migration()
++        migration = objects.Migration(status='accepted')
+         with mock.patch.object(self.compute.network_api,
+                                'setup_networks_on_host') as mock_setup:
+             self.assertRaises(test.TestingException,
+@@ -6045,7 +6054,7 @@ class ComputeTestCase(BaseTestCase,
+         mock_pre.return_value = migrate_data
+ 
+         # start test
+-        migration = objects.Migration()
++        migration = objects.Migration(status='accepted')
+         with test.nested(
+             mock.patch.object(
+                 self.compute.network_api, 'migrate_instance_start'),
+@@ -6433,6 +6442,15 @@ class ComputeTestCase(BaseTestCase,
+         # creating instance testdata
+         c = context.get_admin_context()
+         instance = self._create_fake_instance_obj({'host': 'dummy'})
++
++        @contextlib.contextmanager
++        def fake_cm():
++            yield
++
++        instance.mutated_migration_context = mock.MagicMock(
++            side_effect=fake_cm)
++        instance.drop_migration_context = mock.MagicMock()
++
+         fake_notifier.NOTIFICATIONS = []
+ 
+         # start test
+@@ -6457,6 +6475,8 @@ class ComputeTestCase(BaseTestCase,
+                          'root_device_name': None,
+                          'block_device_mapping': []},
+                         destroy_disks=True, migrate_data=None)
++        instance.mutated_migration_context.assert_called_once_with()
++        instance.drop_migration_context.assert_called_once_with()
+ 
+     @mock.patch('nova.virt.driver.ComputeDriver.'
+                 'rollback_live_migration_at_destination')
+@@ -6465,14 +6485,20 @@ class ComputeTestCase(BaseTestCase,
+     def test_rollback_live_migration_at_destination_network_fails(
+             self, mock_detect, mock_rollback):
+         c = context.get_admin_context()
++        mock_detect.return_value = 'fake-migrate-data'
+         instance = self._create_fake_instance_obj()
++        patch_mutate = mock.patch.object(instance, 'mutated_migration_context')
++        patch_drop = mock.patch.object(instance, 'drop_migration_context')
+         with mock.patch.object(self.compute.network_api,
+                                'setup_networks_on_host',
+                                side_effect=test.TestingException):
+-            self.assertRaises(
+-                test.TestingException,
+-                self.compute.rollback_live_migration_at_destination,
+-                c, instance, destroy_disks=True, migrate_data={})
++            with patch_mutate as mutate_mock, patch_drop as drop_mock:
++                self.assertRaises(
++                    test.TestingException,
++                    self.compute.rollback_live_migration_at_destination,
++                    c, instance, destroy_disks=True, migrate_data={})
++                mutate_mock.assert_called_once_with()
++                drop_mock.assert_called_once_with()
+         mock_rollback.assert_called_once_with(
+             c, instance, mock.ANY, mock.ANY,
+             destroy_disks=True,
+diff --git a/nova/tests/unit/compute/test_compute_mgr.py b/nova/tests/unit/compute/test_compute_mgr.py
+index efaa16a..d158cf1 100644
+--- a/nova/tests/unit/compute/test_compute_mgr.py
++++ b/nova/tests/unit/compute/test_compute_mgr.py
+@@ -30,6 +30,7 @@ import six
+ 
+ import nova
+ from nova.compute import build_results
++from nova.compute import claims
+ from nova.compute import manager
+ from nova.compute import power_state
+ from nova.compute import resource_tracker
+@@ -2321,17 +2322,74 @@ class ComputeManagerUnitTestCase(test.NoDBTestCase):
+ 
+         self.assertTrue(dest_check_data.is_volume_backed)
+ 
+-    def _test_check_can_live_migrate_destination(self, do_raise=False):
+-        db_instance = fake_instance.fake_db_instance(host='fake-host')
+-        instance = objects.Instance._from_db_object(
+-                self.context, objects.Instance(), db_instance)
+-        instance.host = 'fake-host'
++    @mock.patch.object(objects.Migration, 'id', return_value=1)
++    @mock.patch.object(compute_utils, 'EventReporter')
++    @mock.patch.object(objects.Instance, 'save')
++    @mock.patch.object(claims, 'NopClaim')
++    @mock.patch.object(claims, 'MoveClaim')
++    @mock.patch.object(objects.Migration, 'create')
++    def _test_check_can_live_migrate_destination(self, mig_create_mock,
++                                                 move_claim_class_mock,
++                                                 nop_claim_class_mock,
++                                                 save_mock, event_mock,
++                                                 mock_mig_id, do_raise=False,
++                                                 has_mig_data=False,
++                                                 migration=False,
++                                                 node=False,
++                                                 fail_claim=False):
++        claim_mock = mock.MagicMock()
++        claim_mock.claimed_numa_topology = None
++        claim_class_mock = nop_claim_class_mock
++
++        instance = fake_instance.fake_instance_obj(self.context,
++                                                   host='fake-host')
++
++        instance.system_metadata = {}
++        instance.numa_topology = None
++        instance.pci_requests = None
++        instance.pci_devices = None
++
+         block_migration = 'block_migration'
+         disk_over_commit = 'disk_over_commit'
+         src_info = 'src_info'
+         dest_info = 'dest_info'
+         dest_check_data = dict(foo='bar')
+         mig_data = dict(cow='moo')
++        expected_result = dict(mig_data)
++        hypervisor_hostname = 'fake-mini'
++
++        migration_obj = None
++        if migration:
++            migration_obj = mock.Mock(spec=objects.Migration)
++            migration_obj.id = 1
++            migration_obj.status = 'accepted'
++            migration_obj.migration_type = 'live-migration'
++            claim_class_mock = move_claim_class_mock
++
++        claim_class_mock.return_value = claim_mock
++
++        # override tracker with a version that doesn't need the database:
++        fake_rt = fake_resource_tracker.FakeResourceTracker(
++                self.compute.host,
++                self.compute.driver)
++
++        compute_node = mock.Mock(spec=objects.ComputeNode)
++        compute_node.memory_mb = 512
++        compute_node.memory_mb_used = 0
++        compute_node.local_gb = 259
++        compute_node.local_gb_used = 0
++        compute_node.vcpus = 2
++        compute_node.vcpus_used = 0
++        compute_node.get = mock.Mock()
++        compute_node.get.return_value = None
++        compute_node.hypervisor_hostname = hypervisor_hostname
++        fake_rt.compute_nodes[hypervisor_hostname] = compute_node
++
++        if fail_claim:
++            claim_class_mock.side_effect = (
++                exception.ComputeResourcesUnavailable(reason='tough luck'))
++        else:
++            claim_mock.create_migration_context.return_value = None
+ 
+         with test.nested(
+             mock.patch.object(self.compute, '_get_compute_info'),
+@@ -2342,50 +2400,96 @@ class ComputeManagerUnitTestCase(test.NoDBTestCase):
+             mock.patch.object(self.compute.driver,
+                               'cleanup_live_migration_destination_check'),
+             mock.patch.object(db, 'instance_fault_create'),
+-            mock.patch.object(compute_utils, 'EventReporter')
++            mock.patch.object(compute_utils, 'EventReporter'),
++            mock.patch.object(manager.ComputeManager, '_get_resource_tracker')
+         ) as (mock_get, mock_check_dest, mock_check_src, mock_check_clean,
+-              mock_fault_create, mock_event):
+-            mock_get.side_effect = (src_info, dest_info)
+-            mock_check_dest.return_value = dest_check_data
+-
++              mock_fault_create, mock_event, mock_get_rt):
++            mock_get_rt.return_value = fake_rt
+             if do_raise:
+                 mock_check_src.side_effect = test.TestingException
+                 mock_fault_create.return_value = \
+                     test_instance_fault.fake_faults['fake-uuid'][0]
++            if fail_claim:
++                mock_get.return_value = compute_node
++                mock_fault_create.return_value = \
++                    test_instance_fault.fake_faults['fake-uuid'][0]
+             else:
++                mock_get.side_effect = (compute_node, src_info, dest_info)
+                 mock_check_src.return_value = mig_data
+-
+-            result = self.compute.check_can_live_migrate_destination(
+-                self.context, instance=instance,
+-                block_migration=block_migration,
+-                disk_over_commit=disk_over_commit)
++                mock_check_dest.return_value = dest_check_data
++
++            if fail_claim:
++                self.assertRaises(
++                    exception.MigrationPreCheckError,
++                    self.compute.check_can_live_migrate_destination,
++                    self.context, instance=instance,
++                    block_migration=block_migration,
++                    disk_over_commit=disk_over_commit,
++                    migration=migration_obj, limits='fake-limits')
++            else:
++                result = self.compute.check_can_live_migrate_destination(
++                    self.context, instance=instance,
++                    block_migration=block_migration,
++                    disk_over_commit=disk_over_commit,
++                    migration=migration_obj, limits='fake-limits')
++                mock_check_dest.assert_called_once_with(self.context, instance,
++                    src_info, dest_info, block_migration, disk_over_commit)
++                self.assertEqual(expected_result, result)
++                mock_check_src.assert_called_once_with(self.context, instance,
++                                                       dest_check_data)
++                mock_event.assert_called_once_with(
++                    self.context, 'compute_check_can_live_migrate_destination',
++                    instance.uuid)
++                mock_check_clean.assert_called_once_with(self.context,
++                                                         dest_check_data)
++                mock_get.assert_has_calls(
++                    [mock.call(self.context, CONF.host),
++                     mock.call(self.context, 'fake-host'),
++                     mock.call(self.context, CONF.host)])
++            if migration:
++                claim_class_mock.assert_called_once_with(
++                    self.context, instance,
++                    hypervisor_hostname,
++                    mock.ANY, mock.ANY,
++                    fake_rt, compute_node,
++                    mock.ANY,
++                    overhead=mock.ANY,
++                    limits='fake-limits')
++            else:
++                claim_class_mock.assert_called_once_with(
++                    self.context, instance,
++                    hypervisor_hostname,
++                    mock.ANY,
++                    limits='fake-limits')
+ 
+             if do_raise:
+                 mock_fault_create.assert_called_once_with(self.context,
+                                                           mock.ANY)
+-            mock_check_src.assert_called_once_with(self.context, instance,
+-                                                   dest_check_data)
+-            mock_check_clean.assert_called_once_with(self.context,
+-                                                     dest_check_data)
+-            mock_get.assert_has_calls([mock.call(self.context, 'fake-host'),
+-                                       mock.call(self.context, CONF.host)])
+-            mock_check_dest.assert_called_once_with(self.context, instance,
+-                        src_info, dest_info, block_migration, disk_over_commit)
+-
+-            self.assertEqual(mig_data, result)
+-            mock_event.assert_called_once_with(
+-                self.context, 'compute_check_can_live_migrate_destination',
+-                instance.uuid)
+ 
+     def test_check_can_live_migrate_destination_success(self):
+         self._test_check_can_live_migrate_destination()
+ 
++    def test_check_can_live_migrate_destination_success_mig(self):
++        self._test_check_can_live_migrate_destination(migration=True)
++
++    def test_check_can_live_migrate_destination_success_mig_node(self):
++        self._test_check_can_live_migrate_destination(migration=True,
++                                                      node=True)
++
++    def test_check_can_live_migrate_destination_success_w_mig_data(self):
++        self._test_check_can_live_migrate_destination(has_mig_data=True)
++
+     def test_check_can_live_migrate_destination_fail(self):
+         self.assertRaises(
+                 test.TestingException,
+                 self._test_check_can_live_migrate_destination,
+                 do_raise=True)
+ 
++    def test_check_can_live_migrate_destination_fail_claim(self):
++        self._test_check_can_live_migrate_destination(migration=True,
++                                                      node=True,
++                                                      fail_claim=True)
++
+     @mock.patch('nova.compute.manager.InstanceEvents._lock_name')
+     def test_prepare_for_instance_event(self, lock_name_mock):
+         inst_obj = objects.Instance(uuid=uuids.instance)
+@@ -5845,6 +5949,7 @@ class ComputeManagerMigrationTestCase(test.NoDBTestCase):
+         def _do_it(mock_mig_save):
+             instance = objects.Instance(uuid=uuids.fake)
+             migration = objects.Migration()
++            migration.status = 'accepted'
+             self.compute.live_migration(self.context,
+                                         mock.sentinel.dest,
+                                         instance,
+@@ -5911,15 +6016,18 @@ class ComputeManagerMigrationTestCase(test.NoDBTestCase):
+     def test_pre_live_migration_handles_dict(self):
+         compute = manager.ComputeManager()
+ 
++        @mock.patch.object(self.instance, 'mutated_migration_context')
+         @mock.patch.object(compute, '_notify_about_instance_usage')
+         @mock.patch.object(compute, 'network_api')
+         @mock.patch.object(compute.driver, 'pre_live_migration')
+         @mock.patch.object(compute, '_get_instance_block_device_info')
+         @mock.patch.object(compute_utils, 'is_volume_backed_instance')
+-        def _test(mock_ivbi, mock_gibdi, mock_plm, mock_nwapi, mock_notify):
++        def _test(mock_ivbi, mock_gibdi, mock_plm, mock_nwapi, mock_notify,
++                  mock_mc):
+             migrate_data = migrate_data_obj.LiveMigrateData()
+             mock_plm.return_value = migrate_data
+-            r = compute.pre_live_migration(self.context, {'uuid': 'foo'},
++
++            r = compute.pre_live_migration(self.context, self.instance,
+                                            False, {}, {})
+             self.assertIsInstance(r, dict)
+             self.assertIsInstance(mock_plm.call_args_list[0][0][5],
+@@ -5930,18 +6038,21 @@ class ComputeManagerMigrationTestCase(test.NoDBTestCase):
+     def test_live_migration_handles_dict(self):
+         compute = manager.ComputeManager()
+ 
++        @mock.patch.object(self.instance, 'mutated_migration_context')
+         @mock.patch.object(compute, 'compute_rpcapi')
+         @mock.patch.object(compute, 'driver')
+-        def _test(mock_driver, mock_rpc):
++        def _test(mock_driver, mock_rpc, mock_mc):
+             migrate_data = migrate_data_obj.LiveMigrateData()
+             migration = objects.Migration()
++            migration.status = 'queued'
+             migration.save = mock.MagicMock()
+             mock_rpc.pre_live_migration.return_value = migrate_data
+-            compute._do_live_migration(self.context, 'foo', {'uuid': 'foo'},
++            compute._do_live_migration(self.context, 'foo', self.instance,
+                                        False, migration, {})
+             self.assertIsInstance(
+                 mock_rpc.pre_live_migration.call_args_list[0][0][5],
+                 migrate_data_obj.LiveMigrateData)
++            mock_mc.assert_called_once_with()
+ 
+         _test()
+ 
+@@ -6017,6 +6128,9 @@ class ComputeManagerMigrationTestCase(test.NoDBTestCase):
+     def test_post_live_migration_at_destination_success(self):
+ 
+         @mock.patch.object(self.instance, 'save')
++        @mock.patch.object(self.instance, 'mutated_migration_context')
++        @mock.patch.object(self.instance, 'drop_migration_context')
++        @mock.patch.object(self.instance, 'apply_migration_context')
+         @mock.patch.object(self.compute.network_api, 'get_instance_nw_info',
+                            return_value='test_network')
+         @mock.patch.object(self.compute.network_api, 'setup_networks_on_host')
+@@ -6024,19 +6138,24 @@ class ComputeManagerMigrationTestCase(test.NoDBTestCase):
+         @mock.patch.object(self.compute, '_notify_about_instance_usage')
+         @mock.patch.object(self.compute, '_get_instance_block_device_info')
+         @mock.patch.object(self.compute, '_get_power_state', return_value=1)
++        @mock.patch.object(objects.Migration, 'get_by_instance_and_status')
+         @mock.patch.object(self.compute, '_get_compute_info')
+         @mock.patch.object(self.compute.driver,
+                            'post_live_migration_at_destination')
+         def _do_test(post_live_migration_at_destination, _get_compute_info,
++                     get_by_instance_and_status,
+                      _get_power_state, _get_instance_block_device_info,
+                      _notify_about_instance_usage, migrate_instance_finish,
+-                     setup_networks_on_host, get_instance_nw_info, save):
+-
++                     setup_networks_on_host, get_instance_nw_info,
++                     apply_migration_context, drop_migration_context,
++                     mutated_migration_context, save):
+             cn = mock.Mock(spec_set=['hypervisor_hostname'])
++            migration = mock.Mock(spec=objects.Migration)
+             cn.hypervisor_hostname = 'test_host'
+             _get_compute_info.return_value = cn
+             cn_old = self.instance.host
+             instance_old = self.instance
++            get_by_instance_and_status.return_value = migration
+ 
+             self.compute.post_live_migration_at_destination(
+                 self.context, self.instance, False)
+@@ -6079,31 +6198,48 @@ class ComputeManagerMigrationTestCase(test.NoDBTestCase):
+             self.assertIsNone(self.instance.task_state)
+             save.assert_called_once_with(
+                 expected_task_state=task_states.MIGRATING)
++            self.assertEqual('finished', migration.status)
++            mutated_migration_context.assert_called_once_with()
++            apply_migration_context.assert_called_once_with()
++            drop_migration_context.assert_called_once_with()
+ 
+         _do_test()
+ 
+     def test_post_live_migration_at_destination_compute_not_found(self):
+ 
+         @mock.patch.object(self.instance, 'save')
++        @mock.patch.object(self.instance, 'mutated_migration_context')
++        @mock.patch.object(self.instance, 'drop_migration_context')
++        @mock.patch.object(self.instance, 'apply_migration_context')
+         @mock.patch.object(self.compute, 'network_api')
+         @mock.patch.object(self.compute, '_notify_about_instance_usage')
+         @mock.patch.object(self.compute, '_get_instance_block_device_info')
+         @mock.patch.object(self.compute, '_get_power_state', return_value=1)
++        @mock.patch.object(objects.Migration, 'get_by_instance_and_status')
+         @mock.patch.object(self.compute, '_get_compute_info',
+                            side_effect=exception.ComputeHostNotFound(
+                                host=uuids.fake_host))
+         @mock.patch.object(self.compute.driver,
+                            'post_live_migration_at_destination')
+         def _do_test(post_live_migration_at_destination, _get_compute_info,
++                     get_by_instance_and_status,
+                      _get_power_state, _get_instance_block_device_info,
+-                     _notify_about_instance_usage, network_api, save):
++                     _notify_about_instance_usage, network_api,
++                     apply_migration_context, drop_migration_context,
++                     mutated_migration_context, save):
+             cn = mock.Mock(spec_set=['hypervisor_hostname'])
++            migration = mock.Mock(spec=objects.Migration)
+             cn.hypervisor_hostname = 'test_host'
+             _get_compute_info.return_value = cn
++            get_by_instance_and_status.return_value = migration
+ 
+             self.compute.post_live_migration_at_destination(
+                 self.context, self.instance, False)
+             self.assertIsNone(self.instance.node)
++            self.assertEqual('finished', migration.status)
++            mutated_migration_context.assert_called_once_with()
++            apply_migration_context.assert_called_once_with()
++            drop_migration_context.assert_called_once_with()
+ 
+         _do_test()
+ 
+@@ -6111,26 +6247,40 @@ class ComputeManagerMigrationTestCase(test.NoDBTestCase):
+ 
+         @mock.patch.object(compute_utils, 'add_instance_fault_from_exc')
+         @mock.patch.object(self.instance, 'save')
++        @mock.patch.object(self.instance, 'mutated_migration_context')
++        @mock.patch.object(self.instance, 'drop_migration_context')
++        @mock.patch.object(self.instance, 'apply_migration_context')
+         @mock.patch.object(self.compute, 'network_api')
+         @mock.patch.object(self.compute, '_notify_about_instance_usage')
+         @mock.patch.object(self.compute, '_get_instance_block_device_info')
+         @mock.patch.object(self.compute, '_get_power_state', return_value=1)
+         @mock.patch.object(self.compute, '_get_compute_info')
++        @mock.patch.object(objects.Migration, 'get_by_instance_and_status')
+         @mock.patch.object(self.compute.driver,
+                            'post_live_migration_at_destination',
+                            side_effect=exception.NovaException)
+-        def _do_test(post_live_migration_at_destination, _get_compute_info,
++        def _do_test(post_live_migration_at_destination,
++                     get_by_instance_and_status,
++                     _get_compute_info,
+                      _get_power_state, _get_instance_block_device_info,
+-                     _notify_about_instance_usage, network_api, save,
+-                     add_instance_fault_from_exc):
++                     _notify_about_instance_usage, network_api,
++                     apply_migration_context, drop_migration_context,
++                     mutated_migration_context,
++                     save, add_instance_fault_from_exc):
+             cn = mock.Mock(spec_set=['hypervisor_hostname'])
++            migration = mock.Mock(spec=objects.Migration)
+             cn.hypervisor_hostname = 'test_host'
+             _get_compute_info.return_value = cn
++            get_by_instance_and_status.return_value = migration
+ 
+             self.assertRaises(exception.NovaException,
+                               self.compute.post_live_migration_at_destination,
+                               self.context, self.instance, False)
+             self.assertEqual(vm_states.ERROR, self.instance.vm_state)
++            self.assertEqual('failed', migration.status)
++            mutated_migration_context.assert_called_once_with()
++            apply_migration_context.assert_called_once_with()
++            drop_migration_context.assert_called_once_with()
+ 
+         _do_test()
+ 
+diff --git a/nova/tests/unit/compute/test_resource_tracker.py b/nova/tests/unit/compute/test_resource_tracker.py
+index 4cec1a9..23d334b 100644
+--- a/nova/tests/unit/compute/test_resource_tracker.py
++++ b/nova/tests/unit/compute/test_resource_tracker.py
+@@ -2275,23 +2275,6 @@ class TestRebuild(BaseTestCase):
+         inst_save_mock.assert_called_once_with()
+ 
+ 
+-class TestUpdateUsageFromMigration(test.NoDBTestCase):
+-    @mock.patch('nova.compute.resource_tracker.ResourceTracker.'
+-                '_get_instance_type')
+-    def test_unsupported_move_type(self, get_mock):
+-        rt = resource_tracker.ResourceTracker(mock.sentinel.virt_driver,
+-                                              _HOSTNAME)
+-        migration = objects.Migration(migration_type='live-migration')
+-        # For same-node migrations, the RT's _get_instance_type() method is
+-        # called if there is a migration that is trackable. Here, we want to
+-        # ensure that this method isn't called for live-migration migrations.
+-        rt._update_usage_from_migration(mock.sentinel.ctx,
+-                                        mock.sentinel.instance,
+-                                        migration,
+-                                        _NODENAME)
+-        self.assertFalse(get_mock.called)
+-
+-
+ class TestUpdateUsageFromMigrations(BaseTestCase):
+     @mock.patch('nova.compute.resource_tracker.ResourceTracker.'
+                 '_update_usage_from_migration')
+@@ -2742,22 +2725,6 @@ class ComputeMonitorTestCase(BaseTestCase):
+         self.assertEqual(metrics, expected_metrics)
+ 
+ 
+-class TestIsTrackableMigration(test.NoDBTestCase):
+-    def test_true(self):
+-        mig = objects.Migration()
+-        for mig_type in ('resize', 'migration', 'evacuation'):
+-            mig.migration_type = mig_type
+-
+-            self.assertTrue(resource_tracker._is_trackable_migration(mig))
+-
+-    def test_false(self):
+-        mig = objects.Migration()
+-        for mig_type in ('live-migration',):
+-            mig.migration_type = mig_type
+-
+-            self.assertFalse(resource_tracker._is_trackable_migration(mig))
+-
+-
+ class OverCommitTestCase(BaseTestCase):
+     def test_cpu_allocation_ratio_none_negative(self):
+         self.assertRaises(ValueError,
+diff --git a/nova/tests/unit/compute/test_rpcapi.py b/nova/tests/unit/compute/test_rpcapi.py
+index ab82538..56bca43 100644
+--- a/nova/tests/unit/compute/test_rpcapi.py
++++ b/nova/tests/unit/compute/test_rpcapi.py
+@@ -11,7 +11,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
+-
++#
++# Copyright (c) 2016-2017 Wind River Systems, Inc.
++#
++# The right to copy, distribute, modify, or otherwise make use
++# of this software may be licensed only pursuant to the terms
++# of an applicable Wind River license agreement.
++#
+ """
+ Unit Tests for nova.compute.rpcapi
+ """
+@@ -23,6 +29,7 @@ from nova.compute import rpcapi as compute_rpcapi
+ import nova.conf
+ from nova import context
+ from nova import exception
++from nova import objects
+ from nova.objects import block_device as objects_block_dev
+ from nova.objects import migrate_data as migrate_data_obj
+ from nova.objects import migration as migration_obj
+@@ -107,7 +114,7 @@ class ComputeRpcAPITestCase(test.NoDBTestCase):
+         self.assertEqual('4.4', compute_rpcapi.LAST_VERSION)
+ 
+     def _test_compute_api(self, method, rpc_method,
+-                          expected_args=None, **kwargs):
++                          expected_args=None, drop_kwargs=None, **kwargs):
+         ctxt = context.RequestContext('fake_user', 'fake_project')
+ 
+         rpcapi = kwargs.pop('rpcapi_class', compute_rpcapi.ComputeAPI)()
+@@ -124,12 +131,17 @@ class ComputeRpcAPITestCase(test.NoDBTestCase):
+         expected_version = kwargs.pop('version', base_version)
+ 
+         expected_kwargs = kwargs.copy()
++        drop_kwargs = drop_kwargs or []
++        for kwarg in drop_kwargs:
++            expected_kwargs.pop(kwarg, None)
++
+         if expected_args:
+             expected_kwargs.update(expected_args)
+         if 'host_param' in expected_kwargs:
+             expected_kwargs['host'] = expected_kwargs.pop('host_param')
+         else:
+             expected_kwargs.pop('host', None)
++            expected_kwargs.pop('destination', None)
+ 
+         cast_and_call = ['confirm_resize', 'stop_instance']
+         if rpc_method == 'call' and method in cast_and_call:
+@@ -139,6 +151,8 @@ class ComputeRpcAPITestCase(test.NoDBTestCase):
+                 kwargs['do_cast'] = False
+         if 'host' in kwargs:
+             host = kwargs['host']
++        elif 'destination' in kwargs:
++            host = kwargs['destination']
+         elif 'instances' in kwargs:
+             host = kwargs['instances'][0]['host']
+         else:
+@@ -248,6 +262,27 @@ class ComputeRpcAPITestCase(test.NoDBTestCase):
+         self._test_compute_api('change_instance_metadata', 'cast',
+                 instance=self.fake_instance_obj, diff={}, version='4.0')
+ 
++    def test_check_can_live_migrate_destination(self):
++        self._test_compute_api('check_can_live_migrate_destination', 'call',
++                instance=self.fake_instance_obj, destination="fake",
++                block_migration=False, disk_over_commit=False, migration=None,
++                limits=None, version='4.11',
++                _return_value=migrate_data_obj.LiveMigrateData())
++
++    def test_check_can_live_migrate_destination_downgrades(self):
++        self.flags(group='upgrade_levels', compute='4.0')
++        migration = objects.Migration(dest_compute=None)
++        with mock.patch('nova.objects.Migration.save') as mock_save:
++            self._test_compute_api(
++                    'check_can_live_migrate_destination', 'call',
++                    instance=self.fake_instance_obj, destination="fake",
++                    block_migration=False, disk_over_commit=False,
++                    migration=migration, version='4.0',
++                    drop_kwargs=['migration'],
++                    _return_value=migrate_data_obj.LiveMigrateData())
++            mock_save.assert_called_once_with()
++            self.assertEqual("fake", migration.dest_compute)
++
+     def test_check_instance_shared_storage(self):
+         self._test_compute_api('check_instance_shared_storage', 'call',
+                 instance=self.fake_instance_obj, data='foo',
+diff --git a/nova/tests/unit/conductor/tasks/test_live_migrate.py b/nova/tests/unit/conductor/tasks/test_live_migrate.py
+index a75709f..eb95152 100644
+--- a/nova/tests/unit/conductor/tasks/test_live_migrate.py
++++ b/nova/tests/unit/conductor/tasks/test_live_migrate.py
+@@ -95,12 +95,10 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
+         with test.nested(
+             mock.patch.object(self.task, '_check_host_is_up'),
+             mock.patch.object(self.task, '_find_destination'),
+-            mock.patch.object(self.task.compute_rpcapi, 'live_migration'),
+-            mock.patch.object(self.migration, 'save')
+-        ) as (mock_check, mock_find, mock_mig, mock_save):
+-            mock_find.return_value = "found_host"
++            mock.patch.object(self.task.compute_rpcapi, 'live_migration')
++        ) as (mock_check, mock_find, mock_mig):
++            mock_find.return_value = ("found_host", None)
+             mock_mig.return_value = "bob"
+-
+             self.assertEqual("bob", self.task.execute())
+             mock_check.assert_called_once_with(self.instance_host)
+             mock_find.assert_called_once_with()
+@@ -111,8 +109,6 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
+                 block_migration=self.block_migration,
+                 migration=self.migration,
+                 migrate_data=None)
+-            self.assertTrue(mock_save.called)
+-            self.assertEqual('found_host', self.migration.dest_compute)
+ 
+     def test_check_instance_is_active_passes_when_paused(self):
+         self.task.instance['power_state'] = power_state.PAUSED
+@@ -179,7 +175,8 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
+                           mock.call(self.destination)],
+                          mock_get_info.call_args_list)
+         mock_check.assert_called_once_with(self.context, self.instance,
+-            self.destination, self.block_migration, self.disk_over_commit)
++            self.destination, self.block_migration, self.disk_over_commit,
++            migration=self.migration, limits=self.task.sched_limits)
+ 
+     def test_check_requested_destination_fails_with_same_dest(self):
+         self.task.destination = "same"
+@@ -294,12 +291,15 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
+         self.fake_spec.reset_forced_destinations()
+         self.task.scheduler_client.select_destinations(
+             self.context, self.fake_spec, [self.instance.uuid]).AndReturn(
+-                        [{'host': 'host1'}])
++                [{'host': 'host1',
++                  'nodename': 'node1',
++                  'limits': 'fake-limits'}])
+         self.task._check_compatible_with_source_hypervisor("host1")
+-        self.task._call_livem_checks_on_host("host1")
++        self.task._call_livem_checks_on_host("host1", limits='fake-limits')
+ 
+         self.mox.ReplayAll()
+-        self.assertEqual("host1", self.task._find_destination())
++        self.assertEqual(("host1", 'fake-limits'),
++                         self.task._find_destination())
+ 
+         # Make sure the request_spec was updated to include the cell
+         # mapping.
+@@ -328,9 +328,12 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
+                     check_compat, call_livem_checks):
+             get_image.return_value = "image"
+             from_components.return_value = another_spec
+-            select_dest.return_value = [{'host': 'host1'}]
++            select_dest.return_value = [{'host': 'host1',
++                                         'nodename': 'node1',
++                                         'limits': 'fake-limits'}]
+ 
+-            self.assertEqual("host1", task._find_destination())
++            self.assertEqual(("host1", 'fake-limits'),
++                             task._find_destination())
+ 
+             get_image.assert_called_once_with(self.instance.system_metadata)
+             setup_ig.assert_called_once_with(self.context, another_spec)
+@@ -340,7 +343,8 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
+             # mapping.
+             self.assertIsNotNone(another_spec.requested_destination.cell)
+             check_compat.assert_called_once_with("host1")
+-            call_livem_checks.assert_called_once_with("host1")
++            call_livem_checks.assert_called_once_with("host1",
++                                                      limits='fake-limits')
+         do_test()
+ 
+     def test_find_destination_no_image_works(self):
+@@ -356,12 +360,15 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
+         scheduler_utils.setup_instance_group(self.context, self.fake_spec)
+         self.task.scheduler_client.select_destinations(self.context,
+                 self.fake_spec, [self.instance.uuid]).AndReturn(
+-                        [{'host': 'host1'}])
++                        [{'host': 'host1',
++                          'nodename': 'node1',
++                          'limits': 'fake-limits'}])
+         self.task._check_compatible_with_source_hypervisor("host1")
+-        self.task._call_livem_checks_on_host("host1")
++        self.task._call_livem_checks_on_host("host1", limits='fake-limits')
+ 
+         self.mox.ReplayAll()
+-        self.assertEqual("host1", self.task._find_destination())
++        self.assertEqual(("host1", 'fake-limits'),
++                         self.task._find_destination())
+ 
+     def _test_find_destination_retry_hypervisor_raises(self, error):
+         self.mox.StubOutWithMock(utils, 'get_image_from_system_metadata')
+@@ -377,20 +384,24 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
+         scheduler_utils.setup_instance_group(self.context, self.fake_spec)
+         self.task.scheduler_client.select_destinations(self.context,
+                 self.fake_spec, [self.instance.uuid]).AndReturn(
+-                        [{'host': 'host1', 'nodename': 'node1'}])
++                        [{'host': 'host1', 'nodename': 'node1',
++                          'limits': 'fake-limits'}])
+         self.task._check_compatible_with_source_hypervisor("host1")\
+                 .AndRaise(error)
+ 
+         self.task.scheduler_client.select_destinations(self.context,
+                 self.fake_spec, [self.instance.uuid]).AndReturn(
+-                        [{'host': 'host2'}])
++                        [{'host': 'host2',
++                          'nodename': 'node2',
++                          'limits': 'fake-limits'}])
+         self.task._check_compatible_with_source_hypervisor("host2")
+-        self.task._call_livem_checks_on_host("host2")
++        self.task._call_livem_checks_on_host("host2", limits='fake-limits')
+ 
+         self.mox.ReplayAll()
+         with mock.patch.object(self.task,
+                                '_remove_host_allocations') as remove_allocs:
+-            self.assertEqual("host2", self.task._find_destination())
++            self.assertEqual(("host2", 'fake-limits'),
++                             self.task._find_destination())
+         # Should have removed allocations for the first host.
+         remove_allocs.assert_called_once_with('host1', 'node1')
+ 
+@@ -402,7 +413,7 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
+         self._test_find_destination_retry_hypervisor_raises(
+                 exception.InvalidHypervisorType)
+ 
+-    def test_find_destination_retry_with_invalid_livem_checks(self):
++    def _test_find_destination_retry_livem_checks_fail(self, error):
+         self.flags(migrate_max_retries=1)
+         self.mox.StubOutWithMock(utils, 'get_image_from_system_metadata')
+         self.mox.StubOutWithMock(scheduler_utils, 'setup_instance_group')
+@@ -417,21 +428,26 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
+         scheduler_utils.setup_instance_group(self.context, self.fake_spec)
+         self.task.scheduler_client.select_destinations(self.context,
+                 self.fake_spec, [self.instance.uuid]).AndReturn(
+-                        [{'host': 'host1', 'nodename': 'node1'}])
++                        [{'host': 'host1', 'nodename': 'node1',
++                          'limits': 'fake-limits'}])
+         self.task._check_compatible_with_source_hypervisor("host1")
+-        self.task._call_livem_checks_on_host("host1")\
+-                .AndRaise(exception.Invalid)
++        self.task._call_livem_checks_on_host(
++            "host1", limits='fake-limits').AndRaise(error)
+ 
+         self.task.scheduler_client.select_destinations(self.context,
+                 self.fake_spec, [self.instance.uuid]).AndReturn(
+-                        [{'host': 'host2'}])
++                        [{'host': 'host2',
++                          'nodename': 'node2',
++                          'limits': 'fake-limits'}])
+         self.task._check_compatible_with_source_hypervisor("host2")
+-        self.task._call_livem_checks_on_host("host2")
++        self.task._call_livem_checks_on_host(
++            "host2", limits='fake-limits')
+ 
+         self.mox.ReplayAll()
+         with mock.patch.object(self.task,
+                                '_remove_host_allocations') as remove_allocs:
+-            self.assertEqual("host2", self.task._find_destination())
++            self.assertEqual(("host2", 'fake-limits'),
++                             self.task._find_destination())
+         # Should have removed allocations for the first host.
+         remove_allocs.assert_called_once_with('host1', 'node1')
+ 
+@@ -450,24 +466,36 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
+         scheduler_utils.setup_instance_group(self.context, self.fake_spec)
+         self.task.scheduler_client.select_destinations(self.context,
+                 self.fake_spec, [self.instance.uuid]).AndReturn(
+-                        [{'host': 'host1', 'nodename': 'node1'}])
++                        [{'host': 'host1', 'nodename': 'node1',
++                          'limits': 'fake-limits'}])
+         self.task._check_compatible_with_source_hypervisor("host1")
+-        self.task._call_livem_checks_on_host("host1")\
+-                .AndRaise(exception.MigrationPreCheckError("reason"))
++        self.task._call_livem_checks_on_host(
++            "host1", limits='fake-limits').AndRaise(
++                exception.MigrationPreCheckError("reason"))
+ 
+         self.task.scheduler_client.select_destinations(self.context,
+                 self.fake_spec, [self.instance.uuid]).AndReturn(
+-                        [{'host': 'host2'}])
++                        [{'host': 'host2',
++                          'nodename': 'node2',
++                          'limits': 'fake-limits'}])
+         self.task._check_compatible_with_source_hypervisor("host2")
+-        self.task._call_livem_checks_on_host("host2")
++        self.task._call_livem_checks_on_host("host2", limits='fake-limits')
+ 
+         self.mox.ReplayAll()
+         with mock.patch.object(self.task,
+                                '_remove_host_allocations') as remove_allocs:
+-            self.assertEqual("host2", self.task._find_destination())
++            self.assertEqual(("host2", 'fake-limits'),
++                             self.task._find_destination())
+         # Should have removed allocations for the first host.
+         remove_allocs.assert_called_once_with('host1', 'node1')
+ 
++    def test_find_destination_retry_with_invalid_livem_checks(self):
++        self._test_find_destination_retry_livem_checks_fail(exception.Invalid)
++
++    def test_find_destination_retry_with_failed_mig_pre_checks_fail(self):
++        self._test_find_destination_retry_livem_checks_fail(
++            exception.MigrationPreCheckError("reason"))
++
+     def test_find_destination_retry_exceeds_max(self):
+         self.flags(migrate_max_retries=0)
+         self.mox.StubOutWithMock(utils, 'get_image_from_system_metadata')
+@@ -482,7 +510,8 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
+         scheduler_utils.setup_instance_group(self.context, self.fake_spec)
+         self.task.scheduler_client.select_destinations(self.context,
+                 self.fake_spec, [self.instance.uuid]).AndReturn(
+-                        [{'host': 'host1', 'nodename': 'node1'}])
++                        [{'host': 'host1', 'nodename': 'node1',
++                          'limits': 'fake-limits'}])
+         self.task._check_compatible_with_source_hypervisor("host1")\
+                 .AndRaise(exception.DestinationHypervisorTooOld)
+ 
+diff --git a/nova/virt/libvirt/driver.py b/nova/virt/libvirt/driver.py
+index 6826a2c..04de4dd 100644
+--- a/nova/virt/libvirt/driver.py
++++ b/nova/virt/libvirt/driver.py
+@@ -6376,6 +6376,9 @@ class LibvirtDriver(driver.ComputeDriver):
+             params = None
+             new_xml_str = None
+             if CONF.libvirt.virt_type != "parallels":
++                # TODO(ndipanov): Update this method to update the new XML with
++                # recalculated NUMA/CPU pinning information that is stored in
++                # MigrationContext on the Instance
+                 new_xml_str = libvirt_migrate.get_updated_guest_xml(
+                     # TODO(sahid): It's not a really good idea to pass
+                     # the method _get_volume_config and we should to find
+-- 
+2.7.4
+

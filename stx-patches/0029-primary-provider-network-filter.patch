@@ -1,0 +1,1041 @@
+From dfba1eefb8e334b966fb088d2d4b6b0ab4d15620 Mon Sep 17 00:00:00 2001
+From: Steven Webster <steven.webster@windriver.com>
+Date: Thu, 26 Jan 2017 17:06:03 -0500
+Subject: [PATCH 029/143] primary: provider network filter
+
+This commit adds scheduling filter to drop all compute nodes which do
+not have access to the physical networks required by the instance as
+specified in "provider:physical_network".
+
+Contains content from the following R3 commits:
+
+b5d91cc Port provider network filter
+    This commit merges the following R3 commits:
+
+    89f1265 Port provider network filter to Mitaka
+        This commit adds scheduling filter to drop all compute nodes which do
+        not have access to the physical networks required by the instance as
+        specified in "provider:physical_network".
+
+        Contains content from the following R2 commits:
+            2b6f245 Porting Aggregate Physical Provider Network filter
+                    Fix WebSocket unit tests in python 2.7.3
+            - includes adding of provide network handling in _create_instance and
+             _scheduler along with aggregrate provider network filter and unit test
+             for filter.  Port excludes the WebSocket unit changes as they are no
+             longer required.
+            1988bfb Add keyring as dependency
+            edcafa0 Fix AggregateProviderNetworkFilter for kilo3 rebase changes
+            462c688 Determine network from portid when determining
+                    providernets when network_id not specified
+    7f210c5 OpenStack Rebase to Mitaka: Keystone V3
+        Update a nova addition to use keystone V3 to get admin context
+        
+
+    dc930c9 Eliminate stack traces from nova scheduler related to get_real_admin_context
+        The get_real_admin_context call is no longer needed.
+        get_admin_context works correctly with the neutron API calls.
+
+a41a73d Use port vif_model if exists when launching instance
+   When launching an instance, if networking is defined by a port id, then if
+   wrs-binding:vif_model is set on the specified port, that value is used as
+   the vif_model for the NIC. However, if the vif_model is also specified in
+   the --nic argument, then precedence will be given to that value.
+
+43b13d1 Incorrect interface type reported when configuring SR-IOV
+   with --vnic-type direct
+   Booting an instance with an SR-IOV port that was created manually with neutron
+   will incorrectly show the vif-model for this port has 'virtio'. When the port
+   is initially created (using 'neutron port-create'), the vif-model is set to
+   'default'. But booting the guest updates the vif-model on the port to
+   'virtio'.
+
+   The fix is to change the vif-model from 'virtio' to 'pci-sriov' when the list
+   of requested network is iterated for request specifying a port-id (only do
+   this if the vnic type is 'direct').
+
+64eca6e Add semantic check for disabling vif-model when using a port-id
+   Added the following semantic checks when using port_id:
+   - A port with binding type 'direct' can only be of vif_model None or
+     pci-sriov.
+   - A port with binding type 'direct-physical' can only be of vif_model None or
+     pci-passthrough.
+   - A port with binding type 'normal' can be of any vif_model except
+     pci-sriov or pci-passthrough.
+
+82521f5 Bug 239: Boot SRIOV/PT instance with pre-created neutron port fails
+   The change introduced by upstream commit 3e46a44, which
+   moved the instance database creation from
+   nova.compute.api._provision_instances
+   to conductor, means that network provider filter in scheduler can
+   no longer use instance object on the first pass to retrieve
+   instance info, as the instance now gets created later in the
+   database.
+
+__TYPE_primary
+__TAG_pci-sriov
+__R4_commit_2796ab1
+__R3_commit_b5d91cc
+__TC2936,TC2984,TC2985,TC2986,TC8538
+---
+ nova/compute/api.py                                | 100 +++++++++++
+ nova/network/neutronv2/api.py                      |  10 ++
+ nova/pci/utils.py                                  |  15 ++
+ nova/scheduler/filter_scheduler.py                 |  50 ++++++
+ .../filters/aggregate_provider_network_filter.py   |  72 ++++++++
+ .../unit/api/openstack/compute/test_serversV21.py  |  15 +-
+ nova/tests/unit/compute/test_compute_api.py        |   4 +-
+ .../test_aggregate_provider_network_filters.py     | 126 ++++++++++++++
+ .../tests/unit/scheduler/test_caching_scheduler.py |  29 +++-
+ nova/tests/unit/scheduler/test_filter_scheduler.py | 190 +++++++++++++++++++--
+ 10 files changed, 593 insertions(+), 18 deletions(-)
+ create mode 100644 nova/scheduler/filters/aggregate_provider_network_filter.py
+ create mode 100644 nova/tests/unit/scheduler/filters/test_aggregate_provider_network_filters.py
+
+diff --git a/nova/compute/api.py b/nova/compute/api.py
+index b6e5ec2..46f2636 100644
+--- a/nova/compute/api.py
++++ b/nova/compute/api.py
+@@ -88,6 +88,10 @@ from nova import utils
+ from nova.virt import hardware
+ from nova.volume import cinder
+ 
++# network provider filter
++from nova import context as novacontext
++from nova.pci import utils as pci_utils
++
+ LOG = logging.getLogger(__name__)
+ 
+ get_notifier = functools.partial(rpc.get_notifier, service='compute')
+@@ -1133,15 +1137,111 @@ class API(base.Base):
+ 
+         # - provider physical network
+         if requested_networks:
++            if context.is_admin:
++                admin_context = context
++            else:
++                admin_context = novacontext.get_admin_context()
++            system_metadata = base_options['system_metadata']
++            physkey = 'provider:physical_network'
++            hint = {physkey: set()}
++
+             hw_vif_model = None
+             properties = boot_meta.get('properties', {})
+             hw_vif_model = properties.get('hw_vif_model')
+             if hw_vif_model is None:
+                 hw_vif_model = CONF.default_vif_model
+             for ntwk in requested_networks:
++                network_uuid = ntwk.network_id
++                # 
++                # If port_id specified but not network_uuid
++                # determine the network from the port to determine provider
++                # network info.
++                if ntwk.port_id is not None and network_uuid is None:
++                    # determine network_id from port_id
++                    try:
++                        port_info = self.network_api.show_port(admin_context,
++                                                               ntwk.port_id)
++                    except Exception as e:
++                        LOG.warning("Cannot get network from port (%r)", e)
++                        raise
++                    network_uuid = port_info['port']['network_id']
++                    vnic_type = port_info['port'].get('binding:vnic_type')
++                    port_vif_model = port_info['port'].get(
++                        'wrs-binding:vif_model'
++                    )
++
++                    # Validate vif_model if specified.
++                    if ((vnic_type ==
++                            network_model.VNIC_TYPE_DIRECT and
++                            ntwk.vif_model not in [None,
++                                  network_model.VIF_MODEL_PCI_SRIOV]) or
++                        (vnic_type ==
++                            network_model.VNIC_TYPE_DIRECT_PHYSICAL and
++                            ntwk.vif_model not in [None,
++                                  network_model.VIF_MODEL_PCI_PASSTHROUGH]) or
++                        (vnic_type ==
++                            network_model.VNIC_TYPE_NORMAL and
++                            ntwk.vif_model in
++                                [network_model.VIF_MODEL_PCI_SRIOV,
++                                 network_model.VIF_MODEL_PCI_PASSTHROUGH])):
++                        msg = (_("Invalid vif_model %(vif_model)s for "
++                                 "vnic type %(vnic_type)s.") %
++                               {'vif_model': ntwk.vif_model,
++                                'vnic_type': vnic_type})
++                        raise exception.InvalidInput(reason=msg)
++
++                    # Change vif-model to 'pci-sriov' for ports that
++                    # are directly created with neutron ('neutron
++                    # port-create') with 'binding:vnic_type direct'.
++                    # The compute API will set the vif_model to
++                    # CONF.default_vif_model (default is virtio) if it's
++                    # not specified.
++                    if (vnic_type ==
++                            network_model.VNIC_TYPE_DIRECT):
++                        ntwk.vif_model = \
++                            network_model.VIF_MODEL_PCI_SRIOV
++                    if (vnic_type ==
++                            network_model.VNIC_TYPE_DIRECT_PHYSICAL):
++                        ntwk.vif_model = \
++                            network_model.VIF_MODEL_PCI_PASSTHROUGH
++
++                    # use vif_model set on port if none specified
++                    # for network.
++                    if port_vif_model and not ntwk.vif_model:
++                        ntwk.vif_model = port_vif_model
++
+                 if ntwk.vif_model is None:
+                     ntwk.vif_model = hw_vif_model
+ 
++                vif_model = ntwk.vif_model
++                try:
++                    network_info = self.network_api.get_dict(admin_context,
++                                                             network_uuid)
++                    physnet = network_info.get(physkey, None)
++                    # Only set provider network scheduler hint
++                    # if interface is virtual.
++                    # PCI passthrough devices will be filtered
++                    # based on the PCI requests.
++                    if (not ntwk.port_id and
++                            pci_utils.vif_model_pci_passthrough(vif_model)):
++                        pci_request.create_pci_request(system_metadata,
++                            {'physical_network': physnet})
++                    else:
++                        if physnet is not None:
++                            hint[physkey].update([physnet])
++                except Exception as err:
++                    LOG.warning("Cannot get %(physkey)r "
++                                "from network=%(network_uuid)r, "
++                                "error=%(err)r",
++                                {'physkey': physkey,
++                                 'network_uuid': network_uuid,
++                                 'err': err})
++            if len(hint[physkey]) > 0:
++                scheduler_hints = \
++                      filter_properties.get('scheduler_hints') or {}
++                scheduler_hints.update({physkey: list(hint[physkey])})
++                filter_properties['scheduler_hints'] = scheduler_hints
++
+         instance_group = self._get_requested_instance_group(context,
+                                    filter_properties)
+ 
+diff --git a/nova/network/neutronv2/api.py b/nova/network/neutronv2/api.py
+index f443dfe..bc996d1 100644
+--- a/nova/network/neutronv2/api.py
++++ b/nova/network/neutronv2/api.py
+@@ -77,6 +77,7 @@ def _load_auth_plugin(conf):
+         return auth_plugin
+ 
+     err_msg = _('Unknown auth type: %s') % conf.neutron.auth_type
++
+     raise neutron_client_exc.Unauthorized(message=err_msg)
+ 
+ 
+@@ -1822,6 +1823,15 @@ class API(base_api.NetworkAPI):
+                                   uuid=network['id'])
+         return net_obj
+ 
++    def get_dict(self, context, network_uuid):
++        """Get specific network for client."""
++        client = get_client(context)
++        try:
++            network = client.show_network(network_uuid).get('network') or {}
++        except neutron_client_exc.NetworkNotFoundClient:
++            raise exception.NetworkNotFound(network_id=network_uuid)
++        return network
++
+     def delete(self, context, network_uuid):
+         """Delete a network for client."""
+         raise NotImplementedError()
+diff --git a/nova/pci/utils.py b/nova/pci/utils.py
+index a15dc1b..a775b0e 100644
+--- a/nova/pci/utils.py
++++ b/nova/pci/utils.py
+@@ -13,6 +13,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2013-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ 
+ import glob
+@@ -203,3 +210,11 @@ def get_net_name_by_vf_pci_address(vfaddress):
+         LOG.warning("No net device was found for VF %(vfaddress)s",
+                     {'vfaddress': vfaddress})
+         return
++
++
++def vif_model_pci_passthrough(vif_model):
++    """Checks whether the supplied VIF model is a pci-passthrough device
++    :param vif_model: The VIF model to check
++    :return: TRUE if pci-passthrough VIF model, otherwise FALSE
++    """
++    return vif_model in ['pci-passthrough']
+diff --git a/nova/scheduler/filter_scheduler.py b/nova/scheduler/filter_scheduler.py
+index 42b9656..5bca2f2 100644
+--- a/nova/scheduler/filter_scheduler.py
++++ b/nova/scheduler/filter_scheduler.py
+@@ -40,6 +40,13 @@ from nova.scheduler import client
+ from nova.scheduler import driver
+ from nova.scheduler import utils
+ 
++# - network provider filter
++from nova import context as novacontext
++from nova import exception
++from nova import network
++from nova import objects
++from nova.pci import utils as pci_utils
++
+ CONF = nova.conf.CONF
+ LOG = logging.getLogger(__name__)
+ 
+@@ -51,6 +58,8 @@ class FilterScheduler(driver.Scheduler):
+         self.notifier = rpc.get_notifier('scheduler')
+         scheduler_client = client.SchedulerClient()
+         self.placement_client = scheduler_client.reportclient
++        # - network provider filter
++        self.network_api = network.API()
+ 
+     def select_destinations(self, context, spec_obj, instance_uuids,
+             alloc_reqs_by_rp_uuid, provider_summaries):
+@@ -158,6 +167,47 @@ class FilterScheduler(driver.Scheduler):
+                                    resources.
+         """
+         elevated = context.elevated()
++        admin_context = novacontext.get_admin_context()
++
++        # - network provider filter
++        physkey = 'provider:physical_network'
++        scheduler_hints = {}
++        if spec_obj.obj_attr_is_set('scheduler_hints'):
++            scheduler_hints = spec_obj.scheduler_hints or {}
++        if not scheduler_hints.get(physkey):
++            hint = {physkey: set()}
++            try:
++                instance = objects.BuildRequest.get_by_instance_uuid(
++                    context, spec_obj.instance_uuid).instance
++            except exception.BuildRequestNotFound as err:
++                # This covers for the reschedule case, at which point
++                # the build request object is deleted, and
++                # the instance object now exists in the database
++                instance = objects.Instance.get_by_uuid(context,
++                                                    spec_obj.instance_uuid)
++            network_info = instance.info_cache.network_info
++            for ntwk in network_info:
++                network_uuid = ntwk['network']['id']
++                vif_model = ntwk['vif_model']
++                try:
++                    # Set provider network scheduler hint
++                    # only if a virtual interface
++                    if not pci_utils.vif_model_pci_passthrough(vif_model):
++                        net_info = self.network_api.get_dict(admin_context,
++                                                             network_uuid)
++                        physnet = net_info.get(physkey, None)
++                        if physnet is not None:
++                            hint[physkey].update([physnet])
++                except Exception as err:
++                    LOG.warning("Cannot get %(physkey)r "
++                                    "from network=%(network_uuid)r, "
++                                    "error=%(err)r",
++                                {'physkey': physkey,
++                                 'network_uuid': network_uuid,
++                                 'err': err})
++            if len(hint[physkey]) > 0:
++                scheduler_hints.update({physkey: list(hint[physkey])})
++                spec_obj.scheduler_hints = scheduler_hints
+ 
+         # Find our local list of acceptable hosts by repeatedly
+         # filtering and weighing our options. Each time we choose a
+diff --git a/nova/scheduler/filters/aggregate_provider_network_filter.py b/nova/scheduler/filters/aggregate_provider_network_filter.py
+new file mode 100644
+index 0000000..81b2f30
+--- /dev/null
++++ b/nova/scheduler/filters/aggregate_provider_network_filter.py
+@@ -0,0 +1,72 @@
++#
++# Copyright (c) 2014-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
++"""
++Scheduler filter "AggregateProviderNetworkFilter", host_passes() returns True
++when the host is a member of host-aggregate with metadata key
++provider:physical_network and contains a superset of physical network values
++required by each tenant network specified by the current instance.
++"""
++
++from oslo_log import log as logging
++
++from nova.i18n import _LI
++from nova.scheduler import filters
++
++from nova.scheduler.filters import utils
++
++LOG = logging.getLogger(__name__)
++
++
++class AggregateProviderNetworkFilter(filters.BaseHostFilter):
++    """Filter hosts that have the necessary provider physical network(s)."""
++
++    # Aggregate data and tenant do not change within a request
++    run_filter_once_per_request = True
++
++    def host_passes(self, host_state, spec_obj):
++        """If the host is in an aggregate with metadata key
++        "provider:physical_network" and contains the set of values
++        needed by each tenant network, it may create instances.
++        """
++
++        physkey = 'provider:physical_network'
++        scheduler_hints = {}
++        if spec_obj.obj_attr_is_set('scheduler_hints'):
++            scheduler_hints = spec_obj.scheduler_hints or {}
++        physnets = set(scheduler_hints.get(physkey, []))
++        metadata = utils.aggregate_metadata_get_by_host(host_state,
++                                                        key=physkey)
++        # Match each provider physical network with host-aggregate metadata.
++        if metadata:
++            if not physnets.issubset(metadata[physkey]):
++                msg = ("%s = %r, require: %r"
++                       % (str(physkey),
++                          list(metadata[physkey]),
++                          list(physnets)))
++                self.filter_reject(host_state, spec_obj, msg)
++                return False
++            else:
++                LOG.info(_LI("(%(host)s, %(nodename)s) PASS. "
++                             "%(key)s = %(metalist)r. "
++                             "require: %(physnetlist)r"),
++                         {'host': host_state.host,
++                          'nodename': host_state.nodename,
++                          'key': physkey,
++                          'metalist': list(metadata[physkey]),
++                          'physnetlist': list(physnets)})
++        else:
++            LOG.info(_LI("(%(host)s, %(nodename)s) NOT CONFIGURED. "
++                         "%(key)s = %(metalist)r. "
++                         "require: %(physnetlist)r"),
++                         {'host': host_state.host,
++                          'nodename': host_state.nodename,
++                          'key': physkey,
++                          'metalist': metadata,
++                          'physnetlist': list(physnets)})
++            return False
++        return True
+diff --git a/nova/tests/unit/api/openstack/compute/test_serversV21.py b/nova/tests/unit/api/openstack/compute/test_serversV21.py
+index 893a4a0..c36c977 100644
+--- a/nova/tests/unit/api/openstack/compute/test_serversV21.py
++++ b/nova/tests/unit/api/openstack/compute/test_serversV21.py
+@@ -3736,13 +3736,26 @@ class ServersControllerCreateTestV219(ServersControllerCreateTest):
+     def test_create_instance_with_vif_model(self):
+         self._create_instance_req(False)
+         self.flags(use_neutron=True)
++        self.body['server'] = {'networks': [{'uuid': FAKE_UUID,
++                               'wrs-if:vif_model': 'avp'}]}
++        self.body['server']['name'] = 'test'
++        self.body['server']['flavorRef'] = 2
++        image_uuid = 'c905cedb-7281-47e4-8a62-f26bc5fc4c77'
++        self.body['server']['imageRef'] = image_uuid
++        self.controller.create(self.req, body=self.body).obj
++
++    # add testcase with wrs-if:vif_model and port_id in request
++    def test_create_instance_with_vif_model_and_port(self):
++        self._create_instance_req(False)
++        self.flags(use_neutron=True)
+         self.body['server'] = {'networks': [{'port': FAKE_UUID,
+                                'uuid': FAKE_UUID, 'wrs-if:vif_model': 'avp'}]}
+         self.body['server']['name'] = 'test'
+         self.body['server']['flavorRef'] = 2
+         image_uuid = 'c905cedb-7281-47e4-8a62-f26bc5fc4c77'
+         self.body['server']['imageRef'] = image_uuid
+-        self.controller.create(self.req, body=self.body).obj
++        self.assertRaises(webob.exc.HTTPInternalServerError,
++                          self.controller.create, self.req, body=self.body)
+ 
+ 
+ class ServersControllerCreateTestV232(test.NoDBTestCase):
+diff --git a/nova/tests/unit/compute/test_compute_api.py b/nova/tests/unit/compute/test_compute_api.py
+index 7792fc5..a72180e 100644
+--- a/nova/tests/unit/compute/test_compute_api.py
++++ b/nova/tests/unit/compute/test_compute_api.py
+@@ -202,8 +202,10 @@ class _ComputeAPIUnitTestMixIn(object):
+ 
+         port = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
+         address = '10.0.0.1'
++        network_id = 'fake'
+         requested_networks = objects.NetworkRequestList(
+-            objects=[objects.NetworkRequest(address=address,
++            objects=[objects.NetworkRequest(network_id=network_id,
++                                            address=address,
+                                             port_id=port)])
+ 
+         with mock.patch.object(self.compute_api.network_api,
+diff --git a/nova/tests/unit/scheduler/filters/test_aggregate_provider_network_filters.py b/nova/tests/unit/scheduler/filters/test_aggregate_provider_network_filters.py
+new file mode 100644
+index 0000000..001b859
+--- /dev/null
++++ b/nova/tests/unit/scheduler/filters/test_aggregate_provider_network_filters.py
+@@ -0,0 +1,126 @@
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++#
++# Copyright (c) 2014-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
++
++import collections
++import mock
++
++
++from nova import context
++from nova import objects
++from nova import test
++
++from nova.scheduler.filters import aggregate_provider_network_filter
++
++from nova.tests.unit.scheduler import fakes
++
++
++@mock.patch('nova.scheduler.filters.utils.aggregate_metadata_get_by_host')
++class TestAggregateNetworkProviderFilter(test.NoDBTestCase):
++
++    def setUp(self):
++        super(TestAggregateNetworkProviderFilter, self).setUp()
++        self.filt_cls = \
++            aggregate_provider_network_filter.AggregateProviderNetworkFilter()
++        self.ctxt = context.get_admin_context()
++
++    def test_agg_network_provider_filter_fails_if_blank(self, agg_mock):
++        agg_mock.return_value = collections.defaultdict(set)
++        host = fakes.FakeHostState('host1', 'node1', {})
++
++        spec_obj = objects.RequestSpec(self.ctxt)
++        self.assertFalse(self.filt_cls.host_passes(host, spec_obj))
++
++        spec_obj = objects.RequestSpec(self.ctxt, scheduler_hints=None)
++        self.assertFalse(self.filt_cls.host_passes(host, spec_obj))
++
++        spec_obj = objects.RequestSpec(self.ctxt, scheduler_hints =
++                           {'provider:physical_network': ['physnet0', ]})
++        self.assertFalse(self.filt_cls.host_passes(host, spec_obj))
++
++    def test_agg_network_provider_filter_fails_if_mismatched(self, agg_mock):
++        agg_mock.return_value = {'provider:physical_network': ['physnet22', ]}
++        host = fakes.FakeHostState('host1', 'node1', {})
++
++        spec_obj = objects.RequestSpec(self.ctxt, scheduler_hints =
++                           {'provider:physical_network': ['physnet0', ]})
++        self.assertFalse(self.filt_cls.host_passes(host, spec_obj))
++
++        # Almost matches (too short)
++        spec_obj = objects.RequestSpec(self.ctxt, scheduler_hints =
++                           {'provider:physical_network': ['physnet2', ]})
++        self.assertFalse(self.filt_cls.host_passes(host, spec_obj))
++
++        # Almost matches (too long)
++        spec_obj = objects.RequestSpec(self.ctxt, scheduler_hints =
++                           {'provider:physical_network': ['physnet222', ]})
++        self.assertFalse(self.filt_cls.host_passes(host, spec_obj))
++
++    def test_agg_network_provider_filter_passes(self, agg_mock):
++        agg_mock.return_value = {'provider:physical_network': ['physnet0', ]}
++        host = fakes.FakeHostState('host1', 'node1', {})
++
++        spec_obj = objects.RequestSpec(self.ctxt, scheduler_hints =
++                           {'provider:physical_network': ['physnet0', ]})
++        self.assertTrue(self.filt_cls.host_passes(host, spec_obj))
++
++        agg_mock.return_value = {'provider:physical_network':
++                                     ['physnet0_again', ]}
++        spec_obj = objects.RequestSpec(self.ctxt, scheduler_hints =
++                           {'provider:physical_network': ['physnet0', ]})
++        self.assertFalse(self.filt_cls.host_passes(host, spec_obj))
++
++        spec_obj = objects.RequestSpec(self.ctxt, scheduler_hints =
++                           {'provider:physical_network': ['physnet0_again', ]})
++        self.assertTrue(self.filt_cls.host_passes(host, spec_obj))
++
++    def test_agg_network_provider_filter_multi(self, agg_mock):
++        # 2 diff physical networks. Test we can match either.
++        agg_mock.return_value = {'provider:physical_network':
++                                     ['physnet0', 'physnet1', ]}
++        host = fakes.FakeHostState('host1', 'node1', {})
++
++        # Match first
++        spec_obj = objects.RequestSpec(self.ctxt, scheduler_hints =
++                           {'provider:physical_network': ['physnet0', ]})
++        self.assertTrue(self.filt_cls.host_passes(host, spec_obj))
++
++        # Match second
++        spec_obj = objects.RequestSpec(self.ctxt, scheduler_hints =
++                           {'provider:physical_network': ['physnet1', ]})
++        self.assertTrue(self.filt_cls.host_passes(host, spec_obj))
++
++        # Match both
++        spec_obj = objects.RequestSpec(self.ctxt, scheduler_hints =
++                   {'provider:physical_network': ['physnet0', 'physnet1', ]})
++        self.assertTrue(self.filt_cls.host_passes(host, spec_obj))
++
++        # Match both with duplicate
++        spec_obj = objects.RequestSpec(self.ctxt, scheduler_hints =
++                   {'provider:physical_network': ['physnet1', 'physnet0',
++                                                  'physnet1', ]})
++        self.assertTrue(self.filt_cls.host_passes(host, spec_obj))
++
++        # Returns false if scheduler wants both, but host only provides one.
++        agg_mock.return_value = {'provider:physical_network': ['physnet1', ]}
++        spec_obj = objects.RequestSpec(self.ctxt, scheduler_hints =
++                   {'provider:physical_network': ['physnet0', 'physnet1', ]})
++        self.assertFalse(self.filt_cls.host_passes(host, spec_obj))
++        spec_obj = objects.RequestSpec(self.ctxt, scheduler_hints =
++                   {'provider:physical_network': ['physnet1', 'physnet0', ]})
++        self.assertFalse(self.filt_cls.host_passes(host, spec_obj))
+diff --git a/nova/tests/unit/scheduler/test_caching_scheduler.py b/nova/tests/unit/scheduler/test_caching_scheduler.py
+index 21a9a59..b9f597a 100644
+--- a/nova/tests/unit/scheduler/test_caching_scheduler.py
++++ b/nova/tests/unit/scheduler/test_caching_scheduler.py
+@@ -12,6 +12,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2016-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ import mock
+ from oslo_utils import timeutils
+@@ -80,7 +87,10 @@ class CachingSchedulerTestCase(test_scheduler.SchedulerTestCase):
+             self.assertTrue(mock_get_hosts.called)
+             self.assertEqual({uuids.cell: [host_state]}, result)
+ 
+-    def test_select_destination_raises_with_no_hosts(self):
++    @mock.patch('nova.objects.BuildRequest.get_by_instance_uuid')
++    @mock.patch('nova.objects.Instance.get_by_uuid')
++    def test_select_destination_raises_with_no_hosts(self, mock_get_by_uuid,
++                                                    mock_get_by_instance_uuid):
+         spec_obj = self._get_fake_request_spec()
+         self.driver.all_host_states = {uuids.cell: []}
+ 
+@@ -89,10 +99,13 @@ class CachingSchedulerTestCase(test_scheduler.SchedulerTestCase):
+                 self.context, spec_obj, [spec_obj.instance_uuid],
+                 {}, {})
+ 
++    @mock.patch('nova.objects.BuildRequest.get_by_instance_uuid')
++    @mock.patch('nova.objects.Instance.get_by_uuid')
+     @mock.patch('nova.db.instance_extra_get_by_instance_uuid',
+                 return_value={'numa_topology': None,
+                               'pci_requests': None})
+-    def test_select_destination_works(self, mock_get_extra):
++    def test_select_destination_works(self, mock_get_extra, mock_get_by_uuid,
++                                      mock_get_by_instance_uuid):
+         spec_obj = self._get_fake_request_spec()
+         fake_host = self._get_fake_host_state()
+         self.driver.all_host_states = {uuids.cell: [fake_host]}
+@@ -165,10 +178,14 @@ class CachingSchedulerTestCase(test_scheduler.SchedulerTestCase):
+         host_state.metrics = objects.MonitorMetricList(objects=[])
+         return host_state
+ 
++    @mock.patch('nova.objects.BuildRequest.get_by_instance_uuid')
++    @mock.patch('nova.objects.Instance.get_by_uuid')
+     @mock.patch('nova.db.instance_extra_get_by_instance_uuid',
+                 return_value={'numa_topology': None,
+                               'pci_requests': None})
+-    def test_performance_check_select_destination(self, mock_get_extra):
++    def test_performance_check_select_destination(self, mock_get_extra,
++                                                  mock_get_by_uuid,
++                                                  mock_get_by_instance_uuid):
+         hosts = 2
+         requests = 1
+ 
+@@ -220,10 +237,14 @@ class CachingSchedulerTestCase(test_scheduler.SchedulerTestCase):
+         # But this is here so you can do simply performance testing easily.
+         self.assertLess(per_request_ms, 1000)
+ 
+-    def test_request_single_cell(self):
++    @mock.patch('nova.objects.BuildRequest.get_by_instance_uuid')
++    @mock.patch('nova.objects.Instance.get_by_uuid')
++    def test_request_single_cell(self, mock_get_by_uuid,
++                                 mock_get_by_instance_uuid):
+         spec_obj = self._get_fake_request_spec()
+         spec_obj.requested_destination = objects.Destination(
+             cell=objects.CellMapping(uuid=uuids.cell2))
++        spec_obj.instance_uuid = '00000000-aaaa-bbbb-cccc-000000000000'
+         host_states_cell1 = [self._get_fake_host_state(i)
+                              for i in range(1, 5)]
+         host_states_cell2 = [self._get_fake_host_state(i)
+diff --git a/nova/tests/unit/scheduler/test_filter_scheduler.py b/nova/tests/unit/scheduler/test_filter_scheduler.py
+index 9454745..bcfd900 100644
+--- a/nova/tests/unit/scheduler/test_filter_scheduler.py
++++ b/nova/tests/unit/scheduler/test_filter_scheduler.py
+@@ -12,6 +12,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2016-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ """
+ Tests For Filter Scheduler.
+ """
+@@ -19,6 +26,7 @@ Tests For Filter Scheduler.
+ import mock
+ 
+ from nova import exception
++from nova.network import model as network_model
+ from nova import objects
+ from nova.scheduler import client
+ from nova.scheduler.client import report
+@@ -27,10 +35,16 @@ from nova.scheduler import host_manager
+ from nova.scheduler import utils as scheduler_utils
+ from nova.scheduler import weights
+ from nova import test  # noqa
++from nova.tests.unit import fake_network_cache_model
++from nova.tests.unit.scheduler import fakes
+ from nova.tests.unit.scheduler import test_scheduler
+ from nova.tests import uuidsentinel as uuids
+ 
+ 
++def fake_get_filtered_hosts(hosts, filter_properties, index):
++    return list(hosts)
++
++
+ class FilterSchedulerTestCase(test_scheduler.SchedulerTestCase):
+     """Test case for Filter Scheduler."""
+ 
+@@ -45,6 +59,8 @@ class FilterSchedulerTestCase(test_scheduler.SchedulerTestCase):
+         self.placement_client = pc_client
+         super(FilterSchedulerTestCase, self).setUp()
+ 
++    @mock.patch('nova.objects.BuildRequest.get_by_instance_uuid')
++    @mock.patch('nova.objects.Instance.get_by_uuid')
+     @mock.patch('nova.scheduler.filter_scheduler.FilterScheduler.'
+                 '_claim_resources')
+     @mock.patch('nova.scheduler.filter_scheduler.FilterScheduler.'
+@@ -52,7 +68,8 @@ class FilterSchedulerTestCase(test_scheduler.SchedulerTestCase):
+     @mock.patch('nova.scheduler.filter_scheduler.FilterScheduler.'
+                 '_get_sorted_hosts')
+     def test_schedule_placement_bad_comms(self, mock_get_hosts,
+-            mock_get_all_states, mock_claim):
++            mock_get_all_states, mock_claim, mock_get_by_uuid,
++            mock_get_by_instance_uuid):
+         """If there was a problem communicating with the Placement service,
+         alloc_reqs_by_rp_uuid will be None and we need to avoid trying to claim
+         in the Placement API.
+@@ -65,7 +82,8 @@ class FilterSchedulerTestCase(test_scheduler.SchedulerTestCase):
+                                   swap=0,
+                                   vcpus=1),
+             project_id=uuids.project_id,
+-            instance_group=None)
++            instance_group=None,
++            instance_uuid='00000000-aaaa-bbbb-cccc-000000000000')
+ 
+         host_state = mock.Mock(spec=host_manager.HostState,
+             host=mock.sentinel.host, uuid=uuids.cn1)
+@@ -92,6 +110,8 @@ class FilterSchedulerTestCase(test_scheduler.SchedulerTestCase):
+         # And ensure we never called _claim_resources()
+         self.assertFalse(mock_claim.called)
+ 
++    @mock.patch('nova.objects.BuildRequest.get_by_instance_uuid')
++    @mock.patch('nova.objects.Instance.get_by_uuid')
+     @mock.patch('nova.scheduler.filter_scheduler.FilterScheduler.'
+                 '_claim_resources')
+     @mock.patch('nova.scheduler.filter_scheduler.FilterScheduler.'
+@@ -99,7 +119,8 @@ class FilterSchedulerTestCase(test_scheduler.SchedulerTestCase):
+     @mock.patch('nova.scheduler.filter_scheduler.FilterScheduler.'
+                 '_get_sorted_hosts')
+     def test_schedule_old_conductor(self, mock_get_hosts,
+-            mock_get_all_states, mock_claim):
++            mock_get_all_states, mock_claim, mock_get_by_uuid,
++            mock_get_by_instance_uuid):
+         """Old conductor can call scheduler without the instance_uuids
+         parameter. When this happens, we need to ensure we do not attempt to
+         claim resources in the placement API since obviously we need instance
+@@ -113,7 +134,8 @@ class FilterSchedulerTestCase(test_scheduler.SchedulerTestCase):
+                                   swap=0,
+                                   vcpus=1),
+             project_id=uuids.project_id,
+-            instance_group=None)
++            instance_group=None,
++            instance_uuid='00000000-aaaa-bbbb-cccc-000000000000')
+ 
+         host_state = mock.Mock(spec=host_manager.HostState,
+             host=mock.sentinel.host, uuid=uuids.cn1)
+@@ -141,6 +163,8 @@ class FilterSchedulerTestCase(test_scheduler.SchedulerTestCase):
+         # And ensure we never called _claim_resources()
+         self.assertFalse(mock_claim.called)
+ 
++    @mock.patch('nova.objects.BuildRequest.get_by_instance_uuid')
++    @mock.patch('nova.objects.Instance.get_by_uuid')
+     @mock.patch('nova.scheduler.filter_scheduler.FilterScheduler.'
+                 '_claim_resources')
+     @mock.patch('nova.scheduler.filter_scheduler.FilterScheduler.'
+@@ -148,7 +172,8 @@ class FilterSchedulerTestCase(test_scheduler.SchedulerTestCase):
+     @mock.patch('nova.scheduler.filter_scheduler.FilterScheduler.'
+                 '_get_sorted_hosts')
+     def _test_schedule_successful_claim(self, mock_get_hosts,
+-            mock_get_all_states, mock_claim, num_instances=1):
++            mock_get_all_states, mock_claim, mock_get_by_uuid,
++            mock_get_by_instance_uuid, num_instances=1):
+         spec_obj = objects.RequestSpec(
+             num_instances=num_instances,
+             flavor=objects.Flavor(memory_mb=512,
+@@ -157,7 +182,8 @@ class FilterSchedulerTestCase(test_scheduler.SchedulerTestCase):
+                                   swap=0,
+                                   vcpus=1),
+             project_id=uuids.project_id,
+-            instance_group=None)
++            instance_group=None,
++            instance_uuid='00000000-aaaa-bbbb-cccc-000000000000')
+ 
+         host_state = mock.Mock(spec=host_manager.HostState,
+             host=mock.sentinel.host, uuid=uuids.cn1)
+@@ -198,6 +224,8 @@ class FilterSchedulerTestCase(test_scheduler.SchedulerTestCase):
+         """
+         self._test_schedule_successful_claim(num_instances=3)
+ 
++    @mock.patch('nova.objects.BuildRequest.get_by_instance_uuid')
++    @mock.patch('nova.objects.Instance.get_by_uuid')
+     @mock.patch('nova.scheduler.filter_scheduler.FilterScheduler.'
+                 '_cleanup_allocations')
+     @mock.patch('nova.scheduler.filter_scheduler.FilterScheduler.'
+@@ -207,7 +235,8 @@ class FilterSchedulerTestCase(test_scheduler.SchedulerTestCase):
+     @mock.patch('nova.scheduler.filter_scheduler.FilterScheduler.'
+                 '_get_sorted_hosts')
+     def test_schedule_unsuccessful_claim(self, mock_get_hosts,
+-            mock_get_all_states, mock_claim, mock_cleanup):
++            mock_get_all_states, mock_claim, mock_cleanup, mock_get_by_uuid,
++            mock_get_by_instance_uuid):
+         """Tests that we return an empty list if we are unable to successfully
+         claim resources for the instance
+         """
+@@ -219,7 +248,8 @@ class FilterSchedulerTestCase(test_scheduler.SchedulerTestCase):
+                                   swap=0,
+                                   vcpus=1),
+             project_id=uuids.project_id,
+-            instance_group=None)
++            instance_group=None,
++            instance_uuid='00000000-aaaa-bbbb-cccc-000000000000')
+ 
+         host_state = mock.Mock(spec=host_manager.HostState,
+             host=mock.sentinel.host, uuid=uuids.cn1)
+@@ -251,6 +281,8 @@ class FilterSchedulerTestCase(test_scheduler.SchedulerTestCase):
+         # Ensure that we have consumed the resources on the chosen host states
+         self.assertFalse(host_state.consume_from_request.called)
+ 
++    @mock.patch('nova.objects.BuildRequest.get_by_instance_uuid')
++    @mock.patch('nova.objects.Instance.get_by_uuid')
+     @mock.patch('nova.scheduler.filter_scheduler.FilterScheduler.'
+                 '_cleanup_allocations')
+     @mock.patch('nova.scheduler.filter_scheduler.FilterScheduler.'
+@@ -260,7 +292,8 @@ class FilterSchedulerTestCase(test_scheduler.SchedulerTestCase):
+     @mock.patch('nova.scheduler.filter_scheduler.FilterScheduler.'
+                 '_get_sorted_hosts')
+     def test_schedule_not_all_instance_clean_claimed(self, mock_get_hosts,
+-            mock_get_all_states, mock_claim, mock_cleanup):
++            mock_get_all_states, mock_claim, mock_cleanup, mock_get_by_uuid,
++            mock_get_by_instance_uuid):
+         """Tests that we clean up previously-allocated instances if not all
+         instances could be scheduled
+         """
+@@ -272,7 +305,8 @@ class FilterSchedulerTestCase(test_scheduler.SchedulerTestCase):
+                                   swap=0,
+                                   vcpus=1),
+             project_id=uuids.project_id,
+-            instance_group=None)
++            instance_group=None,
++            instance_uuid='00000000-aaaa-bbbb-cccc-000000000000')
+ 
+         host_state = mock.Mock(spec=host_manager.HostState,
+             host=mock.sentinel.host, uuid=uuids.cn1)
+@@ -295,6 +329,8 @@ class FilterSchedulerTestCase(test_scheduler.SchedulerTestCase):
+         # Ensure we cleaned up the first successfully-claimed instance
+         mock_cleanup.assert_called_once_with([uuids.instance1])
+ 
++    @mock.patch('nova.objects.BuildRequest.get_by_instance_uuid')
++    @mock.patch('nova.objects.Instance.get_by_uuid')
+     @mock.patch('nova.scheduler.filter_scheduler.FilterScheduler.'
+                 '_claim_resources')
+     @mock.patch('nova.scheduler.filter_scheduler.FilterScheduler.'
+@@ -302,7 +338,8 @@ class FilterSchedulerTestCase(test_scheduler.SchedulerTestCase):
+     @mock.patch('nova.scheduler.filter_scheduler.FilterScheduler.'
+                 '_get_sorted_hosts')
+     def test_schedule_instance_group(self, mock_get_hosts,
+-            mock_get_all_states, mock_claim):
++            mock_get_all_states, mock_claim, mock_get_by_uuid,
++            mock_get_by_instance_uuid):
+         """Test that since the request spec object contains an instance group
+         object, that upon choosing a host in the primary schedule loop,
+         that we update the request spec's instance group information
+@@ -317,7 +354,8 @@ class FilterSchedulerTestCase(test_scheduler.SchedulerTestCase):
+                                   swap=0,
+                                   vcpus=1),
+             project_id=uuids.project_id,
+-            instance_group=ig)
++            instance_group=ig,
++            instance_uuid='00000000-aaaa-bbbb-cccc-000000000000')
+ 
+         hs1 = mock.Mock(spec=host_manager.HostState, host='host1',
+             uuid=uuids.cn1)
+@@ -665,3 +703,131 @@ class FilterSchedulerTestCase(test_scheduler.SchedulerTestCase):
+         # compute_uuids being [].
+         get_host_states.assert_called_once_with(
+             mock.sentinel.ctxt, [], mock.sentinel.spec_obj)
++
++    # add tests for instance with provider:physical_network
++    @mock.patch('nova.scheduler.filter_scheduler.FilterScheduler.'
++                '_get_all_host_states')
++    @mock.patch('nova.objects.ServiceList.get_by_binary',
++                return_value=fakes.SERVICES)
++    @mock.patch('nova.objects.InstanceList.get_by_host')
++    @mock.patch('nova.objects.ComputeNodeList.get_all',
++                return_value=fakes.COMPUTE_NODES)
++    def _test_schedule_provider_network(self, scheduler_hints,
++                         mock_get_all, mock_by_host, mock_get_by_binary,
++                         mock_get_all_states):
++
++        vif_dict = dict(vif_model='virtio')
++        fake_vif1 = fake_network_cache_model.new_vif(vif_dict)
++        fake_vif2 = fake_network_cache_model.new_vif(vif_dict)
++        fake_vif2['network']['id'] = 2
++        fake_vif3 = fake_network_cache_model.new_vif(vif_dict)
++        fake_vif3['network']['id'] = 3
++        fake_vif4 = fake_network_cache_model.new_vif(vif_dict)
++        fake_vif4['network']['id'] = 4
++        fake_nw_info = network_model.NetworkInfo([fake_vif1, fake_vif2,
++                                                  fake_vif3, fake_vif4])
++        fake_info_cache = objects.InstanceInfoCache(network_info=fake_nw_info)
++        fake_inst = objects.Instance(info_cache=fake_info_cache)
++        fake_build_req = objects.BuildRequest(instance=fake_inst)
++
++        @staticmethod
++        def _fake_get_by_instance_uuid(context, instance_uuid):
++            return fake_build_req
++
++        @staticmethod
++        def _fake_get_by_uuid(context, instance_uuid):
++            return fake_inst
++
++        self.stub_out('nova.objects.BuildRequest.get_by_instance_uuid',
++                      _fake_get_by_instance_uuid)
++        self.stub_out('nova.objects.Instance.get_by_uuid', _fake_get_by_uuid)
++
++        def _fake_net_get_dict(context, network_uuid):
++            if network_uuid == 1:
++                return {'provider:physical_network': 'physnet0'}
++            elif network_uuid == 2:
++                return {'provider:physical_network': 'physnet1'}
++            elif network_uuid == 3:
++                return {'provider:physical_network': 'physnet1'}
++            else:
++                return {}
++
++        from nova.network.neutronv2 import api as neutronapi
++        self.driver.network_api = neutronapi.API()
++        self.stubs.Set(self.driver.network_api, 'get_dict',
++                      _fake_net_get_dict)
++
++        spec_obj = objects.RequestSpec(
++            num_instances=1,
++            flavor=objects.Flavor(memory_mb=512,
++                                  root_gb=512,
++                                  ephemeral_gb=0,
++                                  vcpus=1),
++            project_id=1,
++            os_type='Linux',
++            instance_uuid='00000000-aaaa-bbbb-cccc-000000000000',
++            pci_requests=None,
++            numa_topology=None,
++            instance_group=None,
++            scheduler_hints=scheduler_hints)
++
++        host_state = mock.Mock(spec=host_manager.HostState,
++            host=mock.sentinel.host, uuid=uuids.cn1)
++        all_host_states = [host_state]
++        mock_get_all_states.return_value = all_host_states
++
++        instance_uuids = [uuids.instance]
++        alloc_reqs_by_rp_uuid = {
++            uuids.cn1: [mock.sentinel.alloc_req],
++        }
++
++        with mock.patch.object(self.driver.host_manager,
++                               'get_filtered_hosts') as mock_get_hosts:
++            mock_get_hosts.side_effect = fake_get_filtered_hosts
++            hosts = self.driver._schedule(self.context, spec_obj,
++                instance_uuids, alloc_reqs_by_rp_uuid,
++                mock.sentinel.provider_summaries)
++
++        self.assertEqual(len(hosts), 1)
++
++        return spec_obj
++
++    # verify that scheduler hints are added to spec with existing hint
++    def test_schedule_provider_network_add_to_sched_hints(self):
++        scheduler_hints = {'dummy_hint': ['fake1']}
++        spec_obj = \
++            self._test_schedule_provider_network(scheduler_hints)
++        self.assertEqual(len(spec_obj.scheduler_hints), 2)
++        spec_obj.scheduler_hints['provider:physical_network'].sort()
++        self.assertEqual(spec_obj.scheduler_hints['provider:physical_network'],
++                         ['physnet0', 'physnet1'])
++        self.assertEqual(spec_obj.scheduler_hints['dummy_hint'], ['fake1'])
++
++    # verify that provider networks are added to scheduler_hints if None
++    def test_schedule_provider_network_sched_hints_none(self):
++        scheduler_hints = None
++        spec_obj = \
++            self._test_schedule_provider_network(scheduler_hints)
++        self.assertEqual(len(spec_obj.scheduler_hints), 1)
++        spec_obj.scheduler_hints['provider:physical_network'].sort()
++        self.assertEqual(spec_obj.scheduler_hints['provider:physical_network'],
++                         ['physnet0', 'physnet1'])
++
++    # verify that provider networks are added to scheduler_hints if empty dict
++    def test_schedule_provider_network_sched_hints_empty_dict(self):
++        scheduler_hints = {}
++        spec_obj = \
++            self._test_schedule_provider_network(scheduler_hints)
++        self.assertEqual(len(spec_obj.scheduler_hints), 1)
++        spec_obj.scheduler_hints['provider:physical_network'].sort()
++        self.assertEqual(spec_obj.scheduler_hints['provider:physical_network'],
++                         ['physnet0', 'physnet1'])
++
++    # verify that existing provider network hints are not overwritten
++    def test_schedule_provider_network_donot_overwrite_sched_hints(self):
++        scheduler_hints = {'provider:physical_network': ['physnet2']}
++        spec_obj = \
++            self._test_schedule_provider_network(scheduler_hints)
++        self.assertEqual(len(spec_obj.scheduler_hints), 1)
++        self.assertEqual(spec_obj.scheduler_hints['provider:physical_network'],
++                         ['physnet2'])
+-- 
+2.7.4
+

@@ -1,0 +1,237 @@
+From 104559c4881616709253a1e4d4052b612e61b393 Mon Sep 17 00:00:00 2001
+From: Gerry Kopec <Gerry.Kopec@windriver.com>
+Date: Tue, 7 Jun 2016 19:58:13 -0400
+Subject: [PATCH 022/143] Add extra spec validation for hw:cpu_policy and
+ hw:cpu_thread_policy
+
+Add validation for extra specs:
+hw:cpu_policy - must be dedicated or shared
+hw:cpu_thread_policy
+- must be isolate, require or prefer
+- hw:cpu_policy must be dedicated
+- cannot use shared vcpu (hw:wrs:shared_vcpu) with require or isolate
+- cannot use cpu scaling (hw:wrs:min_vcpus) with require
+
+This commit is based on the following R3 commits:
+98a5b88 Port hyperthreading extension to Mitaka
+a7645cc Port hw:cpu_policy extra spec validation to Mitaka
+0039140 allow ISOLATE HT policy on non-HT hosts
+fe8250d Fix nova tox test_numa_topology_filter
+635e359 Flavor extra-spec API exception errors
+
+For port to Pike,
+962135f hw:cpu_realtime_mask validation and hw:wrs:vcpu:scheduler deprecation
+   This adds flavor extra-spec validation for hw:cpu_realtime_mask=X.
+   Validity checks include:
+   - mask X must be in valid range of flavor vcpus
+   - there must be one or more RT vCPUS
+   - there must be one or more normal vCPUS
+   - if hw:wrs:shared_vcpu=Y specified, Y must be a subset of normal vCPUs
+   This adds check for deprecated key hw:wrs:vcpu:scheduler, to prevent
+   accidental use.
+
+__TYPE_primary
+__TAG_validation
+__R4_commit_1a11b6d
+__R3_commit_636af1b
+__TC5108,TC5119,TC5120,TC5121,TC5123,TC5124,TC5125,TC5126,TC5127,TC5128
+---
+ nova/api/openstack/compute/flavors_extraspecs.py | 98 ++++++++++++++++++++++++
+ nova/virt/hardware.py                            | 49 +++++++++++-
+ 2 files changed, 146 insertions(+), 1 deletion(-)
+
+diff --git a/nova/api/openstack/compute/flavors_extraspecs.py b/nova/api/openstack/compute/flavors_extraspecs.py
+index d9fb5c3..05f24b1 100644
+--- a/nova/api/openstack/compute/flavors_extraspecs.py
++++ b/nova/api/openstack/compute/flavors_extraspecs.py
+@@ -42,6 +42,9 @@ from oslo_utils import strutils
+ 
+ # flavor extra specs keys needed for multiple validation routines
+ CPU_POLICY_KEY = 'hw:cpu_policy'
++CPU_SCALING_KEY = 'hw:wrs:min_vcpus'
++SHARED_VCPU_KEY = 'hw:wrs:shared_vcpu'
++
+ 
+ # host numa nodes
+ MAX_HOST_NUMA_NODES = 4
+@@ -142,6 +145,97 @@ class FlavorExtraSpecsController(wsgi.Controller):
+             msg = _('%s') % error.message
+             raise webob.exc.HTTPConflict(explanation=msg)
+ 
++    # Validate hw:cpu_realtime_mask and interaction with
++    # hw:wrs:shared_vcpu .
++    @staticmethod
++    def _validate_cpu_realtime_mask(flavor):
++        key = 'hw:cpu_realtime_mask'
++        if key in flavor.extra_specs:
++            value = flavor.extra_specs[key]
++
++            # Check we can properly parse the mask, that the mask defines both
++            # realtime and normal vCPUs, and that shared_vcpu is a subset of
++            # normal vCPUs.
++            try:
++                image = objects.ImageMeta.from_dict({"properties": {}})
++                hardware.vcpus_realtime_topology(flavor, image)
++            except Exception as e:
++                msg = (_("Invalid %(K)s '%(V)s', reason: %(R)s.") %
++                       {'K': key,
++                        'V': value,
++                        'R': e.format_message()
++                        })
++                raise webob.exc.HTTPBadRequest(explanation=msg)
++
++    # cpu policy extra spec
++    @staticmethod
++    def _validate_cpu_policy(flavor):
++        key = CPU_POLICY_KEY
++        specs = flavor.extra_specs
++        if key in specs:
++            value = specs[key]
++            if value not in fields.CPUAllocationPolicy.ALL:
++                msg = _("invalid %(K)s '%(V)s', must be one of: %(A)s") \
++                        % {'K': key,
++                           'V': value,
++                           'A': ', '.join(
++                            list(fields.CPUAllocationPolicy.ALL))}
++                raise webob.exc.HTTPBadRequest(explanation=msg)
++
++    # cpu thread policy extra spec
++    @staticmethod
++    def _validate_cpu_thread_policy(flavor):
++        key = 'hw:cpu_thread_policy'
++        specs = flavor.extra_specs
++        if key in specs:
++            value = specs[key]
++            if value not in fields.CPUThreadAllocationPolicy.ALL:
++                msg = _("invalid %(K)s '%(V)s', must be one of %(A)s") \
++                        % {'K': key,
++                           'V': value,
++                           'A': ', '.join(
++                            list(fields.CPUThreadAllocationPolicy.ALL))}
++                raise webob.exc.HTTPBadRequest(explanation=msg)
++            if specs.get(CPU_POLICY_KEY) != \
++                    fields.CPUAllocationPolicy.DEDICATED:
++                msg = _('%(K)s is only valid when %(P)s is %(D)s.  Either '
++                        'unset %(K)s or set %(P)s to %(D)s.') \
++                        % {'K': key,
++                           'P': CPU_POLICY_KEY,
++                           'D': fields.CPUAllocationPolicy.DEDICATED}
++                raise webob.exc.HTTPConflict(explanation=msg)
++            if SHARED_VCPU_KEY in specs:
++                if value in [fields.CPUThreadAllocationPolicy.REQUIRE,
++                             fields.CPUThreadAllocationPolicy.ISOLATE]:
++                    msg = _('Cannot set %(K)s to %(V)s if %(S)s is set. '
++                            'Either unset %(K)s, set it to %(P)s, or unset '
++                            '%(S)s') \
++                            % {'K': key,
++                               'V': value,
++                               'S': SHARED_VCPU_KEY,
++                               'P': fields.CPUThreadAllocationPolicy.PREFER}
++                    raise webob.exc.HTTPConflict(explanation=msg)
++            if CPU_SCALING_KEY in specs:
++                if value == fields.CPUThreadAllocationPolicy.REQUIRE:
++                    msg = _('Cannot set %(K)s to %(V)s if %(C)s is set. '
++                             'Either unset %(K)s, set it to another policy, '
++                             'or unset %(C)s') \
++                            % {'K': key,
++                               'V': value,
++                               'C': CPU_SCALING_KEY}
++                    raise webob.exc.HTTPConflict(explanation=msg)
++
++    # check that we do not use deprecated keys
++    @staticmethod
++    def _validate_wrs_deprecated_keys(flavor):
++        keys = ['hw:wrs:vcpu:scheduler']
++
++        specs = flavor.extra_specs
++        for key in keys:
++            if key in specs:
++                msg = _('%(k)s is no longer supported.') % {'k': key}
++                raise webob.exc.HTTPBadRequest(explanation=msg)
++
+     @staticmethod
+     def _validate_nested_vmx(flavor):
+         key = 'hw:wrs:nested_vmx'
+@@ -170,8 +264,12 @@ class FlavorExtraSpecsController(wsgi.Controller):
+     # add it back in to the args.
+     def _validate_extra_specs(self, flavor):
+         self._validate_vcpu_models(flavor)
++        self._validate_cpu_policy(flavor)
++        self._validate_cpu_thread_policy(flavor)
+         self._validate_numa_node(flavor)
+         self._validate_nested_vmx(flavor)
++        self._validate_cpu_realtime_mask(flavor)
++        self._validate_wrs_deprecated_keys(flavor)
+ 
+     def _get_extra_specs(self, context, flavor_id):
+         flavor = common.get_flavor(context, flavor_id)
+diff --git a/nova/virt/hardware.py b/nova/virt/hardware.py
+index 32e6dc7..7b5b427 100644
+--- a/nova/virt/hardware.py
++++ b/nova/virt/hardware.py
+@@ -35,7 +35,7 @@ from nova.i18n import _
+ from nova import objects
+ from nova.objects import fields
+ from nova.objects import instance as obj_instance
+-
++from nova import utils
+ 
+ CONF = nova.conf.CONF
+ LOG = logging.getLogger(__name__)
+@@ -1312,6 +1312,53 @@ def vcpus_realtime_topology(flavor, image):
+     if len(vcpus_rt) < 1:
+         raise exception.RealtimeMaskNotFoundOrInvalid()
+ 
++    # extended realtime validation
++    vcpus_set = set(range(flavor.vcpus))
++    vcpus_em = vcpus_set - vcpus_rt
++
++    # Determine the specific key used to define the mask, noting that mask is
++    # evaluated (image_mask or flavor_mask).
++    ikey = 'hw_cpu_realtime_mask'
++    fkey = 'hw:cpu_realtime_mask'
++    key = None
++    if ikey in image.properties:
++        key = ikey
++    if fkey in flavor.extra_specs:
++        key = fkey
++
++    # Check that vcpu_rt, vcpus_em are within valid range
++    if ((not vcpus_rt.issubset(vcpus_set)) or
++            (not vcpus_em.issubset(vcpus_set))):
++        msg = (_('%(K)s (%(V)s) must be a subset of vCPUs (%(S)s)') %
++               {'K': key,
++                'V': mask,
++                'S': utils.list_to_range(list(vcpus_set))
++                })
++        raise exception.RealtimeMaskNotFoundOrInvalid(msg)
++
++    # Check that we have realtime vCPUs
++    if not vcpus_rt:
++        msg = (_('%(K)s (%(V)s) does not have realtime vCPUS defined') %
++               {'K': key, 'V': mask})
++        raise exception.RealtimeMaskNotFoundOrInvalid(msg)
++
++    # Check that we have normal vCPUs
++    if not vcpus_em:
++        msg = (_('%(K)s (%(V)s) does not have normal vCPUS defined') %
++               {'K': key, 'V': mask})
++        raise exception.RealtimeMaskNotFoundOrInvalid(msg)
++
++    # Check that hw:wrs:shared_vcpu is a subset of non-realtime vcpus
++    shared_vcpu = flavor.get('extra_specs', {}).get("hw:wrs:shared_vcpu", None)
++    if shared_vcpu is not None:
++        shared_vcpus = set([int(shared_vcpu)])
++        if not shared_vcpus.issubset(vcpus_em):
++            msg = (_("hw:wrs:shared_vcpu (%(S)s) is not a subset of "
++                     "non-realtime vCPUs (%(N)s)") %
++                   {"S": utils.list_to_range(list(shared_vcpus)),
++                    "N": utils.list_to_range(list(vcpus_em))})
++            raise exception.RealtimeMaskNotFoundOrInvalid(msg)
++
+     return vcpus_rt
+ 
+ 
+-- 
+2.7.4
+

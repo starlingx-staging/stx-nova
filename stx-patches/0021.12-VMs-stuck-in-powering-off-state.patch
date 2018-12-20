@@ -1,0 +1,106 @@
+From 611ba16e2f0e91924f84b18ca1b53294ab938889 Mon Sep 17 00:00:00 2001
+From: Ludovic Beliveau <ludovic.beliveau@windriver.com>
+Date: Tue, 18 Oct 2016 20:29:38 -0400
+Subject: [PATCH] VMs stuck in powering-off state
+
+An issue was observed once where some instances are stuck in task_state
+'powering-off'.  Based on the logs, it hasn't been found what could
+cause this issue.
+
+The only thing we know is that a 'stop' command is issued and the
+compute audits keeps reporting this instance in 'powering-off' but sees
+it running at the same time.  The guest is fully operational.
+
+This commit adds additionnal logging when stopping a guest.   The best
+guess so far is that the guest has been stopped but the nova databse
+missed an update/save.  A similar issue was found with an instance stuck in
+'deleting'.
+
+(cherry picked from commit c06128f)
+---
+ nova/compute/manager.py | 48 ++++++++++++++++++++++++++++++++++++++++++------
+ 1 file changed, 42 insertions(+), 6 deletions(-)
+
+diff --git a/nova/compute/manager.py b/nova/compute/manager.py
+index 3d267bf..abffa8f 100644
+--- a/nova/compute/manager.py
++++ b/nova/compute/manager.py
+@@ -2331,8 +2331,18 @@ class ComputeManager(manager.Manager):
+                                         trying to teardown networking
+         """
+         context = context.elevated()
+-        LOG.info(_LI('Terminating instance'),
+-                 context=context, instance=instance)
++        # Extra logging for debugging issue with stuck
++        # task_state.
++        current_power_state = self._get_power_state(context, instance)
++        LOG.info(_LI('Terminating instance; current vm_state: %(vm_state)s, '
++                     'current task_state: %(task_state)s, current DB '
++                     'power_state: %(db_power_state)s, current VM '
++                     'power_state: %(current_power_state)s'),
++                  {'vm_state': instance.vm_state,
++                   'task_state': instance.task_state,
++                   'db_power_state': instance.power_state,
++                   'current_power_state': current_power_state},
++                  instance_uuid=instance.uuid)
+ 
+         if notify:
+             self._notify_about_instance_usage(context, instance,
+@@ -2377,6 +2387,19 @@ class ComputeManager(manager.Manager):
+                     self._try_deallocate_network(context, instance,
+                                                  requested_networks)
+ 
++        # Extra logging for debugging issue with stuck
++        # task_state.
++        current_power_state = self._get_power_state(context, instance)
++        LOG.info(_LI('Instance terminated; current vm_state: %(vm_state)s, '
++                     'current task_state: %(task_state)s, current DB '
++                     'power_state: %(db_power_state)s, current VM '
++                     'power_state: %(current_power_state)s'),
++                  {'vm_state': instance.vm_state,
++                   'task_state': instance.task_state,
++                   'db_power_state': instance.power_state,
++                   'current_power_state': current_power_state},
++                  instance_uuid=instance.uuid)
++
+         if try_deallocate_networks:
+             self._try_deallocate_network(context, instance, requested_networks)
+ 
+@@ -2572,10 +2595,12 @@ class ComputeManager(manager.Manager):
+         @utils.synchronized(instance.uuid)
+         def do_stop_instance():
+             current_power_state = self._get_power_state(context, instance)
+-            LOG.debug('Stopping instance; current vm_state: %(vm_state)s, '
+-                      'current task_state: %(task_state)s, current DB '
+-                      'power_state: %(db_power_state)s, current VM '
+-                      'power_state: %(current_power_state)s',
++            # Extra logging for debugging issue with stuck
++            # task_state.
++            LOG.info(_LI('Stopping instance; current vm_state: %(vm_state)s, '
++                         'current task_state: %(task_state)s, current DB '
++                         'power_state: %(db_power_state)s, current VM '
++                         'power_state: %(current_power_state)s'),
+                       {'vm_state': instance.vm_state,
+                        'task_state': instance.task_state,
+                        'db_power_state': instance.power_state,
+@@ -2605,6 +2630,17 @@ class ComputeManager(manager.Manager):
+             instance.save(expected_task_state=expected_task_state)
+             self._notify_about_instance_usage(context, instance,
+                                               "power_off.end")
++            # Extra logging for debugging issue with stuck
++            # task_state.
++            LOG.info(_LI('Instance stopped; current vm_state: %(vm_state)s, '
++                         'current task_state: %(task_state)s, current DB '
++                         'power_state: %(db_power_state)s, current VM '
++                         'power_state: %(current_power_state)s'),
++                      {'vm_state': instance.vm_state,
++                       'task_state': instance.task_state,
++                       'db_power_state': instance.power_state,
++                       'current_power_state': current_power_state},
++                      instance_uuid=instance.uuid)
+ 
+         do_stop_instance()
+ 
+-- 
+2.7.4
+

@@ -1,0 +1,658 @@
+From ba128a4f1a88647ba391a2227e71713eb1b6537f Mon Sep 17 00:00:00 2001
+From: Jim Gauld <james.gauld@windriver.com>
+Date: Wed, 25 May 2016 13:42:36 -0400
+Subject: [PATCH] Port compute vswitch monitor metrics to Mitaka.
+
+This ports compute monitor VswitchMonitor metrics to Mitaka.
+
+Based on R2 commits:
+- c37b9d2b5846a056ef91ee7e759064461d78d2f1
+- d6d9e768ecde3cf57a6cab697d9b97b2ed3ddd0a
+
+The compute monitor 'VswitchMonitor' collects vswitch utilization from local
+host via engine/stats REST API.
+
+Utilization per engine is calculated as busy/(busy + idle) cycles.  Aggregate
+utilization of multiple engines is calculated per numa node. This utilization
+is be used later for VM placement decisions.
+
+Aggregate available utilization (i.e. unused power) is calculated per numa
+node. The maximum aggregate available utilization 'vswitch.avail' is obtained
+from the numa nodes. This utilization corresponds to the numa node with the
+most unused power. This single value is used used as the primary metric for
+host selection.
+
+MonitorMetric 'value' field was modified from IntegerField to the new
+GenericDataField which allows more complex metrics: i.e., Integers, Float,
+and dictionary.
+
+New tox testcases were created to demonstrate functional calculation
+based on REST API output.
+---
+ nova/compute/monitors/__init__.py                  |   1 +
+ nova/compute/monitors/vswitch/__init__.py          |   0
+ nova/compute/monitors/vswitch/vswitch_monitor.py   | 179 +++++++++++++++++
+ nova/objects/fields.py                             |  32 +++
+ nova/objects/monitor_metric.py                     |   9 +-
+ nova/scheduler/host_manager.py                     |  13 +-
+ .../unit/compute/monitors/vswitch/__init__.py      |   0
+ .../monitors/vswitch/test_vswitch_monitor.py       | 222 +++++++++++++++++++++
+ nova/tests/unit/objects/test_objects.py            |   2 +-
+ nova/virt/driver.py                                |  17 +-
+ 10 files changed, 471 insertions(+), 4 deletions(-)
+ create mode 100644 nova/compute/monitors/vswitch/__init__.py
+ create mode 100644 nova/compute/monitors/vswitch/vswitch_monitor.py
+ create mode 100644 nova/tests/unit/compute/monitors/vswitch/__init__.py
+ create mode 100644 nova/tests/unit/compute/monitors/vswitch/test_vswitch_monitor.py
+
+diff --git a/nova/compute/monitors/__init__.py b/nova/compute/monitors/__init__.py
+index 3d3b0ee..f8cceb3 100644
+--- a/nova/compute/monitors/__init__.py
++++ b/nova/compute/monitors/__init__.py
+@@ -52,6 +52,7 @@ class MonitorHandler(object):
+ 
+     NAMESPACES = [
+         'nova.compute.monitors.cpu',
++        'nova.compute.monitors.vswitch',
+     ]
+ 
+     def __init__(self, resource_tracker):
+diff --git a/nova/compute/monitors/vswitch/__init__.py b/nova/compute/monitors/vswitch/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/nova/compute/monitors/vswitch/vswitch_monitor.py b/nova/compute/monitors/vswitch/vswitch_monitor.py
+new file mode 100644
+index 0000000..02454e4
+--- /dev/null
++++ b/nova/compute/monitors/vswitch/vswitch_monitor.py
+@@ -0,0 +1,179 @@
++#
++# Copyright (c) 2015-2016 Wind River Systems, Inc.
++#
++#
++#
++#
++#
++
++"""
++Monitor to retrieve vswitch utilization information.
++"""
++
++import math
++import requests
++
++from oslo_log import log as logging
++from oslo_utils import timeutils
++
++from nova.compute.monitors import base
++import nova.conf
++from nova import exception
++from nova.i18n import _LE, _LW
++from nova.objects import fields
++
++CONF = nova.conf.CONF
++LOG = logging.getLogger(__name__)
++
++
++class VswitchMonitor(base.MonitorBase):
++    """vswitch utilization monitor
++
++    This class inherits from the base class for resource monitors,
++    and implements the methods to get vswitch utilization metrics.
++
++    The compute manager may load these monitors to retrieve periodic metrics.
++    """
++
++    def __init__(self, resource_tracker):
++        super(VswitchMonitor, self).__init__(resource_tracker)
++        self.source = 'vswitch-engine-stats'
++        self.driver = resource_tracker.driver
++        self._data = {}
++
++        self._host = 'localhost'
++        self._port = 9000
++        self._api = 'engine/stats'
++        self._url = 'http://%s:%d/v1/%s' % (self._host, self._port, self._api)
++        self._timeout = 3
++        self._update_data(init=True)
++
++    def get_metric_names(self):
++        return set([
++            fields.MonitorMetricType.VSWITCH_MAX_AVAIL,
++            fields.MonitorMetricType.VSWITCH_MULTI_AVAIL,
++            fields.MonitorMetricType.VSWITCH_UTIL,
++        ])
++
++    def get_metrics(self):
++        metrics = []
++        self._update_data()
++        for name in self.get_metric_names():
++            metrics.append((name, self._data[name], self._data["timestamp"]))
++        return metrics
++
++    def _update_data(self, init=False, **kwargs):
++        """Method to update metrics data."""
++
++        if init:
++            # Get host numa topology
++            try:
++                self._numa_topology = self.driver._get_host_numa_topology().\
++                    _to_dict()
++            except Exception as ex:
++                LOG.exception(_LE("Could not get host numa topology in the "
++                                  "compute driver: %(err)s") % {'err': ex})
++                raise exception.ResourceMonitorError(
++                    monitor=self.__class__.__name__)
++
++        # Prevent frequent calls to this function (ie., < 1 sec)
++        now = timeutils.utcnow()
++        if self._data.get('timestamp') is not None:
++            delta = now - self._data.get('timestamp')
++            if delta.seconds <= 1:
++                return
++
++        # Retrieve vswitch engine stats from current compute host
++        try:
++            r = requests.get(self._url,
++                             headers={'Connection': 'close'},
++                             timeout=self._timeout)
++            vswitch_stats = r.json()
++        except Exception as ex:
++            LOG.exception(_LE("Could not get: %(url)s, error=%(err)s")
++                          % {'url': self._url, 'err': ex})
++            raise exception.ResourceMonitorError(
++                monitor=self.__class__.__name__)
++
++        # Initialize numa cells
++        per_numa = {}
++        for cell in self._numa_topology['cells']:
++            cell_id = cell['id']
++            per_numa[cell_id] = {}
++            per_numa[cell_id]['busy'] = 0
++            per_numa[cell_id]['idle'] = 0
++            per_numa[cell_id]['n'] = 0
++
++        # Calculate per-numa node aggregate stats
++        for R in vswitch_stats:
++            socket_id = R['socket-id']
++            cyc_busy = R['cycles-busy']
++            cyc_idle = R['cycles-idle']
++            if socket_id not in per_numa.keys():
++                per_numa[socket_id] = {}
++                per_numa[socket_id]['busy'] = 0
++                per_numa[socket_id]['idle'] = 0
++                per_numa[socket_id]['n'] = 0
++                LOG.warning(_LW("Socket mismatch between vswitch and compute "
++                                "driver host numa topology. socket_id = "
++                                "%(cell)s") % {'cell': socket_id})
++            per_numa[socket_id]['busy'] += cyc_busy
++            per_numa[socket_id]['idle'] += cyc_idle
++            per_numa[socket_id]['n'] += 1
++
++        # Calculate per-numa node aggregate vswitch engine utilization.
++        # (Note: the provided busy and idle cycles are not cumulative.)
++        numa_avail = {}
++        numa_util = {}
++        for socket_id in per_numa.keys():
++            busy = per_numa[socket_id]['busy']
++            idle = per_numa[socket_id]['idle']
++            n = per_numa[socket_id]['n']
++            denom = busy + idle
++            if denom > 0:
++                util = float(n) * float(busy) / float(denom)
++            else:
++                util = 0.0
++
++            # Calculate aggregate engines utilization and availability per
++            # numa node.
++            n_engines = per_numa[socket_id]['n']
++            numa_util[socket_id] = util
++            if n_engines > 0:
++                numa_avail[socket_id] = n_engines - util
++            else:
++                numa_avail[socket_id] = 0.0
++                numa_util[socket_id] = None
++
++            LOG.debug('vswitch_monitor: node=%(node)d, engines=%(engines)d, '
++                      'busy=%(busy)d, idle=%(idle)d, '
++                      'util=%(util)s, avail=%(avail).1f'
++                      % {'node': socket_id,
++                         'engines': n_engines,
++                         'busy': busy,
++                         'idle': idle,
++                         'util': numa_util[socket_id],
++                         'avail': numa_avail[socket_id]
++                         })
++
++        # Determine the amount of available vswitch utilization corresponding
++        # to the numa node with the most unused vswitch power.
++        max_avail = max(numa_avail.values())
++
++        # Calculate aggregate vswitch available power spanning numa nodes.
++        agg_avail = sum(numa_avail.values())
++
++        # Calculate availability for multi-numa guest using the geometric mean
++        # of primary and non-primary numa node availability. Intent is to rank
++        # hosts that have multiple numa nodes available.
++        multi_avail = math.sqrt(max_avail * (agg_avail - max_avail))
++
++        # Store derived metrics for current state
++        self._data = {}
++        self._data['timestamp'] = now
++        self._data[fields.MonitorMetricType.VSWITCH_MAX_AVAIL] = \
++            float(max_avail)
++        self._data[fields.MonitorMetricType.VSWITCH_MULTI_AVAIL] = \
++            float(multi_avail)
++        self._data[fields.MonitorMetricType.VSWITCH_UTIL] = dict(numa_util)
++        LOG.debug('vswitch_monitor: _data=%s' % (self._data))
+diff --git a/nova/objects/fields.py b/nova/objects/fields.py
+index 0f2ca54..db2e90c 100644
+--- a/nova/objects/fields.py
++++ b/nova/objects/fields.py
+@@ -11,9 +11,17 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2015-2016 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ from collections import OrderedDict
+ 
++from mock import MagicMock
+ import netaddr
+ from oslo_versionedobjects import fields
+ import six
+@@ -465,6 +473,9 @@ class MonitorMetricType(Enum):
+     CPU_PERCENT = "cpu.percent"
+     NUMA_MEM_BW_MAX = "numa.membw.max"
+     NUMA_MEM_BW_CURRENT = "numa.membw.current"
++    VSWITCH_MAX_AVAIL = "vswitch.max_avail"
++    VSWITCH_MULTI_AVAIL = "vswitch.multi_avail"
++    VSWITCH_UTIL = "vswitch.util"
+ 
+     ALL = (
+         CPU_FREQUENCY,
+@@ -479,6 +490,9 @@ class MonitorMetricType(Enum):
+         CPU_PERCENT,
+         NUMA_MEM_BW_MAX,
+         NUMA_MEM_BW_CURRENT,
++        VSWITCH_MAX_AVAIL,
++        VSWITCH_MULTI_AVAIL,
++        VSWITCH_UTIL,
+     )
+ 
+     def __init__(self):
+@@ -709,6 +723,20 @@ class NonNegativeInteger(FieldType):
+         return v
+ 
+ 
++# enable much more complex monitor metrics to be used
++class GenericData(FieldType):
++    @staticmethod
++    def coerce(obj, attr, value):
++        accepted_types = (six.integer_types, float, dict, MagicMock)
++        if isinstance(value, accepted_types):
++            return value
++        else:
++            raise ValueError(
++                _('Value must be integer, float, or dict in field '
++                  '%(attr)s, not a %(type)s') %
++                {'attr': attr, 'type': type(value).__name__})
++
++
+ class AutoTypedField(fields.Field):
+     AUTO_TYPE = None
+ 
+@@ -918,3 +946,7 @@ class NonNegativeFloatField(AutoTypedField):
+ 
+ class NonNegativeIntegerField(AutoTypedField):
+     AUTO_TYPE = NonNegativeInteger()
++
++
++class GenericDataField(AutoTypedField):
++    AUTO_TYPE = GenericData()
+diff --git a/nova/objects/monitor_metric.py b/nova/objects/monitor_metric.py
+index 3d3070c..9aafa4b 100644
+--- a/nova/objects/monitor_metric.py
++++ b/nova/objects/monitor_metric.py
+@@ -9,6 +9,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2016 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ from oslo_serialization import jsonutils
+ from oslo_utils import versionutils
+@@ -37,7 +44,7 @@ class MonitorMetric(base.NovaObject):
+ 
+     fields = {
+         'name': fields.MonitorMetricTypeField(nullable=False),
+-        'value': fields.IntegerField(nullable=False),
++        'value': fields.GenericDataField(nullable=False),
+         'numa_membw_values': fields.DictOfIntegersField(nullable=True),
+         'timestamp': fields.DateTimeField(nullable=False),
+         # This will be the stevedore extension full class name
+diff --git a/nova/scheduler/host_manager.py b/nova/scheduler/host_manager.py
+index 4623035..15fda66 100644
+--- a/nova/scheduler/host_manager.py
++++ b/nova/scheduler/host_manager.py
+@@ -12,7 +12,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
+-
++#
++# Copyright (c) 2014-2016 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ """
+ Manage hosts in the current zone.
+ """
+@@ -239,6 +245,11 @@ class HostState(object):
+         # update metrics
+         self.metrics = objects.MonitorMetricList.from_json(compute.metrics)
+ 
++        # extension - add debug logs for each metric
++        nodename = compute.get('hypervisor_hostname')
++        for m in self.metrics.objects:
++            LOG.debug('metrics(%s): metric=%s' % (nodename, m.to_dict()))
++
+         # update allocation ratios given by the ComputeNode object
+         self.cpu_allocation_ratio = compute.cpu_allocation_ratio
+         self.ram_allocation_ratio = compute.ram_allocation_ratio
+diff --git a/nova/tests/unit/compute/monitors/vswitch/__init__.py b/nova/tests/unit/compute/monitors/vswitch/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/nova/tests/unit/compute/monitors/vswitch/test_vswitch_monitor.py b/nova/tests/unit/compute/monitors/vswitch/test_vswitch_monitor.py
+new file mode 100644
+index 0000000..5900549
+--- /dev/null
++++ b/nova/tests/unit/compute/monitors/vswitch/test_vswitch_monitor.py
+@@ -0,0 +1,222 @@
++#
++# Copyright (c) 2016 Wind River Systems, Inc.
++#
++#
++#
++#
++#
++
++"""Tests for Compute Driver Vswitch resource monitor."""
++
++import math
++import mock
++
++from nova.compute.monitors.vswitch import vswitch_monitor
++from nova import objects
++from nova import test
++
++# per-vswitch-engine constants
++CYCLES_TOTAL = 3000000000
++CYCLES_BUSY_1 = 2000000000
++CYCLES_BUSY_2 = 100000000
++CYCLES_BUSY_3 = 500000000
++CYCLES_BUSY_4 = 700000000
++CYCLES_IDLE_1 = CYCLES_TOTAL - CYCLES_BUSY_1
++CYCLES_IDLE_2 = CYCLES_TOTAL - CYCLES_BUSY_2
++CYCLES_IDLE_3 = CYCLES_TOTAL - CYCLES_BUSY_3
++CYCLES_IDLE_4 = CYCLES_TOTAL - CYCLES_BUSY_4
++
++V1_ENGINE_STATS_URL = 'http://localhost:9000/v1/engine/stats'
++V1_ENGINE_STATS_S0 = \
++    [{"id": 0, "cpuid": 1,
++      "uuid": "c9a3c2fe-dd5d-55c7-8509-a4df53f3df71",
++      "socket-id": 0,
++      "cycles-busy": CYCLES_BUSY_1, "cycles-idle": CYCLES_IDLE_1,
++      "load-average": 0.002000, "rx-packets": 0, "tx-packets": 0,
++      "ctrl-packets": 0, "rx-overflow": 0, "tx-disabled": 0,
++      "tx-overflow": 0, "rx-enqueue-0": 0, "rx-discard-0": 0,
++      "tx-enqueue-0": 0, "tx-discard-0": 0, "rx-enqueue-1": 0,
++      "rx-discard-1": 0, "tx-enqueue-1": 0, "tx-discard-1": 0,
++      "rx-enqueue-2": 0, "rx-discard-2": 0, "tx-enqueue-2": 0,
++      "tx-discard-2": 0, "rx-enqueue-3": 0, "rx-discard-3": 0,
++      "tx-enqueue-3": 0, "tx-discard-3": 0, "rx-enqueue-4": 0,
++      "rx-discard-4": 0, "tx-enqueue-4": 0, "tx-discard-4": 0,
++      "rx-enqueue-5": 0, "rx-discard-5": 0, "tx-enqueue-5": 0,
++      "tx-discard-5": 0, "rx-enqueue-6": 0, "rx-discard-6": 0,
++      "tx-enqueue-6": 0, "tx-discard-6": 0, "rx-enqueue-7": 0,
++      "rx-discard-7": 0, "tx-enqueue-7": 0, "tx-discard-7": 0},
++     {"id": 1, "cpuid": 2,
++      "uuid": "2f601016-f04c-5103-905e-3e05adb3c3aa",
++      "socket-id": 0,
++      "cycles-busy": CYCLES_BUSY_2, "cycles-idle": CYCLES_IDLE_2,
++      "load-average": 0.000000, "rx-packets": 0, "tx-packets": 0,
++      "ctrl-packets": 0, "rx-overflow": 0, "tx-disabled": 0,
++      "tx-overflow": 0, "rx-enqueue-0": 0, "rx-discard-0": 0,
++      "tx-enqueue-0": 0, "tx-discard-0": 0, "rx-enqueue-1": 0,
++      "rx-discard-1": 0, "tx-enqueue-1": 0, "tx-discard-1": 0,
++      "rx-enqueue-2": 0, "rx-discard-2": 0, "tx-enqueue-2": 0,
++      "tx-discard-2": 0, "rx-enqueue-3": 0, "rx-discard-3": 0,
++      "tx-enqueue-3": 0, "tx-discard-3": 0, "rx-enqueue-4": 0,
++      "rx-discard-4": 0, "tx-enqueue-4": 0, "tx-discard-4": 0,
++      "rx-enqueue-5": 0, "rx-discard-5": 0, "tx-enqueue-5": 0,
++      "tx-discard-5": 0, "rx-enqueue-6": 0, "rx-discard-6": 0,
++      "tx-enqueue-6": 0, "tx-discard-6": 0, "rx-enqueue-7": 0,
++      "rx-discard-7": 0, "tx-enqueue-7": 0, "tx-discard-7": 0},
++     ]
++V1_ENGINE_STATS_S1 = \
++    [{"id": 2, "cpuid": 3,
++      "uuid": "c9a3c2fe-dd5d-55c7-8509-a4df53f3df71",
++      "socket-id": 1,
++      "cycles-busy": CYCLES_BUSY_3, "cycles-idle": CYCLES_IDLE_3,
++      "load-average": 0.002000, "rx-packets": 0, "tx-packets": 0,
++      "ctrl-packets": 0, "rx-overflow": 0, "tx-disabled": 0,
++      "tx-overflow": 0, "rx-enqueue-0": 0, "rx-discard-0": 0,
++      "tx-enqueue-0": 0, "tx-discard-0": 0, "rx-enqueue-1": 0,
++      "rx-discard-1": 0, "tx-enqueue-1": 0, "tx-discard-1": 0,
++      "rx-enqueue-2": 0, "rx-discard-2": 0, "tx-enqueue-2": 0,
++      "tx-discard-2": 0, "rx-enqueue-3": 0, "rx-discard-3": 0,
++      "tx-enqueue-3": 0, "tx-discard-3": 0, "rx-enqueue-4": 0,
++      "rx-discard-4": 0, "tx-enqueue-4": 0, "tx-discard-4": 0,
++      "rx-enqueue-5": 0, "rx-discard-5": 0, "tx-enqueue-5": 0,
++      "tx-discard-5": 0, "rx-enqueue-6": 0, "rx-discard-6": 0,
++      "tx-enqueue-6": 0, "tx-discard-6": 0, "rx-enqueue-7": 0,
++      "rx-discard-7": 0, "tx-enqueue-7": 0, "tx-discard-7": 0},
++     {"id": 3, "cpuid": 4,
++      "uuid": "2f601016-f04c-5103-905e-3e05adb3c3aa",
++      "socket-id": 1,
++      "cycles-busy": CYCLES_BUSY_4, "cycles-idle": CYCLES_IDLE_4,
++      "load-average": 0.000000, "rx-packets": 0, "tx-packets": 0,
++      "ctrl-packets": 0, "rx-overflow": 0, "tx-disabled": 0,
++      "tx-overflow": 0, "rx-enqueue-0": 0, "rx-discard-0": 0,
++      "tx-enqueue-0": 0, "tx-discard-0": 0, "rx-enqueue-1": 0,
++      "rx-discard-1": 0, "tx-enqueue-1": 0, "tx-discard-1": 0,
++      "rx-enqueue-2": 0, "rx-discard-2": 0, "tx-enqueue-2": 0,
++      "tx-discard-2": 0, "rx-enqueue-3": 0, "rx-discard-3": 0,
++      "tx-enqueue-3": 0, "tx-discard-3": 0, "rx-enqueue-4": 0,
++      "rx-discard-4": 0, "tx-enqueue-4": 0, "tx-discard-4": 0,
++      "rx-enqueue-5": 0, "rx-discard-5": 0, "tx-enqueue-5": 0,
++      "tx-discard-5": 0, "rx-enqueue-6": 0, "rx-discard-6": 0,
++      "tx-enqueue-6": 0, "tx-discard-6": 0, "rx-enqueue-7": 0,
++      "rx-discard-7": 0, "tx-enqueue-7": 0, "tx-discard-7": 0},
++     ]
++
++
++def mocked_requests_get_s0(*args, **kwargs):
++    class FakeResponse(object):
++        def __init__(self, json_data, status_code):
++            self.json_data = json_data
++            self.status_code = status_code
++
++        def json(self):
++            return self.json_data
++
++    if args[0] == V1_ENGINE_STATS_URL:
++        return FakeResponse(V1_ENGINE_STATS_S0, 200)
++
++    return FakeResponse({}, 404)
++
++
++def mocked_requests_get_s0s1(*args, **kwargs):
++    class FakeResponse(object):
++        def __init__(self, json_data, status_code):
++            self.json_data = json_data
++            self.status_code = status_code
++
++        def json(self):
++            return self.json_data
++
++    if args[0] == V1_ENGINE_STATS_URL:
++        return FakeResponse(V1_ENGINE_STATS_S0 + V1_ENGINE_STATS_S1, 200)
++
++    return FakeResponse({}, 404)
++
++
++class FakeDriver(object):
++    def _get_host_numa_topology(self):
++        return objects.NUMATopology(
++            cells=[objects.NUMACell(
++                id=0, cpuset=set([1, 2]), memory=1024,
++                cpu_usage=0, memory_usage=0,
++                mempages=[], siblings=[],
++                pinned_cpus=set([])),
++                objects.NUMACell(
++                    id=1, cpuset=set([3, 4]), memory=1024,
++                    cpu_usage=0, memory_usage=0,
++                    mempages=[], siblings=[],
++                    pinned_cpus=set([]))])
++
++
++class FakeResourceTracker(object):
++    driver = FakeDriver()
++
++
++class VswitchMonitorTestCase(test.NoDBTestCase):
++
++    @mock.patch('requests.get', side_effect=mocked_requests_get_s0)
++    def test_get_metric_names(self, requests_mock):
++        monitor = vswitch_monitor.VswitchMonitor(FakeResourceTracker())
++        names = monitor.get_metric_names()
++        self.assertEqual(3, len(names))
++        self.assertIn("vswitch.max_avail", names)
++        self.assertIn("vswitch.multi_avail", names)
++        self.assertIn("vswitch.util", names)
++
++    @mock.patch('requests.get', side_effect=mocked_requests_get_s0)
++    def test_get_metrics_s0(self, requests_mock):
++        busy0 = CYCLES_BUSY_1 + CYCLES_BUSY_2
++        idle0 = CYCLES_IDLE_1 + CYCLES_IDLE_2
++        n0 = 2
++        u0 = float(n0) * float(busy0) / float(busy0 + idle0)
++        u1 = None
++        a0 = float(n0) - u0
++        max_avail = a0
++        agg_avail = a0
++        multi_avail = math.sqrt(max_avail * (agg_avail - max_avail))
++        util = dict()
++        util[0] = u0
++        util[1] = u1
++
++        metrics = objects.MonitorMetricList()
++        monitor = vswitch_monitor.VswitchMonitor(FakeResourceTracker())
++        monitor.add_metrics_to_list(metrics)
++        names = monitor.get_metric_names()
++        for metric in metrics.objects:
++            self.assertIn(metric.name, names)
++
++        # Test each calculated metric
++        metrics = {m.name: m.value for m in metrics.objects}
++        self.assertEqual(metrics["vswitch.max_avail"], max_avail)
++        self.assertEqual(metrics["vswitch.multi_avail"], multi_avail)
++        self.assertEqual(metrics["vswitch.util"], util)
++
++    @mock.patch('requests.get', side_effect=mocked_requests_get_s0s1)
++    def test_get_metrics_s0s1(self, requests_mock):
++        busy0 = CYCLES_BUSY_1 + CYCLES_BUSY_2
++        idle0 = CYCLES_IDLE_1 + CYCLES_IDLE_2
++        busy1 = CYCLES_BUSY_3 + CYCLES_BUSY_4
++        idle1 = CYCLES_IDLE_3 + CYCLES_IDLE_4
++        n0 = 2
++        n1 = 2
++        u0 = float(n0) * float(busy0) / float(busy0 + idle0)
++        u1 = float(n1) * float(busy1) / float(busy1 + idle1)
++        a0 = float(n0) - u0
++        a1 = float(n1) - u1
++        max_avail = max(a0, a1)
++        agg_avail = a0 + a1
++        multi_avail = math.sqrt(max_avail * (agg_avail - max_avail))
++        util = dict()
++        util[0] = u0
++        util[1] = u1
++
++        metrics = objects.MonitorMetricList()
++        monitor = vswitch_monitor.VswitchMonitor(FakeResourceTracker())
++        monitor.add_metrics_to_list(metrics)
++        names = monitor.get_metric_names()
++        for metric in metrics.objects:
++            self.assertIn(metric.name, names)
++
++        # Test each calculated metric
++        metrics = {m.name: m.value for m in metrics.objects}
++        self.assertEqual(metrics["vswitch.max_avail"], max_avail)
++        self.assertEqual(metrics["vswitch.multi_avail"], multi_avail)
++        self.assertEqual(metrics["vswitch.util"], util)
+diff --git a/nova/tests/unit/objects/test_objects.py b/nova/tests/unit/objects/test_objects.py
+index f0310b7..9e08010 100644
+--- a/nova/tests/unit/objects/test_objects.py
++++ b/nova/tests/unit/objects/test_objects.py
+@@ -1161,7 +1161,7 @@ object_data = {
+     'Migration': '1.4-17979b9f2ae7f28d97043a220b2a8350',
+     'MigrationContext': '1.0-d8c2f10069e410f639c49082b5932c92',
+     'MigrationList': '1.3-55595bfc1a299a5962614d0821a3567e',
+-    'MonitorMetric': '1.1-53b1db7c4ae2c531db79761e7acc52ba',
++    'MonitorMetric': '1.1-6e3500fac4ab912863d4caaca3d64e41',
+     'MonitorMetricList': '1.1-15ecf022a68ddbb8c2a6739cfc9f8f5e',
+     'NotificationPublisher': '1.0-bbbc1402fb0e443a3eb227cc52b61545',
+     'NUMACell': '1.2-74fc993ac5c83005e76e34e8487f1c05',
+diff --git a/nova/virt/driver.py b/nova/virt/driver.py
+index ef82727..e1a1413 100644
+--- a/nova/virt/driver.py
++++ b/nova/virt/driver.py
+@@ -12,7 +12,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
+-
++#
++# Copyright (c) 2014-2016 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ """
+ Driver base-classes:
+ 
+@@ -1226,6 +1232,15 @@ class ComputeDriver(object):
+         """
+         raise NotImplementedError()
+ 
++    # extension - expose host numa topology
++    def _get_host_numa_topology(self):
++        """Get the currently known host numa topology.
++
++        :returns: an object containing NUMATopology(cells=cells)
++
++        """
++        raise NotImplementedError()
++
+     def block_stats(self, instance, disk_id):
+         """Return performance counters associated with the given disk_id on the
+         given instance.  These are returned as [rd_req, rd_bytes, wr_req,
+-- 
+2.7.4
+

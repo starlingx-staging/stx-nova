@@ -1,0 +1,309 @@
+From a20befb66b9aef62f55c611a4c4d5677959087b3 Mon Sep 17 00:00:00 2001
+From: Chris Friesen <chris.friesen@windriver.com>
+Date: Thu, 18 May 2017 18:19:35 -0600
+Subject: [PATCH 047/143] Handle network-changed event for a
+ specific port
+
+It turns out that when Neutron sends the "network-changed"
+event it has a port in scope and can provide the port ID.
+
+Older versions of Neutron wouldn't send this, but if it's
+provided, we can try to optimize the network info cache
+refresh and scope it to just that single port, rather than
+build the entire cache all over again when the other ports
+in the cache may not have changed at all since the last
+time the cache was refreshed.
+
+NOTE: this is a modified verision of
+https://review.openstack.org/#/c/465787
+with some changes to account for the mtu, vif_model, mac_filter
+fields that we added to the port.
+
+8dee5ff fix handling network-changed event for a specific port
+9debaea Compute optimization during server event processing
+   Do not refresh network cache multiple times in a row for the same
+   instance during processing of an event chain.
+   This only affects network-changed events, which typically correspond to
+   port operations
+   We were observing post live migration was rpc timing out.  This reduces
+   the contention on an oslo lock
+   which was contributing to that timeout.
+
+__TYPE_single
+__R4_commit_53c7266
+---
+ nova/compute/manager.py                     |  23 ++++-
+ nova/network/neutronv2/api.py               | 149 +++++++++++++++++++---------
+ nova/tests/unit/compute/test_compute_mgr.py |   6 +-
+ 3 files changed, 126 insertions(+), 52 deletions(-)
+
+diff --git a/nova/compute/manager.py b/nova/compute/manager.py
+index af32e42..ccf5036 100644
+--- a/nova/compute/manager.py
++++ b/nova/compute/manager.py
+@@ -7487,6 +7487,7 @@ class ComputeManager(manager.Manager):
+         # as when we're asked to update the instance's info_cache. If it's
+         # not one of those, look for some thread(s) waiting for the event and
+         # unblock them if so.
++        update_set = set()
+         for event in events:
+             instance = [inst for inst in instances
+                         if inst.uuid == event.instance_uuid][0]
+@@ -7495,7 +7496,27 @@ class ComputeManager(manager.Manager):
+                       instance=instance)
+             if event.name == 'network-changed':
+                 try:
+-                    self.network_api.get_instance_nw_info(context, instance)
++                    # We expect the port_id (if any) to be stored in
++                    # event.tag.  Use the (instance.uuid, event.tag) tuple
++                    # to check for duplicate events that we can ignore.
++                    # In practice, now that we get the port_id we likely
++                    # don't need the duplicate event detection.
++                    if (instance.uuid, event.tag) not in update_set:
++                        update_set.add((instance.uuid, event.tag))
++
++                        # If event.tag is None we will refresh the cache for
++                        # all the ports.
++                        # If event.tag is set we will just try to refresh the
++                        # cache for this one port. In this case something
++                        # about the port was updated, or it was associated/
++                        # disassociated to/from a floating IP.
++                        self.network_api.get_instance_nw_info(
++                            context, instance, refresh_vif_id=event.tag)
++                    else:
++                        LOG.info('Oops, received duplicate network-changed'
++                                 ' event for instance %(uuid)s and event '
++                                 'tag %(evt)s',
++                                 {'uuid': instance.uuid, 'evt': event.tag})
+                 except exception.NotFound as e:
+                     LOG.info('Failed to process external instance event '
+                              '%(event)s due to: %(error)s',
+diff --git a/nova/network/neutronv2/api.py b/nova/network/neutronv2/api.py
+index bc996d1..492e7ff 100644
+--- a/nova/network/neutronv2/api.py
++++ b/nova/network/neutronv2/api.py
+@@ -1328,7 +1328,8 @@ class API(base_api.NetworkAPI):
+ 
+     def _get_instance_nw_info(self, context, instance, networks=None,
+                               port_ids=None, admin_client=None,
+-                              preexisting_port_ids=None, **kwargs):
++                              preexisting_port_ids=None,
++                              refresh_vif_id=None, **kwargs):
+         # NOTE(danms): This is an inner method intended to be called
+         # by other code that updates instance nwinfo. It *must* be
+         # called with the refresh_cache-%(instance_uuid) lock held!
+@@ -1339,7 +1340,8 @@ class API(base_api.NetworkAPI):
+         compute_utils.refresh_info_cache_for_instance(context, instance)
+         nw_info = self._build_network_info_model(context, instance, networks,
+                                                  port_ids, admin_client,
+-                                                 preexisting_port_ids)
++                                                 preexisting_port_ids,
++                                                 refresh_vif_id)
+         return network_model.NetworkInfo.hydrate(nw_info)
+ 
+     def _gather_port_ids_and_networks(self, context, instance, networks=None,
+@@ -2255,9 +2257,51 @@ class API(base_api.NetworkAPI):
+         return [vif['id'] for vif in net_info
+                 if vif.get('preserve_on_delete')]
+ 
++    def _build_vif_model(self, context, client, current_neutron_port,
++                         networks, preexisting_port_ids):
++        vif_active = False
++        if (current_neutron_port['admin_state_up'] is False
++            or current_neutron_port['status'] == 'ACTIVE'):
++            vif_active = True
++
++        network_IPs = self._nw_info_get_ips(client,
++                                            current_neutron_port)
++        subnets = self._nw_info_get_subnets(context,
++                                            current_neutron_port,
++                                            network_IPs, client)
++
++        devname = "tap" + current_neutron_port['id']
++        devname = devname[:network_model.NIC_NAME_LEN]
++
++        network, ovs_interfaceid = (
++            self._nw_info_build_network(current_neutron_port,
++                                        networks, subnets))
++        preserve_on_delete = (current_neutron_port['id'] in
++                              preexisting_port_ids)
++
++        return network_model.VIF(
++            id=current_neutron_port['id'],
++            address=current_neutron_port['mac_address'],
++            network=network,
++            vnic_type=current_neutron_port.get('binding:vnic_type',
++                                               network_model.VNIC_TYPE_NORMAL),
++            type=current_neutron_port.get('binding:vif_type'),
++            profile=_get_binding_profile(current_neutron_port),
++            # extension: add mtu, vif_model, mac_filter
++            mtu=current_neutron_port.get('wrs-binding:mtu'),
++            vif_model= current_neutron_port.get(constants.PORT_VIF_MODEL),
++            details=current_neutron_port.get('binding:vif_details'),
++            ovs_interfaceid=ovs_interfaceid,
++            devname=devname,
++            mac_filter=current_neutron_port.get(
++                constants.PORT_MAC_FILTERING, False),
++            active=vif_active,
++            preserve_on_delete=preserve_on_delete)
++
+     def _build_network_info_model(self, context, instance, networks=None,
+                                   port_ids=None, admin_client=None,
+-                                  preexisting_port_ids=None):
++                                  preexisting_port_ids=None,
++                                  refresh_vif_id=None):
+         """Return list of ordered VIFs attached to instance.
+ 
+         :param context: Request context.
+@@ -2275,6 +2319,10 @@ class API(base_api.NetworkAPI):
+                         an instance is de-allocated. Supplied list will
+                         be added to the cached list of preexisting port
+                         IDs for this instance.
++        :param refresh_vif_id: Optional port ID to refresh within the existing
++                        cache rather than the entire cache. This can be
++                        triggered via a "network-changed" server external event
++                        from Neutron.
+         """
+ 
+         search_opts = {'tenant_id': instance.project_id,
+@@ -2283,14 +2331,8 @@ class API(base_api.NetworkAPI):
+             client = get_client(context, admin=True)
+         else:
+             client = admin_client
+-
+         data = client.list_ports(**search_opts)
+-
+         current_neutron_ports = data.get('ports', [])
+-        nw_info_refresh = networks is None and port_ids is None
+-        networks, port_ids = self._gather_port_ids_and_networks(
+-                context, instance, networks, port_ids, client)
+-        nw_info = network_model.NetworkInfo()
+ 
+         if preexisting_port_ids is None:
+             preexisting_port_ids = []
+@@ -2302,49 +2344,58 @@ class API(base_api.NetworkAPI):
+             current_neutron_port_map[current_neutron_port['id']] = (
+                 current_neutron_port)
+ 
++        # Figure out what kind of operation we're processing. If we're given
++        # a single port to refresh then we try to optimize and update just the
++        # information for that VIF in the existing cache rather than try to
++        # rebuild the entire thing.
++        if refresh_vif_id is not None:
++            nw_info = instance.get_network_info()
++            if nw_info:
++                current_neutron_port = current_neutron_port_map.get(
++                    refresh_vif_id)
++                if current_neutron_port:
++                    # Get the network for the port.
++                    networks = self._get_available_networks(
++                        context, instance.project_id,
++                        [current_neutron_port['network_id']], client)
++                    # Build the VIF model given the latest port information.
++                    vif_updated = self._build_vif_model(
++                        context, client, current_neutron_port, networks,
++                        preexisting_port_ids)
++                    for index, vif in enumerate(nw_info):
++                        if vif['id'] == refresh_vif_id:
++                            # Update the existing entry.
++                            nw_info[index] = vif_updated
++                            break
++                    else:
++                        # If it wasn't in the existing cache, add it.
++                        nw_info.append(vif_updated)
++                else:
++                    # Find the VIF in the existing cache and remove it.
++                    for index, vif in enumerate(nw_info):
++                        if vif['id'] == refresh_vif_id:
++                            LOG.info('Port %s from network info_cache is no '
++                                     'longer associated with instance in '
++                                     'Neutron. Removing from network '
++                                     'info_cache.', refresh_vif_id,
++                                     instance=instance)
++                            del nw_info[index]
++                            break
++                return nw_info
++            # else there is no existing cache and we need to build it
++
++        nw_info_refresh = networks is None and port_ids is None
++        networks, port_ids = self._gather_port_ids_and_networks(
++                context, instance, networks, port_ids, client)
++        nw_info = network_model.NetworkInfo()
++
+         for port_id in port_ids:
+             current_neutron_port = current_neutron_port_map.get(port_id)
+             if current_neutron_port:
+-                vif_active = False
+-                if (current_neutron_port['admin_state_up'] is False
+-                    or current_neutron_port['status'] == 'ACTIVE'):
+-                    vif_active = True
+-
+-                network_IPs = self._nw_info_get_ips(client,
+-                                                    current_neutron_port)
+-                subnets = self._nw_info_get_subnets(context,
+-                                                    current_neutron_port,
+-                                                    network_IPs, client)
+-
+-                devname = "tap" + current_neutron_port['id']
+-                devname = devname[:network_model.NIC_NAME_LEN]
+-
+-                network, ovs_interfaceid = (
+-                    self._nw_info_build_network(current_neutron_port,
+-                                                networks, subnets))
+-                preserve_on_delete = (current_neutron_port['id'] in
+-                                      preexisting_port_ids)
+-
+-                nw_info.append(network_model.VIF(
+-                    id=current_neutron_port['id'],
+-                    address=current_neutron_port['mac_address'],
+-                    network=network,
+-                    vnic_type=current_neutron_port.get('binding:vnic_type',
+-                        network_model.VNIC_TYPE_NORMAL),
+-                    type=current_neutron_port.get('binding:vif_type'),
+-                    profile=_get_binding_profile(current_neutron_port),
+-                    # extension: add mtu, vif_model, mac_filter
+-                    mtu=current_neutron_port.get('wrs-binding:mtu'),
+-                    vif_model=
+-                        current_neutron_port.get(constants.PORT_VIF_MODEL),
+-                    details=current_neutron_port.get('binding:vif_details'),
+-                    ovs_interfaceid=ovs_interfaceid,
+-                    devname=devname,
+-                    mac_filter=current_neutron_port.get(
+-                        constants.PORT_MAC_FILTERING, False),
+-                    active=vif_active,
+-                    preserve_on_delete=preserve_on_delete))
+-
++                vif = self._build_vif_model(
++                    context, client, current_neutron_port, networks,
++                    preexisting_port_ids)
++                nw_info.append(vif)
+             elif nw_info_refresh:
+                 LOG.info(_LI('Port %s from network info_cache is no '
+                              'longer associated with instance in Neutron. '
+diff --git a/nova/tests/unit/compute/test_compute_mgr.py b/nova/tests/unit/compute/test_compute_mgr.py
+index 0986a62..e72c2e7 100644
+--- a/nova/tests/unit/compute/test_compute_mgr.py
++++ b/nova/tests/unit/compute/test_compute_mgr.py
+@@ -2767,7 +2767,8 @@ class ComputeManagerUnitTestCase(test.NoDBTestCase):
+             self.compute.external_instance_event(self.context,
+                                                  instances, events)
+             get_instance_nw_info.assert_called_once_with(self.context,
+-                                                         instances[0])
++                                                         instances[0],
++                                                         refresh_vif_id='tag1')
+             _process_instance_event.assert_called_once_with(instances[1],
+                                                             events[1])
+             _process_instance_vif_deleted_event.assert_called_once_with(
+@@ -2835,7 +2836,8 @@ class ComputeManagerUnitTestCase(test.NoDBTestCase):
+             self.compute.external_instance_event(self.context,
+                                                  instances, events)
+             get_instance_nw_info.assert_called_once_with(self.context,
+-                                                         instances[0])
++                                                         instances[0],
++                                                         refresh_vif_id='tag1')
+             update_instance_cache_with_nw_info.assert_called_once_with(
+                                                    self.compute.network_api,
+                                                    self.context,
+-- 
+2.7.4
+

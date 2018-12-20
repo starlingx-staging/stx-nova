@@ -1,0 +1,141 @@
+From 209aaa9ef1f29ecad3cc9f51618fddecfd017bf4 Mon Sep 17 00:00:00 2001
+From: Chris Friesen <chris.friesen@windriver.com>
+Date: Wed, 11 Feb 2015 12:55:45 -0600
+Subject: [PATCH 020/143] configure qemu reboot timeout to 5 seconds
+
+This configures BIOS reboot timeout so that if guest machine fails,
+it will reboot after specified time in milliseconds.
+
+This configures libvirt XML <os><bios rebootTimeout="5000"/></os> ,
+wich enables qemu option "-boot reboot-timeout=5000".
+
+This enables retry in the case of boot failure, we see on console instance
+can not startup due to "No bootable device".
+
+Renamed from "primary: tweak pinning of emulator threads and qemu boot timeout"
+
+__TYPE_single
+__TAG_qemu
+__R4_commit_2a75531
+__R3_commit_4106fae
+---
+ nova/tests/unit/virt/libvirt/test_config.py | 9 +++++++++
+ nova/tests/unit/virt/wrs/test_vif.py        | 1 +
+ nova/virt/libvirt/config.py                 | 6 ++++++
+ 3 files changed, 16 insertions(+)
+
+diff --git a/nova/tests/unit/virt/libvirt/test_config.py b/nova/tests/unit/virt/libvirt/test_config.py
+index 2e5a772..f19eb75 100644
+--- a/nova/tests/unit/virt/libvirt/test_config.py
++++ b/nova/tests/unit/virt/libvirt/test_config.py
+@@ -1951,6 +1951,7 @@ class LibvirtConfigGuestTest(LibvirtConfigBaseTest):
+               <os>
+                 <type>exe</type>
+                 <init>/sbin/init</init>
++                <bios rebootTimeout="5000"/>
+               </os>
+               <devices>
+                 <filesystem type="mount">
+@@ -1996,6 +1997,7 @@ class LibvirtConfigGuestTest(LibvirtConfigBaseTest):
+               <os>
+                 <type>exe</type>
+                 <init>/sbin/init</init>
++                <bios rebootTimeout="5000"/>
+               </os>
+               <devices>
+                 <filesystem type="mount">
+@@ -2042,6 +2044,7 @@ class LibvirtConfigGuestTest(LibvirtConfigBaseTest):
+                 <kernel>/tmp/vmlinuz</kernel>
+                 <initrd>/tmp/ramdisk</initrd>
+                 <cmdline>console=xvc0</cmdline>
++                <bios rebootTimeout="5000"/>
+               </os>
+               <devices>
+                 <disk type="file" device="disk">
+@@ -2089,6 +2092,7 @@ class LibvirtConfigGuestTest(LibvirtConfigBaseTest):
+                 <loader>/usr/lib/xen/boot/hvmloader</loader>
+                 <cmdline>console=xvc0</cmdline>
+                 <root>root=xvda</root>
++                <bios rebootTimeout="5000"/>
+               </os>
+               <features>
+                 <acpi/>
+@@ -2219,6 +2223,7 @@ class LibvirtConfigGuestTest(LibvirtConfigBaseTest):
+               </sysinfo>
+               <os>
+                 <type>linux</type>
++                <bios rebootTimeout="5000"/>
+                 <boot dev="hd"/>
+                 <boot dev="cdrom"/>
+                 <boot dev="fd"/>
+@@ -2266,6 +2271,7 @@ class LibvirtConfigGuestTest(LibvirtConfigBaseTest):
+               <os>
+                 <type>x86_64</type>
+                 <loader readonly='yes' type='pflash'>/tmp/OVMF_CODE.fd</loader>
++                <bios rebootTimeout="5000"/>
+               </os>
+             </domain>""")
+ 
+@@ -2288,6 +2294,7 @@ class LibvirtConfigGuestTest(LibvirtConfigBaseTest):
+               <vcpu>2</vcpu>
+               <os>
+                 <type>fake</type>
++                <bios rebootTimeout="5000"/>
+                 <bootmenu enable="yes"/>
+               </os>
+             </domain>""")
+@@ -2311,6 +2318,7 @@ class LibvirtConfigGuestTest(LibvirtConfigBaseTest):
+               <vcpu>2</vcpu>
+               <os>
+                 <type>fake</type>
++                <bios rebootTimeout="5000"/>
+               </os>
+               <perf>
+                 <event enabled="yes" name="cmt"/>
+@@ -2337,6 +2345,7 @@ class LibvirtConfigGuestTest(LibvirtConfigBaseTest):
+               <vcpu>2</vcpu>
+               <os>
+                 <type machine="fake_machine_type">hvm</type>
++                <bios rebootTimeout="5000"/>
+               </os>
+             </domain>""")
+ 
+diff --git a/nova/tests/unit/virt/wrs/test_vif.py b/nova/tests/unit/virt/wrs/test_vif.py
+index 416b61e..66b2c25 100644
+--- a/nova/tests/unit/virt/wrs/test_vif.py
++++ b/nova/tests/unit/virt/wrs/test_vif.py
+@@ -162,6 +162,7 @@ class LibvirtWRSVifTestCase(test.NoDBTestCase):
+         <vcpu>4</vcpu>
+         <os>
+             <type>None</type>
++            <bios rebootTimeout="5000"/>
+         </os>
+         <devices>
+             <qemu:commandline
+diff --git a/nova/virt/libvirt/config.py b/nova/virt/libvirt/config.py
+index 361c22c..9ed772a 100644
+--- a/nova/virt/libvirt/config.py
++++ b/nova/virt/libvirt/config.py
+@@ -2118,6 +2118,7 @@ class LibvirtConfigGuest(LibvirtConfigObject):
+         self.os_cmdline = None
+         self.os_root = None
+         self.os_init_path = None
++        self.os_reboot_timeout = "5000"
+         self.os_boot_dev = []
+         self.os_smbios = None
+         self.os_mach_type = None
+@@ -2175,6 +2176,11 @@ class LibvirtConfigGuest(LibvirtConfigObject):
+             os.append(self._text_node("root", self.os_root))
+         if self.os_init_path is not None:
+             os.append(self._text_node("init", self.os_init_path))
++        # Configure BIOS reboot timeout so that if guest machine fails,
++        # it will reboot after specified time in milliseconds.
++        if self.os_reboot_timeout is not None:
++            bios = etree.Element("bios", rebootTimeout=self.os_reboot_timeout)
++            os.append(bios)
+ 
+         for boot_dev in self.os_boot_dev:
+             os.append(etree.Element("boot", dev=boot_dev))
+-- 
+2.7.4
+

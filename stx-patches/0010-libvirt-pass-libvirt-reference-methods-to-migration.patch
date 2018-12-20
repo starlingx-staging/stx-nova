@@ -1,0 +1,182 @@
+From cabb8c5ee97d32d884aa0f2abc6f40252387c548 Mon Sep 17 00:00:00 2001
+From: Sahid Orentino Ferdjaoui <sahid.ferdjaoui@redhat.com>
+Date: Mon, 13 Jun 2016 05:03:13 -0400
+Subject: [PATCH 010/143] libvirt: pass libvirt reference methods to migration
+
+In future the migration module can need more than the method
+get_volume_config. This commit replaces in the method update_guest_xml
+the argument get_volume_config by a well defined datastructure of
+referenced method of the driver.
+
+Change-Id: Ic80b49f04511507f70daec9e52eb147832cf6592
+
+This is the second in a series of three backports to Pike to give
+proper tracking of pinned cpus over live migration. Change was cherry
+picked from upstream review https://review.openstack.org/#/c/328997/26
+
+__TYPE_upstream
+__TAG_livemigration,resource
+__R4_commit_39c1cc2
+__R3_commit_e327194
+__TC6521
+---
+ nova/tests/unit/virt/libvirt/test_driver.py    | 10 ++++++----
+ nova/tests/unit/virt/libvirt/test_migration.py | 11 ++++++-----
+ nova/virt/libvirt/driver.py                    |  7 +++----
+ nova/virt/libvirt/migration.py                 | 13 ++++++++-----
+ 4 files changed, 23 insertions(+), 18 deletions(-)
+
+diff --git a/nova/tests/unit/virt/libvirt/test_driver.py b/nova/tests/unit/virt/libvirt/test_driver.py
+index 5780bc9..b1f38c6 100755
+--- a/nova/tests/unit/virt/libvirt/test_driver.py
++++ b/nova/tests/unit/virt/libvirt/test_driver.py
+@@ -8219,7 +8219,8 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+                              self.context, instance_ref, 'dest', False,
+                              migrate_data, guest, []))
+             mupdate.assert_called_once_with(
+-                guest, migrate_data, mock.ANY)
++                guest, migrate_data, libvirt_migrate.DriverInterface(
++                    drvr._get_volume_config))
+ 
+     def test_live_migration_with_valid_target_connect_addr(self):
+         self.compute = manager.ComputeManager()
+@@ -8315,7 +8316,8 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+                                   return_value=initial_xml)):
+             config = libvirt_migrate.get_updated_guest_xml(guest,
+                             objects.LibvirtLiveMigrateData(bdms=[bdmi]),
+-                            drvr._get_volume_config)
++                            libvirt_migrate.DriverInterface(
++                                drvr._get_volume_config))
+             parser = etree.XMLParser(remove_blank_text=True)
+             config = etree.fromstring(config, parser)
+             target_xml = etree.fromstring(target_xml, parser)
+@@ -8467,7 +8469,7 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+                                   return_value=initial_xml)):
+             config = libvirt_migrate.get_updated_guest_xml(guest,
+                 objects.LibvirtLiveMigrateData(bdms=[bdmi]),
+-                drvr._get_volume_config)
++                drvr)
+             self.assertEqual(target_xml, config)
+ 
+     def test_update_volume_xml_no_connection_info(self):
+@@ -8498,7 +8500,7 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+             config = libvirt_migrate.get_updated_guest_xml(
+                 guest,
+                 objects.LibvirtLiveMigrateData(bdms=[bdmi]),
+-                drvr._get_volume_config)
++                drvr)
+             self.assertEqual(target_xml, config)
+ 
+     @mock.patch.object(libvirt_driver.LibvirtDriver,
+diff --git a/nova/tests/unit/virt/libvirt/test_migration.py b/nova/tests/unit/virt/libvirt/test_migration.py
+index ddb7d23..5cd54c2 100644
+--- a/nova/tests/unit/virt/libvirt/test_migration.py
++++ b/nova/tests/unit/virt/libvirt/test_migration.py
+@@ -100,13 +100,13 @@ class UtilityMigrationTestCase(test.NoDBTestCase):
+             mock_perf_events_xml, mock_tostring):
+         data = objects.LibvirtLiveMigrateData()
+         mock_guest = mock.Mock(spec=libvirt_guest.Guest)
+-        get_volume_config = mock.MagicMock()
++        driver = mock.MagicMock()
+         mock_guest.get_xml_desc.return_value = '<domain></domain>'
+ 
+-        migration.get_updated_guest_xml(mock_guest, data, get_volume_config)
++        migration.get_updated_guest_xml(mock_guest, data, driver)
+         mock_graphics.assert_called_once_with(mock.ANY, data)
+         mock_serial.assert_called_once_with(mock.ANY, data)
+-        mock_volume.assert_called_once_with(mock.ANY, data, get_volume_config)
++        mock_volume.assert_called_once_with(mock.ANY, data, driver)
+         mock_perf_events_xml.assert_called_once_with(mock.ANY, data)
+         self.assertEqual(1, mock_tostring.called)
+ 
+@@ -235,10 +235,11 @@ class UtilityMigrationTestCase(test.NoDBTestCase):
+         conf.source_type = "block"
+         conf.source_path = bdm.connection_info['data'].get('device_path')
+ 
+-        get_volume_config = mock.MagicMock(return_value=conf)
++        driver_interface = migration.DriverInterface(
++            mock.MagicMock(return_value=conf))
+         doc = etree.fromstring(xml)
+         res = etree.tostring(migration._update_volume_xml(
+-            doc, data, get_volume_config))
++            doc, data, driver_interface))
+         new_xml = xml.replace('ip-1.2.3.4:3260-iqn.abc.12345.opst-lun-X',
+                               'ip-1.2.3.4:3260-iqn.cde.67890.opst-lun-Z')
+         self.assertThat(res, matchers.XMLMatches(new_xml))
+diff --git a/nova/virt/libvirt/driver.py b/nova/virt/libvirt/driver.py
+index 04de4dd..4350dd0 100644
+--- a/nova/virt/libvirt/driver.py
++++ b/nova/virt/libvirt/driver.py
+@@ -6379,11 +6379,10 @@ class LibvirtDriver(driver.ComputeDriver):
+                 # TODO(ndipanov): Update this method to update the new XML with
+                 # recalculated NUMA/CPU pinning information that is stored in
+                 # MigrationContext on the Instance
++                driver_interface = libvirt_migrate.DriverInterface(
++                    self._get_volume_config)
+                 new_xml_str = libvirt_migrate.get_updated_guest_xml(
+-                    # TODO(sahid): It's not a really good idea to pass
+-                    # the method _get_volume_config and we should to find
+-                    # a way to avoid this in future.
+-                    guest, migrate_data, self._get_volume_config)
++                    guest, migrate_data, driver_interface)
+             if self._host.has_min_version(
+                     MIN_LIBVIRT_BLOCK_LM_WITH_VOLUMES_VERSION):
+                 params = {
+diff --git a/nova/virt/libvirt/migration.py b/nova/virt/libvirt/migration.py
+index aa98239..d42a787 100644
+--- a/nova/virt/libvirt/migration.py
++++ b/nova/virt/libvirt/migration.py
+@@ -18,7 +18,7 @@
+ """
+ 
+ from collections import deque
+-
++from collections import namedtuple
+ from lxml import etree
+ from oslo_log import log as logging
+ 
+@@ -34,6 +34,9 @@ CONF = nova.conf.CONF
+ # etc in Ocata.
+ libvirt = None
+ 
++DriverInterface = namedtuple(
++    'DriverInterface', ['get_volume_config', ])
++
+ 
+ def graphics_listen_addrs(migrate_data):
+     """Returns listen addresses of vnc/spice from a LibvirtLiveMigrateData"""
+@@ -76,11 +79,11 @@ def serial_listen_ports(migrate_data):
+     return ports
+ 
+ 
+-def get_updated_guest_xml(guest, migrate_data, get_volume_config):
++def get_updated_guest_xml(guest, migrate_data, driver_interface):
+     xml_doc = etree.fromstring(guest.get_xml_desc(dump_migratable=True))
+     xml_doc = _update_graphics_xml(xml_doc, migrate_data)
+     xml_doc = _update_serial_xml(xml_doc, migrate_data)
+-    xml_doc = _update_volume_xml(xml_doc, migrate_data, get_volume_config)
++    xml_doc = _update_volume_xml(xml_doc, migrate_data, driver_interface)
+     xml_doc = _update_perf_events_xml(xml_doc, migrate_data)
+     return etree.tostring(xml_doc)
+ 
+@@ -130,7 +133,7 @@ def _update_serial_xml(xml_doc, migrate_data):
+     return xml_doc
+ 
+ 
+-def _update_volume_xml(xml_doc, migrate_data, get_volume_config):
++def _update_volume_xml(xml_doc, migrate_data, driver_interface):
+     """Update XML using device information of destination host."""
+     migrate_bdm_info = migrate_data.bdms
+ 
+@@ -146,7 +149,7 @@ def _update_volume_xml(xml_doc, migrate_data, get_volume_config):
+             not bdm_info or not bdm_info.connection_info or
+             serial_source not in bdm_info_by_serial):
+             continue
+-        conf = get_volume_config(
++        conf = driver_interface.get_volume_config(
+             bdm_info.connection_info, bdm_info.as_disk_info())
+         xml_doc2 = etree.XML(conf.to_xml(), parser)
+         serial_dest = xml_doc2.findtext('serial')
+-- 
+2.7.4
+

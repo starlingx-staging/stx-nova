@@ -1,0 +1,43 @@
+From 976c4a9e06ce6562fde6d48ea634c951bec24235 Mon Sep 17 00:00:00 2001
+From: Daniel Chavolla <daniel.chavolla@windriver.com>
+Date: Thu, 10 Nov 2016 13:41:07 -0500
+Subject: [PATCH] Error reporting for non-block live migration
+
+Added error message for the case when a Non-block CLI live migration fails because
+instance is not on shared storage.
+---
+ nova/virt/libvirt/driver.py | 13 +++++++++++--
+ 1 file changed, 11 insertions(+), 2 deletions(-)
+
+diff --git a/nova/virt/libvirt/driver.py b/nova/virt/libvirt/driver.py
+index 3ed4e75..1208812 100644
+--- a/nova/virt/libvirt/driver.py
++++ b/nova/virt/libvirt/driver.py
+@@ -5876,13 +5876,22 @@ class LibvirtDriver(driver.ComputeDriver):
+                                           block_device_info))
+ 
+         if 'block_migration' not in dest_check_data:
++            block_migration_explicit = False
+             dest_check_data.block_migration = (
+                 not dest_check_data.is_on_shared_storage())
++        else:
++            block_migration_explicit = True
+ 
+         if dest_check_data.block_migration:
+             if CONF.libvirt.images_type == 'lvm':
+-                reason = _("Block live migration is not supported "
+-                           "for instances with LVM backed storage.")
++                if block_migration_explicit:
++                    reason = _("Block live migration is not supported "
++                               "for instances with LVM backed storage.")
++                else:
++                    reason = _("Live migration can not be used "
++                               "with LVM backed storage except "
++                               "a booted from volume VM which "
++                               "does not have a local disk.")
+                 raise exception.MigrationPreCheckErrorNoRetry(reason=reason)
+ 
+             # TODO(eliqiao): Once block_migration flag is removed from the API
+-- 
+2.7.4
+

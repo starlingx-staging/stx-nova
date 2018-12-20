@@ -1,0 +1,125 @@
+From 6fbbe022bcf3394ec66ab7237e2477ccf37736f3 Mon Sep 17 00:00:00 2001
+From: jichenjc <jichenjc@cn.ibm.com>
+Date: Tue, 23 Feb 2016 02:06:48 +0800
+Subject: [PATCH] nova quota update race condition
+
+Upstream review: https://review.openstack.org/#/c/288153/
+This is race can occur if a delete action is performed during
+create_limit and update_limit, this is acceptable but
+we need to catch the ProjectQuotaNotFound and ignore it.
+
+At the time of this commit, the review was not yet closed and
+the fix not yet commited upstream. My test indicate that the
+changes do indeed fix the issue present.
+
+Upstream commit message included below:
+
+Catch ProjectQuotaNotFound when do update_limit
+
+This is race can occur if a delete action is performed during
+create_limit and update_limit, this is acceptable but
+we need to catch the ProjectQuotaNotFound and ignore it.
+
+Added a test case for QuotaExists as well.
+
+Closes-Bug: 1552622
+
+Change-Id: I725c3616833e9e328b21d975ab45bdfbd2058be7
+
+(cherry picked from commit 27af665)
+---
+ nova/api/openstack/compute/quota_sets.py           | 21 +++++++++++++--
+ .../unit/api/openstack/compute/test_quotas.py      | 31 ++++++++++++++++++++++
+ 2 files changed, 50 insertions(+), 2 deletions(-)
+
+diff --git a/nova/api/openstack/compute/quota_sets.py b/nova/api/openstack/compute/quota_sets.py
+index e9d4a7e..04fd7cc 100644
+--- a/nova/api/openstack/compute/quota_sets.py
++++ b/nova/api/openstack/compute/quota_sets.py
+@@ -13,6 +13,7 @@
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
+ 
++from oslo_log import log as logging
+ from oslo_utils import strutils
+ import six
+ import six.moves.urllib.parse as urlparse
+@@ -40,6 +41,7 @@ QUOTAS = quota.QUOTAS
+ 
+ FILTERED_QUOTAS = ["fixed_ips", "floating_ips", "networks",
+                    "security_group_rules", "security_groups"]
++LOG = logging.getLogger(__name__)
+ 
+ 
+ class QuotaSetsController(wsgi.Controller):
+@@ -181,8 +183,23 @@ class QuotaSetsController(wsgi.Controller):
+                 objects.Quotas.create_limit(context, project_id,
+                                             key, value, user_id=user_id)
+             except exception.QuotaExists:
+-                objects.Quotas.update_limit(context, project_id,
+-                                            key, value, user_id=user_id)
++                try:
++                    objects.Quotas.update_limit(context, project_id,
++                                                key, value, user_id=user_id)
++                except exception.ProjectQuotaNotFound:
++                    # NOTE: When a race condition what DELETE this quota
++                    # just before this update_limit, this exception happens.
++                    # This is a super rare case on productions because there
++                    # are different guys(one is deleting its quota, the other
++                    # is updateing the same quota on the same project). It is
++                    # ok to ignore such exception here. see bug 1552622 for
++                    # more detail.
++                    LOG.debug('Possible race condition encountered when doing '
++                              'update for project:%(project_id)s, '
++                              'user:%(user_id)s, key:%(key)s',
++                              {'project_id': project_id,
++                               'user_id': user_id,
++                               'key': key})
+         # Note(gmann): Removed 'id' from update's response to make it same
+         # as V2. If needed it can be added with microversion.
+         return self._format_quota_set(
+diff --git a/nova/tests/unit/api/openstack/compute/test_quotas.py b/nova/tests/unit/api/openstack/compute/test_quotas.py
+index 2c595fd..e4e2751 100644
+--- a/nova/tests/unit/api/openstack/compute/test_quotas.py
++++ b/nova/tests/unit/api/openstack/compute/test_quotas.py
+@@ -476,6 +476,37 @@ class UserQuotasTestV21(BaseQuotaSetsTest):
+         self.assertEqual(0,
+                          len(mock_createlimit.mock_calls))
+ 
++    @mock.patch('nova.objects.Quotas.update_limit')
++    @mock.patch('nova.objects.Quotas.create_limit')
++    def test_user_quotas_update_quota_exist(self, mock_createlimit,
++                                              mock_updatelimit):
++        body = {'quota_set': {'instances': 1}}
++        mock_createlimit.side_effect = exception.QuotaExists(project_id='1',
++            resource='dummy')
++        url = '/v2/fake4/os-quota-sets/update_me?user_id=1'
++        req = fakes.HTTPRequest.blank(url, use_admin_context=True)
++        self.controller.update(req, 'update_me', body=body)
++        mock_updatelimit.assert_called_once_with(req.environ['nova.context'],
++            'update_me', 'instances', 1, user_id='1')
++
++    @mock.patch('nova.objects.Quotas.update_limit')
++    @mock.patch('nova.objects.Quotas.create_limit')
++    def test_user_quotas_update_project_not_exist(self, mock_createlimit,
++                                              mock_updatelimit):
++        body = {'quota_set': {'instances': 1}}
++        mock_createlimit.side_effect = exception.QuotaExists(project_id='1',
++            resource='dummy')
++        mock_updatelimit.side_effect = exception.ProjectQuotaNotFound(
++            project_id='1')
++        url = '/v2/fake4/os-quota-sets/update_me?user_id=1'
++        req = fakes.HTTPRequest.blank(url, use_admin_context=True)
++        ret = self.controller.update(req, 'update_me', body=body)
++        mock_updatelimit.assert_called_once_with(req.environ['nova.context'],
++            'update_me', 'instances', 1, user_id='1')
++        expected_quota_set = quota_set('123', self.include_server_group_quotas)
++        expected_quota_set['quota_set'].pop('id')
++        self.assertEqual(expected_quota_set, ret)
++
+ 
+ class QuotaSetsPolicyEnforcementV21(test.NoDBTestCase):
+ 
+-- 
+2.7.4
+

@@ -1,0 +1,861 @@
+From c0bff74cae936effbb56ed0b83599caef5c815c0 Mon Sep 17 00:00:00 2001
+From: Jim Gauld <james.gauld@windriver.com>
+Date: Fri, 16 Sep 2016 23:23:48 -0400
+Subject: [PATCH 032/143] Display instance and migration logs for each update
+ usage for debug support
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+This logs instance and migration resource usage details every time the
+resource audit adds in usage via _update_usage_from_migration or
+_update_usage_from_instance. This makes it obvious what instances are
+running and their state on a compute host, by looking at logs.
+
+This improves system debugging support. These logs are intended to always
+be enabled, unlike the logs with CONF.compute_resource_debug.
+Similar logs were available in Grizzly via DEV 0007 commits 5a94ba4c,
+46871e24, 20419a3d), but were not ported to Havana.
+
+Contains resource tracking portions of R3 commit 1ad9636.
+
+22646aa Enhance instance action, claim, and resource tracking logs
+   This commit enhances logs in a number of areas:
+   - Adds info log to instance actions so we can see when we build,
+     reboot, rebuild, evacuate, terminate, etc.
+   - Adds resource tracker udpate debug logging when we enable nova
+     CONF.compute_resource_debug = True.  Every time resource tracker
+     goes through _update_usage() routine, a summary log, and a
+     per-instance BEFORE and AFTER usage summary is displayed.
+   - Adds logs for succesful/abort claims, move, confirm resize,
+     revert resize, rollback live-migration at destination, Start and
+     Stop of live-migration monitor.  Numa topology is added to claims
+     log.  Migration log includes source, destination and type (eg, live,
+     cold, resize, evac, rebuild) info.
+   - Improves error log when snapshot creation via glance fails due to
+     lack of space.
+
+   This commit merges the following R3 commits:
+   3b6cc51 Port instance action info log to Mitaka
+   787f5b4 log claimed numa topology
+   e17a41b Improve error log when snapshot fails
+   25f7cf6 Compute resource tracker update debug logging
+   023235e High level logs for claims, migration and tracking events
+
+   For port to Newton, moved migration log to resource tracker per
+   upstream refactoring.
+
+0f15321 add log events to aid in debugging
+   Add log events to assist debugging when VM creation at downloading
+   the VM image, seems to be stuck somewhere
+   between creating the image (_create_image()) and plug_vifs.
+
+   Newton rebase: this includes R4 commits 46c8ab2 and 8b6a9d1.
+
+ d9cd3ef Bug 154 fix: live-migrations fail silently
+   The issue with live migrations not reporting any feedback to the user is caused
+   by the move in Newton to support asynchronous live migrations.
+   We decided to:
+   * default back to synchronous live migrations when started from Horizon
+   * For live migrations started from the CLI, enhance nova instance-action report
+   to include the reason details in case or error.
+
+64a500b Bug 141 fix: make sure exception info is written to the logs
+   Bug 141  - nova: expected failure log not seen when there is
+   insufficient space to create snapshot
+
+   The cause for this bug is that on Newton the oslo_messaging dispatcher
+   has changed. The important change in this case is that the RPC Server
+   routine that services requests (_process_incoming in Newton) changed from:
+
+       exc_info = sys.exc_info()
+       try:
+           LOG.error(_LE('Exception during message handling: %s'), e,
+               exc_info=exc_info)
+
+   To:
+
+       failure = sys.exc_info()
+       LOG.exception(_LE('Exception during message handling'))
+
+   So that the exception message is not longer included in the header of
+   the traceback in the logs.
+
+38b6153 Bug 140 fix: restore instance object fields into debug logs
+   Restore missing instance object fields to <usage>, and updated
+   the way to retrieve them in _update_usage(). This is because
+   in Newton, <usage> is now a dictionary and no longer an object.
+
+__TYPE_primary
+__TAG_debug,api,resource
+__R4_commit_0088b03
+__R3_commit_683dc7c
+__TC5082,TC5112,TC6455,TC6456
+---
+ nova/api/openstack/compute/instance_actions.py  |   3 +-
+ nova/compute/claims.py                          |  15 +-
+ nova/compute/manager.py                         |   8 +-
+ nova/compute/resource_tracker.py                | 268 +++++++++++++++++++++++-
+ nova/conf/compute.py                            |   3 +
+ nova/exception.py                               |   4 +
+ nova/image/api.py                               |   5 +
+ nova/image/glance.py                            |   2 +
+ nova/objects/instance_action.py                 |  15 +-
+ nova/objects/instance_numa_topology.py          |   3 +
+ nova/tests/unit/compute/test_compute_mgr.py     |   4 +-
+ nova/tests/unit/fake_server_actions.py          |   2 +
+ nova/tests/unit/objects/test_instance_action.py |   1 +
+ nova/tests/unit/objects/test_objects.py         |   2 +-
+ nova/virt/images.py                             |   5 +
+ nova/virt/libvirt/driver.py                     |  12 +-
+ nova/virt/libvirt/imagebackend.py               |   2 +
+ nova/virt/libvirt/vif.py                        |   3 +
+ 18 files changed, 339 insertions(+), 18 deletions(-)
+
+diff --git a/nova/api/openstack/compute/instance_actions.py b/nova/api/openstack/compute/instance_actions.py
+index 7f2ff0d..af9b807 100644
+--- a/nova/api/openstack/compute/instance_actions.py
++++ b/nova/api/openstack/compute/instance_actions.py
+@@ -26,7 +26,8 @@ from nova import utils
+ 
+ ACTION_KEYS = ['action', 'instance_uuid', 'request_id', 'user_id',
+                'project_id', 'start_time', 'message']
+-EVENT_KEYS = ['event', 'start_time', 'finish_time', 'result', 'traceback']
++EVENT_KEYS = ['event', 'start_time', 'finish_time', 'result', 'traceback',
++              'details']
+ 
+ 
+ class InstanceActionsController(wsgi.Controller):
+diff --git a/nova/compute/claims.py b/nova/compute/claims.py
+index 26b5113..873eabf 100644
+--- a/nova/compute/claims.py
++++ b/nova/compute/claims.py
+@@ -59,8 +59,10 @@ class NopClaim(object):
+         pass
+ 
+     def __str__(self):
+-        return "[Claim: %d MB memory, %d GB disk]" % (self.memory_mb,
+-                self.disk_gb)
++        return "[Claim: %d MB memory, %d GB disk, %d vcpus, " \
++               "numa_topology=%r]" \
++               % (self.memory_mb, self.disk_gb, self.vcpus,
++                  self.claimed_numa_topology)
+ 
+ 
+ class Claim(NopClaim):
+@@ -121,7 +123,8 @@ class Claim(NopClaim):
+         """Compute operation requiring claimed resources has failed or
+         been aborted.
+         """
+-        LOG.debug("Aborting claim: %s", self, instance=self.instance)
++        # Promote this log to info.
++        LOG.info("Aborting claim: %s", self, instance=self.instance)
+         self.tracker.abort_instance_claim(self.context, self.instance,
+                                           self.nodename)
+ 
+@@ -164,7 +167,8 @@ class Claim(NopClaim):
+             raise exception.ComputeResourcesUnavailable(reason=
+                     "; ".join(reasons))
+ 
+-        LOG.info('Claim successful on node %s', self.nodename,
++        # Log the claim attributes
++        LOG.info('Claim successful on node %s: %s', self.nodename, self,
+                  instance=self.instance)
+ 
+     def _test_memory(self, resources, limit):
+@@ -324,7 +328,8 @@ class MoveClaim(Claim):
+         """Compute operation requiring claimed resources has failed or
+         been aborted.
+         """
+-        LOG.debug("Aborting claim: %s", self, instance=self.instance)
++        # Promote this log to info.
++        LOG.info("Aborting claim: %s", self, instance=self.instance)
+         self.tracker.drop_move_claim(
+             self.context,
+             self.instance, self.nodename,
+diff --git a/nova/compute/manager.py b/nova/compute/manager.py
+index 4d6ad1c..7d407ce 100644
+--- a/nova/compute/manager.py
++++ b/nova/compute/manager.py
+@@ -242,8 +242,9 @@ def delete_image_on_error(function):
+         try:
+             return function(self, context, image_id, instance,
+                             *args, **kwargs)
+-        except Exception:
++        except Exception as e:
+             with excutils.save_and_reraise_exception():
++                LOG.exception(e)
+                 LOG.debug("Cleaning up image %s", image_id,
+                           exc_info=True, instance=instance)
+                 try:
+@@ -3807,6 +3808,7 @@ class ComputeManager(manager.Manager):
+ 
+     def _confirm_resize(self, context, instance, migration=None):
+         """Destroys the source instance."""
++        LOG.info('Confirm resize.', instance=instance)
+         self._notify_about_instance_usage(context, instance,
+                                           "resize.confirm.start")
+ 
+@@ -3873,6 +3875,8 @@ class ComputeManager(manager.Manager):
+         source machine.
+ 
+         """
++        LOG.info('Revert resize.', instance=instance)
++
+         # NOTE(comstud): A revert_resize is essentially a resize back to
+         # the old size, so we need to send a usage event here.
+         compute_utils.notify_usage_exists(self.notifier, context, instance,
+@@ -6294,6 +6298,8 @@ class ComputeManager(manager.Manager):
+             # always run this even if setup_networks_on_host fails
+             # NOTE(vish): The mapping is passed in so the driver can disconnect
+             #             from remote volumes if necessary
++            LOG.info('Rollback live-migration at destination.',
++                     instance=instance)
+             block_device_info = self._get_instance_block_device_info(context,
+                                                                      instance)
+             # TODO(tdurakov): remove dict to object conversion once RPC API
+diff --git a/nova/compute/resource_tracker.py b/nova/compute/resource_tracker.py
+index fb66489..6bd384f 100644
+--- a/nova/compute/resource_tracker.py
++++ b/nova/compute/resource_tracker.py
+@@ -27,6 +27,7 @@ model.
+ """
+ import collections
+ import copy
++import sys
+ 
+ from oslo_log import log as logging
+ from oslo_serialization import jsonutils
+@@ -34,6 +35,7 @@ from oslo_utils import units
+ 
+ from nova.compute import claims
+ from nova.compute import monitors
++from nova.compute import power_state
+ from nova.compute import stats
+ from nova.compute import task_states
+ from nova.compute import utils as compute_utils
+@@ -58,6 +60,9 @@ CONF = nova.conf.CONF
+ LOG = logging.getLogger(__name__)
+ COMPUTE_RESOURCE_SEMAPHORE = "compute_resources"
+ 
++# tracker debug logging
++_usage_debug = dict()
++
+ 
+ def _instance_in_resize_state(instance):
+     """Returns True if the instance is in one of the resizing states.
+@@ -467,6 +472,26 @@ class ResourceTracker(object):
+             new_pci_devices=claimed_pci_devices,
+             old_pci_requests=instance.pci_requests,
+             new_pci_requests=new_pci_requests)
++
++        def getter(obj, attr, default=None):
++            """Method to get object attributes without exception."""
++            if hasattr(obj, attr):
++                return getattr(obj, attr, default)
++            else:
++                return default
++
++        # Log migration context creation.
++        LOG.info(
++            "Migration type:%(ty)s, "
++            "source_compute:%(sc)s source_node:%(sn)s, "
++            "dest_compute:%(dc)s dest_node:%(dn)s",
++            {'ty': getter(migration, 'migration_type'),
++             'sc': getter(migration, 'source_compute'),
++             'sn': getter(migration, 'source_node'),
++             'dc': getter(migration, 'dest_compute'),
++             'dn': getter(migration, 'dest_node')},
++            instance=instance)
++
+         instance.migration_context = mig_context
+         instance.save()
+ 
+@@ -763,7 +788,7 @@ class ResourceTracker(object):
+                          baremetal resource nodes are handled like any other
+                          resource in the system.
+         """
+-        LOG.debug("Auditing locally available compute resources for "
++        LOG.info("Auditing locally available compute resources for "
+                   "%(host)s (node: %(node)s)",
+                  {'node': nodename,
+                   'host': self.host})
+@@ -868,7 +893,7 @@ class ResourceTracker(object):
+ 
+         # update the compute_node
+         self._update(context, cn)
+-        LOG.debug('Compute_service record updated for %(host)s:%(node)s',
++        LOG.info('Compute_service record updated for %(host)s:%(node)s',
+                   {'host': self.host, 'node': nodename})
+ 
+         # - move _report_final to reflect _update and metrics
+@@ -1084,6 +1109,55 @@ class ResourceTracker(object):
+             self.pci_tracker.save(context)
+ 
+     def _update_usage(self, usage, nodename, sign=1):
++        # tracker debug logging
++        if CONF.compute_resource_debug:
++            # Get parent calling functions
++            p5_fname = sys._getframe(5).f_code.co_name
++            p4_fname = sys._getframe(4).f_code.co_name
++            p3_fname = sys._getframe(3).f_code.co_name
++            p2_fname = sys._getframe(2).f_code.co_name
++            p1_fname = sys._getframe(1).f_code.co_name
++            LOG.info(
++                '_update_usage: '
++                'caller=%(p5)s / %(p4)s / %(p3)s / %(p2)s / %(p1)s, '
++                'sign=%(sign)r, USAGE: host:%(host)s uuid:%(uuid)s '
++                'name:%(name)s display_name:%(display_name)s '
++                'min_vcpus:%(min_vcpus)s vcpus:%(vcpus)s '
++                'max_vcpus:%(max_vcpus)s '
++                'memory_mb:%(memory_mb)s root_gb:%(root_gb)s '
++                'ephemeral_gb:%(ephemeral_gb)s '
++                'instance_type_id:%(instance_type_id)s '
++                'old_flavor:%(old_flavor)s new_flavor:%(new_flavor)s '
++                'vm_mode:%(vm_mode)s task_state:%(task_state)s '
++                'vm_state:%(vm_state)s power_state:%(power_state)s '
++                'launched_at:%(launched_at)s terminated_at:%(terminated_at)s '
++                '%(numa_topology)r',
++                {'p5': p5_fname, 'p4': p4_fname, 'p3': p3_fname,
++                 'p2': p2_fname, 'p1': p1_fname,
++                 'sign': sign,
++                 'host': usage.get('host'),
++                 'uuid': usage.get('uuid'),
++                 'name': usage.get('name'),
++                 'display_name': usage.get('display_name'),
++                 'min_vcpus': usage.get('min_vcpus'),
++                 'vcpus': usage.get('vcpus'),
++                 'max_vcpus': usage.get('max_vcpus'),
++                 'memory_mb': usage.get('memory_mb'),
++                 'root_gb': usage.get('root_gb'),
++                 'ephemeral_gb': usage.get('ephemeral_gb'),
++                 'instance_type_id': usage.get('instance_type_id'),
++                 'old_flavor': usage.get('old_flavor'),
++                 'new_flavor': usage.get('new_flavor'),
++                 'vm_mode': usage.get('vm_mode'),
++                 'task_state': usage.get('task_state'),
++                 'vm_state': usage.get('vm_state'),
++                 'power_state': usage.get('power_state'),
++                 'launched_at': usage.get('launched_at'),
++                 'terminated_at': usage.get('terminated_at'),
++                 'numa_topology': usage.get('numa_topology'),
++                 })
++            self._populate_usage(nodename, id=0)
++
+         mem_usage = usage['memory_mb']
+         disk_usage = usage.get('root_gb', 0)
+         vcpus_usage = usage.get('vcpus', 0)
+@@ -1111,6 +1185,122 @@ class ResourceTracker(object):
+                 cn, usage, free)
+         cn.numa_topology = updated_numa_topology
+ 
++        # tracker debug logging
++        if CONF.compute_resource_debug:
++            self._populate_usage(nodename, id=1)
++            self._display_usage()
++
++    # tracker debug logging
++    def _populate_usage(self, nodename, id=0):
++        """populate before and after usage display lines"""
++        global _usage_debug
++        _usage_debug[id] = list()
++
++        reference = str(id)
++        if id == 0:
++            reference = 'BEFORE: '
++        elif id == 1:
++            reference = 'AFTER:  '
++
++        cn = self.compute_nodes[nodename]
++
++        line = (
++            '%(ref)s'
++            'workload: %(workload)s, vms: %(vms)s, '
++            'vcpus: %(vcpu_used).3f used, %(vcpu_tot).3f total' %
++            {'ref': reference,
++             'workload': cn.current_workload,
++             'vms': cn.running_vms,
++             'vcpu_tot': cn.vcpus,
++             'vcpu_used': cn.vcpus_used,
++             })
++        _usage_debug[id].append(line)
++
++        line = (
++            '%(ref)s'
++            'memory: %(mem_used)6d used, %(mem_tot)6d total (MiB); '
++            'disk: %(disk_used)3d used, %(disk_tot)3d total, '
++            '%(disk_free)3d free, %(disk_least)3d least_avail (GiB)' %
++            {'ref': reference,
++             'mem_tot': cn.memory_mb,
++             'mem_used': cn.memory_mb_used,
++             'disk_tot': cn.local_gb,
++             'disk_used': cn.local_gb_used,
++             'disk_free': cn.free_disk_gb,
++             'disk_least': cn.disk_available_least or 0,
++             })
++        _usage_debug[id].append(line)
++
++        host_numa_topology, jsonify_result = \
++            hardware.host_topology_and_format_from_host(cn)
++        if host_numa_topology is None:
++            host_numa_topology = objects.NUMATopology(cells=[])
++        for cell in host_numa_topology.cells:
++            line = (
++                '%(ref)sNuma node=%(node)d; '
++                'memory: %(T)5d MiB total, %(A)5d MiB avail' %
++                {'ref': reference,
++                 'node': cell.id,
++                 'T': cell.memory, 'A': cell.avail_memory})
++            _usage_debug[id].append(line)
++
++        for cell in host_numa_topology.cells:
++            mem = []
++            for M in cell.mempages:
++                unit = 'K'
++                size = M.size_kb
++                if M.size_kb >= units.Ki and M.size_kb < units.Mi:
++                    unit = 'M'
++                    size = M.size_kb / units.Ki
++                if M.size_kb >= units.Mi:
++                    unit = 'G'
++                    size = M.size_kb / units.Mi
++                m = '%(sz)s%(U)s: %(T)5.0f MiB total, %(A)5.0f MiB avail' % \
++                    {'sz': size, 'U': unit,
++                     'T': M.size_kb * M.total / units.Ki,
++                     'A': M.size_kb * (M.total - M.used) / units.Ki}
++                mem.append(m)
++            line = (
++                '%(ref)sNuma node=%(node)d; per-pgsize: %(pgsize)s' %
++                {'ref': reference,
++                 'node': cell.id,
++                 'pgsize': '; '.join(mem)})
++            _usage_debug[id].append(line)
++
++        for cell in host_numa_topology.cells:
++            cpuset = set(cell.cpuset)
++            pinned = set(cell.pinned_cpus)
++            unpinned = cpuset - pinned
++            shared = cell.cpu_usage - len(pinned)
++            line = (
++                '%(ref)sNuma node=%(node)d; cpu_usage:%(usage)6.3f, '
++                'pcpus:%(pcpus)2d, '
++                'pinned:%(P)2d, shared:%(S)6.3f, unpinned:%(U)2d; map:%(M)s; '
++                'pinned_cpulist:%(LP)s, '
++                'unpinned_cpulist:%(LU)s' %
++                {'ref': reference,
++                 'usage': cell.cpu_usage,
++                 'node': cell.id,
++                 'pcpus': len(cpuset),
++                 'P': len(pinned), 'S': shared,
++                 'U': len(unpinned),
++                 'M': ''.join(
++                     'P' if s in pinned else 'U' for s in cpuset) or '-',
++                 'LP': utils.list_to_range(sorted(list(pinned))) or '-',
++                 'LU': utils.list_to_range(sorted(list(unpinned))) or '-',
++                 })
++            _usage_debug[id].append(line)
++
++    # tracker debug logging
++    def _display_usage(self):
++        """display before and after usage, one line at a time"""
++        global _usage_debug
++        if not (_usage_debug[0] and _usage_debug[1]):
++            return
++        for (before, after) in zip(_usage_debug[0], _usage_debug[1]):
++            LOG.info(before)
++            LOG.info(after)
++
+     def _get_migration_context_resource(self, resource, instance,
+                                         prefix='new_'):
+         migration_context = instance.migration_context
+@@ -1124,8 +1314,14 @@ class ResourceTracker(object):
+         """Update usage for a single migration.  The record may
+         represent an incoming or outbound migration.
+         """
++        def getter(obj, attr, default=None):
++            """Method to get object attributes without exception."""
++            if hasattr(obj, attr):
++                return getattr(obj, attr, default)
++            else:
++                return default
++
+         uuid = migration.instance_uuid
+-        LOG.info("Updating from migration %s", uuid)
+ 
+         incoming = (migration.dest_compute == self.host and
+                     migration.dest_node == nodename)
+@@ -1196,6 +1392,36 @@ class ResourceTracker(object):
+                 cn.pci_device_pools = obj
+             self.tracked_migrations[uuid] = migration
+ 
++            # Display migrations that audit includes via _update_usage.
++            change = None
++            if incoming:
++                change = 'incoming'
++            if outbound:
++                change = 'outbound'
++            if same_node:
++                change = 'same_node'
++            topo = utils.format_instance_numa_topology(
++                numa_topology=numa_topology, instance=instance, delim=', ')
++            LOG.info(
++                'Migration(id=%(mid)s, change=%(change)s, '
++                'status=%(status)s, type=%(type)s); '
++                'sign=%(sign)d, id=%(name)s, name=%(display_name)s, '
++                'source_compute=%(sc)s, source_node=%(sn)s, '
++                'dest_compute=%(dc)s, dest_node=%(dn)s, '
++                'numa_topology=%(topo)s',
++                {'mid': migration.id, 'change': change,
++                 'status': migration.status,
++                 'type': migration.migration_type,
++                 'sign': 1,
++                 'name': getter(instance, 'name'),
++                 'display_name': getter(instance, 'display_name'),
++                 'sc': migration.source_compute,
++                 'sn': migration.source_node,
++                 'dc': migration.dest_compute,
++                 'dn': migration.dest_node,
++                 'topo': topo,
++                 }, instance=instance)
++
+     def _update_usage_from_migrations(self, context, migrations, nodename):
+         filtered = {}
+         instances = {}
+@@ -1245,6 +1471,12 @@ class ResourceTracker(object):
+     def _update_usage_from_instance(self, context, instance, nodename,
+             is_removed=False, require_allocation_refresh=False):
+         """Update usage for a single instance."""
++        def getter(obj, attr, default=None):
++            """Method to get object attributes without exception."""
++            if hasattr(obj, attr):
++                return getattr(obj, attr, default)
++            else:
++                return default
+ 
+         uuid = instance['uuid']
+         is_new_instance = uuid not in self.tracked_instances
+@@ -1307,7 +1539,28 @@ class ResourceTracker(object):
+             self._update_usage(self._get_usage_dict(instance), nodename,
+                                sign=sign)
+ 
++            # Display instances that audit includes via _update_usage.
++            pstate = instance.get('power_state')
++            if pstate is None:
++                pstate = power_state.NOSTATE
++            topo = utils.format_instance_numa_topology(
++                numa_topology=instance.get('numa_topology'),
++                instance=instance, delim=', ')
++            LOG.info(
++                'sign=%(sign)s, id=%(name)s, name=%(display_name)s, '
++                'vm_mode=%(vm)s, task_state=%(task)s, power_state=%(power)s, '
++                'numa_topology=%(topo)s',
++                {'sign': sign,
++                'name': getter(instance, 'name'),
++                'display_name': getter(instance, 'display_name'),
++                'vm': instance.get('vm_state'),
++                'task': instance.get('task_state'),
++                'power': power_state.STATE_MAP[pstate],
++                'topo': topo,
++                }, instance=instance)
++
+         cn.current_workload = self.stats.calculate_workload()
++
+         if self.pci_tracker:
+             obj = self.pci_tracker.stats.to_device_pools_obj()
+             cn.pci_device_pools = obj
+@@ -1591,6 +1844,15 @@ class ResourceTracker(object):
+                      'root_gb': object_or_dict.root_gb,
+                      'ephemeral_gb': object_or_dict.flavor.ephemeral_gb,
+                      'numa_topology': object_or_dict.numa_topology}
++
++            for field in ['host', 'name', 'display_name', 'min_vcpus',
++                          'max_vcpus', 'instance_type_id', 'old_flavor',
++                          'new_flavor', 'vm_mode', 'task_state', 'vm_state',
++                          'power_state', 'launched_at', 'terminated_at']:
++                if hasattr(object_or_dict, field):
++                    usage[field] = getattr(object_or_dict, field)
++                else:
++                    usage[field] = None
+         elif isinstance(object_or_dict, objects.Flavor):
+             usage = obj_base.obj_to_primitive(object_or_dict)
+         else:
+diff --git a/nova/conf/compute.py b/nova/conf/compute.py
+index c215bdb..0d2ecfa 100644
+--- a/nova/conf/compute.py
++++ b/nova/conf/compute.py
+@@ -465,6 +465,9 @@ Possible values:
+ * Any positive integer representing number of physical CPUs to reserve
+   for the host.
+ """),
++    # tracker debug logging
++    cfg.BoolOpt('compute_resource_debug', default=False,
++                help='Enable compute resource tracker update logs'),
+ ]
+ 
+ allocation_ratio_opts = [
+diff --git a/nova/exception.py b/nova/exception.py
+index 53f8d43..40a270f 100644
+--- a/nova/exception.py
++++ b/nova/exception.py
+@@ -186,6 +186,10 @@ class ImageNotAuthorized(NovaException):
+     msg_fmt = _("Not authorized for image %(image_id)s.")
+ 
+ 
++class ImageStorageMediaFull(NovaException):
++    msg_fmt = _("Not enough space on the storage media for image %(image_id)s")
++
++
+ class Invalid(NovaException):
+     msg_fmt = _("Bad Request - Invalid Parameters")
+     code = 400
+diff --git a/nova/image/api.py b/nova/image/api.py
+index e2d6192..30a27d1 100644
+--- a/nova/image/api.py
++++ b/nova/image/api.py
+@@ -17,6 +17,9 @@ images used by the compute layer.
+ 
+ from nova.image import glance
+ from nova import profiler
++from oslo_log import log as logging
++
++LOG = logging.getLogger(__name__)
+ 
+ 
+ @profiler.trace_cls("nova_image")
+@@ -180,5 +183,7 @@ class API(object):
+         #                 to a bytestream iterator and allows the caller to
+         #                 handle streaming/copying/zero-copy as they see fit.
+         session, image_id = self._get_session_and_image_id(context, id_or_uri)
++        LOG.info('download: Downloading %(src)s to %(dest)s',
++                 {'src': image_id, 'dest': dest_path})
+         return session.download(context, image_id, data=data,
+                                 dst_path=dest_path)
+diff --git a/nova/image/glance.py b/nova/image/glance.py
+index 3605699..fb00055 100644
+--- a/nova/image/glance.py
++++ b/nova/image/glance.py
+@@ -852,6 +852,8 @@ def _translate_image_exception(image_id, exc_value):
+     if isinstance(exc_value, glanceclient.exc.BadRequest):
+         return exception.ImageBadRequest(image_id=image_id,
+                                          response=six.text_type(exc_value))
++    if isinstance(exc_value, glanceclient.exc.HTTPOverLimit):
++        return exception.ImageStorageMediaFull(image_id=image_id)
+     return exc_value
+ 
+ 
+diff --git a/nova/objects/instance_action.py b/nova/objects/instance_action.py
+index ee154b8..e0b3af6 100644
+--- a/nova/objects/instance_action.py
++++ b/nova/objects/instance_action.py
+@@ -11,7 +11,15 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2015-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
++from oslo_log import log as logging
+ from oslo_utils import timeutils
+ 
+ from nova import db
+@@ -19,6 +27,8 @@ from nova import objects
+ from nova.objects import base
+ from nova.objects import fields
+ 
++LOG = logging.getLogger(__name__)
++
+ 
+ # TODO(berrange): Remove NovaObjectDictCompat
+ @base.NovaObjectRegistry.register
+@@ -124,6 +134,7 @@ class InstanceActionEvent(base.NovaPersistentObject, base.NovaObject,
+         'finish_time': fields.DateTimeField(nullable=True),
+         'result': fields.StringField(nullable=True),
+         'traceback': fields.StringField(nullable=True),
++        'details': fields.StringField(nullable=True),
+         }
+ 
+     @staticmethod
+@@ -153,7 +164,7 @@ class InstanceActionEvent(base.NovaPersistentObject, base.NovaObject,
+             values['result'] = 'Success'
+         else:
+             values['result'] = 'Error'
+-            values['message'] = exc_val
++            values['details'] = exc_val
+             values['traceback'] = exc_tb
+         return values
+ 
+@@ -166,6 +177,8 @@ class InstanceActionEvent(base.NovaPersistentObject, base.NovaObject,
+     def event_start(cls, context, instance_uuid, event_name, want_result=True):
+         values = cls.pack_action_event_start(context, instance_uuid,
+                                              event_name)
++        LOG.info('%(event)s instance %(uuid)s',
++                 {'event': event_name, 'uuid': instance_uuid})
+         db_event = db.action_event_start(context, values)
+         if want_result:
+             return cls._from_db_object(context, cls(), db_event)
+diff --git a/nova/objects/instance_numa_topology.py b/nova/objects/instance_numa_topology.py
+index bf9729d..aba59eb 100644
+--- a/nova/objects/instance_numa_topology.py
++++ b/nova/objects/instance_numa_topology.py
+@@ -77,6 +77,9 @@ class InstanceNUMACell(base.NovaObject,
+         if 'pagesize' not in kwargs:
+             self.pagesize = None
+             self.obj_reset_changes(['pagesize'])
++        if 'cpu_topology' not in kwargs:
++            self.cpu_topology = None
++            self.obj_reset_changes(['cpu_topology'])
+         if 'cpu_pinning' not in kwargs:
+             self.cpu_pinning = None
+             self.obj_reset_changes(['cpu_pinning_raw'])
+diff --git a/nova/tests/unit/compute/test_compute_mgr.py b/nova/tests/unit/compute/test_compute_mgr.py
+index 9112476..b7634b3 100644
+--- a/nova/tests/unit/compute/test_compute_mgr.py
++++ b/nova/tests/unit/compute/test_compute_mgr.py
+@@ -4191,8 +4191,8 @@ class ComputeManagerUnitTestCase(test.NoDBTestCase):
+ 
+         mock_image_api.delete.assert_called_once_with(
+             self.context, image_id)
+-        # make sure nothing was logged at exception level
+-        mock_log.assert_not_called()
++        # expect only one exception call
++        mock_log.assert_called_once()
+ 
+     @mock.patch('nova.volume.cinder.API.attachment_delete')
+     @mock.patch('nova.volume.cinder.API.terminate_connection')
+diff --git a/nova/tests/unit/fake_server_actions.py b/nova/tests/unit/fake_server_actions.py
+index d22f08c..024d6e4 100644
+--- a/nova/tests/unit/fake_server_actions.py
++++ b/nova/tests/unit/fake_server_actions.py
+@@ -70,6 +70,7 @@ FAKE_EVENTS = {
+                        'updated_at': None,
+                        'deleted_at': None,
+                        'deleted': False,
++                       'details': None,
+                       },
+                       {'id': 2,
+                        'action_id': FAKE_ACTION_ID1,
+@@ -84,6 +85,7 @@ FAKE_EVENTS = {
+                        'updated_at': None,
+                        'deleted_at': None,
+                        'deleted': False,
++                       'details': None,
+                        }
+     ],
+     FAKE_ACTION_ID2: [{'id': 3,
+diff --git a/nova/tests/unit/objects/test_instance_action.py b/nova/tests/unit/objects/test_instance_action.py
+index 5dcc6a0..cd79875 100644
+--- a/nova/tests/unit/objects/test_instance_action.py
++++ b/nova/tests/unit/objects/test_instance_action.py
+@@ -54,6 +54,7 @@ fake_event = {
+     'finish_time': None,
+     'result': 'fake-result',
+     'traceback': 'fake-tb',
++    'details': 'val'
+ }
+ 
+ 
+diff --git a/nova/tests/unit/objects/test_objects.py b/nova/tests/unit/objects/test_objects.py
+index 32b2940..54935bd 100644
+--- a/nova/tests/unit/objects/test_objects.py
++++ b/nova/tests/unit/objects/test_objects.py
+@@ -1109,7 +1109,7 @@ object_data = {
+     'ImageMetaProps': '1.19-248e4e71d64cc694b4167485a9f9b251',
+     'Instance': '2.3-9b20afdc7f46ea0d83f9f0fb4a01f02d',
+     'InstanceAction': '1.1-f9f293e526b66fca0d05c3b3a2d13914',
+-    'InstanceActionEvent': '1.1-e56a64fa4710e43ef7af2ad9d6028b33',
++    'InstanceActionEvent': '1.1-cc5342ce9da679b9ee3f704cbbfbb63f',
+     'InstanceActionEventList': '1.1-13d92fb953030cdbfee56481756e02be',
+     'InstanceActionList': '1.0-4a53826625cc280e15fae64a575e0879',
+     'InstanceDeviceMetadata': '1.0-74d78dd36aa32d26d2769a1b57caf186',
+diff --git a/nova/virt/images.py b/nova/virt/images.py
+index 0463a8c..2e431b6 100644
+--- a/nova/virt/images.py
++++ b/nova/virt/images.py
+@@ -144,8 +144,13 @@ def _convert_image(source, dest, in_format, out_format, run_as_root):
+ def fetch(context, image_href, path):
+     with fileutils.remove_path_on_error(path):
+         # execute operation with disk concurrency sema
++        LOG.info('virt.images.fetch(): acquiring disk_op_sema')
+         with utils.disk_op_sema:
++            LOG.info('fetch: Downloading %(src)s to %(dest)s',
++            {'src': image_href, 'dest': path})
+             IMAGE_API.download(context, image_href, dest_path=path)
++            LOG.info('fetch: Downloading %(dest)s completed',
++            {'dest': path})
+ 
+ 
+ def get_info(context, image_href):
+diff --git a/nova/virt/libvirt/driver.py b/nova/virt/libvirt/driver.py
+index 1f3b6e6..9950a02 100644
+--- a/nova/virt/libvirt/driver.py
++++ b/nova/virt/libvirt/driver.py
+@@ -3467,6 +3467,8 @@ class LibvirtDriver(driver.ComputeDriver):
+                                      size=size,
+                                      swap_mb=swap_mb)
+ 
++        LOG.info('Image download completed', instance=instance)
++
+     def _create_and_inject_local_root(self, context, instance,
+                                       booted_from_volume, suffix, disk_images,
+                                       injection_info, fallback_from_host):
+@@ -7075,8 +7077,9 @@ class LibvirtDriver(driver.ComputeDriver):
+         time.sleep(0)
+ 
+         try:
+-            LOG.debug("Starting monitoring of live migration",
+-                      instance=instance)
++            # Promote from debug to info.
++            LOG.info("Starting monitoring of live migration",
++                     instance=instance)
+             self._live_migration_monitor(context, instance, guest, dest,
+                                          post_method, recover_method,
+                                          block_migration, migrate_data,
+@@ -7086,8 +7089,9 @@ class LibvirtDriver(driver.ComputeDriver):
+                         {"ex": ex}, instance=instance, exc_info=True)
+             raise
+         finally:
+-            LOG.debug("Live migration monitoring is all done",
+-                      instance=instance)
++            # Promote from debug to info.
++            LOG.info("Live migration monitoring is all done",
++                     instance=instance)
+ 
+     def _is_post_copy_enabled(self, migration_flags):
+         if self._is_post_copy_available():
+diff --git a/nova/virt/libvirt/imagebackend.py b/nova/virt/libvirt/imagebackend.py
+index fb6f5f1..a7a5977 100644
+--- a/nova/virt/libvirt/imagebackend.py
++++ b/nova/virt/libvirt/imagebackend.py
+@@ -243,8 +243,10 @@ class Image(object):
+                 fetch_func(target=target, *args, **kwargs)
+ 
+         if not self.exists() or not os.path.exists(base):
++            LOG.info('Creating image %(name)s ...', {'name': filename})
+             self.create_image(fetch_func_sync, base, size,
+                               *args, **kwargs)
++            LOG.info('...done. image %(name)s; ', {'name': filename})
+ 
+         if size:
+             # create_image() only creates the base image if needed, so
+diff --git a/nova/virt/libvirt/vif.py b/nova/virt/libvirt/vif.py
+index 8db105c..9a42c71 100644
+--- a/nova/virt/libvirt/vif.py
++++ b/nova/virt/libvirt/vif.py
+@@ -792,6 +792,9 @@ class LibvirtGenericVIFDriver(object):
+                   {'vif_type': vif_type, 'instance': instance_repr,
+                    'vif': vif})
+ 
++        LOG.info('vif_type=%(vif_type)s vif=%(vif)s',
++                  {'vif_type': vif_type, 'vif': vif})
++
+         if vif_type is None:
+             raise exception.VirtualInterfacePlugException(
+                 _("vif_type parameter must be present "
+-- 
+2.7.4
+

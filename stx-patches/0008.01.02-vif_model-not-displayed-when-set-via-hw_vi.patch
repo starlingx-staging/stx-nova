@@ -1,0 +1,102 @@
+From a2dba07683d7ae8234816a775ce749010ae05ef5 Mon Sep 17 00:00:00 2001
+From: Giao Le <giao.le@windriver.com>
+Date: Wed, 22 Apr 2015 11:44:28 -0400
+Subject: [PATCH] vif_model not displayed when set via hw_vif_model
+
+if vif_model is not specified then use hw_vif_model;
+if hw_vif_model is not set then use default vif_model in CONF
+hw_vif_model is set as properties in the boot image's metadata
+---
+ nova/api/openstack/compute/plugins/v3/servers.py |  3 +--
+ nova/api/openstack/compute/servers.py            |  4 ----
+ nova/compute/api.py                              | 15 ++++++++++++++-
+ nova/virt/libvirt/vif.py                         |  3 +--
+ 4 files changed, 16 insertions(+), 9 deletions(-)
+
+diff --git a/nova/api/openstack/compute/plugins/v3/servers.py b/nova/api/openstack/compute/plugins/v3/servers.py
+index b206219..6f91d8b 100644
+--- a/nova/api/openstack/compute/plugins/v3/servers.py
++++ b/nova/api/openstack/compute/plugins/v3/servers.py
+@@ -55,8 +55,7 @@ ALIAS = 'servers'
+ CONF = cfg.CONF
+ CONF.import_opt('enable_instance_password',
+                 'nova.api.openstack.compute.servers')
+-CONF.import_opt('default_vif_model',
+-                'nova.api.openstack.compute.servers')
++CONF.import_opt('default_vif_model', 'nova.compute.api')
+ CONF.import_opt('network_api_class', 'nova.network')
+ CONF.import_opt('reclaim_instance_interval', 'nova.compute.manager')
+ CONF.import_opt('extensions_blacklist', 'nova.api.openstack', group='osapi_v3')
+diff --git a/nova/api/openstack/compute/servers.py b/nova/api/openstack/compute/servers.py
+index 91af0f2..f95d056 100644
+--- a/nova/api/openstack/compute/servers.py
++++ b/nova/api/openstack/compute/servers.py
+@@ -58,10 +58,6 @@ server_opts = [
+                      ' or rescue, If the hypervisor does not support'
+                      ' password injection then the password returned will'
+                      ' not be correct'),
+-    cfg.StrOpt('default_vif_model',
+-               default='virtio',
+-               help='Name of default emulated VIF hardware type (e.g., '
+-                    'virtio, e1000, etc...)'),
+ ]
+ CONF = cfg.CONF
+ CONF.register_opts(server_opts)
+diff --git a/nova/compute/api.py b/nova/compute/api.py
+index 54b1a80..b600e34 100644
+--- a/nova/compute/api.py
++++ b/nova/compute/api.py
+@@ -130,6 +130,10 @@ compute_opts = [
+                     'in a local image being created on the hypervisor node. '
+                     'Setting this to 0 means nova will allow only '
+                     'boot from volume. A negative number means unlimited.'),
++    cfg.StrOpt('default_vif_model',
++               default='virtio',
++               help='Name of default emulated VIF hardware type (e.g., '
++                    'virtio, e1000, etc...)'),
+ ]
+ 
+ ephemeral_storage_encryption_group = cfg.OptGroup(
+@@ -1147,7 +1151,15 @@ class API(base.Base):
+                     admin_context = context
+             physkey = 'provider:physical_network'
+             hint = {physkey: set()}
++            hw_vif_model = None
++            properties = boot_meta.get('properties')
++            if properties:
++                hw_vif_model = properties.get('hw_vif_model')
++            if hw_vif_model is None:
++                hw_vif_model = CONF.default_vif_model
+             for ntwk in requested_networks:
++                if ntwk.vif_model is None:
++                    ntwk.vif_model = hw_vif_model
+                 network_uuid = ntwk.network_id
+                 vif_model = ntwk.vif_model
+                 try:
+@@ -2752,7 +2764,8 @@ class API(base.Base):
+                     request_id=str(uuid.uuid4()))
+                 pci_requests.append(request)
+ 
+-        instance.pci_requests = objects.InstancePCIRequests(requests=pci_requests,
++        instance.pci_requests = objects.InstancePCIRequests(
++            requests=pci_requests,
+             instance_uuid=instance.uuid)
+ 
+         instance.task_state = task_states.RESIZE_PREP
+diff --git a/nova/virt/libvirt/vif.py b/nova/virt/libvirt/vif.py
+index ab5e728..fc50af3 100644
+--- a/nova/virt/libvirt/vif.py
++++ b/nova/virt/libvirt/vif.py
+@@ -44,8 +44,7 @@ libvirt_vif_opts = [
+ CONF = cfg.CONF
+ CONF.register_opts(libvirt_vif_opts, 'libvirt')
+ CONF.import_opt('use_ipv6', 'nova.netconf')
+-CONF.import_opt('default_vif_model',
+-                'nova.api.openstack.compute.servers')
++CONF.import_opt('default_vif_model', 'nova.compute.api')
+ 
+ DEV_PREFIX_ETH = 'eth'
+ 
+-- 
+2.7.4
+

@@ -1,0 +1,1672 @@
+From 456b3585c50888b039c49d17ab99c4db35015f8f Mon Sep 17 00:00:00 2001
+From: Gerry Kopec <Gerry.Kopec@windriver.com>
+Date: Thu, 16 Jun 2016 19:36:02 -0400
+Subject: [PATCH 021/143] primary: robustness
+
+optimize image download to avoid stalling other tasks
+
+Under heavy disk IO load in Nokia testing, seeing significant delays
+in nova-compute activities on compute node (e.g. observe that regular
+audit doesn't run for minutes).
+
+Reduce scenarios where main nova-compute process thread could get
+stuck on disk IO task by offloading image download work to another
+thread in eventlet pool.
+
+This ports R2 commits to mitaka:
+bdd7d0f add sleep to avoid delays in periodic tasks
+0f44c44 creating and deleting 10 stacks from heat template failed
+
+(cherry picked from R3 commit c97f53c)
+
+12e31da Add support for cinderclient session retries
+   Port R2 commit ca80a00 to Mitaka:
+   This adds a service parameter to cinderclient's keystone session to
+   enable retries on InternalServer errors (500). This is to accommodate
+   commands that can't be handled in a timely manner due to a heavy load
+   placed on cinder.
+
+   By default 4 retries are enabled. To disable add the following to
+   nova.conf.
+
+   [cinder]
+   session_retries=0
+
+   python-cinderclient package is updated to enable retries.
+
+   (cherry picked from R3 commit a0c9e60)
+
+62ecf84 retry instance save after VM creation
+   In a customer site we saw a case where the VM was created successfully
+   but the instance save() call timed out, resulting in the instance being
+   torn down and causing problems later when it got recreated with no NICs.
+
+   As a partial workaround, let's allow 2 retries for the instance save()
+   in order to minimize the likelihood that we'll need to tear down the
+   instance.
+
+   Change-Id: Id28acc0a9d8ca6066b0b72a3e18e0997da28d19b
+
+   (cherry picked from R3 commit 3e24b30)
+
+c9e9ccd Allow migrations to be confirmed when in confirming state
+   The confirm_resize API in nova/compute/api.py sets the migration
+   status to "confirming" before sending the RPC to nova-compute. If
+   nova-compute doesn't process the RPC, the instance is stuck in this
+   state - both the revert_resize and confirm_resize APIs only look
+   for migrations with the "finished" status and raise a
+   MigrationNotFound exception if no migration is found. Since this
+   migration is in the "confirming" state, we raise the exception,
+   which results in the "Instance has not been resized" error being
+   returned to the caller.
+
+   To allow the migration to be confirmed after the compute node
+   recovers, the confirm_resize handler will be changed to allow
+   migrations in the "confirming" state. On the target compute node
+   the actual confirmation is synchronized by instance.uuid, so
+   there should be no race conditions, and confirm_resize already
+   handles the "migration is already confirmed" case, which is used
+   by _confirm_resize_on_deleting().
+
+   (cherry picked from commit caa39e8)
+
+80c46e5 Guard against overwriting a deleting task state
+   This is a backport of an upstream commit under review at:
+   https://review.openstack.org/#/c/288933/5
+   The original commit message follows below.
+
+   The following reviews try to fix bugs where a deleting task state
+   gets overwritten due to racing instance.save() operations in the
+   ongoing task being interrupted by a instance delete operation.
+
+   https://review.openstack.org/245038
+   https://review.openstack.org/276783
+
+   The same race conditon exist in many other places where task_state
+   is being updated without setting expected_task_state to guard against
+   these bad state changes.
+
+   A way to solve this is to enforce some rules in the db api to not
+   allow certain task state changes when a deleting state is involved.
+
+   A positive side-effect of this is that instance deletes are detected
+   faster by running tasks due to the UnexpectedDeletingTaskStateError
+   exception being raised.
+
+   Change-Id: I8e7e3861c971d8571096600414869f374741e7b8
+   Closes-Bug: #1512563
+   Closes-Bug: #1542039
+
+   (cherry picked from R3 commit 895e4a8)
+
+6fbbe02 nova quota update race condition
+   Upstream review: https://review.openstack.org/#/c/288153/
+   This is race can occur if a delete action is performed during
+   create_limit and update_limit, this is acceptable but
+   we need to catch the ProjectQuotaNotFound and ignore it.
+
+   At the time of this commit, the review was not yet closed and
+   the fix not yet commited upstream. My test indicate that the
+   changes do indeed fix the issue present.
+
+   Upstream commit message included below:
+
+   Catch ProjectQuotaNotFound when do update_limit
+
+   This is race can occur if a delete action is performed during
+   create_limit and update_limit, this is acceptable but
+   we need to catch the ProjectQuotaNotFound and ignore it.
+
+   Added a test case for QuotaExists as well.
+
+   Closes-Bug: 1552622
+
+   Change-Id: I725c3616833e9e328b21d975ab45bdfbd2058be7
+
+   (cherry picked from R3 commit 27af665)
+
+00f21a9 Limit concurrent migrations
+   This limits concurrent outgoing migrations (i.e., cold-migration, resize)
+   with default max_concurrent_migrations of 1. This mechanism limits the
+   IO load on a host.  Migration status is first changed to 'queued', then
+   outgoing migrations are processed in order.
+
+5815ce5 pass down image_ref to compute's rebuild instance
+   The numa topology info set into the image metadata, was being lost after
+   an evacuation.
+   The reason for this issue is that the original image info was not been passed
+   to compute.manager.ComputeManager.rebuild_instance by the evacuation code in
+   compute.api.API.evacuate. This caused the numa topology info to be ignored when
+   the rebuild_claim object was made.
+
+   (cherry picked from R3 commit e26be3a)
+
+   addendum to commit e26be3a39e2 to fix rebuild to a new image case
+
+   compute.manager.ComputeManager.rebuild_instance to take new image_ref
+   when passed down by a rebuild.
+
+   (cherry picked from R3 commit a47b686)
+
+1e491ac ported over changes to reject instance deletion during resize/migrate
+
+   (cherry picked from R3 commits 3ad6477 and 2cbff05)
+
+d8ac027 Limit flavor vcpus to 128 to prevent Horizon memory bottleneck
+   This limits flavor create vcpus between 1 and 128.
+
+   Note that a fix in Horizon was previously made to limit to
+   128. Setting to larger (eg, > 180) caused cpu hog issue and memory
+   growth due to how the form iterates over each vcpu. It was triggering
+   OOM on CPE systems. Architects agreed that we could limit to 128 as
+   maximum supported value.
+
+   (cherry picked from R3 commit 916aa8d)
+
+d492ff3 handle None value for connection_info when migrate
+   Add a check for bdm.connection_info before calling jsonutils.loads to get
+   rid off the following exception when detach valumes during migration:
+     TypeError("%s can't be decoded" % type(text))
+
+   (cherry picked from R3 commit 6831462)
+
+   For port to Newton, upstream has moved call to jsonutils.loads so have
+   to apply the fix in a couple places.
+
+611ba16 VMs stuck in powering-off state
+   An issue was observed once where some instances are stuck in task_state
+   'powering-off'.  Based on the logs, it hasn't been found what could
+   cause this issue.
+
+   The only thing we know is that a 'stop' command is issued and the
+   compute audits keeps reporting this instance in 'powering-off' but sees
+   it running at the same time.  The guest is fully operational.
+
+   This commit adds additionnal logging when stopping a guest.   The best
+   guess so far is that the guest has been stopped but the nova databse
+   missed an update/save.  A similar issue was found with an instance stuck in
+   'deleting'.
+
+   (cherry picked from R3 commit c06128f)
+
+494fb77 modified Nova to make the "suspend"
+   HTTP API call act as though it were the "pause" call.
+
+   Note that the VM state shows "paused" both for VM status and
+   power state. VM is saved to RAM.
+
+5343f59 Decorate dispatch functions for resize and live_migration
+
+   Jira title: Unexpected API Error returned on nova flavor-key set and nova
+   flavor-delete on existing flavor after running negative resize vm testcases
+
+   - Change dispatch_resize_instance() to be a decoraded class member
+     function.
+     In case of migration failure, the decorated function is able to
+     set the state of this migration to error in the DB.
+
+   - Change dispatch_live_migration() to be a decoraded class member
+     function.
+
+   - Add check in resize() api for flavor ephemeral size
+
+   Newton rebase note:
+   This commit includes the following R4 commits:
+   23de1d7, b196396, 733c317, 4153fb2, a529715
+   The changes related to flavor are removed since we are now allowing
+   in-use flavor deletion.
+
+ 6adc0db Add robustness to instance save after create retry mechanism
+   Update commit a7df1fb (retry instance save after VM creation)
+   to add flexibility when instance.save() times out:
+   - check instance state before attempting retry as instance state change
+     may have already succeeded
+   - on retry, allow for expected state to already be active.  This
+     prevents exception on expected state mismatch when earlier attempt
+     succeeds after messaging timeout.
+
+a27f076 optimize image download to avoid stalling other tasks
+   This adds the same IO offload mechanism to the new download method
+   GlanceImageServiceV2 in nova/image/glance.py as V1. Note we now
+   default to glance V2.
+
+   Can see the offload working by collecting 'schedtop' on the compute,
+   we now see significant occupancy and disk writes for in nova-compute
+   task with a TID unequal to main PID.
+
+6500249 Fix Circular reference error on resize/cold migrate retry
+   This commit adds NovaObjectDictCompat to VirtCPUTopology object to
+   avoid Circular reference detected error when compute attempts reschedule
+   after failure during prep_resize.  This is required due to upstream
+   commit 76dfb4b in Newton which added json serialize/unserialize of
+   legacy_spec prior to rpc call to prep_resize().  On first pass through,
+   cpu_topology field of numa_topology cell is not defined so there isn't
+   an issue but on reschedule it exists and triggers the error.
+
+   This same fix had also been done in R3/Mitaka by commit 2fb28a0, but that
+   was to support upgrade from R2/Kilo so it was not ported forward to
+   R4/Newton.
+
+   This change is a candidate for upstreaming.
+
+0ebba2d increase RPC timeout to 5 min for block migration
+   Increase RPC msg timeout from 1 minute to 5 minutes for block migration,
+   in case glance image download takes too long at destination.
+
+1df718a Handle config drive disk migration with infra interfaces
+   When we have an infrastructure interface configured, the nova ssh
+   migration keys will be setup to use that interface for instance
+   migrations.
+
+   When the config drive disk is copied, nova's remotefs SshDriver is
+   copying files via scp using the hostname which aligns to the mgmt
+   interface (compute-n vs. compute-n-infra)
+
+   Since the compute-n-infra name is aliased on hosts that don't have a
+   provisioned infra interface, the infra related hostname is always
+   present.
+
+   Update the safe_ip_format() utility routine to always use the infra
+   hostname when a hostname is detected and call safe_ip_format() when
+   forming the src path for the config drive disk copy.
+
+   This is related to https://bugs.launchpad.net/nova/+bug/1246201.
+
+2cea356 abort the volume detach if the connection_info is None.
+   Root Cause:
+   The issue is a rare race condition where compute-0 was rebooted right
+   after the instance tenant2-image_vol-26 live-migrated to compute-0
+   and had not completed attaching its volumes.
+   When volume ba5438bb-aac5-48ef-8982-28330e18d159 was being attached
+   to the instance tenant2-image_vol-26, nova started the attaching
+   process, but the cinder backend had not finished the attaching before
+   compute-0 went down. As a result, bdm.connection_info is not saved.
+   At volume detach during evacuation, bdm.connection_info was empty and
+   caused exception.
+
+   Fix:
+   Nova should abort the detach process if the connection_info is None.
+
+dc46cfd add error reporting when resizing to a smaller disk
+   When resizing a booted from image VM, we already check for the
+   "resizing from a non-zero root_gb to a zero root_gb" case. Given
+   that resizing to a smaller disk is ultimately not allowed and
+   rejected by the libvirt driver, make sense to extend the check here
+   to prevent that case. Note that since this error is now being
+   caught early, it is correctly propagated to Heat.
+
+72c6fdf Increase RPC timeout to 120s for post live migration
+   This increases post_live_migration_at_destination RPC timeout to 120
+   seconds from the 60 seconds default. This should prevent the
+   MessagingTimeout we see due to updating ports taking a long time when
+   there are many VIFs.
+
+   For future rebase, this should be merged with the following commit:
+   c69528059048b0a2bc44d42cda5795e03fe19e29
+   (increase RPC timeout to 5 min for block migration)
+
+792023e Patch orchestration failed after failed evacuate
+   When an instance is evacuated, a 'tombestone' migration record is created
+   in the nova migrations table so that any instance files can be cleaned up
+   when nova-compute on the node hosting the evacuation comes back up.
+
+   When nova-compute comes back up, the migrations table is checked for any
+   records in 'accepted' or 'done' state and regards these as indications
+   that it can remove the instance files.
+
+   A problem can occur if the evacuate fails to schedule.  The migration
+   record is left in the 'accepted' state.  This means that even if the
+   instance is able to recover at a later time via a hard-reboot (for example),
+   the instance files will be removed when nova-compute is restarted,
+   or the host is locked/unlocked.
+
+   The JIRA associated with this commit had a migration record sitting in
+   accepted for a couple of days, while the instance had successfully
+   relaunched on the evacuated host.
+
+   This commit resolves this issue by setting the migration record to
+   'failed' if the instance fails to re-schedule on an evacuate request.
+
+83325a9 instances not being cleaned up properly from
+/opt/cgcs/nova/instances/
+  Rreplace with config change to maximum_instance_delete_attempts. Change
+  it to sys.maxsize (9223372036854775807), which would give an effectively
+  unlimited number of retries.
+
+__TYPE_primary
+__TAG_robustness
+__R4_commit_12e31da
+__R3_commit_2cfecb2
+__TC5113,TC5114,TC5115,TC6497,TC6500,TC6556,TC6568,TC6680,TC6685,TC6687
+---
+ nova/api/openstack/compute/quota_sets.py           |  21 ++-
+ .../api/openstack/compute/schemas/flavor_manage.py |   6 +-
+ nova/api/openstack/compute/suspend_server.py       |  13 +-
+ nova/compute/api.py                                |  47 ++++-
+ nova/compute/manager.py                            | 189 +++++++++++++++++----
+ nova/compute/rpcapi.py                             |  13 +-
+ nova/conf/cinder.py                                |  13 ++
+ nova/conf/compute.py                               |   9 +-
+ nova/db/sqlalchemy/api.py                          |  20 ++-
+ nova/image/glance.py                               |  68 +++++---
+ nova/objects/virt_cpu_topology.py                  |   3 +-
+ .../unit/api/openstack/compute/test_quotas.py      |  31 ++++
+ .../unit/api/openstack/compute/test_serversV21.py  |   8 +-
+ .../api/openstack/compute/test_suspend_server.py   |  24 ++-
+ nova/tests/unit/api/openstack/fakes.py             |  10 ++
+ nova/tests/unit/compute/test_compute.py            |   9 +-
+ nova/tests/unit/compute/test_compute_api.py        |  24 ++-
+ nova/tests/unit/compute/test_compute_mgr.py        |  24 ++-
+ nova/tests/unit/compute/test_rpcapi.py             |  15 +-
+ nova/tests/unit/conductor/test_conductor.py        |  52 ++++++
+ nova/tests/unit/db/test_db_api.py                  |  24 +++
+ nova/tests/unit/test_utils.py                      |   4 +-
+ nova/tests/unit/virt/libvirt/test_driver.py        |   2 +-
+ nova/tests/unit/virt/libvirt/test_utils.py         |   4 +-
+ .../unit/virt/libvirt/volume/test_remotefs.py      |  10 +-
+ nova/utils.py                                      |  11 ++
+ nova/virt/libvirt/driver.py                        |   4 +-
+ nova/volume/cinder.py                              |  11 +-
+ 28 files changed, 550 insertions(+), 119 deletions(-)
+
+diff --git a/nova/api/openstack/compute/quota_sets.py b/nova/api/openstack/compute/quota_sets.py
+index e618f66..6327004 100644
+--- a/nova/api/openstack/compute/quota_sets.py
++++ b/nova/api/openstack/compute/quota_sets.py
+@@ -13,6 +13,7 @@
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
+ 
++from oslo_log import log as logging
+ from oslo_utils import strutils
+ 
+ import six.moves.urllib.parse as urlparse
+@@ -40,6 +41,7 @@ QUOTAS = quota.QUOTAS
+ 
+ FILTERED_QUOTAS = ["fixed_ips", "floating_ips", "networks",
+                    "security_group_rules", "security_groups"]
++LOG = logging.getLogger(__name__)
+ 
+ 
+ class QuotaSetsController(wsgi.Controller):
+@@ -188,8 +190,23 @@ class QuotaSetsController(wsgi.Controller):
+                 objects.Quotas.create_limit(context, project_id,
+                                             key, value, user_id=user_id)
+             except exception.QuotaExists:
+-                objects.Quotas.update_limit(context, project_id,
+-                                            key, value, user_id=user_id)
++                try:
++                    objects.Quotas.update_limit(context, project_id,
++                                                key, value, user_id=user_id)
++                except exception.ProjectQuotaNotFound:
++                    # NOTE: When a race condition what DELETE this quota
++                    # just before this update_limit, this exception happens.
++                    # This is a super rare case on productions because there
++                    # are different guys(one is deleting its quota, the other
++                    # is updateing the same quota on the same project). It is
++                    # ok to ignore such exception here. see bug 1552622 for
++                    # more detail.
++                    LOG.debug('Possible race condition encountered when doing '
++                              'update for project:%(project_id)s, '
++                              'user:%(user_id)s, key:%(key)s',
++                              {'project_id': project_id,
++                               'user_id': user_id,
++                               'key': key})
+         # Note(gmann): Removed 'id' from update's response to make it same
+         # as V2. If needed it can be added with microversion.
+         return self._format_quota_set(
+diff --git a/nova/api/openstack/compute/schemas/flavor_manage.py b/nova/api/openstack/compute/schemas/flavor_manage.py
+index 5eb5326..15a0db9 100644
+--- a/nova/api/openstack/compute/schemas/flavor_manage.py
++++ b/nova/api/openstack/compute/schemas/flavor_manage.py
+@@ -32,7 +32,11 @@ create = {
+                     'pattern': '^(?! )[a-zA-Z0-9. _-]+(?<! )$'
+                 },
+                 'ram': parameter_types.flavor_param_positive,
+-                'vcpus': parameter_types.flavor_param_positive,
++                'vcpus': {
++                    'type': ['integer'],
++                    'minimum': 0, 'exclusiveMinimum': True,
++                    'maximum': 128
++                },
+                 'disk': parameter_types.flavor_param_non_negative,
+                 'OS-FLV-EXT-DATA:ephemeral':
+                     parameter_types.flavor_param_non_negative,
+diff --git a/nova/api/openstack/compute/suspend_server.py b/nova/api/openstack/compute/suspend_server.py
+index cf0b945..ee72f21 100644
+--- a/nova/api/openstack/compute/suspend_server.py
++++ b/nova/api/openstack/compute/suspend_server.py
+@@ -11,6 +11,13 @@
+ #   WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #   License for the specific language governing permissions and limitations
+ #   under the License.
++#
++# Copyright (c) 2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ from webob import exc
+ 
+@@ -38,7 +45,8 @@ class SuspendServerController(wsgi.Controller):
+             context.can(ss_policies.POLICY_ROOT % 'suspend',
+                         target={'user_id': server.user_id,
+                                 'project_id': server.project_id})
+-            self.compute_api.suspend(context, server)
++            # suspend operation stubbed for pause
++            self.compute_api.pause(context, server)
+         except exception.InstanceUnknownCell as e:
+             raise exc.HTTPNotFound(explanation=e.format_message())
+         except exception.InstanceIsLocked as e:
+@@ -56,7 +64,8 @@ class SuspendServerController(wsgi.Controller):
+         context.can(ss_policies.POLICY_ROOT % 'resume')
+         server = common.get_instance(self.compute_api, context, id)
+         try:
+-            self.compute_api.resume(context, server)
++            # suspend operation stubbed for pause
++            self.compute_api.unpause(context, server)
+         except exception.InstanceUnknownCell as e:
+             raise exc.HTTPNotFound(explanation=e.format_message())
+         except exception.InstanceIsLocked as e:
+diff --git a/nova/compute/api.py b/nova/compute/api.py
+index 0543550..e6c95c4 100644
+--- a/nova/compute/api.py
++++ b/nova/compute/api.py
+@@ -1848,6 +1848,23 @@ class API(base.Base):
+                     # Instance is already deleted
+                     return
+ 
++        # if this instance is in the middle of a resize/migrate, we can't
++        # safely delete it.  (Theoretically we could fix the
++        # _confirm_resize_on_deleting() code to handle this case but it'd
++        # be more risky and more work to validate.
++        if instance.task_state in (task_states.RESIZE_PREP,
++                                   task_states.RESIZE_MIGRATING,
++                                   task_states.RESIZE_MIGRATED,
++                                   task_states.RESIZE_FINISH):
++            LOG.warning("Unable to delete instance since a "
++                        "resize/migration  is in progress",
++                        instance=instance)
++            raise exception.InstanceInvalidState(
++                    instance_uuid = instance.uuid,
++                    attr = 'task_state',
++                    state = instance.task_state,
++                    method = 'delete')
++
+         bdms = objects.BlockDeviceMappingList.get_by_instance_uuid(
+                 context, instance.uuid)
+ 
+@@ -3145,8 +3162,20 @@ class API(base.Base):
+         # a confirm resize is just a clean up of the migration objects and a
+         # state change in compute.
+         if migration is None:
+-            migration = objects.Migration.get_by_instance_and_status(
+-                elevated, instance.uuid, 'finished')
++            # Look for migrations in confirming state as well as finished to
++            # handle cases where the confirm did not complete (eg. because
++            # the compute node went away during the confirm).
++            for status in ('finished', 'confirming'):
++                try:
++                    migration = objects.Migration.get_by_instance_and_status(
++                        elevated, instance.uuid, status)
++                    break
++                except exception.MigrationNotFoundByStatus:
++                    pass
++
++            if migration is None:
++                raise exception.MigrationNotFoundByStatus(
++                    instance_id=instance.uuid, status='finished|confirming')
+ 
+         migration.status = 'confirming'
+         migration.save()
+@@ -3202,11 +3231,17 @@ class API(base.Base):
+         else:
+             new_instance_type = flavors.get_flavor_by_flavor_id(
+                     flavor_id, read_deleted="no")
+-            if (new_instance_type.get('root_gb') == 0 and
+-                current_instance_type.get('root_gb') != 0 and
++            if (new_instance_type.get('root_gb') <
++                current_instance_type.get('root_gb') and
+                 not compute_utils.is_volume_backed_instance(context,
+                     instance)):
+-                reason = _('Resize to zero disk flavor is not allowed.')
++                reason = _('Resize to smaller disk flavor is not allowed.')
++                raise exception.CannotResizeDisk(reason=reason)
++
++            if (new_instance_type.get('ephemeral_gb') <
++                    current_instance_type.get('ephemeral_gb')):
++                reason = _('Resize to smaller ephemeral flavor'
++                           ' is not allowed.')
+                 raise exception.CannotResizeDisk(reason=reason)
+ 
+         if not new_instance_type:
+@@ -4116,7 +4151,7 @@ class API(base.Base):
+                        new_pass=admin_password,
+                        injected_files=None,
+                        image_ref=None,
+-                       orig_image_ref=None,
++                       orig_image_ref=instance.image_ref,
+                        orig_sys_metadata=None,
+                        bdms=None,
+                        recreate=True,
+diff --git a/nova/compute/manager.py b/nova/compute/manager.py
+index 68c4b72..c9b6b1e 100644
+--- a/nova/compute/manager.py
++++ b/nova/compute/manager.py
+@@ -540,6 +540,11 @@ class ComputeManager(manager.Manager):
+                 CONF.max_concurrent_live_migrations)
+         else:
+             self._live_migration_semaphore = compute_utils.UnlimitedSemaphore()
++        if max(CONF.max_concurrent_migrations, 0) != 0:
++            self._migration_semaphore = eventlet.semaphore.Semaphore(
++                CONF.max_concurrent_migrations)
++        else:
++            self._migration_semaphore = compute_utils.UnlimitedSemaphore()
+         self._failed_builds = 0
+         self.suspected_uuids = set([])
+ 
+@@ -2160,16 +2165,51 @@ class ComputeManager(manager.Manager):
+ 
+         self._update_instance_after_spawn(context, instance)
+ 
+-        try:
+-            instance.save(expected_task_state=task_states.SPAWNING)
+-        except (exception.InstanceNotFound,
+-                exception.UnexpectedDeletingTaskStateError) as e:
+-            with excutils.save_and_reraise_exception():
+-                self._notify_about_instance_usage(context, instance,
+-                    'create.error', fault=e)
+-                compute_utils.notify_about_instance_create(
+-                    context, instance, self.host,
+-                    phase=fields.NotificationPhase.ERROR, exception=e)
++        # 
++        # We observed this instance.save() call to timeout under stress test.
++        # It would be a shame to tear the instance down simply because the
++        # conductor is busy, so give it a couple of chances.
++        attempt = 0
++        retries = 2
++        while True:
++            try:
++                if attempt == 0:
++                    instance.save(expected_task_state=task_states.SPAWNING)
++                else:
++                    # On retries, allow for state to already be active
++                    instance.save(
++                             expected_task_state=[task_states.SPAWNING, None],
++                             expected_vm_state=[vm_states.BUILDING,
++                                                vm_states.ACTIVE])
++                break
++            except (exception.InstanceNotFound,
++                    exception.UnexpectedDeletingTaskStateError) as e:
++                with excutils.save_and_reraise_exception():
++                    self._notify_about_instance_usage(context, instance,
++                        'create.error', fault=e)
++                    compute_utils.notify_about_instance_create(
++                        context, instance, self.host,
++                        phase=fields.NotificationPhase.ERROR, exception=e)
++            except messaging.MessagingTimeout:
++                # if timeout lets check if instance got created before
++                # attempting retry of instance.save()
++                try:
++                    instance_new = objects.Instance.get_by_uuid(context,
++                                                                instance.uuid)
++                    if instance_new.launched_at:
++                        break
++                except Exception:
++                    pass
++                attempt += 1
++                if attempt <= retries:
++                    LOG.warning(
++                        "Retrying instance.save() for uuid %(uuid)s "
++                        "after a MessagingTimeout, attempt %(attempt)s "
++                        "of %(retries)s.",
++                        {'uuid': instance.uuid, 'attempt': attempt,
++                         'retries': retries})
++                else:
++                    raise
+ 
+         self._update_scheduler_instance_info(context, instance)
+         self._notify_about_instance_usage(context, instance, 'create.end',
+@@ -2336,7 +2376,18 @@ class ComputeManager(manager.Manager):
+                                         trying to teardown networking
+         """
+         context = context.elevated()
+-        LOG.info('Terminating instance', instance=instance)
++        # Extra logging for debugging issue with stuck
++        # task_state.
++        current_power_state = self._get_power_state(context, instance)
++        LOG.info('Terminating instance; current vm_state: %(vm_state)s, '
++                 'current task_state: %(task_state)s, current DB '
++                 'power_state: %(db_power_state)s, current VM '
++                 'power_state: %(current_power_state)s',
++                 {'vm_state': instance.vm_state,
++                  'task_state': instance.task_state,
++                  'db_power_state': instance.power_state,
++                  'current_power_state': current_power_state},
++                 instance_uuid=instance.uuid)
+ 
+         if notify:
+             self._notify_about_instance_usage(context, instance,
+@@ -2375,6 +2426,19 @@ class ComputeManager(manager.Manager):
+                     self._try_deallocate_network(context, instance,
+                                                  requested_networks)
+ 
++        # Extra logging for debugging issue with stuck
++        # task_state.
++        current_power_state = self._get_power_state(context, instance)
++        LOG.info('Instance terminated; current vm_state: %(vm_state)s, '
++                 'current task_state: %(task_state)s, current DB '
++                 'power_state: %(db_power_state)s, current VM '
++                 'power_state: %(current_power_state)s',
++                 {'vm_state': instance.vm_state,
++                  'task_state': instance.task_state,
++                  'db_power_state': instance.power_state,
++                  'current_power_state': current_power_state},
++                 instance_uuid=instance.uuid)
++
+         if try_deallocate_networks:
+             self._try_deallocate_network(context, instance, requested_networks)
+ 
+@@ -2511,7 +2575,6 @@ class ComputeManager(manager.Manager):
+                                 system_meta)
+ 
+     @wrap_exception()
+-    @reverts_task_state
+     @wrap_instance_event(prefix='compute')
+     @wrap_instance_fault
+     def terminate_instance(self, context, instance, bdms, reservations):
+@@ -2545,7 +2608,8 @@ class ComputeManager(manager.Manager):
+                 with excutils.save_and_reraise_exception():
+                     LOG.exception('Setting instance vm_state to ERROR',
+                                   instance=instance)
+-                    self._set_instance_obj_error_state(context, instance)
++                    self._set_instance_obj_error_state(context, instance,
++                                                       clean_task_state=True)
+ 
+         do_terminate_instance(instance, bdms)
+ 
+@@ -2571,15 +2635,17 @@ class ComputeManager(manager.Manager):
+                          instance_uuid=instance.uuid)
+                 return
+ 
+-            LOG.debug('Stopping instance; current vm_state: %(vm_state)s, '
+-                      'current task_state: %(task_state)s, current DB '
+-                      'power_state: %(db_power_state)s, current VM '
+-                      'power_state: %(current_power_state)s',
+-                      {'vm_state': instance.vm_state,
+-                       'task_state': instance.task_state,
+-                       'db_power_state': instance.power_state,
+-                       'current_power_state': current_power_state},
+-                      instance_uuid=instance.uuid)
++            # Extra logging for debugging issue with stuck
++            # task_state.
++            LOG.info('Stopping instance; current vm_state: %(vm_state)s, '
++                     'current task_state: %(task_state)s, current DB '
++                     'power_state: %(db_power_state)s, current VM '
++                     'power_state: %(current_power_state)s',
++                     {'vm_state': instance.vm_state,
++                      'task_state': instance.task_state,
++                      'db_power_state': instance.power_state,
++                      'current_power_state': current_power_state},
++                     instance_uuid=instance.uuid)
+ 
+             # NOTE(mriedem): If the instance is already powered off, we are
+             # possibly tearing down and racing with other operations, so we can
+@@ -2609,6 +2675,17 @@ class ComputeManager(manager.Manager):
+             instance.save(expected_task_state=expected_task_state)
+             self._notify_about_instance_usage(context, instance,
+                                               "power_off.end")
++            # Extra logging for debugging issue with stuck
++            # task_state.
++            LOG.info('Instance stopped; current vm_state: %(vm_state)s, '
++                     'current task_state: %(task_state)s, current DB '
++                     'power_state: %(db_power_state)s, current VM '
++                     'power_state: %(current_power_state)s',
++                     {'vm_state': instance.vm_state,
++                      'task_state': instance.task_state,
++                      'db_power_state': instance.power_state,
++                      'current_power_state': current_power_state},
++                     instance_uuid=instance.uuid)
+ 
+             compute_utils.notify_about_instance_action(context, instance,
+                         self.host, action=fields.NotificationAction.POWER_OFF,
+@@ -2860,8 +2937,11 @@ class ComputeManager(manager.Manager):
+             rebuild_claim = claims.NopClaim
+ 
+         image_meta = {}
+-        if image_ref:
+-            image_meta = self.image_api.get(context, image_ref)
++        if image_ref or orig_image_ref:
++            if image_ref:
++                image_meta = self.image_api.get(context, image_ref)
++            else:
++                image_meta = self.image_api.get(context, orig_image_ref)
+ 
+         # NOTE(mriedem): On a recreate (evacuate), we need to update
+         # the instance's host and node properties to reflect it's
+@@ -3963,14 +4043,9 @@ class ComputeManager(manager.Manager):
+             # not re-scheduling
+             six.reraise(*exc_info)
+ 
+-    @wrap_exception()
+-    @reverts_task_state
+-    @wrap_instance_event(prefix='compute')
+-    @errors_out_migration
+-    @wrap_instance_fault
+-    def resize_instance(self, context, instance, image,
+-                        reservations, migration, instance_type,
+-                        clean_shutdown):
++    def _do_resize_instance(self, context, instance, image,
++                            reservations, migration, instance_type,
++                            clean_shutdown):
+         """Starts the migration of a running instance to another host."""
+         with self._error_out_instance_on_exception(context, instance):
+             # TODO(chaochin) Remove this until v5 RPC API
+@@ -4038,6 +4113,41 @@ class ComputeManager(manager.Manager):
+                    phase=fields.NotificationPhase.END)
+             self.instance_events.clear_events_for_instance(instance)
+ 
++    @wrap_exception()
++    @reverts_task_state
++    @wrap_instance_event(prefix='compute')
++    @errors_out_migration
++    @wrap_instance_fault
++    def dispatch_resize_instance(self, context, instance, image,
++                                 reservations, migration, instance_type,
++                                 clean_shutdown):
++
++        with self._migration_semaphore:
++            self._do_resize_instance(context, instance, image,
++                      reservations, migration, instance_type,
++                      clean_shutdown)
++
++    @wrap_exception()
++    @reverts_task_state
++    @errors_out_migration
++    @wrap_instance_fault
++    def resize_instance(self, context, instance, image,
++                        reservations, migration, instance_type,
++                        clean_shutdown):
++        """Queue resize instance to another host."""
++
++        migration.status = 'queued'
++        with migration.obj_as_admin():
++            migration.save()
++
++        # NOTE(jgauld): We spawn here to return the RPC worker thread back to
++        # the pool. Since what follows could take a really long time, we don't
++        # want to tie up RPC workers.
++        utils.spawn_n(self.dispatch_resize_instance,
++                      context, instance, image,
++                      reservations, migration, instance_type,
++                      clean_shutdown)
++
+     def _terminate_volume_connections(self, context, instance, bdms):
+         connector = None
+         for bdm in bdms:
+@@ -5634,6 +5744,15 @@ class ComputeManager(manager.Manager):
+     @wrap_exception()
+     @wrap_instance_event(prefix='compute')
+     @wrap_instance_fault
++    def dispatch_live_migration(self, context, dest, instance,
++                                block_migration, migration, migrate_data):
++            with self._live_migration_semaphore:
++                self._do_live_migration(context, dest,
++                                        instance, block_migration,
++                                        migration, migrate_data)
++
++    @wrap_exception()
++    @wrap_instance_fault
+     def live_migration(self, context, dest, instance, block_migration,
+                        migration, migrate_data):
+         """Executing live migration.
+@@ -5648,14 +5767,10 @@ class ComputeManager(manager.Manager):
+         """
+         self._set_migration_status(migration, 'queued')
+ 
+-        def dispatch_live_migration(*args, **kwargs):
+-            with self._live_migration_semaphore:
+-                self._do_live_migration(*args, **kwargs)
+-
+         # NOTE(danms): We spawn here to return the RPC worker thread back to
+         # the pool. Since what follows could take a really long time, we don't
+         # want to tie up RPC workers.
+-        utils.spawn_n(dispatch_live_migration,
++        utils.spawn_n(self.dispatch_live_migration,
+                       context, dest, instance,
+                       block_migration, migration,
+                       migrate_data)
+diff --git a/nova/compute/rpcapi.py b/nova/compute/rpcapi.py
+index e1ba84c..62d3314 100644
+--- a/nova/compute/rpcapi.py
++++ b/nova/compute/rpcapi.py
+@@ -750,8 +750,9 @@ class ComputeAPI(object):
+     def post_live_migration_at_destination(self, ctxt, instance,
+             block_migration, host):
+         version = '4.0'
++        # Increase RPC timeout to handle VMs with lots of VIFs
+         cctxt = self.router.client(ctxt).prepare(
+-                server=host, version=version)
++                server=host, version=version, timeout=120)
+         return cctxt.call(ctxt, 'post_live_migration_at_destination',
+             instance=instance, block_migration=block_migration)
+ 
+@@ -764,7 +765,15 @@ class ComputeAPI(object):
+             version = '4.0'
+             if migrate_data:
+                 migrate_data = migrate_data.to_legacy_dict()
+-        cctxt = client.prepare(server=host, version=version)
++
++        # increase RPC msg timeout from 1 minute to 5 minutes
++        # for block migration, in case glance image download takes too long at
++        # destination
++        if (migrate_data and 'block_migration' in migrate_data and
++                migrate_data.block_migration):
++            cctxt = client.prepare(server=host, version=version, timeout=300)
++        else:
++            cctxt = client.prepare(server=host, version=version)
+         result = cctxt.call(ctxt, 'pre_live_migration',
+                             instance=instance,
+                             block_migration=block_migration,
+diff --git a/nova/conf/cinder.py b/nova/conf/cinder.py
+index 133e9de..0db0227 100644
+--- a/nova/conf/cinder.py
++++ b/nova/conf/cinder.py
+@@ -12,6 +12,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2016-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ from keystoneauth1 import loading as ks_loading
+ from oslo_config import cfg
+@@ -94,6 +101,12 @@ cinder.conf), the volume create request will fail and the instance will fail
+ the build request.
+ By default there is no availability zone restriction on volume attach.
+ """),
++    # add session_retries for cinder client
++    cfg.IntOpt('session_retries',
++               default=4,
++               help="""
++Allow cinder client to retry on InternalServer errors (500).
++"""),
+ ]
+ 
+ 
+diff --git a/nova/conf/compute.py b/nova/conf/compute.py
+index 8f6e50b..5638ac2 100644
+--- a/nova/conf/compute.py
++++ b/nova/conf/compute.py
+@@ -24,6 +24,7 @@
+ #
+ 
+ import socket
++import sys
+ 
+ from oslo_config import cfg
+ from oslo_config import types
+@@ -607,6 +608,11 @@ Possible values:
+ * Any positive integer representing maximum number of live migrations
+   to run concurrently.
+ """),
++    cfg.IntOpt('max_concurrent_migrations',
++               default=1,
++               help="""
++Maximum number of migrations to run concurrently.
++"""),
+     cfg.IntOpt('block_device_allocate_retries',
+         default=60,
+         help="""
+@@ -1038,7 +1044,8 @@ Related options:
+ instance_cleaning_opts = [
+     # TODO(macsz): add min=1 flag in P development cycle
+     cfg.IntOpt('maximum_instance_delete_attempts',
+-        default=5,
++        # give an effectively unlimited number of retries
++        default=sys.maxsize,
+         help="""
+ The number of times to attempt to reap an instance's files.
+ 
+diff --git a/nova/db/sqlalchemy/api.py b/nova/db/sqlalchemy/api.py
+index afe1b80..3d6e9b6 100644
+--- a/nova/db/sqlalchemy/api.py
++++ b/nova/db/sqlalchemy/api.py
+@@ -2737,10 +2737,21 @@ def _instance_update(context, instance_uuid, values, expected, original=None):
+         _validate_unique_server_name(context, values['hostname'])
+ 
+     compare = models.Instance(uuid=instance_uuid, **expected)
++    query = model_query(context, models.Instance, project_only=True)
++
++    # Make sure we do not accidentally overwrite a deleting task state.
++    # Setting vm_state to DELETED or ERROR however is always allowed.
++    if values.get('vm_state') not in (vm_states.DELETED, vm_states.ERROR):
++        overwrite_condition = ('task_state' in values and
++                               'task_state' not in expected and
++                               values['task_state'] != task_states.DELETING)
++        if overwrite_condition:
++            query = query.filter(or_(
++                models.Instance.task_state != task_states.DELETING,
++                models.Instance.task_state == null()))
++
+     try:
+-        instance_ref = model_query(context, models.Instance,
+-                                   project_only=True).\
+-                       update_on_match(compare, 'uuid', values)
++        instance_ref = query.update_on_match(compare, 'uuid', values)
+     except update_match.NoRowsMatched:
+         # Update failed. Try to find why and raise a specific error.
+ 
+@@ -2771,6 +2782,9 @@ def _instance_update(context, instance_uuid, values, expected, original=None):
+                 conflicts_expected[field] = expected_values
+                 conflicts_actual[field] = actual
+ 
++        if original.task_state == task_states.DELETING:
++            conflicts_actual['task_state'] = original.task_state
++
+         # Exception properties
+         exc_props = {
+             'instance_uuid': instance_uuid,
+diff --git a/nova/image/glance.py b/nova/image/glance.py
+index 00eb041..3605699 100644
+--- a/nova/image/glance.py
++++ b/nova/image/glance.py
+@@ -12,6 +12,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2016-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ """Implementation of an image service that uses Glance as the backend."""
+ 
+@@ -28,6 +35,7 @@ import time
+ import cryptography
+ from cursive import exception as cursive_exception
+ from cursive import signature_utils
++from eventlet import tpool
+ import glanceclient
+ import glanceclient.exc
+ from glanceclient.v2 import schemas
+@@ -346,33 +354,41 @@ class GlanceImageServiceV2(object):
+                                   'for image: %s', image_id)
+             return image_chunks
+         else:
+-            try:
+-                for chunk in image_chunks:
++            # offload image download to another thread to reduce chances
++            #      of nova-compute getting stuck on disk IO
++            def write_image(data, image_chunks, close_file, verifier):
++                try:
++                    for chunk in image_chunks:
++                        if verifier:
++                            verifier.update(chunk)
++                        data.write(chunk)
++                        # Without this periodic tasks get delayed
++                        time.sleep(0)
+                     if verifier:
+-                        verifier.update(chunk)
+-                    data.write(chunk)
+-                if verifier:
+-                    verifier.verify()
+-                    LOG.info('Image signature verification succeeded '
+-                             'for image %s', image_id)
+-            except cryptography.exceptions.InvalidSignature:
+-                data.truncate(0)
+-                with excutils.save_and_reraise_exception():
+-                    LOG.error('Image signature verification failed '
+-                              'for image: %s', image_id)
+-            except Exception as ex:
+-                with excutils.save_and_reraise_exception():
+-                    LOG.error("Error writing to %(path)s: %(exception)s",
+-                              {'path': dst_path, 'exception': ex})
+-            finally:
+-                if close_file:
+-                    # Ensure that the data is pushed all the way down to
+-                    # persistent storage. This ensures that in the event of a
+-                    # subsequent host crash we don't have running instances
+-                    # using a corrupt backing file.
+-                    data.flush()
+-                    os.fsync(data.fileno())
+-                    data.close()
++                        verifier.verify()
++                        LOG.info('Image signature verification succeeded '
++                                 'for image %s', image_id)
++                except cryptography.exceptions.InvalidSignature:
++                    data.truncate(0)
++                    with excutils.save_and_reraise_exception():
++                        LOG.error('Image signature verification failed '
++                                  'for image: %s', image_id)
++                except Exception as ex:
++                    with excutils.save_and_reraise_exception():
++                        LOG.error("Error writing to %(path)s: "
++                                  "%(exception)s",
++                                  {'path': dst_path, 'exception': ex})
++                finally:
++                    if close_file:
++                        # Ensure that the data is pushed all the way down to
++                        # persistent storage. This ensures that in the event
++                        # of a subsequent host crash we don't have running
++                        # instances using a corrupt backing file.
++                        data.flush()
++                        os.fsync(data.fileno())
++                        data.close()
++            tpool.execute(write_image, data, image_chunks, close_file,
++                          verifier)
+ 
+     def create(self, context, image_meta, data=None):
+         """Store the image data and return the new image object."""
+diff --git a/nova/objects/virt_cpu_topology.py b/nova/objects/virt_cpu_topology.py
+index bb74c0d..015a270 100644
+--- a/nova/objects/virt_cpu_topology.py
++++ b/nova/objects/virt_cpu_topology.py
+@@ -15,7 +15,8 @@ from nova.objects import fields
+ 
+ 
+ @base.NovaObjectRegistry.register
+-class VirtCPUTopology(base.NovaObject):
++class VirtCPUTopology(base.NovaObject,
++                      base.NovaObjectDictCompat):
+     # Version 1.0: Initial version
+     VERSION = '1.0'
+ 
+diff --git a/nova/tests/unit/api/openstack/compute/test_quotas.py b/nova/tests/unit/api/openstack/compute/test_quotas.py
+index 4cf1c87..78ca761 100644
+--- a/nova/tests/unit/api/openstack/compute/test_quotas.py
++++ b/nova/tests/unit/api/openstack/compute/test_quotas.py
+@@ -474,6 +474,37 @@ class UserQuotasTestV21(BaseQuotaSetsTest):
+         self.assertEqual(0,
+                          len(mock_createlimit.mock_calls))
+ 
++    @mock.patch('nova.objects.Quotas.update_limit')
++    @mock.patch('nova.objects.Quotas.create_limit')
++    def test_user_quotas_update_quota_exist(self, mock_createlimit,
++                                              mock_updatelimit):
++        body = {'quota_set': {'instances': 1}}
++        mock_createlimit.side_effect = exception.QuotaExists(project_id='1',
++            resource='dummy')
++        url = '/v2/fake4/os-quota-sets/update_me?user_id=1'
++        req = fakes.HTTPRequest.blank(url, use_admin_context=True)
++        self.controller.update(req, 'update_me', body=body)
++        mock_updatelimit.assert_called_once_with(req.environ['nova.context'],
++            'update_me', 'instances', 1, user_id='1')
++
++    @mock.patch('nova.objects.Quotas.update_limit')
++    @mock.patch('nova.objects.Quotas.create_limit')
++    def test_user_quotas_update_project_not_exist(self, mock_createlimit,
++                                              mock_updatelimit):
++        body = {'quota_set': {'instances': 1}}
++        mock_createlimit.side_effect = exception.QuotaExists(project_id='1',
++            resource='dummy')
++        mock_updatelimit.side_effect = exception.ProjectQuotaNotFound(
++            project_id='1')
++        url = '/v2/fake4/os-quota-sets/update_me?user_id=1'
++        req = fakes.HTTPRequest.blank(url, use_admin_context=True)
++        ret = self.controller.update(req, 'update_me', body=body)
++        mock_updatelimit.assert_called_once_with(req.environ['nova.context'],
++            'update_me', 'instances', 1, user_id='1')
++        expected_quota_set = quota_set('123', self.include_server_group_quotas)
++        expected_quota_set['quota_set'].pop('id')
++        self.assertEqual(expected_quota_set, ret)
++
+ 
+ class QuotaSetsPolicyEnforcementV21(test.NoDBTestCase):
+ 
+diff --git a/nova/tests/unit/api/openstack/compute/test_serversV21.py b/nova/tests/unit/api/openstack/compute/test_serversV21.py
+index 38ef2fb..893a4a0 100644
+--- a/nova/tests/unit/api/openstack/compute/test_serversV21.py
++++ b/nova/tests/unit/api/openstack/compute/test_serversV21.py
+@@ -1842,7 +1842,13 @@ class ServersControllerDeleteTest(ControllerTest):
+         self.stubs.Set(compute_api.API, 'get',
+                        lambda api, *a, **k: fake_get(*a, **k))
+ 
+-        self.controller.delete(req, FAKE_UUID)
++        self.stubs.Set(compute_api.API, 'delete',
++                       fakes.fake_actions_to_server_instance_while_resize)
++
++        # self.controller.delete(req, FAKE_UUID)
++        # prevent delete while resizing, it leads to a race.
++        self.assertRaises(webob.exc.HTTPConflict, self.controller.delete,
++                          req, FAKE_UUID)
+ 
+     def test_delete_server_instance_if_not_launched(self):
+         self.flags(reclaim_instance_interval=3600)
+diff --git a/nova/tests/unit/api/openstack/compute/test_suspend_server.py b/nova/tests/unit/api/openstack/compute/test_suspend_server.py
+index d3576e5..76c42cb 100644
+--- a/nova/tests/unit/api/openstack/compute/test_suspend_server.py
++++ b/nova/tests/unit/api/openstack/compute/test_suspend_server.py
+@@ -41,17 +41,32 @@ class SuspendServerTestsV21(admin_only_action_common.CommonTests):
+         self.mox.StubOutWithMock(self.compute_api, 'get')
+ 
+     def test_suspend_resume(self):
+-        self._test_actions(['_suspend', '_resume'])
++        # suspend operation stubbed for pause
++        method_translations = {'_suspend': 'pause',
++                               '_resume': 'unpause'}
++        self._test_actions(['_suspend', '_resume'],
++                           method_translations=method_translations)
+ 
+     def test_suspend_resume_with_non_existed_instance(self):
+         self._test_actions_with_non_existed_instance(['_suspend', '_resume'])
+ 
+     def test_suspend_resume_raise_conflict_on_invalid_state(self):
++        # suspend operation stubbed for pause
++        method_translations = {'_suspend': 'pause',
++                               '_resume': 'unpause'}
++        exception_args = {'_suspend': 'suspend',
++                         '_resume': 'resume'}
+         self._test_actions_raise_conflict_on_invalid_state(['_suspend',
+-                                                            '_resume'])
++                                                            '_resume'],
++                                method_translations=method_translations,
++                                exception_args=exception_args)
+ 
+     def test_actions_with_locked_instance(self):
+-        self._test_actions_with_locked_instance(['_suspend', '_resume'])
++        # suspend operation stubbed for pause
++        method_translations = {'_suspend': 'pause',
++                               '_resume': 'unpause'}
++        self._test_actions_with_locked_instance(['_suspend', '_resume'],
++                           method_translations=method_translations)
+ 
+ 
+ class SuspendServerPolicyEnforcementV21(test.NoDBTestCase):
+@@ -94,7 +109,8 @@ class SuspendServerPolicyEnforcementV21(test.NoDBTestCase):
+                       "Policy doesn't allow %s to be performed." % rule_name,
+                       exc.format_message())
+ 
+-    @mock.patch('nova.compute.api.API.suspend')
++    # suspend operation stubbed for pause
++    @mock.patch('nova.compute.api.API.pause')
+     @mock.patch('nova.api.openstack.common.get_instance')
+     def test_suspend_overridden_policy_pass_with_same_user(self,
+                                                         get_instance_mock,
+diff --git a/nova/tests/unit/api/openstack/fakes.py b/nova/tests/unit/api/openstack/fakes.py
+index 8167b34..fdea6dd 100644
+--- a/nova/tests/unit/api/openstack/fakes.py
++++ b/nova/tests/unit/api/openstack/fakes.py
+@@ -361,6 +361,16 @@ def fake_actions_to_locked_server(self, context, instance, *args, **kwargs):
+     raise exc.InstanceIsLocked(instance_uuid=instance['uuid'])
+ 
+ 
++def fake_actions_to_server_instance_while_resize(self, context, instance,
++                                                 *args, **kwargs):
++
++    raise exc.InstanceInvalidState(
++                    instance_uuid = instance['uuid'],
++                    attr = 'task_state',
++                    state = instance.task_state,
++                    method = 'delete')
++
++
+ def fake_instance_get_all_by_filters(num_servers=5, **kwargs):
+     def _return_servers(context, *args, **kwargs):
+         servers_list = []
+diff --git a/nova/tests/unit/compute/test_compute.py b/nova/tests/unit/compute/test_compute.py
+index 49bb269..fb1efc6 100644
+--- a/nova/tests/unit/compute/test_compute.py
++++ b/nova/tests/unit/compute/test_compute.py
+@@ -854,8 +854,7 @@ class ComputeVolumeTestCase(BaseTestCase):
+     @mock.patch.object(fake.FakeDriver, 'block_stats')
+     @mock.patch.object(compute_manager.ComputeManager, '_get_host_volume_bdms')
+     @mock.patch.object(fake.FakeDriver, 'get_all_volume_usage')
+-    @mock.patch.object(fake.FakeDriver, 'instance_exists')
+-    def test_detach_volume_usage(self, mock_exists, mock_get_all,
++    def test_detach_volume_usage(self, mock_get_all,
+                                  mock_get_bdms, mock_stats, mock_get,
+                                  mock_notify, mock_elevate):
+         mock_elevate.return_value = self.context
+@@ -885,7 +884,6 @@ class ComputeVolumeTestCase(BaseTestCase):
+                                       'wr_req': 1,
+                                       'wr_bytes': 5,
+                                       'instance': instance}]
+-        mock_exists.return_value = True
+ 
+         def fake_get_volume_encryption_metadata(self, context, volume_id):
+             return {}
+@@ -955,7 +953,6 @@ class ComputeVolumeTestCase(BaseTestCase):
+         mock_stats.assert_called_once_with(instance, 'vdb')
+         mock_get_bdms.assert_called_once_with(self.context, use_slave=True)
+         mock_get_all(self.context, host_volume_bdms)
+-        mock_exists.assert_called_once_with(mock.ANY)
+ 
+     def test_prepare_image_mapping(self):
+         swap_size = 1
+@@ -6079,7 +6076,7 @@ class ComputeTestCase(BaseTestCase,
+ 
+         self.assertIsNone(ret)
+         mock_event.assert_called_with(
+-                c, 'compute_live_migration', instance.uuid)
++                c, 'compute_dispatch_live_migration', instance.uuid)
+         # cleanup
+         instance.destroy()
+ 
+@@ -10821,7 +10818,7 @@ class ComputeAPITestCase(BaseTestCase):
+                 new_pass=None,
+                 injected_files=None,
+                 image_ref=None,
+-                orig_image_ref=None,
++                orig_image_ref=instance.image_ref,
+                 orig_sys_metadata=None,
+                 bdms=None,
+                 recreate=True,
+diff --git a/nova/tests/unit/compute/test_compute_api.py b/nova/tests/unit/compute/test_compute_api.py
+index 8ec7b80..46db66c 100644
+--- a/nova/tests/unit/compute/test_compute_api.py
++++ b/nova/tests/unit/compute/test_compute_api.py
+@@ -996,10 +996,20 @@ class _ComputeAPIUnitTestMixIn(object):
+         self._test_delete('delete', launched_at=None)
+ 
+     def test_delete_in_resizing(self):
+-        old_flavor = objects.Flavor(vcpus=1, memory_mb=512, extra_specs={})
+-        self._test_delete('delete',
+-                          task_state=task_states.RESIZE_FINISH,
+-                          old_flavor=old_flavor)
++        # the delete code has been changed to raise an exception if a
++        # resize is in progress due to a race condition that can potentially
++        # lead to leaked vswitch ports on the source host.
++        inst = self._create_instance_obj()
++        attrs = {'task_state': task_states.RESIZE_FINISH}
++        inst.update(attrs)
++        inst._context = self.context
++        self.mox.ReplayAll()
++
++        self.assertRaises(exception.InstanceInvalidState,
++                          getattr(self.compute_api, 'delete'),
++                          self.context, inst)
++
++        self.mox.UnsetStubs()
+ 
+     def test_delete_in_resized(self):
+         self._test_delete('delete', vm_state=vm_states.RESIZED)
+@@ -1789,11 +1799,13 @@ class _ComputeAPIUnitTestMixIn(object):
+                                    'user': user_count}
+ 
+         cur_flavor = objects.Flavor(id=1, name='foo', vcpus=1, memory_mb=512,
+-                                    root_gb=10, disabled=False)
++                                    root_gb=10, disabled=False,
++                                    ephemeral_gb=10)
+         fake_inst = self._create_instance_obj()
+         fake_inst.flavor = cur_flavor
+         new_flavor = objects.Flavor(id=2, name='bar', vcpus=1, memory_mb=2048,
+-                                    root_gb=10, disabled=False)
++                                    root_gb=10, disabled=False,
++                                    ephemeral_gb=10)
+         mock_get.return_value = new_flavor
+         mock_check.side_effect = exception.OverQuota(
+                 overs=['ram'], quotas={'cores': 1, 'ram': 2048},
+diff --git a/nova/tests/unit/compute/test_compute_mgr.py b/nova/tests/unit/compute/test_compute_mgr.py
+index 0d8ed92..e3eed08 100644
+--- a/nova/tests/unit/compute/test_compute_mgr.py
++++ b/nova/tests/unit/compute/test_compute_mgr.py
+@@ -1720,12 +1720,12 @@ class ComputeManagerUnitTestCase(test.NoDBTestCase):
+         c = FakeInstance('789', 'banana', {})
+ 
+         mock_get.side_effect = _fake_get
+-        mock_delete.side_effect = [True, False]
++        mock_delete.side_effect = [True, True, False]
+ 
+         self.compute._run_pending_deletes({})
+ 
+-        self.assertFalse(a.cleaned)
+-        self.assertEqual('100', a.system_metadata['clean_attempts'])
++        self.assertTrue(a.cleaned)
++        self.assertEqual('101', a.system_metadata['clean_attempts'])
+         self.assertTrue(b.cleaned)
+         self.assertEqual('4', b.system_metadata['clean_attempts'])
+         self.assertFalse(c.cleaned)
+@@ -4116,6 +4116,20 @@ class ComputeManagerUnitTestCase(test.NoDBTestCase):
+         mock_delete_instance.assert_called_once_with(
+             self.context, instance, bdms)
+ 
++    def test_terminate_instance_sets_error_state_on_failure(self):
++        instance = fake_instance.fake_instance_obj(self.context)
++        with test.nested(
++            mock.patch.object(self.compute, '_delete_instance'),
++            mock.patch.object(self.compute, '_set_instance_obj_error_state'),
++            mock.patch.object(compute_utils, 'add_instance_fault_from_exc')
++        ) as (mock_delete_instance, mock_set_error_state, mock_add_fault):
++            mock_delete_instance.side_effect = test.TestingException
++            self.assertRaises(test.TestingException,
++                              self.compute.terminate_instance,
++                              self.context, instance, [], [])
++            mock_set_error_state.assert_called_once_with(
++                self.context, instance, clean_task_state=True)
++
+     @mock.patch.object(nova.compute.manager.ComputeManager,
+                        '_notify_about_instance_usage')
+     def test_trigger_crash_dump(self, notify_mock):
+@@ -5751,9 +5765,9 @@ class ComputeManagerMigrationTestCase(test.NoDBTestCase):
+                 reservations=[], migration=self.migration,
+                 instance_type='type', clean_shutdown=True)
+             self.assertEqual("error", self.migration.status)
+-            self.assertEqual([mock.call(), mock.call()],
++            self.assertEqual([mock.call(), mock.call(), mock.call()],
+                              migration_save.mock_calls)
+-            self.assertEqual([mock.call(), mock.call()],
++            self.assertEqual([mock.call(), mock.call(), mock.call()],
+                              migration_obj_as_admin.mock_calls)
+ 
+     def _test_revert_resize_instance_destroy_disks(self, is_shared=False):
+diff --git a/nova/tests/unit/compute/test_rpcapi.py b/nova/tests/unit/compute/test_rpcapi.py
+index 56bca43..79b37da 100644
+--- a/nova/tests/unit/compute/test_rpcapi.py
++++ b/nova/tests/unit/compute/test_rpcapi.py
+@@ -114,7 +114,8 @@ class ComputeRpcAPITestCase(test.NoDBTestCase):
+         self.assertEqual('4.4', compute_rpcapi.LAST_VERSION)
+ 
+     def _test_compute_api(self, method, rpc_method,
+-                          expected_args=None, drop_kwargs=None, **kwargs):
++                          expected_args=None, drop_kwargs=None, timeout=None,
++                          **kwargs):
+         ctxt = context.RequestContext('fake_user', 'fake_project')
+ 
+         rpcapi = kwargs.pop('rpcapi_class', compute_rpcapi.ComputeAPI)()
+@@ -182,8 +183,13 @@ class ComputeRpcAPITestCase(test.NoDBTestCase):
+             retval = getattr(rpcapi, method)(ctxt, **kwargs)
+             self.assertEqual(retval, rpc_mock.return_value)
+ 
+-            prepare_mock.assert_called_once_with(version=expected_version,
+-                                                 server=host)
++            if timeout is None:
++                prepare_mock.assert_called_once_with(version=expected_version,
++                                                     server=host)
++            else:
++                prepare_mock.assert_called_once_with(version=expected_version,
++                                                     server=host,
++                                                     timeout=timeout)
+             rpc_mock.assert_called_once_with(ctxt, method, **expected_kwargs)
+ 
+     def test_add_aggregate_host(self):
+@@ -468,7 +474,8 @@ class ComputeRpcAPITestCase(test.NoDBTestCase):
+     def test_post_live_migration_at_destination(self):
+         self._test_compute_api('post_live_migration_at_destination', 'call',
+                 instance=self.fake_instance_obj,
+-                block_migration='block_migration', host='host', version='4.0')
++                block_migration='block_migration', host='host', version='4.0',
++                timeout=120)
+ 
+     def test_pause_instance(self):
+         self._test_compute_api('pause_instance', 'cast',
+diff --git a/nova/tests/unit/conductor/test_conductor.py b/nova/tests/unit/conductor/test_conductor.py
+index bcaf994..bbe7806 100644
+--- a/nova/tests/unit/conductor/test_conductor.py
++++ b/nova/tests/unit/conductor/test_conductor.py
+@@ -1348,6 +1348,58 @@ class _BaseTaskTestCase(object):
+                                instance=inst_obj,
+                                **compute_args)
+ 
++    @mock.patch.object(conductor_manager.compute_rpcapi.ComputeAPI,
++                       'rebuild_instance')
++    @mock.patch.object(scheduler_utils, 'setup_instance_group')
++    @mock.patch.object(conductor_manager.scheduler_client.SchedulerClient,
++                       'select_destinations')
++    @mock.patch('nova.scheduler.utils.build_request_spec')
++    @mock.patch.object(conductor_manager.ComputeTaskManager,
++                       '_set_vm_state_and_notify')
++    @mock.patch.object(objects.Migration, 'get_by_instance_and_status')
++    @mock.patch.object(objects.Migration, 'save')
++    def test_rebuild_instance_evacuate_migration_record_fail(self,
++                                                             mig_save_mock,
++                                                             mig_mock,
++                                                             state_mock,
++                                                             bs_mock,
++                                                             select_dest_mock,
++                                                             sig_mock,
++                                                             rebuild_mock):
++        inst_obj = self._create_fake_instance_obj()
++        migration = objects.Migration(context=self.context,
++                                      source_compute=inst_obj.host,
++                                      source_node=inst_obj.node,
++                                      instance_uuid=inst_obj.uuid,
++                                      status='accepted',
++                                      migration_type='evacuation')
++        mig_mock.return_value = migration
++        rebuild_args, _ = self._prepare_rebuild_args({'host': None})
++
++        fake_spec = fake_request_spec.fake_spec_obj()
++        legacy_request_spec = fake_spec.to_legacy_request_spec_dict()
++        bs_mock.return_value = legacy_request_spec
++
++        exception = exc.NoValidHost(reason='')
++        sig_mock.side_effect = exception
++
++        # build_instances() is a cast, we need to wait for it to complete
++        self.useFixture(cast_as_call.CastAsCall(self))
++
++        self.assertRaises(exc.NoValidHost,
++                          self.conductor.rebuild_instance,
++                          self.context,
++                          inst_obj,
++                          **rebuild_args)
++        updates = {'vm_state': vm_states.ACTIVE, 'task_state': None}
++        state_mock.assert_called_once_with(self.context, inst_obj.uuid,
++                                           'rebuild_server', updates,
++                                           exception, legacy_request_spec)
++        self.assertFalse(select_dest_mock.called)
++        self.assertFalse(rebuild_mock.called)
++        self.assertEqual('error', migration.status)
++        mig_save_mock.assert_called_once_with()
++
+     def test_rebuild_instance_with_request_spec(self):
+         inst_obj = self._create_fake_instance_obj()
+         inst_obj.host = 'noselect'
+diff --git a/nova/tests/unit/db/test_db_api.py b/nova/tests/unit/db/test_db_api.py
+index 75e3d1d..b28529e 100644
+--- a/nova/tests/unit/db/test_db_api.py
++++ b/nova/tests/unit/db/test_db_api.py
+@@ -2861,6 +2861,30 @@ class InstanceTestCase(test.TestCase, ModelsObjectComparatorMixin):
+                     db.instance_update, self.ctxt, instance['uuid'],
+                     {'host': 'h1', 'expected_vm_state': ('spam', 'bar')})
+ 
++    def test_instance_update_cannot_overwrite_deleting_task_state(self):
++        instance = self.create_instance_with_args(
++            task_state=task_states.DELETING)
++        self.assertRaises(exception.UnexpectedDeletingTaskStateError,
++                    db.instance_update, self.ctxt, instance['uuid'],
++                    {'task_state': 'foo'})
++
++    def test_instance_update_can_set_deleting_task_state(self):
++        instance = self.create_instance_with_args(
++            task_state=task_states.DELETING)
++        db.instance_update(self.ctxt, instance['uuid'],
++                           {'task_state': task_states.DELETING})
++
++    def test_instance_update_can_overwrite_deleting_task_state_on_delete(self):
++        instance = self.create_instance_with_args(
++            task_state=task_states.DELETING)
++        db.instance_update(self.ctxt, instance['uuid'],
++                           {'task_state': None, 'vm_state': vm_states.DELETED})
++
++    def test_instance_update_can_overwrite_none_task_state(self):
++        instance = self.create_instance_with_args(task_state=None)
++        db.instance_update(self.ctxt, instance['uuid'],
++                           {'task_state': 'foo'})
++
+     def test_instance_update_with_instance_uuid(self):
+         # test instance_update() works when an instance UUID is passed.
+         ctxt = context.get_admin_context()
+diff --git a/nova/tests/unit/test_utils.py b/nova/tests/unit/test_utils.py
+index bd6a05a..5593484 100644
+--- a/nova/tests/unit/test_utils.py
++++ b/nova/tests/unit/test_utils.py
+@@ -201,7 +201,7 @@ class GenericUtilsTestCase(test.NoDBTestCase):
+         self.assertEqual("127.0.0.1", utils.safe_ip_format("127.0.0.1"))
+         self.assertEqual("[::ffff:127.0.0.1]", utils.safe_ip_format(
+                          "::ffff:127.0.0.1"))
+-        self.assertEqual("localhost", utils.safe_ip_format("localhost"))
++        self.assertEqual("localhost-infra", utils.safe_ip_format("localhost"))
+ 
+     def test_format_remote_path(self):
+         self.assertEqual("[::1]:/foo/bar",
+@@ -211,7 +211,7 @@ class GenericUtilsTestCase(test.NoDBTestCase):
+         self.assertEqual("[::ffff:127.0.0.1]:/foo/bar",
+                          utils.format_remote_path("::ffff:127.0.0.1",
+                                                   "/foo/bar"))
+-        self.assertEqual("localhost:/foo/bar",
++        self.assertEqual("localhost-infra:/foo/bar",
+                          utils.format_remote_path("localhost", "/foo/bar"))
+         self.assertEqual("/foo/bar", utils.format_remote_path(None,
+                                                               "/foo/bar"))
+diff --git a/nova/tests/unit/virt/libvirt/test_driver.py b/nova/tests/unit/virt/libvirt/test_driver.py
+index 86c47ff..32a9478 100755
+--- a/nova/tests/unit/virt/libvirt/test_driver.py
++++ b/nova/tests/unit/virt/libvirt/test_driver.py
+@@ -721,7 +721,7 @@ def _create_test_instance():
+         'user_id': '838a72b0-0d54-4827-8fd6-fb1227633ceb',
+         'ephemeral_key_uuid': None,
+         'vcpu_model': None,
+-        'host': 'fake-host',
++        'host': 'fake-host-infra',
+         'task_state': None,
+     }
+ 
+diff --git a/nova/tests/unit/virt/libvirt/test_utils.py b/nova/tests/unit/virt/libvirt/test_utils.py
+index 44eaabb..611a671 100644
+--- a/nova/tests/unit/virt/libvirt/test_utils.py
++++ b/nova/tests/unit/virt/libvirt/test_utils.py
+@@ -62,14 +62,14 @@ class LibvirtUtilsTestCase(test.NoDBTestCase):
+     def test_copy_image_remote_ssh(self, mock_rem_fs_remove):
+         self.flags(remote_filesystem_transport='ssh', group='libvirt')
+         libvirt_utils.copy_image('src', 'dest', host='host')
+-        mock_rem_fs_remove.assert_called_once_with('src', 'host:dest',
++        mock_rem_fs_remove.assert_called_once_with('src', 'host-infra:dest',
+             on_completion=None, on_execute=None, compression=True)
+ 
+     @mock.patch('nova.virt.libvirt.volume.remotefs.RsyncDriver.copy_file')
+     def test_copy_image_remote_rsync(self, mock_rem_fs_remove):
+         self.flags(remote_filesystem_transport='rsync', group='libvirt')
+         libvirt_utils.copy_image('src', 'dest', host='host')
+-        mock_rem_fs_remove.assert_called_once_with('src', 'host:dest',
++        mock_rem_fs_remove.assert_called_once_with('src', 'host-infra:dest',
+             on_completion=None, on_execute=None, compression=True)
+ 
+     @mock.patch('os.path.exists', return_value=True)
+diff --git a/nova/tests/unit/virt/libvirt/volume/test_remotefs.py b/nova/tests/unit/virt/libvirt/volume/test_remotefs.py
+index 1c4be00..1cc72a2 100644
+--- a/nova/tests/unit/virt/libvirt/volume/test_remotefs.py
++++ b/nova/tests/unit/virt/libvirt/volume/test_remotefs.py
+@@ -66,7 +66,7 @@ class RemoteFSTestCase(test.NoDBTestCase):
+         rsync_call_args = mock.call('rsync', '--archive',
+                                     '--delete', '--include',
+                                     'dest', '--exclude', '*',
+-                                    '/tmp/Mercury/', 'host:',
++                                    '/tmp/Mercury/', 'host-infra:',
+                                     on_completion=None, on_execute=None)
+         self.assertEqual(mock_execute.mock_calls[0], rsync_call_args)
+         rm_call_args = mock.call('rm', '-rf', '/tmp/Mercury')
+@@ -87,13 +87,13 @@ class RemoteFSTestCase(test.NoDBTestCase):
+         remotefs.RsyncDriver().remove_dir('host', 'dest', None, None)
+         rsync_call_args = mock.call('rsync', '--archive',
+                                     '--delete-excluded', '/tmp/Venus/',
+-                                    'host:dest',
++                                    'host-infra:dest',
+                                     on_completion=None, on_execute=None)
+         self.assertEqual(mock_execute.mock_calls[0], rsync_call_args)
+         rsync_call_args = mock.call('rsync', '--archive',
+                                     '--delete', '--include',
+                                     'dest', '--exclude', '*',
+-                                    '/tmp/Venus/', 'host:',
++                                    '/tmp/Venus/', 'host-infra:',
+                                     on_completion=None, on_execute=None)
+         self.assertEqual(mock_execute.mock_calls[1], rsync_call_args)
+         rm_call_args = mock.call('rm', '-rf', '/tmp/Venus')
+@@ -120,7 +120,7 @@ class RemoteFSTestCase(test.NoDBTestCase):
+         self.assertEqual(mock_execute.mock_calls[1], touch_call_args)
+         rsync_call_args = mock.call('rsync', '--archive', '--relative',
+                                     '--no-implied-dirs',
+-                                    '/tmp/Mars/./dest_dir', 'host:/',
++                                    '/tmp/Mars/./dest_dir', 'host-infra:/',
+                                     on_completion=None, on_execute=None)
+         self.assertEqual(mock_execute.mock_calls[2], rsync_call_args)
+         rm_call_args = mock.call('rm', '-rf', '/tmp/Mars')
+@@ -145,7 +145,7 @@ class RemoteFSTestCase(test.NoDBTestCase):
+         self.assertEqual(mock_execute.mock_calls[0], mkdir_call_args)
+         rsync_call_args = mock.call('rsync', '--archive', '--relative',
+                                     '--no-implied-dirs',
+-                                    '/tmp/Jupiter/./dest_dir', 'host:/',
++                                    '/tmp/Jupiter/./dest_dir', 'host-infra:/',
+                                     on_completion=None, on_execute=None)
+         self.assertEqual(mock_execute.mock_calls[1], rsync_call_args)
+         rm_call_args = mock.call('rm', '-rf', '/tmp/Jupiter')
+diff --git a/nova/utils.py b/nova/utils.py
+index c783021..ae07215 100644
+--- a/nova/utils.py
++++ b/nova/utils.py
+@@ -582,6 +582,17 @@ def safe_ip_format(ip):
+         if netaddr.IPAddress(ip).version == 6:
+             return '[%s]' % ip
+     except (TypeError, netaddr.AddrFormatError):  # hostname
++        # set up ssh keys for passwordless ssh between
++        # computes. If we have an infra interface present, the keys
++        # will be associated with that interface rather than the
++        # mgmt interface. We also always provide hostname
++        # resolution for the mgmt interface (compute-n) and the
++        # infra interface (compute-n-infra) irrespective of the
++        # infra interface actually being provisioned. By ensuring
++        # that we use the infra interface hostname we guarantee we
++        # will align with the ssh keys.
++        if '-infra' not in ip:
++            return '%s-infra' % ip
+         pass
+     # it's IPv4 or hostname
+     return ip
+diff --git a/nova/virt/libvirt/driver.py b/nova/virt/libvirt/driver.py
+index 9a9db0f..6760728 100644
+--- a/nova/virt/libvirt/driver.py
++++ b/nova/virt/libvirt/driver.py
+@@ -7114,7 +7114,9 @@ class LibvirtDriver(driver.ComputeDriver):
+                     # live migration will fail on copying iso config drive to
+                     # destination and writing to read-only device.
+                     # Please see bug/1246201 for more details.
+-                    src = "%s:%s/disk.config" % (instance.host, instance_dir)
++                    src = "%s:%s/disk.config" % (
++                        utils.safe_ip_format(instance.host),
++                        instance_dir)
+                     self._remotefs.copy_file(src, instance_dir)
+ 
+             if not is_block_migration:
+diff --git a/nova/volume/cinder.py b/nova/volume/cinder.py
+index e7a8ae4..1b6dfc4 100644
+--- a/nova/volume/cinder.py
++++ b/nova/volume/cinder.py
+@@ -13,6 +13,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2016-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ """
+ Handles all requests relating to volumes + cinder.
+@@ -107,7 +114,9 @@ def cinderclient(context, microversion=None, skip_version_check=False):
+     service_parameters = {'service_type': service_type,
+                           'service_name': service_name,
+                           'interface': interface,
+-                          'region_name': CONF.cinder.os_region_name}
++                          'region_name': CONF.cinder.os_region_name,
++                          # set retries based on conf option
++                          'retries': CONF.cinder.session_retries}
+ 
+     if CONF.cinder.endpoint_template:
+         url = CONF.cinder.endpoint_template % context.to_dict()
+-- 
+2.7.4
+

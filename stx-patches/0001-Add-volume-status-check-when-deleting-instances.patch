@@ -1,0 +1,276 @@
+From bfb7d2c1ac14ca0cae6818f4abce819dee324ebd Mon Sep 17 00:00:00 2001
+From: Zhihai Song <zhihai.song@easystack.cn>
+Date: Tue, 22 Dec 2015 12:58:44 +0800
+Subject: [PATCH 001/143] Add volume status check when deleting instances
+
+(cherry-picked)
+
+When terminating instances, nova compute deletes the volumes after
+detaching directly, when volumes may not be in the status of deletable.
+That will orphan volumes. This commit add the status check after
+detaching the volumes.
+
+Closes-Bug: #1527623
+
+Co-Authored-By: ChangBo Guo (gcb) <eric.guo@easystack.cn>
+Change-Id: Ib7e258c25d047a0fa15e400cc44e3de8940ec785
+
+__TYPE_upstream
+__R4_commit_4331a38
+__R3_commit_321c6ac
+---
+ nova/compute/manager.py                     | 34 ++++++++++--
+ nova/exception.py                           |  6 +++
+ nova/tests/unit/compute/test_compute.py     | 84 +++++++++++++++++++++++++++--
+ nova/tests/unit/compute/test_compute_mgr.py | 29 +++++++---
+ 4 files changed, 138 insertions(+), 15 deletions(-)
+
+diff --git a/nova/compute/manager.py b/nova/compute/manager.py
+index 1d331e5..28393bb 100644
+--- a/nova/compute/manager.py
++++ b/nova/compute/manager.py
+@@ -1246,10 +1246,7 @@ class ComputeManager(manager.Manager):
+             LOG.warning("Treating negative config value (%(retries)s) for "
+                         "'block_device_retries' as 0.",
+                         {'retries': retries})
+-        # (1) treat  negative config value as 0
+-        # (2) the configured value is 0, one attempt should be made
+-        # (3) the configured value is > 0, then the total number attempts
+-        #      is (retries + 1)
++
+         attempts = 1
+         if retries >= 1:
+             attempts = retries + 1
+@@ -1270,6 +1267,33 @@ class ComputeManager(manager.Manager):
+                                          attempts=attempt,
+                                          volume_status=volume_status)
+ 
++    def _await_volume_detached(self, context, vol_id):
++        start = time.time()
++        retries = CONF.block_device_allocate_retries
++        if retries < 0:
++            LOG.warning("Treating negative config value (%(retries)s) for "
++                        "'block_device_retries' as 0.", {'retries': retries})
++
++        attempts = 1
++        if retries >= 1:
++            attempts = retries + 1
++        for attempt in range(1, attempts + 1):
++            volume = self.volume_api.get(context, vol_id)
++            volume_status = volume['status']
++            if volume_status not in ['in-use', 'detaching']:
++                if volume_status == 'available':
++                    return attempt
++                LOG.warning("Volume id: %(vol_id)s finished being "
++                            "detached but its status is %(vol_status)s.",
++                            {'vol_id': vol_id,
++                             'vol_status': volume_status})
++                break
++            greenthread.sleep(CONF.block_device_allocate_retries_interval)
++        raise exception.VolumeNotDetached(volume_id=vol_id,
++                                         seconds=int(time.time() - start),
++                                         attempts=attempt,
++                                         volume_status=volume_status)
++
+     def _decode_files(self, injected_files):
+         """Base64 decode the list of files to inject."""
+         if not injected_files:
+@@ -2386,12 +2410,14 @@ class ComputeManager(manager.Manager):
+                       instance_uuid=instance_uuid)
+             if bdm.volume_id and bdm.delete_on_termination:
+                 try:
++                    self._await_volume_detached(context, bdm.volume_id)
+                     self.volume_api.delete(context, bdm.volume_id)
+                 except Exception as exc:
+                     exc_info = sys.exc_info()
+                     LOG.warning('Failed to delete volume: %(volume_id)s '
+                                 'due to %(exc)s',
+                                 {'volume_id': bdm.volume_id, 'exc': exc})
++
+         if exc_info is not None and raise_exc:
+             six.reraise(exc_info[0], exc_info[1], exc_info[2])
+ 
+diff --git a/nova/exception.py b/nova/exception.py
+index 7a0212d..c444b06 100644
+--- a/nova/exception.py
++++ b/nova/exception.py
+@@ -260,6 +260,12 @@ class ExtendVolumeNotSupported(Invalid):
+     msg_fmt = _("Volume size extension is not supported by the hypervisor.")
+ 
+ 
++class VolumeNotDetached(NovaException):
++    msg_fmt = _("Volume %(volume_id)s did not finish being detached"
++                " even after we waited %(seconds)s seconds or %(attempts)s"
++                " attempts. And its status is %(volume_status)s.")
++
++
+ class VolumeEncryptionNotSupported(Invalid):
+     msg_fmt = _("Volume encryption is not supported for %(volume_type)s "
+                 "volume %(volume_id)s")
+diff --git a/nova/tests/unit/compute/test_compute.py b/nova/tests/unit/compute/test_compute.py
+index dbd6ffd..8021f42 100644
+--- a/nova/tests/unit/compute/test_compute.py
++++ b/nova/tests/unit/compute/test_compute.py
+@@ -548,6 +548,83 @@ class ComputeVolumeTestCase(BaseTestCase):
+         attempts = c._await_block_device_map_created(self.context, '1')
+         self.assertEqual(1, attempts)
+ 
++    def test_await_volume_detached_too_slow(self):
++        self.flags(block_device_allocate_retries=2)
++        self.flags(block_device_allocate_retries_interval=0.1)
++
++        def never_get(context, volume_id):
++            return {
++                'status': 'detaching',
++                'id': 'blah',
++            }
++
++        self.stubs.Set(self.compute.volume_api, 'get', never_get)
++        self.assertRaises(exception.VolumeNotDetached,
++                          self.compute._await_volume_detached,
++                          self.context, '1')
++
++    def test_await_volume_detached_failed(self):
++        c = self.compute
++
++        fake_result = {'status': 'error', 'id': 'blah'}
++        with mock.patch.object(c.volume_api, 'get',
++                               return_value=fake_result) as fake_get:
++            self.assertRaises(exception.VolumeNotDetached,
++                c._await_volume_detached,
++                self.context, '1')
++            fake_get.assert_called_once_with(self.context, '1')
++
++    def test_await_volume_detached_slow(self):
++        c = self.compute
++        self.flags(block_device_allocate_retries=4)
++        self.flags(block_device_allocate_retries_interval=0.1)
++
++        def slow_get(context, volume_id):
++            if self.fetched_attempts < 2:
++                self.fetched_attempts += 1
++                return {
++                    'status': 'detaching',
++                    'id': 'blah',
++                }
++            return {
++                'status': 'available',
++                'id': 'blah',
++            }
++
++        self.stubs.Set(c.volume_api, 'get', slow_get)
++        attempts = c._await_volume_detached(self.context, '1')
++        self.assertEqual(attempts, 3)
++
++    def test_await_volume_detached_retries_negative(self):
++        c = self.compute
++        self.flags(block_device_allocate_retries=-1)
++        self.flags(block_device_allocate_retries_interval=0.1)
++
++        def volume_get(context, volume_id):
++            return {
++                'status': 'available',
++                'id': 'blah',
++            }
++
++        self.stubs.Set(c.volume_api, 'get', volume_get)
++        attempts = c._await_volume_detached(self.context, '1')
++        self.assertEqual(1, attempts)
++
++    def test_await_volume_detached_retries_zero(self):
++        c = self.compute
++        self.flags(block_device_allocate_retries=0)
++        self.flags(block_device_allocate_retries_interval=0.1)
++
++        def volume_get(context, volume_id):
++            return {
++                'status': 'available',
++                'id': 'blah',
++            }
++
++        self.stubs.Set(c.volume_api, 'get', volume_get)
++        attempts = c._await_volume_detached(self.context, '1')
++        self.assertEqual(1, attempts)
++
+     def test_boot_volume_serial(self):
+         self.stub_out('nova.volume.cinder.API.check_attach',
+                        lambda *a, **kw: None)
+@@ -2052,8 +2129,8 @@ class ComputeTestCase(BaseTestCase,
+                     'attachments': {instance.uuid: {
+                                        'attachment_id': 'abc123'
+                                         }
+-                                    }
+-                    }
++                                    },
++                    'status': 'available'}
+ 
+         def fake_terminate_connection(self, context, volume_id, connector):
+             pass
+@@ -10446,7 +10523,8 @@ class ComputeAPITestCase(BaseTestCase):
+         self.stub_out('nova.volume.cinder.API.detach', mock.MagicMock())
+ 
+         def fake_volume_get(self, context, volume_id):
+-            return {'id': volume_id}
++            return {'id': volume_id,
++                    'status': 'available'}
+         self.stub_out('nova.volume.cinder.API.get', fake_volume_get)
+ 
+         self.stub_out('nova.compute.manager.ComputeManager_prep_block_device',
+diff --git a/nova/tests/unit/compute/test_compute_mgr.py b/nova/tests/unit/compute/test_compute_mgr.py
+index 82b4ab3..efaa16a 100644
+--- a/nova/tests/unit/compute/test_compute_mgr.py
++++ b/nova/tests/unit/compute/test_compute_mgr.py
+@@ -3544,9 +3544,14 @@ class ComputeManagerUnitTestCase(test.NoDBTestCase):
+         bdms = block_device_obj.block_device_make_list(self.context,
+             [bdm_do_not_delete_dict, bdm_delete_dict])
+ 
+-        with mock.patch.object(self.compute.volume_api,
+-                'delete') as volume_delete:
++        fake_result = {'status': 'available', 'id': 'blah'}
++        with test.nested(
++            mock.patch.object(self.compute.volume_api, 'delete'),
++            mock.patch.object(self.compute.volume_api, 'get',
++                              return_value=fake_result)
++        ) as (volume_delete, fake_get):
+             self.compute._cleanup_volumes(self.context, instance.uuid, bdms)
++            fake_get.assert_called_once_with(self.context, bdms[1].volume_id)
+             volume_delete.assert_called_once_with(self.context,
+                     bdms[1].volume_id)
+ 
+@@ -3561,9 +3566,13 @@ class ComputeManagerUnitTestCase(test.NoDBTestCase):
+         bdms = block_device_obj.block_device_make_list(self.context,
+             [bdm_dict1, bdm_dict2])
+ 
+-        with mock.patch.object(self.compute.volume_api,
+-                'delete',
+-                side_effect=[test.TestingException(), None]) as volume_delete:
++        fake_result = {'status': 'available', 'id': 'blah'}
++        with test.nested(
++            mock.patch.object(self.compute.volume_api, 'delete',
++                side_effect=[test.TestingException(), None]),
++            mock.patch.object(self.compute.volume_api, 'get',
++                return_value=fake_result)
++        ) as (volume_delete, fake_get):
+             self.compute._cleanup_volumes(self.context, instance.uuid, bdms,
+                     raise_exc=False)
+             calls = [mock.call(self.context, bdm.volume_id) for bdm in bdms]
+@@ -3580,9 +3589,13 @@ class ComputeManagerUnitTestCase(test.NoDBTestCase):
+         bdms = block_device_obj.block_device_make_list(self.context,
+             [bdm_dict1, bdm_dict2])
+ 
+-        with mock.patch.object(self.compute.volume_api,
+-                'delete',
+-                side_effect=[test.TestingException(), None]) as volume_delete:
++        fake_result = {'status': 'available', 'id': 'blah'}
++        with test.nested(
++            mock.patch.object(self.compute.volume_api, 'delete',
++                side_effect=[test.TestingException(), None]),
++            mock.patch.object(self.compute.volume_api, 'get',
++                return_value=fake_result)
++        ) as (volume_delete, fake_get):
+             self.assertRaises(test.TestingException,
+                     self.compute._cleanup_volumes, self.context, instance.uuid,
+                     bdms)
+-- 
+2.7.4
+

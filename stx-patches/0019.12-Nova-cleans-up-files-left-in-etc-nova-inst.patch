@@ -1,0 +1,96 @@
+From ff873e889640ffeeed2fe87427ecb5bfabba761e Mon Sep 17 00:00:00 2001
+From: Irina Mihai <irina.mihai@windriver.com>
+Date: Thu, 29 Sep 2016 14:04:22 +0300
+Subject: [PATCH] Nova cleans up files left in /etc/nova/instances
+ after cold migration
+
+(cherry picked from commit d2ebea1)
+---
+ nova/tests/unit/virt/libvirt/test_driver.py | 14 +++++++-------
+ nova/virt/libvirt/driver.py                 | 16 +++++++++++++---
+ 2 files changed, 20 insertions(+), 10 deletions(-)
+
+diff --git a/nova/tests/unit/virt/libvirt/test_driver.py b/nova/tests/unit/virt/libvirt/test_driver.py
+index 6b99643..a6cf6ee 100644
+--- a/nova/tests/unit/virt/libvirt/test_driver.py
++++ b/nova/tests/unit/virt/libvirt/test_driver.py
+@@ -16549,23 +16549,23 @@ class LibvirtDriverTestCase(test.NoDBTestCase):
+         with test.nested(
+                 mock.patch.object(os.path, 'exists'),
+                 mock.patch.object(libvirt_utils, 'get_instance_path'),
+-                mock.patch.object(utils, 'execute'),
+                 mock.patch.object(drvr, '_undefine_domain'),
+                 mock.patch.object(drvr, 'unplug_vifs'),
+                 mock.patch.object(drvr, 'unfilter_instance'),
+-                mock.patch.object(drvr, '_cleanup_lvm')
+-        ) as (mock_exists, mock_get_path, mock_exec, mock_undef,
+-              mock_unplug, mock_unfilter, mock_cleanup_lvm):
++                mock.patch.object(drvr, '_cleanup_lvm'),
++                mock.patch.object(drvr, '_cleanup_target')
++        ) as (mock_exists, mock_get_path, mock_undef,
++              mock_unplug, mock_unfilter, mock_cleanup_lvm,
++              mock_cleanup_target):
+             mock_exists.return_value = True
+             mock_get_path.return_value = '/fake/inst'
+ 
+             drvr._cleanup_resize(ins_ref, fake_net)
+-            mock_get_path.assert_called_once_with(ins_ref)
+-            mock_exec.assert_called_once_with('rm', '-rf', '/fake/inst_resize',
+-                                              delay_on_retry=True, attempts=5)
+             mock_undef.assert_called_once_with(ins_ref)
+             mock_unplug.assert_called_once_with(ins_ref, fake_net)
+             mock_unfilter.assert_called_once_with(ins_ref, fake_net)
++            self.assertEqual(2, mock_get_path.call_count)
++            self.assertEqual(2, mock_cleanup_target.call_count)
+             mock_cleanup_lvm.assert_called_once_with(
+                 ins_ref, preserve_disk_filter="Non-Resize")
+ 
+diff --git a/nova/virt/libvirt/driver.py b/nova/virt/libvirt/driver.py
+index 1208812..ddca778 100644
+--- a/nova/virt/libvirt/driver.py
++++ b/nova/virt/libvirt/driver.py
+@@ -1207,9 +1207,8 @@ class LibvirtDriver(driver.ComputeDriver):
+             enforce_multipath=True,
+             host=CONF.host)
+ 
+-    def _cleanup_resize(self, instance, network_info):
+-        target = libvirt_utils.get_instance_path(instance) + '_resize'
+-
++    def _cleanup_target(self, target):
++        """If the target path exists, remove all its content."""
+         if os.path.exists(target):
+             # Deletion can fail over NFS, so retry the deletion as required.
+             # Set maximum attempt as 5, most test can remove the directory
+@@ -1217,6 +1216,11 @@ class LibvirtDriver(driver.ComputeDriver):
+             utils.execute('rm', '-rf', target, delay_on_retry=True,
+                           attempts=5)
+ 
++    def _cleanup_resize(self, instance, network_info):
++        target = libvirt_utils.get_instance_path(instance) + '_resize'
++
++        self._cleanup_target(target)
++
+         root_disk = self.image_backend.image(instance, 'disk')
+         # TODO(nic): Set ignore_errors=False in a future release.
+         # It is set to True here to avoid any upgrade issues surrounding
+@@ -1229,11 +1233,17 @@ class LibvirtDriver(driver.ComputeDriver):
+             root_disk.remove_snap(libvirt_utils.RESIZE_SNAPSHOT_NAME,
+                                   ignore_errors=True)
+ 
++        # Check if the instance has migrated.
+         if instance.host != CONF.host:
+             self._undefine_domain(instance)
+             self.unplug_vifs(instance, network_info)
+             self.unfilter_instance(instance, network_info)
+ 
++            # Obtain the instance's path and if needed, remove any files
++            # belonging to it, from the source host.
++            instance_nova_path = libvirt_utils.get_instance_path(instance)
++            self._cleanup_target(instance_nova_path)
++
+         # Resize is complete. Remove any _resize volumes associated
+         # with the instance
+         self._cleanup_lvm(instance, preserve_disk_filter="Non-Resize")
+-- 
+2.7.4
+

@@ -1,0 +1,48 @@
+From 3e276608c2931d735b299cc7230b47a81337554e Mon Sep 17 00:00:00 2001
+From: Michael Lo <Michael.Lo@windriver.com>
+Date: Wed, 19 Apr 2017 14:52:44 -0400
+Subject: [PATCH] Live-migration failed: Pre live migration failed
+ at dest node
+
+For CoW local image backing instance, the qcow2 image backing file is converted
+into raw format during pre live migration. Such conversion took too long
+and had caused the pre-live migration RPC timeout. The image under test  was
+about 248MB (with virtual size of 2.2 G). The RPC timeout value was 60 seconds.
+
+To eliminate such conversion, we set force_raw_images=False in nova.conf.
+Only the qcow2 and raw image formats are not converted, other image formats,
+such as vmdk and vdi, are still be converted during pre live migration.
+We have seen problems with backing file formats other than qcow2/raw,
+so we unconditionally force those formats to raw.
+
+---
+ nova/virt/images.py | 13 ++++++++++++-
+ 1 file changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/nova/virt/images.py b/nova/virt/images.py
+index 70d460b..933423a 100644
+--- a/nova/virt/images.py
++++ b/nova/virt/images.py
+@@ -159,7 +159,18 @@ def fetch_to_raw(context, image_href, path):
+                 reason=(_("fmt=%(fmt)s backed by: %(backing_file)s") %
+                         {'fmt': fmt, 'backing_file': backing_file}))
+ 
+-        if fmt != "raw" and CONF.force_raw_images:
++        if CONF.force_raw_images:
++            force_convert = (fmt != "raw")
++        else:
++            # we have seen problems with backing file formats
++            #      other than qcow2/raw, so we unconditionally
++            #      force those formats to raw.
++            force_convert = (fmt != 'qcow2') and (fmt != "raw")
++            if force_convert:
++                LOG.info(_LI("Ignore force_raw_images:convert %(fmt)s to raw"),
++                         {'fmt': fmt})
++
++        if force_convert:
+             staged = "%s.converted" % path
+             LOG.debug("%s was %s, converting to raw", image_href, fmt)
+             with fileutils.remove_path_on_error(staged):
+-- 
+2.7.4
+

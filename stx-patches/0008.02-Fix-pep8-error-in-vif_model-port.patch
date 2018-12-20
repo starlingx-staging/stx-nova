@@ -1,0 +1,26 @@
+From 6098c872fc854629371378676547f17eac424835 Mon Sep 17 00:00:00 2001
+From: Gerry Kopec <Gerry.Kopec@windriver.com>
+Date: Mon, 30 May 2016 11:20:29 -0400
+Subject: [PATCH] Fix pep8 error in vif_model port
+
+Fixes error introduced in commit d0522cd576e34d86897e364fd4a08adbcd38709d
+---
+ nova/compute/api.py | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/nova/compute/api.py b/nova/compute/api.py
+index 8bd56ee..1795aee 100644
+--- a/nova/compute/api.py
++++ b/nova/compute/api.py
+@@ -1187,7 +1187,7 @@ class API(base.Base):
+         # provider physical network
+         if requested_networks:
+             hw_vif_model = None
+-            properties = boot_meta.get('properties',{})
++            properties = boot_meta.get('properties', {})
+             hw_vif_model = properties.get('hw_vif_model')
+             if hw_vif_model is None:
+                 hw_vif_model = CONF.default_vif_model
+-- 
+2.7.4
+
