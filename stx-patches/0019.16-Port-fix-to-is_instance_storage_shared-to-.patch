@@ -1,0 +1,82 @@
+From b4f9f3521f0c1cd96dab4de4c0367a43498f47e8 Mon Sep 17 00:00:00 2001
+From: Gerry Kopec <Gerry.Kopec@windriver.com>
+Date: Thu, 16 Jun 2016 19:50:24 -0400
+Subject: [PATCH] Port fix to is_instance_storage_shared to mitaka
+
+The code in _is_instance_storage_shared() is suboptimal. Currently it
+assumes that shared_storage is true, which means that if the other
+compute node is also down we'll get the wrong answer.
+
+In our environment there are two configurations where
+_is_instance_storage_shared() should return True. The first is the case
+where instance storage is on Ceph via the Rbd backend. In that case
+self.driver.check_instance_shared_storage_local() will return None.
+
+The second case is where we're checking local storage on the current
+compute node (in which case storage is trivially shared).
+
+In all other cases _is_instance_storage_shared() should return False.
+
+The most efficient solution would be to remove the call to
+self.compute_rpcapi.check_instance_shared_storage() since in our
+environment it's not actually needed. Instead, just do
+
++ if host == self.host:
++     shared_storage = True
++ else:
++     shared_storage = False
+
+This ports commits:
+6af8ad9 Evacuation of VM failed when Management network cable
+                  was removed from compute node
+bcd2828 fix local host implies shared storage
+---
+ nova/compute/manager.py                 | 8 +++++---
+ nova/tests/unit/compute/test_compute.py | 5 -----
+ 2 files changed, 5 insertions(+), 8 deletions(-)
+
+diff --git a/nova/compute/manager.py b/nova/compute/manager.py
+index e7d78aa..9b7d9f6 100644
+--- a/nova/compute/manager.py
++++ b/nova/compute/manager.py
+@@ -895,9 +895,11 @@ class ComputeManager(manager.Manager):
+             data = self.driver.check_instance_shared_storage_local(context,
+                                                        instance)
+             if data:
+-                shared_storage = (self.compute_rpcapi.
+-                                  check_instance_shared_storage(context,
+-                                  instance, data, host=host))
++                # Not using Ceph, so only shared if it's on the same host
++                if host == self.host:
++                    shared_storage = True
++                else:
++                    shared_storage = False
+         except NotImplementedError:
+             LOG.debug('Hypervisor driver does not support '
+                       'instance shared storage check, '
+diff --git a/nova/tests/unit/compute/test_compute.py b/nova/tests/unit/compute/test_compute.py
+index 7ca506c..2f69e08 100644
+--- a/nova/tests/unit/compute/test_compute.py
++++ b/nova/tests/unit/compute/test_compute.py
+@@ -6744,8 +6744,6 @@ class ComputeTestCase(BaseTestCase):
+                                  '_get_instance_block_device_info')
+         self.mox.StubOutWithMock(self.compute.driver,
+                                  'check_instance_shared_storage_local')
+-        self.mox.StubOutWithMock(self.compute.compute_rpcapi,
+-                                 'check_instance_shared_storage')
+         self.mox.StubOutWithMock(self.compute.driver,
+                                  'check_instance_shared_storage_cleanup')
+         self.mox.StubOutWithMock(self.compute.driver, 'destroy')
+@@ -6758,9 +6756,6 @@ class ComputeTestCase(BaseTestCase):
+                 fake_context, evacuated_instance).AndReturn('fake_bdi')
+         self.compute.driver.check_instance_shared_storage_local(fake_context,
+                 evacuated_instance).AndReturn({'filename': 'tmpfilename'})
+-        self.compute.compute_rpcapi.check_instance_shared_storage(fake_context,
+-                evacuated_instance,
+-                {'filename': 'tmpfilename'}, host=None).AndReturn(False)
+         self.compute.driver.check_instance_shared_storage_cleanup(fake_context,
+                 {'filename': 'tmpfilename'})
+         self.compute.driver.destroy(fake_context, evacuated_instance,
+-- 
+2.7.4
+

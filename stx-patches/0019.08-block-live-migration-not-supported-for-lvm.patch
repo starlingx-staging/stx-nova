@@ -1,0 +1,87 @@
+From 8c75b4b1eaf59a43c4132091a57ffc06afb94e99 Mon Sep 17 00:00:00 2001
+From: Stefan Dinescu <stefan.dinescu@windriver.com>
+Date: Wed, 27 Apr 2016 17:15:05 +0300
+Subject: [PATCH] block live migration not supported for lvm backed instances
+
+Block live migration for LVm backed instances is not supported at this
+time. The migration will fail, but without actually informing the user
+or giving a proper error message.
+
+The solution is to block live migration earlier in the code and give a
+proper error message.
+
+Change-Id: I026a4b266ecf50a22d608c65cd9da7d91a336218
+
+(cherry picked from commit 6a5f811)
+---
+ nova/conductor/manager.py   |  2 ++
+ nova/exception.py           |  4 ++++
+ nova/virt/libvirt/driver.py | 10 ++++++++++
+ 3 files changed, 16 insertions(+)
+
+diff --git a/nova/conductor/manager.py b/nova/conductor/manager.py
+index 37bdf7e..18ef966 100644
+--- a/nova/conductor/manager.py
++++ b/nova/conductor/manager.py
+@@ -197,6 +197,7 @@ class ComputeTaskManager(base.Base):
+         exception.InstanceInvalidState,
+         exception.MigrationPreCheckError,
+         exception.MigrationPreCheckClientException,
++        exception.MigrationPreCheckErrorNoRetry,
+         exception.LiveMigrationWithOldNovaNotSupported,
+         exception.UnsupportedPolicyException)
+     @wrap_instance_event(prefix='conductor')
+@@ -383,6 +384,7 @@ class ComputeTaskManager(base.Base):
+                 exception.InstanceInvalidState,
+                 exception.MigrationPreCheckError,
+                 exception.MigrationPreCheckClientException,
++                exception.MigrationPreCheckErrorNoRetry,
+                 exception.LiveMigrationWithOldNovaNotSupported,
+                 exception.MigrationSchedulerRPCError) as ex:
+             with excutils.save_and_reraise_exception():
+diff --git a/nova/exception.py b/nova/exception.py
+index be454f1..ec9f206 100644
+--- a/nova/exception.py
++++ b/nova/exception.py
+@@ -1305,6 +1305,10 @@ class MigrationPreCheckClientException(MigrationError):
+     msg_fmt = _("Client exception during Migration Pre check: %(reason)s")
+ 
+ 
++class MigrationPreCheckErrorNoRetry(MigrationError):
++    msg_fmt = _("Migration pre-check error no retry: %(reason)s")
++
++
+ class MigrationSchedulerRPCError(MigrationError):
+     msg_fmt = _("Migration select destinations error: %(reason)s")
+ 
+diff --git a/nova/virt/libvirt/driver.py b/nova/virt/libvirt/driver.py
+index 18eedf9..ea929e3 100644
+--- a/nova/virt/libvirt/driver.py
++++ b/nova/virt/libvirt/driver.py
+@@ -5597,6 +5597,11 @@ class LibvirtDriver(driver.ComputeDriver):
+         :param disk_over_commit: if true, allow disk over commit
+         :returns: a LibvirtLiveMigrateData object
+         """
++        if block_migration and CONF.libvirt.images_type == 'lvm':
++            reason = _("Block live migration is not supported "
++                           "for hosts with LVM backed storage.")
++            raise exception.MigrationPreCheckError(reason=reason)
++
+         disk_available_gb = dst_compute_info['disk_available_least']
+         disk_available_mb = (
+             (disk_available_gb * units.Ki) - CONF.reserved_host_disk_mb)
+@@ -5676,6 +5681,11 @@ class LibvirtDriver(driver.ComputeDriver):
+                 not dest_check_data.is_on_shared_storage())
+ 
+         if dest_check_data.block_migration:
++            if CONF.libvirt.images_type == 'lvm':
++                reason = _("Block live migration is not supported "
++                           "for instances with LVM backed storage.")
++                raise exception.MigrationPreCheckErrorNoRetry(reason=reason)
++
+             # TODO(eliqiao): Once block_migration flag is removed from the API
+             # we can safely remove the if condition
+             if dest_check_data.is_on_shared_storage():
+-- 
+2.7.4
+

@@ -1,0 +1,1595 @@
+From 66b6a45adb2a0167870095e87d0af3a77ac5036f Mon Sep 17 00:00:00 2001
+From: Jim Gauld <james.gauld@windriver.com>
+Date: Thu, 28 Jul 2016 18:24:11 -0400
+Subject: [PATCH 041/143] primary: resource tracking fixes
+
+This introduces live-migration cleanup at the source side, instead of
+forcing a resource audit to correct things.
+
+_post_live_migration step now calls drop_move_claim instead of
+update_available_resource. drop_move_claim is enhanced to also drop
+instance tracking claims and update usage at the source side. Calling
+resource audit here is no longer required.
+
+The tracker and drop_move_claim are placed in try block to catch
+unforeseen exceptions.
+
+(cherry picked from R3 commit 29a6ae3)
+
+918c424 Filter out stale migrations in resource audit
+   When doing the resource audit there is a subtle bug in the current
+   code.  The problem arises if:
+
+   1) You have one or more stale migrations which didn't complete
+   properly that involve the current compute node.
+
+   2) The instance from the uncompleted migration is currently doing a
+   resize/migration that does not involve the current compute node.
+
+   When this happens, _update_usage_from_migrations() will be passed in
+   the stale migration, and the instance is in fact in a resize state,
+   so the current compute node will erroneously account for the instance.
+
+   The fix is to check that the instance migration ID matches the ID
+   of the migration being analyzed.  This will work because in the case
+   of the stale migration we will have hit the error case in
+   _pair_instances_to_migrations(), and so the instance will be
+   lazy-loaded from the DB, ensuring that its migration ID is up-to-date.
+
+   Change-Id: I6f5ad01cb1392db3e2b71e322c5be353de9071a2
+
+   (cherry picked from R3 commit 19d291c)
+
+36993e3 fix race between migration and resource audit
+   If an instance is migrating we want to ensure that the resource
+   audit accounts for it in _update_usage_from_migrations() and not
+   _update_usage_from_instances(), because until the migration is
+   finished the numa_topology is stored in the migration object and
+   not directly in the instance object.
+
+   The fix is to explicitly ignore instances with a task_state of
+   RESIZE_MIGRATED in _update_usage_from_instances(), because they'll
+   be handled correctly by _update_usage_from_migrations().
+
+   Instances with a task_state of RESIZE_FINISH will be handled by
+   _update_usage_from_instances(), but will then be added to
+   self.tracked_instances so that _update_usage_from_migrations()
+   can properly handle them.
+
+   I think we still have a small race window if an instance is in the
+   task_states.RESIZE_MIGRATED state when we call
+   objects.InstanceList.get_by_host_and_node() (which means it has a
+   stale instance.numa_topology) but the resize has been confirmed by
+   the time we call objects.MigrationList.get_in_progress_by_host_and_node().
+
+   If this happens, then the instance will be ignored by the resource
+   audit.  To try to minimize this I've put the two calls to the DB
+   as close together as possible.
+
+   This issue is tracked upstream by bug 1498126
+   Change-Id: Ide1b7f4c16c011beabefb5ab9272f24f883cf156
+
+   (cherry picked from R3 commit 7908d24)
+
+124f9b0 migration to same host and revert/resize confirmation robustness
+   This commit adds the instances current host to ignore_hosts list for
+   cold migrate.  This optimizes upstream change for bug 1364851
+   (commit 9b22464).  Upstream supports capability to migrate to same host
+   depending on hypervisor.  However since libvirt doesn't support this,
+   we can save the overhead of attempting to migrate to the same host,
+   having it fail, then having to retry on another host.
+
+   This commit also helps prevent instance going into error state and
+   requiring subsequent recovery as result of migration resize confirmation
+   or resize revert step. This has seen to rarely occur when instance.node
+   is None (which is unexpected), or due to unforeseen pinning exception.
+   The tracker and drop_move_claim are placed in try block for
+   revert_resize and _confirm_resize.
+
+   This commit merges the following R3 commits:
+   e3a9d90 Prevent cold migrate attempt to same host
+   ba5f5d0 migration revert/resize confirmation resource tracking robustness
+
+f6c4033 live-migration rollback resource tracking fix at destination
+
+   This introduces live-migration rollback cleanup at the destination side,
+   instead of waiting for resource audit to correct things.
+
+   compute/manager rollback_live_migration_at_destination now calls
+   drop_move_claim to release claim resources and update usage at
+   destination. This reuses existing functionality of drop_move_claim. As a
+   result, we do not have to wait for next update_available_resource audit
+   to correct the accounting.
+
+   The tracker and drop_move_claim are placed in try block to catch
+   unforeseen exceptions.
+
+   Upstreaming note:
+   There is additional work to do adding unit test cases to actually
+   test that a live rollback indeed calls drop_move_claim, etc.
+
+   (cherry picked from R3 commit 95a2998)
+
+   For port to Newton, upstream has removed _is_trackable_migration() so
+   nothing to modify.
+
+29af885 Race condition between audit and migrate/resize revert
+   There was a race condition where an instance was being reverted and the
+   migration was marked 'reverted' on the destination node but the instance was
+   not yet re-spawned on the original source node.
+
+   The resource tracker on the source node was then not seeing any
+   migration in progress neither the instance running, which caused
+   resource usage to be wrong.
+
+   This fix introduce a new migration status of 'reverting' in
+   revert_resize() and the migration is now set in 'reverted' in
+   finish_revert_resize().  Therefore a reverted migration will only be
+   reported as in progress until it is being reverted on the source node.
+
+   (cherry picked from R3 commit 202d9f3)
+
+02ae190 Save mutated numa topology after live-migration rollback at destination
+   This saves the mutated instance numa_topology after live-migration
+   rollback at destination.
+
+   Without this, the result of mutated numa_topology is not actually seen
+   at the source compute. That results in CPU pinning exceptions that
+   manifest once the resource audit runs. Note that once the exceptions
+   occur, the given compute has incorrect resource accounting (e.g.,
+   under-accounting of servers and vcpus used, etc).
+
+   Large Lab exhibited serious resource accounting
+   errors that manifested after live-migration failure which cause rollback,
+   and subsequent CPU Pinning exceptions.
+
+   This update is candidate for upstreaming.
+
+   (cherry picked from R3 commit 071b2d5)
+
+d1388eb Include live-migration in resource usage tracking of migrations
+   This includes live-migration as a migration in resource usage tracking
+   routine _update_usage_from_migrations. Without this fix, concurrent
+   live-migrations spanning resource audit may cause CPU pinning
+   exception, since migration claims before the audit stop being counted
+   by the audit, hence causing subsequent claims to reuse cpus that
+   should have been reserved.
+
+   This was based on DEV 0016 commit bfe2a677 (support live-migration),
+   originally from Grizzly DEV 0007 commit 5a94ba4c.
+
+   This update is a candidate for upstreaming.
+
+   (cherry picked from R3 commit f98604b)
+
+7f5fc40 Fix resource accounting errors due to live migrates
+   Fixes a number of scenarios where resource audit was hitting
+   CPUPinningInvalid errors after instances were live migrated. All
+   scenarios resulted from races during post live migration phase between
+   source and destination activities and resource audit.
+
+   Use resource audit semaphore around the update of instance state, host,
+   numa topology and migration status at the end of
+   post_live_migration_at_destination.  This prevents the compute manager
+   from clearing the migrating state of the instance in the middle of the
+   resource audit causing the instance to be missed as it was not included
+   in the host instance list and would now no longer count as a migration.
+
+   Change resource audit update usage from instances to skip instance if
+   state is migrating and it has a migration context.  The instance
+   accounting will then be done under migration phase of audit. This covers
+   the scenario of the audit on the source getting the list of instances
+   from db while the destination is simultaneously updating the db during
+   post live migration.  As the numa_topology is updated before host,
+   the source side would improperly account for the dest topology.
+
+   (cherry picked from R3 commit 6d9cf1a)
+
+   For port to Newton, didn't port portions of R3 commit related to change
+   of rpc to post_live_migration_at_destination from cast to call as that
+   has been merged upstream.  However added return of instance object from
+   destination to source along with additional error handling in case of
+   exception.  Kilo compatibility support has also been removed.
+
+6241aba Pinning robustness for resource audit
+   This modifies the pinning routines to only raise exceptions due to
+   pinning errors for Claims.  Pinning routines are called with new flag
+   strict=True. When the same routines are used for resource audit, or
+   resource freeing, it makes no sense to raise exceptions and abort
+   accounting. Instead, we call the same routines with strict=False.
+
+   In the case of cpus overlap, or cpus not part of the pinned set, we do
+   best-effort set accounting and just log the problem.  The accounting
+   remains correct and we can continue even if there was a problem.
+
+   Note that this update is under consideration for upstreaming.
+
+   (cherry picked from R3 commits 25a1a9b and a6bf253)
+
+8763d12 Instance loses pinning on evacuate if policy only set in image
+   Fixes issue where cpu pinning would be lost on evacuate for boot from
+   volume instance if cpu_policy (and/or cpu_thread_policy) was only defined
+   in image properties used to create volume.  Fix by referencing image
+   properties in Instance object during rebuild claim as is currently done
+   on live migrates.
+
+   This commit is a candidate for upstreaming.
+
+   R4 Newton rebase: cherry-picked from 12500c2.
+
+ 4b93353 Fix cpu unpin error log
+   Error log in case of cpu unpinning mismatch has a formatting bug
+   which causes an exception.
+
+   This fix should be merged with commit 81a7d5f in the next rebase.
+   This is a bug with the original R3 commit 25a1a9b
+
+c27a4d5 (part): fix race condition by move revert_migration_context()
+   to finish_revert_resize()
+
+3edadc4 Fix resource tracking during evacuate
+   During evacuation observed instances with dedicated cpu policy being
+   pinned to same cpus as other instances on the destination host. During
+   subsequent resource audits, see cpu pinning errors.
+
+   Root cause was the resource audit was skipping instance during migration
+   phase of audit while instance was rebuilding on the new host as vm_state
+   was error.
+
+   Fix is to count instances in vm_state of error and any of the rebuilding
+   task states as migrating in resource audit.  This fix also consolidates
+   instance's state change to active/None with change of host under
+   resource semaphore to prevent resource audit from picking up partial
+   changes.
+
+   In R3/Mitaka, this was fixed differently as a PCI-PT/SRIOV workaround
+   (see commits a652b7b and 84c16dc) changed instance host early in the
+   rebuilding stage on the new host which allowed the audit to pick up the
+   instance.  However that change is no longer required in R4/Newton and
+   this commit is more in line with intended upstream behaviour.
+
+   This fix is a candidate for upstreaming.
+   See upstream bug https://bugs.launchpad.net/nova/+bug/1688599
+
+a5ad74a (Part) Post live migration recovery after RPC timeout
+   If we hit an exception in post_live_migration_at_destination (typically
+   due to RPC timeout), this sets the VM to ERROR state, and kicks off
+   recovery method (i.e., live-migration rollback).  Instance numa-topology
+   is reverted back to source, and the instance is cleaned up on the
+   destination.
+
+   This will leave the VM shutdown at the source. The VM finishes recovery
+   via hard-reboot driven by VIM.
+
+   NOTE: Post live migration recovery_method does not currently work
+   properly for VMs with cinder block storage. That will have to be
+   addressed in a subsequent robustness update.
+
+75fdbf7 (Part) Fix PCI resource tracking in Newton
+   3. We need to ensure we update the compute node's pci stats before
+   updating the resource stats and pci tracker in do_drop_update.
+
+95cf741 Pike rebase: bug 218: fix post live migration error logs
+   In Pike, upstream (3397987c) added nodename to drop_move_claim()
+   parameters and we need to do the same for our added calls.  For
+   _post_live_migration(), we can just use the migration object (source
+   node).  For rollback_live_migration_at_destination(), we can usually use
+   the migration object (dest node), but it seems that if it's a rollback
+   during pre_live_migration(), we don't have the migration data so we have
+   to force a full resource audit.
+
+da956fe Pike rebase: bugs 243 & 247:  Fix resource tracking issues
+   Fixes a couple of issues with resource tracking:
+   bug 243:  When we call drop_move_claim() on the source host (post live
+   migration or resize confirm), the instance may have been tracked in the
+   previous resource audit as a migration or as an instance. If it was
+   tracked as migration, we drop the claim properly but not if it was
+   tracked as an instance. Need to add call to _update_usage() in tracked
+   instance case. In R4/Newton, this was done by _do_drop_update() (which
+   we added), but wasn't ported forward.
+
+   bug 247:  When doing a cold migrate revert, we've added the extra
+   migration state of 'reverting' to properly track resources during this
+   transient phase. When this is done, we need to put the state to
+   'reverted' to complete the migration however this wasn't happening. Turns
+   out upstream restructuring of finish_revert_resize() had removed a
+   migration object save that we were dependent on. Need to add that back in.
+
+e3a83c4 resource tracking pinning robustness
+   There are new pinning code paths that requiring strict accounting
+   handling. The strict=True option was incorrectly placed in the routine
+   _update_usage_from_instances().
+
+__TYPE_primary
+__TAG_livemigration,resource
+__R4_commit_d228ea3
+__R3_commit_8c09ab9
+__TC6464,TC6492,TC6542,TC6554,TC6567,TC6536,TC6605,TC6607,TC6606,TC6622,TC7781
+---
+ nova/compute/api.py                              |   6 +-
+ nova/compute/manager.py                          | 225 +++++++++++++++++------
+ nova/compute/resource_tracker.py                 | 139 +++++++++++---
+ nova/conductor/manager.py                        |   1 +
+ nova/objects/numa.py                             |  30 +--
+ nova/scheduler/host_manager.py                   |   2 +-
+ nova/tests/unit/compute/test_compute.py          |  28 ++-
+ nova/tests/unit/compute/test_compute_api.py      |   5 +-
+ nova/tests/unit/compute/test_compute_mgr.py      |  15 +-
+ nova/tests/unit/compute/test_resource_tracker.py |  92 +++++++--
+ nova/tests/unit/scheduler/test_host_manager.py   |   7 +-
+ nova/virt/hardware.py                            |  30 ++-
+ 12 files changed, 442 insertions(+), 138 deletions(-)
+
+diff --git a/nova/compute/api.py b/nova/compute/api.py
+index 0d99f42..7c48c2f 100644
+--- a/nova/compute/api.py
++++ b/nova/compute/api.py
+@@ -3418,7 +3418,11 @@ class API(base.Base):
+ 
+         filter_properties = {'ignore_hosts': []}
+ 
+-        if not CONF.allow_resize_to_same_host:
++        # exclude current host if migrate (no flavor_id)
++        # Upstream supports ability to migrate to same host depending on
++        # hypervisor. However since libvirt doesn't support this, we can save
++        # the overhead and just add it to ignore_hosts here.
++        if not CONF.allow_resize_to_same_host or not flavor_id:
+             filter_properties['ignore_hosts'].append(instance.host)
+ 
+         if self.cell_type == 'api':
+diff --git a/nova/compute/manager.py b/nova/compute/manager.py
+index 39ddfc4..699364e 100644
+--- a/nova/compute/manager.py
++++ b/nova/compute/manager.py
+@@ -3059,7 +3059,8 @@ class ComputeManager(manager.Manager):
+                 self._do_rebuild_instance_with_claim(
+                     claim_ctxt, context, instance, orig_image_ref,
+                     image_ref, injected_files, new_pass, orig_sys_metadata,
+-                    bdms, recreate, on_shared_storage, preserve_ephemeral)
++                    bdms, recreate, on_shared_storage, preserve_ephemeral,
++                    scheduled_node)
+             except exception.ComputeResourcesUnavailable as e:
+                 LOG.debug("Could not rebuild instance on this host, not "
+                           "enough resources available.", instance=instance)
+@@ -3089,16 +3090,6 @@ class ComputeManager(manager.Manager):
+                 self._notify_instance_rebuild_error(context, instance, e)
+                 raise
+             else:
+-                instance.apply_migration_context()
+-                # NOTE (ndipanov): This save will now update the host and node
+-                # attributes making sure that next RT pass is consistent since
+-                # it will be based on the instance and not the migration DB
+-                # entry.
+-                instance.host = self.host
+-                instance.node = scheduled_node
+-                instance.save()
+-                instance.drop_migration_context()
+-
+                 # NOTE (ndipanov): Mark the migration as done only after we
+                 # mark the instance as belonging to this host.
+                 self._set_migration_status(migration, 'done')
+@@ -3119,7 +3110,8 @@ class ComputeManager(manager.Manager):
+     def _do_rebuild_instance(self, context, instance, orig_image_ref,
+                              image_ref, injected_files, new_pass,
+                              orig_sys_metadata, bdms, recreate,
+-                             on_shared_storage, preserve_ephemeral):
++                             on_shared_storage, preserve_ephemeral,
++                             scheduled_node):
+         orig_vm_state = instance.vm_state
+ 
+         if recreate:
+@@ -3230,8 +3222,26 @@ class ComputeManager(manager.Manager):
+             # NOTE(rpodolyaka): driver doesn't provide specialized version
+             # of rebuild, fall back to the default implementation
+             self._rebuild_default_impl(**kwargs)
+-        self._update_instance_after_spawn(context, instance)
+-        instance.save(expected_task_state=[task_states.REBUILD_SPAWNING])
++
++        # synchronize update of vm and task state, host and numa topology
++        # with resource audit.  This prevents vm state changing during the
++        # audit after the list of instances on this host has been generated
++        # which could lead to this instance being not counted as either an
++        # instance or migration.
++        @utils.synchronized(
++            resource_tracker.COMPUTE_RESOURCE_SEMAPHORE)
++        def _update_instance_state_and_host(context, instance, scheduled_node):
++            self._update_instance_after_spawn(context, instance)
++            instance.apply_migration_context()
++            # NOTE (ndipanov): This save will now update the host and
++            # node attributes making sure that next RT pass is
++            # consistent since it will be based on the instance and not
++            # the migration DB entry.
++            instance.host = self.host
++            instance.node = scheduled_node
++            instance.save(expected_task_state=[task_states.REBUILD_SPAWNING])
++            instance.drop_migration_context()
++        _update_instance_state_and_host(context, instance, scheduled_node)
+ 
+         if orig_vm_state == vm_states.STOPPED:
+             LOG.info("bringing vm to original state: '%s'",
+@@ -3834,9 +3844,16 @@ class ComputeManager(manager.Manager):
+             with migration.obj_as_admin():
+                 migration.save()
+ 
+-            rt = self._get_resource_tracker()
+-            rt.drop_move_claim(context, instance, migration.source_node,
+-                               old_instance_type, prefix='old_')
++            # Catch rare case where source_node is None, or there
++            # is unforseen pinning exception.
++            # NOTE(jgauld): Ideally we should bottom out the root cause.
++            try:
++                rt = self._get_resource_tracker()
++                rt.drop_move_claim(context, instance, migration.source_node,
++                                   old_instance_type, prefix='old_')
++            except Exception as e:
++                LOG.error('_confirm_resize: error=%(err)s',
++                          {'err': e}, instance=instance)
+             instance.drop_migration_context()
+ 
+             # NOTE(mriedem): The old_vm_state could be STOPPED but the user
+@@ -3906,22 +3923,22 @@ class ComputeManager(manager.Manager):
+ 
+             self._terminate_volume_connections(context, instance, bdms)
+ 
+-            migration.status = 'reverted'
++            # Instance is not reverted yet (see note in
++            # finish_revert_resize).
++            migration.status = 'reverting'
+             with migration.obj_as_admin():
+                 migration.save()
+ 
+-            # NOTE(ndipanov): We need to do this here because dropping the
+-            # claim means we lose the migration_context data. We really should
+-            # fix this by moving the drop_move_claim call to the
+-            # finish_revert_resize method as this is racy (revert is dropped,
+-            # but instance resources will be tracked with the new flavor until
+-            # it gets rolled back in finish_revert_resize, which is
+-            # potentially wrong for a period of time).
+-            instance.revert_migration_context()
+-            instance.save()
+-
+-            rt = self._get_resource_tracker()
+-            rt.drop_move_claim(context, instance, instance.node)
++            # moved revert_migration_context() to finish_revert_resize()
++            # as that is where the migration_context is now dropped.
++            # Catch rare cases where instance.node is None, or there
++            # is unforseen pinning exception.
++            try:
++                rt = self._get_resource_tracker()
++                rt.drop_move_claim(context, instance, instance.node)
++            except Exception as e:
++                LOG.error('revert_resize: error=%(err)s',
++                          {'err': e}, instance=instance)
+ 
+             self.compute_rpcapi.finish_revert_resize(context, instance,
+                     migration, migration.source_compute)
+@@ -3948,6 +3965,10 @@ class ComputeManager(manager.Manager):
+             old_vm_state = instance.system_metadata.pop('old_vm_state',
+                                                         vm_states.ACTIVE)
+ 
++            # revert migration context at same time as host is
++            # reverted.  This reduces window where numa_topology matches
++            # source host but instance host is still the destination.
++            instance.revert_migration_context()
+             self._set_instance_info(instance, instance.old_flavor)
+             instance.old_flavor = None
+             instance.new_flavor = None
+@@ -3955,6 +3976,16 @@ class ComputeManager(manager.Manager):
+             instance.node = migration.source_node
+             instance.save()
+ 
++            # There was a race condition where an instance was being
++            # reverted and the migration was marked 'reverted' on the
++            # destination node but the instance was not yet re-spawned on
++            # the original source node.  The resource tracker on the source
++            # node was then not seeing any migration in progress neither the
++            # instance running, which caused resource usage to be wrong.
++            migration.status = 'reverted'
++            with migration.obj_as_admin():
++                migration.save()
++
+             self.network_api.setup_networks_on_host(context, instance,
+                                                     migration.source_compute)
+             migration_p = obj_base.obj_to_primitive(migration)
+@@ -6049,15 +6080,45 @@ class ComputeManager(manager.Manager):
+         # pause/suspend/terminate do not work.
+         post_at_dest_success = True
+         try:
+-            self.compute_rpcapi.post_live_migration_at_destination(ctxt,
+-                    instance, block_migration, dest)
++            # To avoid race between source and destination, rpc call was
++            # changed to synchronous (cast to call) by upstream.
++            # Additionally need to use returned instance to prevent
++            # overwriting destination changes to instance in db with stale
++            # data from source.
++            dest_instance = \
++                self.compute_rpcapi.post_live_migration_at_destination(
++                ctxt, instance, block_migration, dest)
++            if dest_instance is not None:
++                instance = dest_instance
+         except Exception as error:
+             post_at_dest_success = False
+             # We don't want to break _post_live_migration() if
+             # post_live_migration_at_destination() fails as it should never
+             # affect cleaning up source node.
+-            LOG.exception("Post live migration at destination %s failed",
+-                          dest, instance=instance, error=error)
++            # Problem with destination, so need to get instance from db.
++            # If exception was after instance host was updated to destination,
++            # we'll continue on.  If not set to error.
++            # Migration cleanup is handled by post_method
++            # recover_method, so just set vm_state to ERROR.
++            msg = ('Post live migration at destination %(dest)s failed: '
++                   'error=%(error)r; %(action)s')
++            expected_attrs = ['metadata', 'system_metadata', 'flavor']
++            instance = objects.Instance.get_by_uuid(ctxt, instance.uuid,
++                               expected_attrs=expected_attrs)
++            if instance.host == self.host:
++                with excutils.save_and_reraise_exception():
++                    instance.vm_state = vm_states.ERROR
++                    instance.revert_migration_context()
++                    instance.save()
++                    LOG.error(msg,
++                              {'dest': dest, 'error': error,
++                               'action': 'on source: setting to ERROR state'},
++                              instance=instance)
++            else:
++                LOG.error(msg,
++                          {'dest': dest, 'error': error,
++                           'action': 'on destination: continuing'},
++                          instance=instance)
+ 
+         do_cleanup, destroy_disks = self._live_migration_cleanup_flags(
+                 migrate_data)
+@@ -6072,9 +6133,18 @@ class ComputeManager(manager.Manager):
+ 
+         self.instance_events.clear_events_for_instance(instance)
+ 
+-        # NOTE(timello): make sure we update available resources on source
+-        # host even before next periodic task.
+-        self.update_available_resource(ctxt)
++        # Drop live-migration instance tracking at source.
++        try:
++            rt = self._get_resource_tracker(
++                migrate_data.migration.source_node)
++            rt.drop_move_claim(ctxt, instance,
++                               migrate_data.migration.source_node,
++                               instance['flavor'], prefix='old_')
++            instance.drop_migration_context()
++        except Exception as e:
++            LOG.error('_post_live_migration: error=%(err)s',
++                      {'err': e}, instance=instance)
++            self.update_available_resource(ctxt)
+ 
+         rt = self._get_resource_tracker()
+         rt.delete_allocation_for_migrated_instance(
+@@ -6163,19 +6233,34 @@ class ComputeManager(manager.Manager):
+             except exception.ComputeHostNotFound:
+                 LOG.exception('Failed to get compute_info for %s', self.host)
+             finally:
+-                # TODO(pkoniszewski): instance.save() is not a single atomic
+-                # transaction, therefore, resource audit on the source side
+-                # might see an instance with updated, e.g., numa_topology, but
+-                # the old host/node.
+-                instance.apply_migration_context()
+-                instance.host = self.host
+-                instance.power_state = current_power_state
+-                instance.task_state = None
+-                instance.node = node_name
+-                instance.progress = 0
+-                instance.save(expected_task_state=task_states.MIGRATING)
+-                instance.drop_migration_context()
+-                self._set_migration_status(migration, migration_status)
++                # synchronize update of vm state, host and numa topology
++                # with resource audit.  This prevents vm state changing during
++                # the audit after the list of instances on this host has been
++                # generated which could lead to this instance being not counted
++                # as either an instance or migration.
++
++                # Skip this instance update if we are no longer in
++                # migrating task_state (eg. due to a rollback, or hard reboot).
++                instance.refresh()
++                if instance.task_state != task_states.MIGRATING:
++                    return instance
++
++                @utils.synchronized(
++                    resource_tracker.COMPUTE_RESOURCE_SEMAPHORE)
++                def _update_instance_migration_state(instance, migration,
++                                                     migration_status):
++                    instance.apply_migration_context()
++                    instance.host = self.host
++                    instance.power_state = current_power_state
++                    instance.task_state = None
++                    instance.node = node_name
++                    instance.progress = 0
++                    instance.save(expected_task_state=task_states.MIGRATING)
++                    self._set_migration_status(migration, migration_status)
++                    return instance
++                instance = _update_instance_migration_state(instance,
++                                                            migration,
++                                                            migration_status)
+ 
+         # NOTE(tr3buchet): tear down networks on source host
+         self.network_api.setup_networks_on_host(context, instance,
+@@ -6185,6 +6270,8 @@ class ComputeManager(manager.Manager):
+         self._notify_about_instance_usage(
+                      context, instance, "live_migration.post.dest.end",
+                      network_info=network_info)
++        # return updated instance to source host
++        return instance
+ 
+     @wrap_exception()
+     @wrap_instance_fault
+@@ -6313,11 +6400,39 @@ class ComputeManager(manager.Manager):
+                 self.driver.rollback_live_migration_at_destination(
+                     context, instance, network_info, block_device_info,
+                     destroy_disks=destroy_disks, migrate_data=migrate_data)
+-            # TODO(ndipanov): We should drop the claim here too, as we are
+-            # currently "leaking" resources, but only until the next run of the
+-            # update_available_resource periodic task, since we error the
+-            # migration. For that, we need to be passing migration objects over
+-            # RPC
++            # Save instance, otherwise the result of mutated numa_topology
++            # is not seen at source compute, which results in CPU pinning
++            # exceptions starting when the resource audit runs.
++            instance.save()
++            LOG.info('Rollback live-migration: '
++                     'revert numa_topology=%(numa)r.',
++                     {'numa': instance.numa_topology}, instance=instance)
++
++            # Drop live-migration claim and migration at destination.
++            # NOTE(jgauld): migrate_data not always defined if there is an
++            #               exception in pre_live_migration. Using self.host
++            #               as a fallback. Should find better solution.
++            try:
++                dest_node = migrate_data.migration.dest_node
++            except Exception:
++                dest_node = self.host
++            try:
++                # Depending on where we are in the live migration,
++                # migrate_data may not have the migration object. If it does,
++                # we can direct the resource tracker to drop the claim on the
++                # appropriate node.  Otherwise force a full resource audit.
++                if hasattr(migrate_data, 'migration'):
++                    rt = self._get_resource_tracker(dest_node)
++                    rt.drop_move_claim(context, instance,
++                                       migrate_data.migration.dest_node,
++                                       instance.flavor,
++                                       prefix='new_')
++                else:
++                    self.update_available_resource(context)
++            except Exception as e:
++                LOG.error('rollback_live_migration_at_destination: '
++                          'error=%(err)s',
++                          {'err': e}, instance=instance)
+             instance.drop_migration_context()
+ 
+         self._notify_about_instance_usage(
+diff --git a/nova/compute/resource_tracker.py b/nova/compute/resource_tracker.py
+index 3bfaafa..af563a3 100644
+--- a/nova/compute/resource_tracker.py
++++ b/nova/compute/resource_tracker.py
+@@ -66,8 +66,9 @@ COMPUTE_RESOURCE_SEMAPHORE = "compute_resources"
+ _usage_debug = dict()
+ 
+ 
+-def _instance_in_resize_state(instance):
+-    """Returns True if the instance is in one of the resizing states.
++# migration tracking
++def _instance_in_migration_or_resize_state(instance):
++    """Returns True if the instance is in progress of migrating or resizing.
+ 
+     :param instance: `nova.objects.Instance` object
+     """
+@@ -80,7 +81,14 @@ def _instance_in_resize_state(instance):
+     if (vm in [vm_states.ACTIVE, vm_states.STOPPED]
+             and task in [task_states.RESIZE_PREP,
+             task_states.RESIZE_MIGRATING, task_states.RESIZE_MIGRATED,
+-            task_states.RESIZE_FINISH, task_states.REBUILDING]):
++            task_states.RESIZE_FINISH, task_states.REBUILDING,
++            task_states.MIGRATING]):
++        return True
++
++    # handle evacuation case where instance is in ERROR state
++    if (vm == vm_states.ERROR and task in [task_states.REBUILDING,
++            task_states.REBUILD_BLOCK_DEVICE_MAPPING,
++            task_states.REBUILD_SPAWNING]):
+         return True
+ 
+     return False
+@@ -197,7 +205,7 @@ class ResourceTracker(object):
+                             reason="unable to find free sibling cpu "
+                                    "on NUMA node")
+                     # Update the host numa topology
+-                    cell.pin_cpus(siblings)
++                    cell.pin_cpus(siblings, strict=True)
+                     cell.cpu_usage += len(siblings)
+                     resources.vcpus_used += len(siblings)
+                 else:
+@@ -211,7 +219,7 @@ class ResourceTracker(object):
+                         raise exception.ComputeResourcesUnavailable(
+                             reason="unable to find free cpu on NUMA node")
+                     # Update the host numa topology
+-                    cell.pin_cpus(set([pcpu]))
++                    cell.pin_cpus(set([pcpu]), strict=True)
+                     cell.cpu_usage += 1
+                     resources.vcpus_used += 1
+ 
+@@ -237,11 +245,13 @@ class ResourceTracker(object):
+                 host_has_threads = (cell.siblings and
+                                     len(cell.siblings[0]) > 1)
+                 if (host_has_threads and thread_policy_is_isolate):
+-                    cell.unpin_cpus_with_siblings(set([pcpu]))
++                    # non-strict pinning accounting when freeing
++                    cell.unpin_cpus_with_siblings(set([pcpu]), strict=False)
+                     cell.cpu_usage -= len(cell.siblings[0])
+                     resources.vcpus_used -= len(cell.siblings[0])
+                 else:
+-                    cell.unpin_cpus(set([pcpu]))
++                    # non-strict pinning accounting when freeing
++                    cell.unpin_cpus(set([pcpu]), strict=False)
+                     cell.cpu_usage -= 1
+                     resources.vcpus_used -= 1
+                 if jsonify_result:
+@@ -358,7 +368,8 @@ class ResourceTracker(object):
+                                             instance_numa_topology)
+ 
+         # Mark resources in-use and update stats
+-        self._update_usage_from_instance(context, instance, nodename)
++        self._update_usage_from_instance(context, instance, nodename,
++                                         strict=True)
+ 
+         elevated = context.elevated()
+         # persist changes to the compute node:
+@@ -381,6 +392,10 @@ class ResourceTracker(object):
+                       image_meta=None, migration=None):
+         """Create a claim for a rebuild operation."""
+         instance_type = instance.flavor
++        # If boot from volume, image_meta will be empty so get from
++        # the instance.
++        if not image_meta:
++            image_meta = objects.ImageMeta.from_instance(instance)
+         return self._move_claim(context, instance, instance_type, nodename,
+                                 move_type='evacuation', limits=limits,
+                                 image_meta=image_meta, migration=migration)
+@@ -513,7 +528,7 @@ class ResourceTracker(object):
+         # Mark the resources in-use for the resize landing on this
+         # compute host:
+         self._update_usage_from_migration(context, instance, migration,
+-                                          nodename)
++                                          nodename, strict=True)
+         elevated = context.elevated()
+         self._update(elevated, cn)
+ 
+@@ -580,9 +595,9 @@ class ResourceTracker(object):
+     @utils.synchronized(COMPUTE_RESOURCE_SEMAPHORE)
+     def abort_instance_claim(self, context, instance, nodename):
+         """Remove usage from the given instance."""
++        # non-strict pinning accounting when freeing
+         self._update_usage_from_instance(context, instance, nodename,
+-                                         is_removed=True)
+-
++                                         is_removed=True, strict=False)
+         instance.clear_numa_topology()
+         self._unset_instance_host_and_node(instance)
+ 
+@@ -600,9 +615,14 @@ class ResourceTracker(object):
+                 dev_pools_obj = self.pci_tracker.stats.to_device_pools_obj()
+                 self.compute_nodes[nodename].pci_device_pools = dev_pools_obj
+ 
++    # Refactor drop_move_claim to cleanup both tracked_migrations and
++    # tracked_instances.
+     @utils.synchronized(COMPUTE_RESOURCE_SEMAPHORE)
+     def drop_move_claim(self, context, instance, nodename,
+                         instance_type=None, prefix='new_'):
++        # get numa_topology based on prefix
++        numa_topology = self._get_migration_context_resource('numa_topology',
++                                  instance, prefix=prefix)
+         # Remove usage for an incoming/outgoing migration on the destination
+         # node.
+         if instance['uuid'] in self.tracked_migrations:
+@@ -614,8 +634,6 @@ class ResourceTracker(object):
+                                                         migration)
+ 
+             if instance_type is not None:
+-                numa_topology = self._get_migration_context_resource(
+-                    'numa_topology', instance, prefix=prefix)
+                 usage = self._get_usage_dict(
+                         instance_type, numa_topology=numa_topology)
+                 self._drop_pci_devices(instance, nodename, prefix)
+@@ -632,6 +650,13 @@ class ResourceTracker(object):
+             self._drop_pci_devices(instance, nodename, prefix)
+             # TODO(lbeliveau): Validate if numa needs the same treatment.
+ 
++            if not instance_type:
++                instance_type = instance.flavor
++            usage = self._get_usage_dict(
++                        instance_type, numa_topology=numa_topology)
++            # non-strict pinning accounting when freeing
++            self._update_usage(usage, nodename, sign=-1, strict=False,
++                               from_migration=True)
+             ctxt = context.elevated()
+             self._update(ctxt, self.compute_nodes[nodename])
+ 
+@@ -678,7 +703,8 @@ class ResourceTracker(object):
+         # don't update usage for this instance unless it submitted a resource
+         # claim first:
+         if uuid in self.tracked_instances:
+-            self._update_usage_from_instance(context, instance, nodename)
++            self._update_usage_from_instance(context, instance, nodename,
++                                             strict=False)
+             self._update(context.elevated(), self.compute_nodes[nodename])
+ 
+     def disabled(self, nodename):
+@@ -863,13 +889,19 @@ class ResourceTracker(object):
+                             'numa_topology',
+                             'flavor', 'migration_context'])
+ 
+-        # Now calculate usage based on instance utilization:
+-        self._update_usage_from_instances(context, instances, nodename)
+-
+         # Grab all in-progress migrations:
++        # Move this up as close as possible after the call to
++        # get_by_host_and_node() because there is a window where an instance
++        # is in the RESIZE_MIGRATED state during the above call but the
++        # resize finishes and gets confirmed before this call.
++        # If that happens the result is that the instance gets missed by
++        # the resource audit.
+         migrations = objects.MigrationList.get_in_progress_by_host_and_node(
+                 context, self.host, nodename)
+ 
++        # Now calculate usage based on instance utilization:
++        self._update_usage_from_instances(context, instances, nodename)
++
+         self._pair_instances_to_migrations(migrations, instances)
+         self._update_usage_from_migrations(context, migrations, nodename)
+ 
+@@ -1221,7 +1253,8 @@ class ResourceTracker(object):
+         return vcpus
+ 
+     # add update_affinity
+-    def _update_usage(self, usage, nodename, sign=1, update_affinity=True):
++    def _update_usage(self, usage, nodename, sign=1, update_affinity=True,
++                      strict=True):
+         # tracker debug logging
+         if CONF.compute_resource_debug:
+             # Get parent calling functions
+@@ -1295,7 +1328,7 @@ class ResourceTracker(object):
+         # Calculate the numa usage
+         free = sign == -1
+         updated_numa_topology = hardware.get_host_numa_usage_from_instance(
+-                cn, usage, free)
++                cn, usage, free, strict=strict)
+         cn.numa_topology = updated_numa_topology
+ 
+         # update the affinity of instances with non-dedicated CPUs.
+@@ -1427,7 +1460,7 @@ class ResourceTracker(object):
+         return None
+ 
+     def _update_usage_from_migration(self, context, instance, migration,
+-                                     nodename):
++                                     nodename, strict=True):
+         """Update usage for a single migration.  The record may
+         represent an incoming or outbound migration.
+         """
+@@ -1500,7 +1533,8 @@ class ResourceTracker(object):
+             if self.pci_tracker and sign:
+                 self.pci_tracker.update_pci_for_instance(
+                     context, instance, sign=sign)
+-            self._update_usage(usage, nodename)
++            self._update_usage(usage, nodename, strict=strict)
++
+             if self.pci_tracker:
+                 obj = self.pci_tracker.stats.to_device_pools_obj()
+                 cn.pci_device_pools = obj
+@@ -1557,9 +1591,18 @@ class ResourceTracker(object):
+                 LOG.debug('Migration instance not found: %s', e)
+                 continue
+ 
+-            # skip migration if instance isn't in a resize state:
+-            if not _instance_in_resize_state(instances[uuid]):
+-                LOG.warning("Instance not resizing, skipping migration.",
++            # skip migration if instance isn't in a migration or resize state:
++            if not _instance_in_migration_or_resize_state(instances[uuid]):
++                id = migration.id if hasattr(migration, 'id') else None
++                type = (migration.migration_type
++                        if hasattr(migration, 'migration_type') else None)
++                status = (migration.status
++                          if hasattr(migration, 'status') else None)
++                LOG.warning("Instance not migrating, skipping migration: "
++                            "id=%(id)s, type=%(type)s, status=%(status)s",
++                            {'id': id,
++                            'type': type,
++                            'status': status},
+                             instance_uuid=uuid)
+                 continue
+ 
+@@ -1577,9 +1620,22 @@ class ResourceTracker(object):
+ 
+         for migration in filtered.values():
+             instance = instances[migration.instance_uuid]
++            # Skip migration if it doesn't match the instance migration id.
++            # This can happen if we have a stale migration record.
++            # We want to proceed if instance.migration_context is None
++            # (see test_update_available_resources_migration_no_context).
++            if (instance.migration_context is not None and
++                    instance.migration_context.migration_id != migration.id):
++                LOG.warning("Instance migration %(im)s doesn't match "
++                            "migration %(m)s, skipping migration.",
++                     {'im': instance.migration_context.migration_id,
++                     'm': migration.id})
++                continue
++
+             try:
++                # non-strict pinning accounting for resource audit
+                 self._update_usage_from_migration(context, instance, migration,
+-                                                  nodename)
++                                                  nodename, strict=False)
+             except exception.FlavorNotFound:
+                 LOG.warning("Flavor could not be found, skipping migration.",
+                             instance_uuid=instance.uuid)
+@@ -1588,7 +1644,7 @@ class ResourceTracker(object):
+     # add update_affinity
+     def _update_usage_from_instance(self, context, instance, nodename,
+             is_removed=False, require_allocation_refresh=False,
+-            update_affinity=True):
++            update_affinity=True, strict=True):
+         """Update usage for a single instance."""
+         def getter(obj, attr, default=None):
+             """Method to get object attributes without exception."""
+@@ -1656,7 +1712,8 @@ class ResourceTracker(object):
+ 
+             # new instance, update compute node resource usage:
+             self._update_usage(self._get_usage_dict(instance), nodename,
+-                               sign=sign, update_affinity=update_affinity)
++                               sign=sign, update_affinity=update_affinity,
++                               strict=strict)
+ 
+             # Display instances that audit includes via _update_usage.
+             pstate = instance.get('power_state')
+@@ -1745,9 +1802,32 @@ class ResourceTracker(object):
+             self.driver.requires_allocation_refresh)
+ 
+         for instance in instances:
++            if instance.task_state == task_states.RESIZE_MIGRATED:
++                # We need to ignore these instances because
++                # instance.nova_topology still points at the old value.
++                # _update_usage_from_migrations() will handle them.
++                LOG.debug("Instance %s task state is RESIZE_MIGRATED, "
++                          "ignoring in _update_usage_from_instances().",
++                          instance.uuid)
++                continue
++            # During post live migration, destination host will update
++            # instance host and numa_topology but it seems that these are
++            # separate db operations.  If this is happening just as the
++            # resource audit on the source host is getting the list of
++            # instances from the db, the instance numa_topology can be updated
++            # to the destination but the host is not.  So skip those cases here
++            # based on MIGRATING state and available migration context and let
++            # the migration part of the audit update the resource accounting.
++            if instance.task_state == task_states.MIGRATING and \
++                   instance.migration_context is not None:
++                LOG.debug("Instance %s task state is MIGRATING, "
++                          "ignoring in _update_usage_from_instances().",
++                          instance.uuid)
++                continue
+             if instance.vm_state not in vm_states.ALLOW_RESOURCE_REMOVAL:
+                 self._update_usage_from_instance(context, instance, nodename,
+-                    require_allocation_refresh=require_allocation_refresh)
++                    require_allocation_refresh=require_allocation_refresh,
++                    strict=False)
+ 
+         self._remove_deleted_instances_allocations(context, cn)
+         # update the affinity of instances with non-dedicated CPUs.
+@@ -1902,7 +1982,6 @@ class ResourceTracker(object):
+ 
+         orphan_uuids = vuuids - uuids
+         orphans = [usage[uuid] for uuid in orphan_uuids]
+-
+         return orphans
+ 
+     def _update_usage_from_orphans(self, orphans, nodename):
+@@ -1916,7 +1995,7 @@ class ResourceTracker(object):
+ 
+             # just record memory usage for the orphan
+             usage = {'memory_mb': memory_mb}
+-            self._update_usage(usage, nodename)
++            self._update_usage(usage, nodename, strict=False)
+ 
+     def delete_allocation_for_shelve_offloaded_instance(self, instance):
+         self.reportclient.delete_allocation_for_instance(instance.uuid)
+diff --git a/nova/conductor/manager.py b/nova/conductor/manager.py
+index 78895a7..f11b3ea 100644
+--- a/nova/conductor/manager.py
++++ b/nova/conductor/manager.py
+@@ -433,6 +433,7 @@ class ComputeTaskManager(base.Base):
+         migration.status = 'accepted'
+         migration.instance_uuid = instance.uuid
+         migration.source_compute = instance.host
++        migration.source_node = instance.node
+         migration.migration_type = 'live-migration'
+         if instance.obj_attr_is_set('flavor'):
+             migration.old_instance_type_id = instance.flavor.id
+diff --git a/nova/objects/numa.py b/nova/objects/numa.py
+index c7473a3..893db28 100644
+--- a/nova/objects/numa.py
++++ b/nova/objects/numa.py
+@@ -92,50 +92,54 @@ class NUMACell(base.NovaObject):
+     def avail_memory(self):
+         return self.memory - self.memory_usage
+ 
+-    def pin_cpus(self, cpus):
+-        if cpus - self.cpuset:
++    def pin_cpus(self, cpus, strict=True):
++        if strict and (cpus - self.cpuset):
+             raise exception.CPUPinningUnknown(requested=list(cpus),
+                                               cpuset=list(self.cpuset))
+-        if self.pinned_cpus & cpus:
++        if strict and (self.pinned_cpus & cpus):
+             raise exception.CPUPinningInvalid(requested=list(cpus),
+                                               free=list(self.cpuset -
+                                                         self.pinned_cpus))
+-        self.pinned_cpus |= cpus
++        intersect = self.pinned_cpus & (cpus & self.cpuset)
++        self.pinned_cpus |= (cpus & self.cpuset)
++        return intersect
+ 
+-    def unpin_cpus(self, cpus):
+-        if cpus - self.cpuset:
++    def unpin_cpus(self, cpus, strict=True):
++        if strict and (cpus - self.cpuset):
+             raise exception.CPUUnpinningUnknown(requested=list(cpus),
+                                                 cpuset=list(self.cpuset))
+-        if (self.pinned_cpus & cpus) != cpus:
++        if strict and (self.pinned_cpus & cpus) != cpus:
+             raise exception.CPUUnpinningInvalid(requested=list(cpus),
+                                                 pinned=list(self.pinned_cpus))
++        nointersect = cpus - self.pinned_cpus
+         self.pinned_cpus -= cpus
++        return nointersect
+ 
+-    def pin_cpus_with_siblings(self, cpus):
++    def pin_cpus_with_siblings(self, cpus, strict=True):
+         # NOTE(snikitin): Empty siblings list means that HyperThreading is
+         # disabled on the NUMA cell and we must pin CPUs like normal CPUs.
+         if not self.siblings:
+-            self.pin_cpus(cpus)
++            self.pin_cpus(cpus, strict=strict)
+             return
+ 
+         pin_siblings = set()
+         for sib in self.siblings:
+             if cpus & sib:
+                 pin_siblings.update(sib)
+-        self.pin_cpus(pin_siblings)
++        return self.pin_cpus(pin_siblings, strict=strict)
+ 
+-    def unpin_cpus_with_siblings(self, cpus):
++    def unpin_cpus_with_siblings(self, cpus, strict=True):
+         # NOTE(snikitin): Empty siblings list means that HyperThreading is
+         # disabled on the NUMA cell and we must unpin CPUs like normal CPUs.
+         if not self.siblings:
+-            self.unpin_cpus(cpus)
++            self.unpin_cpus(cpus, strict=strict)
+             return
+ 
+         pin_siblings = set()
+         for sib in self.siblings:
+             if cpus & sib:
+                 pin_siblings.update(sib)
+-        self.unpin_cpus(pin_siblings)
++        return self.unpin_cpus(pin_siblings, strict=strict)
+ 
+     def _to_dict(self):
+         return {
+diff --git a/nova/scheduler/host_manager.py b/nova/scheduler/host_manager.py
+index a471d37..365d4c8 100644
+--- a/nova/scheduler/host_manager.py
++++ b/nova/scheduler/host_manager.py
+@@ -340,7 +340,7 @@ class HostState(object):
+         instance = objects.Instance(numa_topology=spec_obj.numa_topology)
+ 
+         self.numa_topology = hardware.get_host_numa_usage_from_instance(
+-                self, instance)
++                self, instance, strict=True)
+ 
+         # Get set of reserved thread sibling pcpus that cannot be allocated
+         # when using 'isolate' cpu_thread_policy.
+diff --git a/nova/tests/unit/compute/test_compute.py b/nova/tests/unit/compute/test_compute.py
+index 23b63fa..2ccee72 100644
+--- a/nova/tests/unit/compute/test_compute.py
++++ b/nova/tests/unit/compute/test_compute.py
+@@ -6165,6 +6165,7 @@ class ComputeTestCase(BaseTestCase,
+ 
+         # start test
+         migration = objects.Migration(status='accepted')
++        mock_post.return_value = instance
+         with test.nested(
+             mock.patch.object(
+                 self.compute.network_api, 'migrate_instance_start'),
+@@ -6275,6 +6276,7 @@ class ComputeTestCase(BaseTestCase,
+             is_shared_block_storage=False,
+             block_migration=False)
+ 
++        mock_post.return_value = instance
+         with test.nested(
+             mock.patch.object(
+                 self.compute.network_api, 'migrate_instance_start'),
+@@ -6328,14 +6330,17 @@ class ComputeTestCase(BaseTestCase,
+                               'setup_networks_on_host'),
+             mock.patch.object(self.compute.instance_events,
+                               'clear_events_for_instance'),
+-            mock.patch.object(self.compute, 'update_available_resource'),
++            # Instead of update_available_resource(), use RT and call
++            # drop_move_claim()
++            mock.patch.object(self.rt, 'drop_move_claim'),
+             mock.patch.object(migration_obj, 'save'),
+         ) as (
+             post_live_migration, unfilter_instance,
+             migrate_instance_start, post_live_migration_at_destination,
+             post_live_migration_at_source, setup_networks_on_host,
+-            clear_events, update_available_resource, mig_save
++            clear_events, drop_move_claim, mig_save
+         ):
++            post_live_migration_at_destination.return_value = instance
+             self.compute._post_live_migration(c, instance, dest,
+                                               migrate_data=migrate_data)
+ 
+@@ -6354,7 +6359,11 @@ class ComputeTestCase(BaseTestCase,
+             post_live_migration_at_source.assert_has_calls(
+                 [mock.call(c, instance, [])])
+             clear_events.assert_called_once_with(instance)
+-            update_available_resource.assert_has_calls([mock.call(c)])
++
++            # Instead of update_available_resource(), use RT and call
++            # drop_move_claim()
++            drop_move_claim.assert_has_calls([])
++
+             self.assertEqual('completed', migration_obj.status)
+             mig_save.assert_called_once_with()
+             # assert we logged a success message
+@@ -6385,6 +6394,16 @@ class ComputeTestCase(BaseTestCase,
+         migrate_data = migrate_data_obj.LiveMigrateData(
+             migration=migration_obj)
+ 
++        # upstream _post_live_migration() will not re-raise exception if
++        # post_live_migration_at_destination() fails at any point, but we will
++        # unless the instance host has been updated to destination.  So create
++        # fake to update instance host to destination so this test can pass.
++        def fake_post_live_migration_at_destination(context, instance,
++                                                    block_migration, dest):
++            instance.host = dest
++            instance.save()
++            raise Exception
++
+         # creating mocks
+         with test.nested(
+             mock.patch.object(self.compute.driver, 'post_live_migration'),
+@@ -6393,7 +6412,7 @@ class ComputeTestCase(BaseTestCase,
+                               'migrate_instance_start'),
+             mock.patch.object(self.compute.compute_rpcapi,
+                               'post_live_migration_at_destination',
+-                              side_effect=Exception),
++                              fake_post_live_migration_at_destination),
+             mock.patch.object(self.compute.driver,
+                               'post_live_migration_at_source'),
+             mock.patch.object(self.compute.network_api,
+@@ -6460,6 +6479,7 @@ class ComputeTestCase(BaseTestCase,
+         ):
+             get_by_instance_uuid.return_value = bdms
+             get_volume_connector.return_value = 'fake-connector'
++            post_live_migration_at_destination.return_value = instance
+ 
+             self.compute._post_live_migration(c, instance, 'dest_host')
+ 
+diff --git a/nova/tests/unit/compute/test_compute_api.py b/nova/tests/unit/compute/test_compute_api.py
+index 609e4d2..01a43c3 100644
+--- a/nova/tests/unit/compute/test_compute_api.py
++++ b/nova/tests/unit/compute/test_compute_api.py
+@@ -1839,8 +1839,9 @@ class _ComputeAPIUnitTestMixIn(object):
+     def test_migrate_with_kwargs(self):
+         self._test_migrate(extra_kwargs=dict(cow='moo'))
+ 
+-    def test_migrate_same_host_and_allowed(self):
+-        self._test_migrate(same_host=True, allow_same_host=True)
++    # remove testcase, migration to same host not supported
++    # def test_migrate_same_host_and_allowed(self):
++    #     self._test_migrate(same_host=True, allow_same_host=True)
+ 
+     def test_migrate_same_host_and_not_allowed(self):
+         self._test_migrate(same_host=True, allow_same_host=False)
+diff --git a/nova/tests/unit/compute/test_compute_mgr.py b/nova/tests/unit/compute/test_compute_mgr.py
+index 8fd57ff..064bd80 100644
+--- a/nova/tests/unit/compute/test_compute_mgr.py
++++ b/nova/tests/unit/compute/test_compute_mgr.py
+@@ -3866,7 +3866,6 @@ class ComputeManagerUnitTestCase(test.NoDBTestCase):
+             self.compute.rebuild_instance(self.context, instance, None, None,
+                                           None, None, None, None, True)
+             mock_get.assert_called_once_with(mock.ANY, self.compute.host)
+-            self.assertEqual('new-node', instance.node)
+             mock_set.assert_called_once_with(None, 'done')
+             mock_rt.assert_called_once_with()
+ 
+@@ -5812,7 +5811,6 @@ class ComputeManagerErrorsOutMigrationTestCase(test.NoDBTestCase):
+         super(ComputeManagerErrorsOutMigrationTestCase, self).setUp()
+         self.context = context.RequestContext(fakes.FAKE_USER_ID,
+                                               fakes.FAKE_PROJECT_ID)
+-
+         self.instance = fake_instance.fake_instance_obj(self.context)
+ 
+         self.migration = objects.Migration()
+@@ -5884,6 +5882,7 @@ class ComputeManagerMigrationTestCase(test.NoDBTestCase):
+         self.image = {}
+         self.instance = fake_instance.fake_instance_obj(self.context,
+                 vm_state=vm_states.ACTIVE,
++                task_state=task_states.MIGRATING,
+                 expected_attrs=['metadata', 'system_metadata', 'info_cache'])
+         self.migration = objects.Migration(context=self.context.elevated(),
+                                            new_instance_type_id=7)
+@@ -6355,6 +6354,7 @@ class ComputeManagerMigrationTestCase(test.NoDBTestCase):
+ 
+     def test_post_live_migration_at_destination_success(self):
+ 
++        @mock.patch.object(self.instance, 'refresh')
+         @mock.patch.object(self.instance, 'save')
+         @mock.patch.object(self.instance, 'mutated_migration_context')
+         @mock.patch.object(self.instance, 'drop_migration_context')
+@@ -6376,7 +6376,7 @@ class ComputeManagerMigrationTestCase(test.NoDBTestCase):
+                      _notify_about_instance_usage, migrate_instance_finish,
+                      setup_networks_on_host, get_instance_nw_info,
+                      apply_migration_context, drop_migration_context,
+-                     mutated_migration_context, save):
++                     mutated_migration_context, save, refresh):
+             cn = mock.Mock(spec_set=['hypervisor_hostname'])
+             migration = mock.Mock(spec=objects.Migration)
+             cn.hypervisor_hostname = 'test_host'
+@@ -6429,12 +6429,12 @@ class ComputeManagerMigrationTestCase(test.NoDBTestCase):
+             self.assertEqual('finished', migration.status)
+             mutated_migration_context.assert_called_once_with()
+             apply_migration_context.assert_called_once_with()
+-            drop_migration_context.assert_called_once_with()
+ 
+         _do_test()
+ 
+     def test_post_live_migration_at_destination_compute_not_found(self):
+ 
++        @mock.patch.object(self.instance, 'refresh')
+         @mock.patch.object(self.instance, 'save')
+         @mock.patch.object(self.instance, 'mutated_migration_context')
+         @mock.patch.object(self.instance, 'drop_migration_context')
+@@ -6454,7 +6454,7 @@ class ComputeManagerMigrationTestCase(test.NoDBTestCase):
+                      _get_power_state, _get_instance_block_device_info,
+                      _notify_about_instance_usage, network_api,
+                      apply_migration_context, drop_migration_context,
+-                     mutated_migration_context, save):
++                     mutated_migration_context, save, refresh):
+             cn = mock.Mock(spec_set=['hypervisor_hostname'])
+             migration = mock.Mock(spec=objects.Migration)
+             cn.hypervisor_hostname = 'test_host'
+@@ -6467,13 +6467,13 @@ class ComputeManagerMigrationTestCase(test.NoDBTestCase):
+             self.assertEqual('finished', migration.status)
+             mutated_migration_context.assert_called_once_with()
+             apply_migration_context.assert_called_once_with()
+-            drop_migration_context.assert_called_once_with()
+ 
+         _do_test()
+ 
+     def test_post_live_migration_at_destination_unexpected_exception(self):
+ 
+         @mock.patch.object(compute_utils, 'add_instance_fault_from_exc')
++        @mock.patch.object(self.instance, 'refresh')
+         @mock.patch.object(self.instance, 'save')
+         @mock.patch.object(self.instance, 'mutated_migration_context')
+         @mock.patch.object(self.instance, 'drop_migration_context')
+@@ -6494,7 +6494,7 @@ class ComputeManagerMigrationTestCase(test.NoDBTestCase):
+                      _notify_about_instance_usage, network_api,
+                      apply_migration_context, drop_migration_context,
+                      mutated_migration_context,
+-                     save, add_instance_fault_from_exc):
++                     save, refresh, add_instance_fault_from_exc):
+             cn = mock.Mock(spec_set=['hypervisor_hostname'])
+             migration = mock.Mock(spec=objects.Migration)
+             cn.hypervisor_hostname = 'test_host'
+@@ -6508,7 +6508,6 @@ class ComputeManagerMigrationTestCase(test.NoDBTestCase):
+             self.assertEqual('failed', migration.status)
+             mutated_migration_context.assert_called_once_with()
+             apply_migration_context.assert_called_once_with()
+-            drop_migration_context.assert_called_once_with()
+ 
+         _do_test()
+ 
+diff --git a/nova/tests/unit/compute/test_resource_tracker.py b/nova/tests/unit/compute/test_resource_tracker.py
+index 66374c5..5290a1f 100644
+--- a/nova/tests/unit/compute/test_resource_tracker.py
++++ b/nova/tests/unit/compute/test_resource_tracker.py
+@@ -890,6 +890,7 @@ class TestUpdateAvailableResources(BaseTestCase):
+         get_inst_mock.return_value = instance
+         get_cn_mock.return_value = _COMPUTE_NODE_FIXTURES[0]
+         instance.migration_context = _MIGRATION_CONTEXT_FIXTURES[inst_uuid]
++        instance.migration_context.migration_id = migr_obj.id
+ 
+         update_mock = self._update_available_resources()
+ 
+@@ -2258,7 +2259,9 @@ class TestRebuild(BaseTestCase):
+         with test.nested(
+             mock.patch('nova.objects.Migration.save'),
+             mock.patch('nova.objects.Instance.save'),
+-        ) as (mig_save_mock, inst_save_mock):
++            mock.patch('nova.objects.ImageMeta.from_instance',
++                       return_value={}),
++        ) as (mig_save_mock, inst_save_mock, from_inst_mock):
+             self.rt.rebuild_claim(ctx, instance, _NODENAME,
+                                   migration=migration)
+ 
+@@ -2266,6 +2269,7 @@ class TestRebuild(BaseTestCase):
+         self.assertEqual(_NODENAME, migration.dest_node)
+         self.assertEqual("pre-migrating", migration.status)
+         self.assertEqual(1, len(self.rt.tracked_migrations))
++        from_inst_mock.assert_called_once_with(instance)
+         mig_save_mock.assert_called_once_with()
+         inst_save_mock.assert_called_once_with()
+ 
+@@ -2339,17 +2343,56 @@ class TestUpdateUsageFromMigrations(BaseTestCase):
+         ]
+         mig1, mig2 = migrations
+         mig_list = objects.MigrationList(objects=migrations)
++        instance.migration_context = None
+         self.rt._update_usage_from_migrations(mock.sentinel.ctx, mig_list,
+                                               _NODENAME)
+         upd_mock.assert_called_once_with(mock.sentinel.ctx, instance, mig2,
+-                                         _NODENAME)
++                                         _NODENAME, strict=False)
+ 
+         upd_mock.reset_mock()
+         mig2.updated_at = None
+         self.rt._update_usage_from_migrations(mock.sentinel.ctx, mig_list,
+                 _NODENAME)
+         upd_mock.assert_called_once_with(mock.sentinel.ctx, instance, mig1,
+-                _NODENAME)
++                _NODENAME, strict=False)
++
++    @mock.patch.object(resource_tracker.ResourceTracker,
++                       '_update_usage_from_migration')
++    @mock.patch('nova.objects.instance.Instance.get_by_uuid')
++    def test_ignore_stale_migration(self, mock_get_instance,
++                                    mock_update_usage):
++        self._setup_rt()
++        instance = objects.Instance(vm_state=vm_states.RESIZED,
++                                    task_state=None)
++        mock_get_instance.return_value = instance
++        migration_2002 = objects.Migration(
++            id=2002,
++            source_compute=_HOSTNAME,
++            source_node=_NODENAME,
++            dest_compute=_HOSTNAME,
++            dest_node=_NODENAME,
++            instance_uuid=uuids.instance,
++            updated_at=datetime.datetime(2002, 1, 1, 0, 0, 0),
++            instance=instance
++        )
++        migration_2001 = objects.Migration(
++            id=2001,
++            source_compute=_HOSTNAME,
++            source_node=_NODENAME,
++            dest_compute=_HOSTNAME,
++            dest_node=_NODENAME,
++            instance_uuid=uuids.instance,
++            updated_at=datetime.datetime(2001, 1, 1, 0, 0, 0),
++            instance=instance
++        )
++
++        mig_context = objects.MigrationContext(instance_uuid=uuids.instance,
++            migration_id=migration_2002.id)
++        instance.migration_context = mig_context
++        nodename = _NODENAME
++        self.rt._update_usage_from_migrations(
++            mock.sentinel.ctx, [migration_2001], nodename)
++        self.assertFalse(mock_update_usage.called)
+ 
+ 
+ class TestUpdateUsageFromInstance(BaseTestCase):
+@@ -2370,7 +2413,7 @@ class TestUpdateUsageFromInstance(BaseTestCase):
+ 
+         mock_update_usage.assert_called_once_with(
+             self.rt._get_usage_dict(self.instance), _NODENAME, sign=1,
+-            update_affinity=True)
++            update_affinity=True, strict=True)
+ 
+     @mock.patch('nova.compute.resource_tracker.ResourceTracker.'
+                 '_update_usage')
+@@ -2384,7 +2427,7 @@ class TestUpdateUsageFromInstance(BaseTestCase):
+ 
+         mock_update_usage.assert_called_once_with(
+             self.rt._get_usage_dict(self.instance), _NODENAME, sign=-1,
+-            update_affinity=True)
++            update_affinity=True, strict=True)
+ 
+     @mock.patch('nova.compute.resource_tracker.ResourceTracker.'
+                 '_update_usage')
+@@ -2395,7 +2438,7 @@ class TestUpdateUsageFromInstance(BaseTestCase):
+ 
+         mock_update_usage.assert_called_once_with(
+             self.rt._get_usage_dict(self.instance), _NODENAME, sign=1,
+-            update_affinity=True)
++            update_affinity=True, strict=True)
+ 
+     @mock.patch('nova.compute.resource_tracker.ResourceTracker.'
+                 '_update_usage')
+@@ -2405,11 +2448,12 @@ class TestUpdateUsageFromInstance(BaseTestCase):
+                 self.instance.uuid: obj_base.obj_to_primitive(self.instance)
+         }
+         self.rt._update_usage_from_instance(mock.sentinel.ctx,
+-                                            self.instance, _NODENAME, True)
++                                            self.instance, _NODENAME, True,
++                                            strict=False)
+ 
+         mock_update_usage.assert_called_once_with(
+             self.rt._get_usage_dict(self.instance), _NODENAME, sign=-1,
+-            update_affinity=True)
++            update_affinity=True, strict=False)
+ 
+     @mock.patch('nova.objects.Instance.get_by_uuid')
+     def test_remove_deleted_instances_allocations_deleted_instance(self,
+@@ -2552,7 +2596,8 @@ class TestUpdateUsageFromInstance(BaseTestCase):
+                                                  _NODENAME)
+ 
+             uufi.assert_called_once_with('ctxt', self.instance, _NODENAME,
+-                                         require_allocation_refresh=True)
++                                         require_allocation_refresh=True,
++                                         strict=False)
+ 
+         test()
+ 
+@@ -2569,7 +2614,8 @@ class TestUpdateUsageFromInstance(BaseTestCase):
+                                                  _NODENAME)
+ 
+             uufi.assert_called_once_with('ctxt', self.instance, _NODENAME,
+-                                         require_allocation_refresh=False)
++                                         require_allocation_refresh=False,
++                                         strict=False)
+ 
+         test()
+ 
+@@ -2590,26 +2636,42 @@ class TestUpdateUsageFromInstance(BaseTestCase):
+             instance.user_id, instance.project_id, mock_resource)
+ 
+ 
+-class TestInstanceInResizeState(test.NoDBTestCase):
++class TestInstanceInMigrationOrResizeState(test.NoDBTestCase):
+     def test_active_suspending(self):
+         instance = objects.Instance(vm_state=vm_states.ACTIVE,
+                                     task_state=task_states.SUSPENDING)
+-        self.assertFalse(resource_tracker._instance_in_resize_state(instance))
++        self.assertFalse(
++            resource_tracker._instance_in_migration_or_resize_state(instance))
+ 
+     def test_resized_suspending(self):
+         instance = objects.Instance(vm_state=vm_states.RESIZED,
+                                     task_state=task_states.SUSPENDING)
+-        self.assertTrue(resource_tracker._instance_in_resize_state(instance))
++        self.assertTrue(
++            resource_tracker._instance_in_migration_or_resize_state(instance))
+ 
+     def test_resized_resize_migrating(self):
+         instance = objects.Instance(vm_state=vm_states.RESIZED,
+                                     task_state=task_states.RESIZE_MIGRATING)
+-        self.assertTrue(resource_tracker._instance_in_resize_state(instance))
++        self.assertTrue(
++            resource_tracker._instance_in_migration_or_resize_state(instance))
+ 
+     def test_resized_resize_finish(self):
+         instance = objects.Instance(vm_state=vm_states.RESIZED,
+                                     task_state=task_states.RESIZE_FINISH)
+-        self.assertTrue(resource_tracker._instance_in_resize_state(instance))
++        self.assertTrue(
++            resource_tracker._instance_in_migration_or_resize_state(instance))
++
++    def test_live_migrating(self):
++        instance = objects.Instance(vm_state=vm_states.ACTIVE,
++                                task_state=task_states.MIGRATING)
++        self.assertTrue(
++        resource_tracker._instance_in_migration_or_resize_state(instance))
++
++    def test_rebuilding(self):
++        instance = objects.Instance(vm_state=vm_states.ACTIVE,
++                                    task_state=task_states.REBUILDING)
++        self.assertTrue(
++            resource_tracker._instance_in_migration_or_resize_state(instance))
+ 
+ 
+ class TestSetInstanceHostAndNode(BaseTestCase):
+diff --git a/nova/tests/unit/scheduler/test_host_manager.py b/nova/tests/unit/scheduler/test_host_manager.py
+index cd02365..037b20e 100644
+--- a/nova/tests/unit/scheduler/test_host_manager.py
++++ b/nova/tests/unit/scheduler/test_host_manager.py
+@@ -1237,7 +1237,8 @@ class HostStateTestCase(test.NoDBTestCase):
+                                               pci_requests=None,
+                                               pci_stats=None,
+                                               vswitch_strict=False)
+-        numa_usage_mock.assert_called_once_with(host, fake_instance)
++        numa_usage_mock.assert_called_once_with(host, fake_instance,
++                                                strict=True)
+         sync_mock.assert_called_once_with(("fakehost", "fakenode"))
+         self.assertEqual(fake_host_numa_topology, host.numa_topology)
+         self.assertIsNotNone(host.updated)
+@@ -1261,7 +1262,9 @@ class HostStateTestCase(test.NoDBTestCase):
+         self.assertEqual(2, host.num_instances)
+         self.assertEqual(2, host.num_io_ops)
+         self.assertEqual(2, numa_usage_mock.call_count)
+-        self.assertEqual(((host, fake_instance),), numa_usage_mock.call_args)
++        self.assertEqual(((host, fake_instance),
++                          {'strict': True}),
++                         numa_usage_mock.call_args)
+         self.assertEqual(second_host_numa_topology, host.numa_topology)
+         self.assertIsNotNone(host.updated)
+ 
+diff --git a/nova/virt/hardware.py b/nova/virt/hardware.py
+index 1da8d8a..414723a 100644
+--- a/nova/virt/hardware.py
++++ b/nova/virt/hardware.py
+@@ -2138,7 +2138,7 @@ def _numa_pagesize_usage_from_cell(hostcell, instancecell, sign):
+     return topo
+ 
+ 
+-def numa_usage_from_instances(host, instances, free=False):
++def numa_usage_from_instances(host, instances, free=False, strict=True):
+     """Get host topology usage.
+ 
+     Sum the usage from all provided instances to report the overall
+@@ -2207,15 +2207,29 @@ def numa_usage_from_instances(host, instances, free=False):
+                         if free:
+                             if (instancecell.cpu_thread_policy ==
+                                     fields.CPUThreadAllocationPolicy.ISOLATE):
+-                                newcell.unpin_cpus_with_siblings(pinned_cpus)
++                                e = newcell.unpin_cpus_with_siblings(
++                                        pinned_cpus, strict=strict)
+                             else:
+-                                newcell.unpin_cpus(pinned_cpus)
++                                e = newcell.unpin_cpus(pinned_cpus,
++                                                       strict=strict)
++                            if e:
++                                LOG.error(
++                                    'Cannot unpin:%(e)s (not pinned); '
++                                    'requested:%(req)s',
++                                    {'e': e, 'req': pinned_cpus})
+                         else:
+                             if (instancecell.cpu_thread_policy ==
+                                     fields.CPUThreadAllocationPolicy.ISOLATE):
+-                                newcell.pin_cpus_with_siblings(pinned_cpus)
++                                e = newcell.pin_cpus_with_siblings(
++                                        pinned_cpus, strict=strict)
+                             else:
+-                                newcell.pin_cpus(pinned_cpus)
++                                e = newcell.pin_cpus(pinned_cpus,
++                                                     strict=strict)
++                            if e:
++                                LOG.error(
++                                    'Overlap pinning:%(e)s; '
++                                    'requested:%(req)s',
++                                    {'e': e, 'req': pinned_cpus})
+ 
+         newcell.cpu_usage = max(0, cpu_usage)
+         newcell.memory_usage = max(0, memory_usage)
+@@ -2333,7 +2347,8 @@ def host_topology_and_format_from_host(host):
+ 
+ # TODO(ndipanov): Remove when all code paths are using objects
+ def get_host_numa_usage_from_instance(host, instance, free=False,
+-                                     never_serialize_result=False):
++                                     never_serialize_result=False,
++                                     strict=True):
+     """Calculate new host NUMA usage from an instance's NUMA usage.
+ 
+     Until the RPC version is bumped to 5.x, both host and instance
+@@ -2364,7 +2379,8 @@ def get_host_numa_usage_from_instance(host, instance, free=False,
+ 
+     updated_numa_topology = (
+         numa_usage_from_instances(
+-            host_numa_topology, instance_numa_topology, free=free))
++            host_numa_topology, instance_numa_topology,
++            free=free, strict=strict))
+ 
+     if updated_numa_topology is not None:
+         if jsonify_result and not never_serialize_result:
+-- 
+2.7.4
+

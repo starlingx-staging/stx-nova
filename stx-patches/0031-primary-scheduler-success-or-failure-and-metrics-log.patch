@@ -1,0 +1,3151 @@
+From d653c5f443bfef20207f23f1ddd05e4fd65655b9 Mon Sep 17 00:00:00 2001
+From: Jack Ding <jack.ding@windriver.com>
+Date: Fri, 19 Jan 2018 16:14:44 -0500
+Subject: [PATCH 031/143] primary: scheduler success or failure and metrics
+ logs
+
+d2a8b78 Add scheduler success or failure log
+    This adds a log for every scheduler operation, showing
+    key information such as uuid, instance name, display name,
+    on success or failure.
+    On failure, the complete spec_obj contents are displayed
+    mainly to aid in debugging.
+
+506d2fc Print metrics log for every scheduling operation
+    This prints metrics for every scheduling operation, this shows the
+    raw metrics prior to being weighed.  This will print one log
+    per-compute, with all metrics on the line.
+    We may want to set this to a debug log later (e.g., once we have
+    > 20 computes). This is valuable in understanding scheduler filter
+    and load-balance decisions.
+
+cb325af Port Scheduler Error reporting to Newton
+   This commit enhances scheduling logging:
+   - filter_properties is augmented with 2 additional maps containing
+     which compute nodes were filtered out by the scheduler (reject_map)
+     and ones that had failures (compute_failures).  As of Mitaka,
+     filter_properties is no longer passed to the scheduler so
+     reject_map is also added to the RequestSpec object.
+   - all filter host_passes() functions are modified to call the added
+     function filter_reject() with a custom message, detailing the
+     failure, which will be added to the reject_map
+   - for compute failures, _notify_about_instance_usage() is modified to
+     add details to compute_failures in case of a fault
+   - if scheduling fails, NoValidHost exception is extended with failure
+     details from filter_properties maps and passed back to the user
+   - success log is added if filters pass with details on instance,
+     hosts, flavor, image properties and scheduler hints
+   - error details are added for build, cold and live migrate and
+     live-migrate rollback
+   - adds details to all failure paths in hardware numa instance fitting
+     functions, e.g insufficient memory or cpus available, core packing
+     failiure due to thread policy
+   - adds handling of more volume exceptions to log appropriate details
+
+af80883 Error reporting port from TiS/Kilo to TiS/Mitaka.
+
+cecd07a Fix typo in error string
+
+a25b026 Mitaka rebase
+   Addendum to commit 89f1265 "Port provider network filter to Mitaka"
+a051630 Allow linear packing of cores on HT computes
+
+de67a8c Remove redundant pinning mismatch info log
+
+ba47205 add error reporting on Horizon when unsupported
+   live block migration
+   77ef938 addendum to commit ba47205ba51
+   417efac Add image properties to scheduler filters succeeded log
+
+   For port to Newton, moved cinder volume exceptions handling to
+   translate_volume_exception wrapper per upstream refactoring, updated
+   hardware logs to merge with added upstream debug logs, and revised
+   tox mock outs in test_compute_mgr per upstream changes.
+
+d7e4b2a Restore error reporting on numa_topology_filter
+   Error reporting was broken bycommit 2927ead260d
+   which cloned spec_obj. This commit makes sure the
+   original spec_obj is passed down to filter_reject
+   when the fileter rejects a host.
+
+820cd03 Demote CPU pinning usable pCPUs log to debug
+   This changes a few noisy nova-scheduler.log and nova-compute.log
+   from LOG.info to LOG.debug.
+   Example:
+     Computed NUMA topology CPU pinning: usable pCPUs: [. . .]
+     Computed NUMA topology reserved pCPUs: usable pCPUs: [. . .]
+   These logs are basically useless since they do not indicate instance,
+   and the presentation of the mapping is too verbose.
+   We get similar information in one of our customisations
+   by printing the Numa topology as part of the Claim details.
+
+416c831 nova scheduler placement and numa rejection errors
+   This update populates scheduler rejection reasons in the cases where
+   Placement service filters out hosts. This update adds the ability to
+   append multiple reasons per host. This will benefit both placement
+   and NUMA related rejection messages.
+
+   Since the Placement service does not keep any reasons for filtering
+   out hosts, this must query resource provider inventories and usages,
+   then evaluate capacity constraint reasons. For performance reasons,
+   this is done only for scheduling failure case. This does not incur
+   any extra overhead in the case of successful scheduling.
+
+bd78d7e PlatformFilter reject map reason unexpectedly
+   "unknown"
+   The scheduler placement rejection messages should only evaluate
+   resource types that are requested. When booting server from volume,
+   the placement request does not actually include the key DISK_GB.
+
+3c4fd2b nova migration precheck error mesages are poorly
+   formatted. This corrects nova scheduler filter rejection message
+   string formatting whether the message is regular string, unicode,
+   or list of strings. Some rejection messages ended up having commas
+   inserted between every letter in the message making it ugly to read.
+
+__TYPE_primary
+__TAG_debugging,scheduler,log
+__R4_commit_029b61f
+__R3_commit_6a3b9f2
+__TC5122
+---
+ nova/cells/filters/image_properties.py             |  14 ++
+ nova/compute/api.py                                |   1 +
+ nova/compute/claims.py                             |  13 +-
+ nova/compute/manager.py                            |  86 ++++++++-
+ nova/compute/utils.py                              |  23 ++-
+ nova/conductor/manager.py                          |   3 +-
+ nova/conductor/tasks/live_migrate.py               |  12 ++
+ nova/exception.py                                  |   4 +
+ nova/filters.py                                    |  57 ++++++
+ nova/objects/image_meta.py                         |   7 +
+ nova/objects/request_spec.py                       |  17 +-
+ nova/scheduler/client/report.py                    | 155 +++++++++++++++
+ nova/scheduler/filter_scheduler.py                 |  61 +++++-
+ nova/scheduler/filters/affinity_filter.py          |  45 ++++-
+ .../aggregate_image_properties_isolation.py        |  10 +
+ .../filters/aggregate_instance_extra_specs.py      |  14 ++
+ .../filters/aggregate_multitenancy_isolation.py    |  11 ++
+ nova/scheduler/filters/availability_zone_filter.py |  11 ++
+ .../filters/compute_capabilities_filter.py         |  19 +-
+ nova/scheduler/filters/compute_filter.py           |  17 +-
+ nova/scheduler/filters/core_filter.py              |  14 ++
+ nova/scheduler/filters/disk_filter.py              |  10 +
+ nova/scheduler/filters/exact_core_filter.py        |  12 ++
+ nova/scheduler/filters/exact_disk_filter.py        |  10 +
+ nova/scheduler/filters/exact_ram_filter.py         |  10 +
+ nova/scheduler/filters/image_props_filter.py       |  23 ++-
+ nova/scheduler/filters/io_ops_filter.py            |  10 +
+ nova/scheduler/filters/isolated_hosts_filter.py    |  27 ++-
+ nova/scheduler/filters/json_filter.py              |   9 +
+ nova/scheduler/filters/metrics_filter.py           |  10 +
+ nova/scheduler/filters/num_instances_filter.py     |  10 +
+ nova/scheduler/filters/numa_topology_filter.py     |  34 +++-
+ nova/scheduler/filters/pci_passthrough_filter.py   |  10 +
+ nova/scheduler/filters/ram_filter.py               |  13 ++
+ nova/scheduler/filters/retry_filter.py             |   9 +
+ nova/scheduler/filters/trusted_filter.py           |  13 +-
+ nova/scheduler/filters/type_filter.py              |  14 ++
+ nova/scheduler/filters/vcpu_model_filter.py        |  16 +-
+ nova/scheduler/host_manager.py                     |   9 +-
+ nova/scheduler/manager.py                          |   1 +
+ nova/scheduler/utils.py                            |  51 ++++-
+ nova/tests/unit/compute/test_compute_mgr.py        |  15 +-
+ nova/tests/unit/conductor/test_conductor.py        |   6 +-
+ nova/tests/unit/fake_request_spec.py               |   3 +
+ nova/tests/unit/objects/test_objects.py            |   2 +-
+ nova/tests/unit/objects/test_request_spec.py       |  19 +-
+ .../unit/scheduler/filters/test_metrics_filters.py |  14 +-
+ .../tests/unit/scheduler/test_caching_scheduler.py |  37 +++-
+ nova/tests/unit/scheduler/test_filter_scheduler.py |  45 ++++-
+ nova/tests/unit/scheduler/test_scheduler.py        |   6 +-
+ nova/tests/unit/scheduler/test_scheduler_utils.py  |   2 +-
+ nova/tests/unit/volume/test_cinder.py              |  11 +-
+ nova/utils.py                                      |  63 +++++++
+ nova/virt/hardware.py                              | 207 +++++++++++++++++----
+ nova/volume/cinder.py                              |   7 +-
+ 55 files changed, 1216 insertions(+), 116 deletions(-)
+
+diff --git a/nova/cells/filters/image_properties.py b/nova/cells/filters/image_properties.py
+index 69ef33b..eae174c 100644
+--- a/nova/cells/filters/image_properties.py
++++ b/nova/cells/filters/image_properties.py
+@@ -12,6 +12,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2013-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ """
+ Image properties filter.
+@@ -58,6 +65,13 @@ class ImagePropertiesFilter(filters.BaseCellFilter):
+             if not version or self._matches_version(version,
+                                             hypervisor_version_requires):
+                 filtered_cells.append(cell)
++            else:
++                # extension - extend failure message
++                self.filter_reject(cell,
++                                   {'filter_properties': filter_properties},
++                                   "Hypervisor=%s. Required=%s" % (
++                                   str(version),
++                                   str(hypervisor_version_requires)))
+ 
+         return filtered_cells
+ 
+diff --git a/nova/compute/api.py b/nova/compute/api.py
+index 46f2636..52377bc 100644
+--- a/nova/compute/api.py
++++ b/nova/compute/api.py
+@@ -926,6 +926,7 @@ class API(base.Base):
+                 # batch.
+                 req_spec.num_instances = num_instances
+                 req_spec.min_num_instances = min_count
++                req_spec.display_name = base_options['display_name']
+                 req_spec.create()
+ 
+                 # Create an instance object, but do not store in db yet.
+diff --git a/nova/compute/claims.py b/nova/compute/claims.py
+index 5f429e5..26b5113 100644
+--- a/nova/compute/claims.py
++++ b/nova/compute/claims.py
+@@ -22,6 +22,7 @@ from oslo_log import log as logging
+ from nova import exception
+ from nova.i18n import _
+ from nova import objects
++from nova import utils
+ from nova.virt import hardware
+ 
+ 
+@@ -158,6 +159,8 @@ class Claim(NopClaim):
+                    self._test_pci()]
+         reasons = [r for r in reasons if r is not None]
+         if len(reasons) > 0:
++            LOG.error('Claim unsuccessful on node %s: %s', self.nodename,
++                      "; ".join(reasons), instance=self.instance)
+             raise exception.ComputeResourcesUnavailable(reason=
+                     "; ".join(reasons))
+ 
+@@ -210,14 +213,22 @@ class Claim(NopClaim):
+             if pci_requests.requests:
+                 pci_stats = self.tracker.pci_tracker.stats
+ 
++            details = None
+             instance_topology = (
+                     hardware.numa_fit_instance_to_host(
+                         host_topology, requested_topology,
+                         limits=limit,
+                         pci_requests=pci_requests.requests,
+-                        pci_stats=pci_stats))
++                        pci_stats=pci_stats,
++                        details=details))
+ 
+             if requested_topology and not instance_topology:
++                details = utils.details_initialize(details=details)
++                msg = details.get('reason', [])
++                LOG.info('%(class)s: (%(node)s) REJECT: %(desc)s',
++                         {'class': self.__class__.__name__,
++                          'node': self.nodename,
++                          'desc': ', '.join(msg)})
+                 if pci_requests.requests:
+                     return (_("Requested instance NUMA topology together with"
+                               " requested PCI devices cannot fit the given"
+diff --git a/nova/compute/manager.py b/nova/compute/manager.py
+index 8571095..4d6ad1c 100644
+--- a/nova/compute/manager.py
++++ b/nova/compute/manager.py
+@@ -1411,6 +1411,14 @@ class ComputeManager(manager.Manager):
+         LOG.error('Error: %s', exc_info[1], instance_uuid=instance_uuid,
+                   exc_info=exc_info)
+ 
++    # extension - append filter failure message for a given host
++    def add_filter_failure(self, filter_properties, msg):
++        failure_map = filter_properties.get('compute_failures', None)
++        if failure_map is None:
++            failure_map = {}
++            filter_properties['compute_failures'] = failure_map
++        failure_map[str(self.host)] = msg
++
+     def _reschedule(self, context, request_spec, filter_properties,
+             instance, reschedule_method, method_args, task_state,
+             exc_info=None):
+@@ -1689,6 +1697,20 @@ class ComputeManager(manager.Manager):
+                         ' Error: %s', e.message, instance=instance)
+             raise
+ 
++        except exception.VolumeLimitExceeded:
++            msg = 'Failed to create block device for instance due to ' \
++                  'maximum number of volumes exceeded'
++            LOG.warning(msg, instance=instance)
++            # raise exception.VolumeLimitExceeded()
++            raise
++
++        except exception.InvalidVolume as e:
++            LOG.exception('Failed to create block device for instance '
++                          'due to invalid volume configuration. '
++                          'Reason: %s', e,
++                          instance=instance)
++            raise
++
+         except Exception as ex:
+             LOG.exception('Instance failed block device setup',
+                           instance=instance)
+@@ -1743,13 +1765,29 @@ class ComputeManager(manager.Manager):
+ 
+     def _notify_about_instance_usage(self, context, instance, event_suffix,
+                                      network_info=None, system_metadata=None,
+-                                     extra_usage_info=None, fault=None):
++                                     extra_usage_info=None, fault=None,
++                                     filter_properties=None):
+         compute_utils.notify_about_instance_usage(
+             self.notifier, context, instance, event_suffix,
+             network_info=network_info,
+             system_metadata=system_metadata,
+             extra_usage_info=extra_usage_info, fault=fault)
+ 
++        # extension - append filter rejection message
++        if fault and filter_properties:
++            # Get parent calling functions
++            p3_fname = sys._getframe(3).f_code.co_name
++            p2_fname = sys._getframe(2).f_code.co_name
++            p1_fname = sys._getframe(1).f_code.co_name
++            msg = six.text_type(fault)
++            LOG.error(
++                'notify_about_instance_usage: '
++                'caller=%(p3)s / %(p2)s / %(p1)s; '
++                'Fault: %(fault)s',
++                {'p3': p3_fname, 'p2': p2_fname, 'p1': p1_fname,
++                 'fault': msg}, instance=instance)
++            self.add_filter_failure(filter_properties, msg)
++
+     def _deallocate_network(self, context, instance,
+                             requested_networks=None):
+         # If we were told not to allocate networks let's save ourselves
+@@ -2095,14 +2133,16 @@ class ComputeManager(manager.Manager):
+                 exception.UnexpectedDeletingTaskStateError) as e:
+             with excutils.save_and_reraise_exception():
+                 self._notify_about_instance_usage(context, instance,
+-                    'create.error', fault=e)
++                    'create.error', fault=e,
++                    filter_properties=filter_properties)
+                 compute_utils.notify_about_instance_create(
+                     context, instance, self.host,
+                     phase=fields.NotificationPhase.ERROR, exception=e)
+         except exception.ComputeResourcesUnavailable as e:
+             LOG.debug(e.format_message(), instance=instance)
+             self._notify_about_instance_usage(context, instance,
+-                    'create.error', fault=e)
++                    'create.error', fault=e,
++                    filter_properties=filter_properties)
+             compute_utils.notify_about_instance_create(
+                     context, instance, self.host,
+                     phase=fields.NotificationPhase.ERROR, exception=e)
+@@ -2112,7 +2152,8 @@ class ComputeManager(manager.Manager):
+             with excutils.save_and_reraise_exception():
+                 LOG.debug(e.format_message(), instance=instance)
+                 self._notify_about_instance_usage(context, instance,
+-                    'create.error', fault=e)
++                    'create.error', fault=e,
++                    filter_properties=filter_properties)
+                 compute_utils.notify_about_instance_create(
+                     context, instance, self.host,
+                     phase=fields.NotificationPhase.ERROR, exception=e)
+@@ -2121,7 +2162,8 @@ class ComputeManager(manager.Manager):
+             LOG.warning('No more network or fixed IP to be allocated',
+                         instance=instance)
+             self._notify_about_instance_usage(context, instance,
+-                    'create.error', fault=e)
++                    'create.error', fault=e,
++                    filter_properties=filter_properties)
+             compute_utils.notify_about_instance_create(
+                     context, instance, self.host,
+                     phase=fields.NotificationPhase.ERROR, exception=e)
+@@ -2136,7 +2178,8 @@ class ComputeManager(manager.Manager):
+             LOG.exception('Failed to allocate network(s)',
+                           instance=instance)
+             self._notify_about_instance_usage(context, instance,
+-                    'create.error', fault=e)
++                    'create.error', fault=e,
++                    filter_properties=filter_properties)
+             compute_utils.notify_about_instance_create(
+                     context, instance, self.host,
+                     phase=fields.NotificationPhase.ERROR, exception=e)
+@@ -2153,7 +2196,8 @@ class ComputeManager(manager.Manager):
+                 exception.VolumeEncryptionNotSupported,
+                 exception.InvalidInput) as e:
+             self._notify_about_instance_usage(context, instance,
+-                    'create.error', fault=e)
++                    'create.error', fault=e,
++                    filter_properties=filter_properties)
+             compute_utils.notify_about_instance_create(
+                     context, instance, self.host,
+                     phase=fields.NotificationPhase.ERROR, exception=e)
+@@ -2161,7 +2205,8 @@ class ComputeManager(manager.Manager):
+                     reason=e.format_message())
+         except Exception as e:
+             self._notify_about_instance_usage(context, instance,
+-                    'create.error', fault=e)
++                    'create.error', fault=e,
++                    filter_properties=filter_properties)
+             compute_utils.notify_about_instance_create(
+                     context, instance, self.host,
+                     phase=fields.NotificationPhase.ERROR, exception=e)
+@@ -2210,7 +2255,8 @@ class ComputeManager(manager.Manager):
+                     exception.UnexpectedDeletingTaskStateError) as e:
+                 with excutils.save_and_reraise_exception():
+                     self._notify_about_instance_usage(context, instance,
+-                        'create.error', fault=e)
++                        'create.error', fault=e,
++                        filter_properties=filter_properties)
+                     compute_utils.notify_about_instance_create(
+                         context, instance, self.host,
+                         phase=fields.NotificationPhase.ERROR, exception=e)
+@@ -2296,6 +2342,28 @@ class ComputeManager(manager.Manager):
+                 network_info.wait(do_raise=False)
+             raise exception.BuildAbortException(instance_uuid=instance.uuid,
+                     reason=e.format_message())
++        except exception.VolumeLimitExceeded as e:
++            LOG.exception('Failed to create block device for instance '
++                          'due to being over volume resource quota. '
++                          'Reason: %s', e,
++                          instance=instance)
++            # Make sure the async call finishes
++            if network_info is not None:
++                network_info.wait(do_raise=False)
++            msg = _('Over Quota prepping block device.')
++            raise exception.BuildAbortException(instance_uuid=instance.uuid,
++                    reason=msg)
++        except exception.InvalidVolume as e:
++            LOG.exception('Failure prepping block device. Invalid '
++                          'volume configuration. Reason: %s', e,
++                    instance=instance)
++            # Make sure the async call finishes
++            if network_info is not None:
++                network_info.wait(do_raise=False)
++            msg = _('Failure prepping block device. Invalid volume '
++                    'configuration. Check attached volumes for details.')
++            raise exception.BuildAbortException(instance_uuid=instance.uuid,
++                    reason=msg)
+         except Exception:
+             LOG.exception('Failure prepping block device',
+                           instance=instance)
+diff --git a/nova/compute/utils.py b/nova/compute/utils.py
+index 3f439b2..3329b49 100644
+--- a/nova/compute/utils.py
++++ b/nova/compute/utils.py
+@@ -31,6 +31,7 @@ import traceback
+ 
+ import netifaces
+ from oslo_log import log
++from oslo_utils import encodeutils
+ import six
+ 
+ from nova import block_device
+@@ -56,13 +57,16 @@ CONF = nova.conf.CONF
+ LOG = log.getLogger(__name__)
+ 
+ 
++# extension -- pass through 'details'
+ def exception_to_dict(fault, message=None):
+     """Converts exceptions to a dict for use in notifications."""
+     # TODO(johngarbutt) move to nova/exception.py to share with wrap_exception
+ 
+     code = 500
++    details = ''
+     if hasattr(fault, "kwargs"):
+         code = fault.kwargs.get('code', 500)
++        details = fault.kwargs.get('details', '')
+ 
+     # get the message from the exception that was thrown
+     # if that does not exist, use the name of the exception class itself
+@@ -82,14 +86,25 @@ def exception_to_dict(fault, message=None):
+     # MySQL silently truncates overly long messages, but PostgreSQL throws an
+     # error if we don't truncate it.
+     u_message = utils.safe_truncate(message, 255)
++    b_details = encodeutils.safe_encode(details)
++
++    decode_ok = False
++    while not decode_ok:
++        try:
++            u_details = encodeutils.safe_decode(b_details)
++            decode_ok = True
++        except UnicodeDecodeError:
++            b_details = b_details[:-1]
++
+     fault_dict = dict(exception=fault)
+     fault_dict["message"] = u_message
++    fault_dict["details"] = u_details
+     fault_dict["code"] = code
+     return fault_dict
+ 
+ 
+-def _get_fault_details(exc_info, error_code):
+-    details = ''
++# extension -- pass through 'details'
++def _get_fault_details(exc_info, error_code, details=''):
+     if exc_info and error_code == 500:
+         tb = exc_info[2]
+         if tb:
+@@ -97,6 +112,7 @@ def _get_fault_details(exc_info, error_code):
+     return six.text_type(details)
+ 
+ 
++# extension -- pass through 'details'
+ def add_instance_fault_from_exc(context, instance, fault, exc_info=None,
+                                 fault_message=None):
+     """Adds the specified fault to the database."""
+@@ -106,7 +122,8 @@ def add_instance_fault_from_exc(context, instance, fault, exc_info=None,
+     fault_obj.instance_uuid = instance.uuid
+     fault_obj.update(exception_to_dict(fault, message=fault_message))
+     code = fault_obj.code
+-    fault_obj.details = _get_fault_details(exc_info, code)
++    details = str(fault_obj.details)
++    fault_obj.details = _get_fault_details(exc_info, code, details=details)
+     fault_obj.create()
+ 
+ 
+diff --git a/nova/conductor/manager.py b/nova/conductor/manager.py
+index b368652..78895a7 100644
+--- a/nova/conductor/manager.py
++++ b/nova/conductor/manager.py
+@@ -354,7 +354,8 @@ class ComputeTaskManager(base.Base):
+                 msg = _("No valid host found for cold migrate")
+             else:
+                 msg = _("No valid host found for resize")
+-            raise exception.NoValidHost(reason=msg)
++            LOG.error("%s", msg)
++            raise
+         except exception.UnsupportedPolicyException as ex:
+             with excutils.save_and_reraise_exception():
+                 vm_state = instance.vm_state
+diff --git a/nova/conductor/tasks/live_migrate.py b/nova/conductor/tasks/live_migrate.py
+index 56e59c4..8acbf79 100644
+--- a/nova/conductor/tasks/live_migrate.py
++++ b/nova/conductor/tasks/live_migrate.py
+@@ -369,6 +369,7 @@ class LiveMigrationTask(base.TaskBase):
+ 
+         request_spec.ensure_project_id(self.instance)
+         host = limits = None
++        migration_error = {}
+         while host is None:
+             self._check_not_over_max_retries(attempted_hosts)
+             request_spec.ignore_hosts = attempted_hosts
+@@ -385,6 +386,16 @@ class LiveMigrationTask(base.TaskBase):
+                 # ex.exc_type.
+                 raise exception.MigrationSchedulerRPCError(
+                     reason=six.text_type(ex))
++            except exception.NoValidHost as ex:
++                if (migration_error):
++                    # remove duplicated and superfluous info from exception
++                    msg = "%s" % ex.message
++                    msg = msg.replace("No valid host was found.", "")
++                    msg = msg.replace("No filter information", "")
++                    fp = {'reject_map': migration_error}
++                    scheduler_utils.NoValidHost_extend(fp, reason=msg)
++                else:
++                    raise
+             try:
+                 self._check_compatible_with_source_hypervisor(host)
+                 # NOTE(ndipanov): We don't need to pass the node as it's not
+@@ -395,6 +406,7 @@ class LiveMigrationTask(base.TaskBase):
+                 # Change this from 'debug' log to 'info', we need this.
+                 LOG.info("Skipping host: %(host)s because: %(e)s",
+                          {"host": host, "e": e})
++                migration_error[host] = "%s" % e.message
+                 attempted_hosts.append(host)
+                 # The scheduler would have created allocations against the
+                 # selected destination host in Placement, so we need to remove
+diff --git a/nova/exception.py b/nova/exception.py
+index cabc4c8..53f8d43 100644
+--- a/nova/exception.py
++++ b/nova/exception.py
+@@ -172,6 +172,10 @@ class PolicyNotAuthorized(Forbidden):
+     msg_fmt = _("Policy doesn't allow %(action)s to be performed.")
+ 
+ 
++class VolumeLimitExceeded(Forbidden):
++    msg_fmt = _("Maximum number of volumes exceeded: %(reason)s")
++
++
+ class ImageNotActive(NovaException):
+     # NOTE(jruzicka): IncorrectState is used for volumes only in EC2,
+     # but it still seems like the most appropriate option.
+diff --git a/nova/filters.py b/nova/filters.py
+index 4793e22..beeb90e 100644
+--- a/nova/filters.py
++++ b/nova/filters.py
+@@ -12,6 +12,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2013-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ """
+ Filter support
+@@ -21,6 +28,8 @@ from oslo_log import log as logging
+ 
+ from nova.i18n import _LI
+ from nova import loadables
++from nova import objects
++from nova import utils
+ 
+ LOG = logging.getLogger(__name__)
+ 
+@@ -58,6 +67,11 @@ class BaseFilter(object):
+         else:
+             return True
+ 
++    # extension - append filter rejection message
++    def filter_reject(self, host_obj, spec_obj, description, append=False):
++        utils.filter_reject(self.__class__.__name__, host_obj, spec_obj,
++                            description, append=append)
++
+ 
+ class BaseFilterHandler(loadables.BaseLoader):
+     """Base class to handle loading filter classes.
+@@ -67,6 +81,7 @@ class BaseFilterHandler(loadables.BaseLoader):
+ 
+     def get_filtered_objects(self, filters, objs, spec_obj, index=0):
+         list_objs = list(objs)
++        n_hosts = len(list_objs)
+         LOG.debug("Starting with %d host(s)", len(list_objs))
+         # Track the hosts as they are removed. The 'full_filter_results' list
+         # contains the host/nodename info for every host that passes each
+@@ -102,6 +117,48 @@ class BaseFilterHandler(loadables.BaseLoader):
+                 LOG.debug("Filter %(cls_name)s returned "
+                           "%(obj_len)d host(s)",
+                           {'cls_name': cls_name, 'obj_len': len(list_objs)})
++
++        # extension - add info logs to improve system debugging
++
++        if len(list_objs) > 0 and isinstance(spec_obj, objects.RequestSpec):
++            if spec_obj.obj_attr_is_set('instance_uuid'):
++                instance_uuid = spec_obj.instance_uuid
++            else:
++                instance_uuid = None
++            if spec_obj.obj_attr_is_set('flavor'):
++                flavor = spec_obj.flavor
++            else:
++                flavor = None
++            if spec_obj.obj_attr_is_set('scheduler_hints'):
++                scheduler_hints = spec_obj.scheduler_hints
++            else:
++                scheduler_hints = None
++            if spec_obj.obj_attr_is_set('name'):
++                name = spec_obj.name
++            else:
++                name = None
++            if spec_obj.obj_attr_is_set('display_name'):
++                display_name = spec_obj.display_name
++            else:
++                display_name = None
++            if spec_obj.obj_attr_is_set('image') and spec_obj.image:
++                image_props = spec_obj.image.properties.to_dict()
++            else:
++                image_props = None
++
++            LOG.info(_LI(
++                'Filters succeeded with %(num)d out of %(tot)d host(s), '
++                'uuid=%(uuid)s, id=%(id)s, name=%(name)s, '
++                'flavor=%(flavor)s, image_props=%(props)s, hints=%(hint)s'
++            ), {'num': len(list_objs),
++                'tot': n_hosts,
++                'uuid': instance_uuid,
++                'id': name,
++                'name': display_name,
++                'flavor': flavor,
++                'props': image_props,
++                'hint': scheduler_hints})
++
+         if not list_objs:
+             # Log the filtration history
+             # NOTE(sbauza): Since the Cells scheduler still provides a legacy
+diff --git a/nova/objects/image_meta.py b/nova/objects/image_meta.py
+index 15bbd5b..22f6412 100644
+--- a/nova/objects/image_meta.py
++++ b/nova/objects/image_meta.py
+@@ -601,6 +601,13 @@ class ImageMetaProps(base.NovaObject):
+         obj._set_attr_from_current_names(image_props)
+         return obj
+ 
++    def to_dict(self):
++        image_props = {}
++        for field in self.fields:
++            if self.obj_attr_is_set(field):
++                image_props[field] = getattr(self, field)
++        return image_props
++
+     def get(self, name, defvalue=None):
+         """Get the value of an attribute
+         :param name: the attribute to request
+diff --git a/nova/objects/request_spec.py b/nova/objects/request_spec.py
+index 82b8c9e..5bf0eab 100644
+--- a/nova/objects/request_spec.py
++++ b/nova/objects/request_spec.py
+@@ -49,6 +49,9 @@ class RequestSpec(base.NovaObject):
+     # Version 1.7: Added destroy()
+     # Version 1.8: Added security_groups
+     #              add min_num_instances
++    #              add display_name
++    #              add name
++    #              add reject_map
+     VERSION = '1.8'
+ 
+     fields = {
+@@ -86,6 +89,9 @@ class RequestSpec(base.NovaObject):
+         'instance_uuid': fields.UUIDField(),
+         'security_groups': fields.ObjectField('SecurityGroupList'),
+         'min_num_instances': fields.IntegerField(default=1),
++        'display_name': fields.StringField(nullable=True),
++        'name': fields.StringField(nullable=True),
++        'reject_map': fields.DictOfListOfStringsField(nullable=True),
+     }
+ 
+     def obj_make_compatible(self, primitive, target_version):
+@@ -163,6 +169,8 @@ class RequestSpec(base.NovaObject):
+ 
+         instance_fields = ['numa_topology', 'pci_requests', 'uuid',
+                            'project_id', 'availability_zone']
++        # extension
++        instance_fields.extend(['display_name', 'name'])
+         for field in instance_fields:
+             if field == 'uuid':
+                 setattr(self, 'instance_uuid', getter(instance, field))
+@@ -281,6 +289,7 @@ class RequestSpec(base.NovaObject):
+             'requested_destination')
+         spec.min_num_instances = filter_properties.get('min_num_instances',
+                                                        num_instances)
++        spec.reject_map = filter_properties.get('reject_map', {})
+ 
+         # NOTE(sbauza): Default the other fields that are not part of the
+         # original contract
+@@ -317,6 +326,8 @@ class RequestSpec(base.NovaObject):
+         instance = {}
+         instance_fields = ['numa_topology', 'pci_requests',
+                            'project_id', 'availability_zone', 'instance_uuid']
++        # extension
++        instance_fields.extend(['display_name', 'name', 'reject_map'])
+         for field in instance_fields:
+             if not self.obj_attr_is_set(field):
+                 continue
+@@ -398,6 +409,8 @@ class RequestSpec(base.NovaObject):
+         if self.obj_attr_is_set('requested_destination'
+                                 ) and self.requested_destination:
+             filt_props['requested_destination'] = self.requested_destination
++        if self.obj_attr_is_set('reject_map') and self.reject_map:
++            filt_props['reject_map'] = self.reject_map
+         return filt_props
+ 
+     @classmethod
+@@ -449,7 +462,9 @@ class RequestSpec(base.NovaObject):
+             'requested_destination')
+         spec_obj.min_num_instances = filter_properties.get(
+                          'min_num_instances', spec_obj.num_instances)
+-
++        spec_obj.display_name = ''
++        spec_obj.name = ''
++        spec_obj.reject_map = filter_properties.get('reject_map', {})
+         # NOTE(sbauza): Default the other fields that are not part of the
+         # original contract
+         spec_obj.obj_set_defaults()
+diff --git a/nova/scheduler/client/report.py b/nova/scheduler/client/report.py
+index e6509e5..2f4c3d2 100644
+--- a/nova/scheduler/client/report.py
++++ b/nova/scheduler/client/report.py
+@@ -234,6 +234,10 @@ class SchedulerReportClient(object):
+         # A dict, keyed by resource provider UUID, of sets of aggregate UUIDs
+         # the provider is associated with
+         self._provider_aggregate_map = {}
++        self._provider_age = {}
++        self._inventory = {}
++        self._usage = {}
++
+         auth_plugin = keystone.load_auth_from_conf_options(
+             CONF, 'placement')
+         self._client = keystone.load_session_from_conf_options(
+@@ -307,6 +311,150 @@ class SchedulerReportClient(object):
+             endpoint_filter=self.ks_filter, raise_exc=False, **kwargs)
+ 
+     @safe_connect
++    def get_rejection_reasons(self, requested=None):
++        """Returns dictionary of placement rejection reasons.
++
++        This evaluates whether the requested allocation exceeds capacity or
++        size constraints for VCPU, MEMORY, and DISK, against all hosts.
++
++        This mimics the evaluation of objects/resource_provider.py routine:
++        _check_capacity_exceeded(). There are related SQL query functions with
++        the same constraints implemented, eg, _get_all_by_filters_from_db(),
++        _get_providers_with_shared_capacity(), _get_all_with_shared().
++
++        Rejection reasons are scaled units, eg, divide by scaling ratio
++        because that is more intuitive and more consistent with normalized
++        resources.
++
++        :returns: A dictionary with a list of rejection strings per host,
++                  where the request would have failed.
++
++        :param requested: A dict, keyed by resource class name, of requested
++                          amounts of those resources.
++        """
++        reasons = {}
++
++        # Evaluate capacity and constraints with subset of resources
++        VCPU = fields.ResourceClass.VCPU
++        MEMORY_MB = fields.ResourceClass.MEMORY_MB
++        DISK_GB = fields.ResourceClass.DISK_GB
++        resources = [VCPU, MEMORY_MB, DISK_GB]
++
++        # Evaluate short variable name titles, without units
++        titles = {}
++        for rc in resources:
++            titles[rc] = rc.split('_')[0].lower()
++        scale = {VCPU: CONF.cpu_allocation_ratio,
++                 MEMORY_MB: CONF.ram_allocation_ratio,
++                 DISK_GB: CONF.disk_allocation_ratio}
++        # Decimals of precision to print scaled units
++        precision = {}
++        for k, v in scale.items():
++            if v > 1:
++                precision.update({k: 3})
++            else:
++                precision.update({k: 0})
++
++        # Ensure that empty request is zero
++        if requested is None:
++            requested = {}
++            for res in resources:
++                requested[res] = 0
++
++        rp_version = '1.10'
++        rp_url = '/resource_providers'
++
++        r = self.get(rp_url, version=rp_version)
++        if r.status_code == 200:
++            prov = r.json()
++            for rp in prov['resource_providers']:
++                uuid = rp['uuid']
++                gen = self._provider_age.get(uuid, None)
++                self._provider_age[uuid] = rp['generation']
++                if gen == self._provider_age[uuid]:
++                    continue
++                self._inventory[uuid] = \
++                    self._get_inventory(uuid)['inventories']
++                self._usage[uuid] = self._get_usage(uuid)['usages']
++
++        else:
++            LOG.error(
++                _LE("Failed to get placement resource providers. "
++                    "Got %(status_code)d: %(err_text)s."),
++                {'status_code': r.status_code, 'err_text': r.text})
++            return reasons
++
++        # Evaluate capacity constraints per host, per resource.
++        # Populate reasons dictionary of with the result.
++        for uuid in self._provider_age.keys():
++            reasons[uuid] = []
++            for rc in resources:
++                if rc not in requested:
++                    continue
++                title = titles[rc]
++                ratio = self._inventory[uuid][rc]['allocation_ratio']
++                max_unit = self._inventory[uuid][rc]['max_unit']
++                min_unit = self._inventory[uuid][rc]['min_unit']
++                reserved = self._inventory[uuid][rc]['reserved']
++                step_size = self._inventory[uuid][rc]['step_size']
++                total = self._inventory[uuid][rc]['total']
++                used = self._usage[uuid][rc] or 0
++                capacity = (total - reserved) * ratio
++                avail = capacity - used
++                amount_needed = requested[rc]
++
++                # Format scaled values for display purposes
++                requested_sc = "{value:.{precision}f}".\
++                    format(value=float(amount_needed / scale[rc]),
++                           precision=precision[rc])
++                avail_sc = "{value:.{precision}f}".\
++                    format(value=float(avail / scale[rc]),
++                           precision=precision[rc])
++                max_unit_sc = "{value:.{precision}f}".\
++                    format(value=float(max_unit / scale[rc]),
++                           precision=precision[rc])
++                min_unit_sc = "{value:.{precision}f}".\
++                    format(value=float(min_unit / scale[rc]),
++                           precision=precision[rc])
++                step_size_sc = "{value:.{precision}f}".\
++                    format(value=float(step_size / scale[rc]),
++                           precision=precision[rc])
++
++                # check allocation exceeds capacity
++                if capacity < (used + amount_needed):
++                    msg = ("%(req)s %(title)s requested > %(avail)s avail" %
++                           {'title': title,
++                            'req': requested_sc,
++                            'avail': avail_sc})
++                    reasons[uuid].append(msg)
++
++                # check allocation constraints
++                if amount_needed < min_unit:
++                    msg = ("%(req)s %(title)s requested < "
++                           "%(min_unit)s min_unit" %
++                           {'title': title,
++                            'req': requested_sc,
++                            'min_unit': min_unit_sc})
++                    reasons[uuid].append(msg)
++
++                if amount_needed > max_unit:
++                    msg = ("%(req)s %(title)s requested > "
++                           "%(max_unit)s max_unit" %
++                           {'title': title,
++                            'req': requested_sc,
++                            'max_unit': max_unit_sc})
++                    reasons[uuid].append(msg)
++
++                if amount_needed % step_size != 0:
++                    msg = ("%(req)s %(title)s requested not divisible by "
++                           "%(step_size)s step_size" %
++                           {'title': title,
++                            'req': requested_sc,
++                            'step_size': step_size_sc})
++                    reasons[uuid].append(msg)
++        return reasons
++
++    @safe_connect
+     def get_allocation_candidates(self, resources):
+         """Returns a tuple of (allocation_requests, provider_summaries).
+ 
+@@ -520,6 +668,13 @@ class SchedulerReportClient(object):
+             return {'inventories': {}}
+         return result.json()
+ 
++    def _get_usage(self, rp_uuid):
++        url = '/resource_providers/%s/usages' % rp_uuid
++        result = self.get(url)
++        if not result:
++            return {'usages': {}}
++        return result.json()
++
+     def _get_inventory_and_update_provider_generation(self, rp_uuid):
+         """Helper method that retrieves the current inventory for the supplied
+         resource provider according to the placement API. If the cached
+diff --git a/nova/scheduler/filter_scheduler.py b/nova/scheduler/filter_scheduler.py
+index 5bca2f2..639a068 100644
+--- a/nova/scheduler/filter_scheduler.py
++++ b/nova/scheduler/filter_scheduler.py
+@@ -26,6 +26,7 @@ You can customize this scheduler by specifying your own Host Filters and
+ Weighing Functions.
+ """
+ 
++import pprint
+ import random
+ 
+ from oslo_log import log as logging
+@@ -33,12 +34,11 @@ from oslo_utils import strutils
+ from six.moves import range
+ 
+ import nova.conf
+-from nova import exception
+ from nova.i18n import _
+ from nova import rpc
+ from nova.scheduler import client
+ from nova.scheduler import driver
+-from nova.scheduler import utils
++from nova.scheduler import utils as scheduler_utils
+ 
+ # - network provider filter
+ from nova import context as novacontext
+@@ -46,6 +46,7 @@ from nova import exception
+ from nova import network
+ from nova import objects
+ from nova.pci import utils as pci_utils
++from nova import utils
+ 
+ CONF = nova.conf.CONF
+ LOG = logging.getLogger(__name__)
+@@ -128,8 +129,60 @@ class FilterScheduler(driver.Scheduler):
+                       {'hosts': len(selected_hosts),
+                        'num_instances': num_instances})
+ 
++            # Determine normalized resource allocation request required to do
++            # placement query.
++            resources = scheduler_utils.resources_from_request_spec(spec_obj)
++            empty_computenode = objects.ComputeNode(
++                numa_topology=objects.NUMATopology(
++                    cells=[objects.NUMACell(siblings=[])])._to_json())
++            normalized_resources = \
++                scheduler_utils.normalized_resources_for_placement_claim(
++                    resources, empty_computenode,
++                    spec_obj.flavor.vcpus,
++                    spec_obj.flavor.extra_specs,
++                    spec_obj.image.properties,
++                    spec_obj.numa_topology)
++
++            # Determine the rejection reasons for all hosts based on
++            # placement vcpu, memory, and disk criteria. This is done
++            # after-the-fact since the placement query does not return
++            # any reasons.
++            reasons = self.placement_client.get_rejection_reasons(
++                requested=normalized_resources)
++
++            # Populate per-host rejection map based on placement criteria.
++            host_states = self.host_manager.get_all_host_states(context)
++            for host_state in host_states:
++                if host_state.uuid in reasons:
++                    msg = reasons[host_state.uuid]
++                    if msg:
++                        utils.filter_reject('Placement',
++                                                 host_state, spec_obj, msg,
++                                                 append=False)
++
++            # - failure message
++            pp = pprint.PrettyPrinter(indent=1)
++            spec_ = {k.lstrip('_obj_'): v for k, v in
++                     (spec_obj.__dict__).items() if k.startswith('_obj_')}
++            LOG.warning('CANNOT SCHEDULE:  %(num)s available out of '
++                        '%(req)s requested.  spec_obj=\n%(spec)s',
++                        {'num': len(selected_hosts),
++                         'req': num_instances,
++                         'spec': pp.pformat(spec_),
++                         })
+             reason = _('There are not enough hosts available.')
+-            raise exception.NoValidHost(reason=reason)
++            filter_properties = spec_obj.to_legacy_filter_properties_dict()
++            scheduler_utils.NoValidHost_extend(filter_properties,
++                                               reason=reason)
++        else:
++            # - success message
++            LOG.info(
++                'SCHED: PASS. Selected %(hosts)s, uuid=%(uuid)s, '
++                'name=%(name)s, display_name=%(display_name)s, '
++                'scheduled=%(num)s',
++                {'hosts': selected_hosts, 'uuid': spec_obj.instance_uuid,
++                 'name': spec_obj.name, 'display_name': spec_obj.display_name,
++                 'num': len(selected_hosts)})
+ 
+         self.notifier.info(
+             context, 'scheduler.select_destinations.end',
+@@ -364,7 +417,7 @@ class FilterScheduler(driver.Scheduler):
+                            resources for the instance
+         """
+ 
+-        if utils.request_is_rebuild(spec_obj):
++        if scheduler_utils.request_is_rebuild(spec_obj):
+             # NOTE(danms): This is a rebuild-only scheduling request, so we
+             # should not be doing any extra claiming
+             LOG.debug('Not claiming resources in the placement API for '
+diff --git a/nova/scheduler/filters/affinity_filter.py b/nova/scheduler/filters/affinity_filter.py
+index e9f5ed5..67368a5 100644
+--- a/nova/scheduler/filters/affinity_filter.py
++++ b/nova/scheduler/filters/affinity_filter.py
+@@ -13,6 +13,13 @@
+ # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
++#
++# Copyright (c) 2013-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ 
+ import netaddr
+@@ -35,6 +42,10 @@ class DifferentHostFilter(filters.BaseHostFilter):
+         affinity_uuids = spec_obj.get_scheduler_hint('different_host')
+         if affinity_uuids:
+             overlap = utils.instance_uuids_overlap(host_state, affinity_uuids)
++            if overlap:
++                msg = ('found in hosts: %(uuids)s' %
++                       {'uuids': ','.join(map(str, affinity_uuids))})
++                self.filter_reject(host_state, spec_obj, msg)
+             return not overlap
+         # With no different_host key
+         return True
+@@ -53,6 +64,10 @@ class SameHostFilter(filters.BaseHostFilter):
+         affinity_uuids = spec_obj.get_scheduler_hint('same_host')
+         if affinity_uuids:
+             overlap = utils.instance_uuids_overlap(host_state, affinity_uuids)
++            if not overlap:
++                msg = ('not found in hosts: %(uuids)s' %
++                       {'uuids': ','.join(map(str, affinity_uuids))})
++                self.filter_reject(host_state, spec_obj, msg)
+             return overlap
+         # With no same_host key
+         return True
+@@ -73,7 +88,12 @@ class SimpleCIDRAffinityFilter(filters.BaseHostFilter):
+             affinity_net = netaddr.IPNetwork(str.join('', (affinity_host_addr,
+                                                            affinity_cidr)))
+ 
+-            return netaddr.IPAddress(host_ip) in affinity_net
++            retval = netaddr.IPAddress(host_ip) in affinity_net
++            if not retval:
++                msg = ('host ip %(ip)s not in network %(net)s' %
++                       {'ip': host_ip, 'net': affinity_net})
++                self.filter_reject(host_state, spec_obj, msg)
++            return retval
+ 
+         # We don't have an affinity host address.
+         return True
+@@ -104,7 +124,18 @@ class _GroupAntiAffinityFilter(filters.BaseHostFilter):
+                   "in %(configured)s", {'host': host_state.host,
+                                         'configured': group_hosts})
+         if group_hosts:
+-            return host_state.host not in group_hosts
++            retval = host_state.host not in group_hosts
++            if not retval:
++                hints = {}
++                if spec_obj.obj_attr_is_set('scheduler_hints'):
++                    hints = spec_obj.scheduler_hints or {}
++                msg = ('Anti-affinity server group specified, but this host'
++                       ' is already used by that group: '
++                       '%(configured)s, hint=%(hint)s' %
++                       {'configured': ', '.join(map(str, group_hosts)),
++                        'hint': hints})
++                self.filter_reject(host_state, spec_obj, msg)
++            return retval
+ 
+         # No groups configured
+         return True
+@@ -135,7 +166,15 @@ class _GroupAffinityFilter(filters.BaseHostFilter):
+                   "%(configured)s", {'host': host_state.host,
+                                      'configured': group_hosts})
+         if group_hosts:
+-            return host_state.host in group_hosts
++            retval = host_state.host in group_hosts
++            if not retval:
++                filter_properties = spec_obj.to_legacy_filter_properties_dict()
++                hints = filter_properties.get('scheduler_hints', {})
++                msg = ('not found in: %(configured)s, hint=%(hint)s' %
++                       {'configured': ', '.join(map(str, group_hosts)),
++                        'hint': hints})
++                self.filter_reject(host_state, spec_obj, msg)
++            return retval
+ 
+         # No groups configured
+         return True
+diff --git a/nova/scheduler/filters/aggregate_image_properties_isolation.py b/nova/scheduler/filters/aggregate_image_properties_isolation.py
+index 3649d1d..702bd71 100644
+--- a/nova/scheduler/filters/aggregate_image_properties_isolation.py
++++ b/nova/scheduler/filters/aggregate_image_properties_isolation.py
+@@ -12,6 +12,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2013-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ from oslo_log import log as logging
+ 
+@@ -69,5 +76,8 @@ class AggregateImagePropertiesIsolation(filters.BaseHostFilter):
+                           {'host_state': host_state,
+                            'prop': prop,
+                            'options': options})
++                msg = ('image aggregate property: %(prop)s not in: '
++                       '%(options)s' % {'prop': prop, 'options': options})
++                self.filter_reject(host_state, spec_obj, msg)
+                 return False
+         return True
+diff --git a/nova/scheduler/filters/aggregate_instance_extra_specs.py b/nova/scheduler/filters/aggregate_instance_extra_specs.py
+index d2e2d15..70ca5fa 100644
+--- a/nova/scheduler/filters/aggregate_instance_extra_specs.py
++++ b/nova/scheduler/filters/aggregate_instance_extra_specs.py
+@@ -13,6 +13,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2013-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ from oslo_log import log as logging
+ 
+@@ -64,6 +71,10 @@ class AggregateInstanceExtraSpecsFilter(filters.BaseHostFilter):
+                 LOG.debug("%(host_state)s fails instance_type extra_specs "
+                     "requirements. Extra_spec %(key)s is not in aggregate.",
+                     {'host_state': host_state, 'key': key})
++                msg = ("extra_specs '%(key)s' not in aggregate, "
++                       "cannot match '%(req)s'." %
++                       {'key': key, 'req': req})
++                self.filter_reject(host_state, spec_obj, msg)
+                 return False
+             for aggregate_val in aggregate_vals:
+                 if extra_specs_ops.match(aggregate_val, req):
+@@ -74,5 +85,8 @@ class AggregateInstanceExtraSpecsFilter(filters.BaseHostFilter):
+                             "match '%(req)s'",
+                           {'host_state': host_state, 'req': req,
+                            'aggregate_vals': aggregate_vals})
++                msg = ("extra_specs '%(agg)s' do not match '%(req)s'" %
++                       {'req': req, 'agg': aggregate_vals})
++                self.filter_reject(host_state, spec_obj, msg)
+                 return False
+         return True
+diff --git a/nova/scheduler/filters/aggregate_multitenancy_isolation.py b/nova/scheduler/filters/aggregate_multitenancy_isolation.py
+index e74294a..69716ef 100644
+--- a/nova/scheduler/filters/aggregate_multitenancy_isolation.py
++++ b/nova/scheduler/filters/aggregate_multitenancy_isolation.py
+@@ -12,6 +12,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2013-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ from oslo_log import log as logging
+ 
+@@ -48,6 +55,10 @@ class AggregateMultiTenancyIsolation(filters.BaseHostFilter):
+             if configured_tenant_ids:
+                 if tenant_id not in configured_tenant_ids:
+                     LOG.debug("%s fails tenant id on aggregate", host_state)
++                    msg = ('tenant_id %(tid)s not in aggregate: %(agg)s' %
++                           {'tid': tenant_id,
++                            'agg': metadata.get("filter_tenant_id")})
++                    self.filter_reject(host_state, spec_obj, msg)
+                     return False
+                 LOG.debug("Host tenant id %s matched", tenant_id)
+             else:
+diff --git a/nova/scheduler/filters/availability_zone_filter.py b/nova/scheduler/filters/availability_zone_filter.py
+index f48a9f3..6a5abfb 100644
+--- a/nova/scheduler/filters/availability_zone_filter.py
++++ b/nova/scheduler/filters/availability_zone_filter.py
+@@ -12,6 +12,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2016-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ from oslo_log import log as logging
+ 
+@@ -59,5 +66,9 @@ class AvailabilityZoneFilter(filters.BaseHostFilter):
+                       {'host_state': host_state,
+                        'az': availability_zone,
+                        'host_az': host_az})
++            msg = ('avail zone %(az)s not in host AZ: %(host_az)s' %
++                   {'az': availability_zone,
++                    'host_az': host_az})
++            self.filter_reject(host_state, spec_obj, msg)
+ 
+         return hosts_passes
+diff --git a/nova/scheduler/filters/compute_capabilities_filter.py b/nova/scheduler/filters/compute_capabilities_filter.py
+index 72ac579..afea5a4 100644
+--- a/nova/scheduler/filters/compute_capabilities_filter.py
++++ b/nova/scheduler/filters/compute_capabilities_filter.py
+@@ -12,6 +12,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2013-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ from oslo_log import log as logging
+ from oslo_serialization import jsonutils
+@@ -66,7 +73,7 @@ class ComputeCapabilitiesFilter(filters.BaseHostFilter):
+                 return None
+         return cap
+ 
+-    def _satisfies_extra_specs(self, host_state, instance_type):
++    def _satisfies_extra_specs(self, host_state, instance_type, spec_obj):
+         """Check that the host_state provided by the compute service
+         satisfies the extra specs associated with the instance type.
+         """
+@@ -96,6 +103,8 @@ class ComputeCapabilitiesFilter(filters.BaseHostFilter):
+ 
+             cap = self._get_capabilities(host_state, scope)
+             if cap is None:
++                msg = ('capability is missing')
++                self.filter_reject(host_state, spec_obj, msg)
+                 return False
+ 
+             if not extra_specs_ops.match(str(cap), req):
+@@ -103,13 +112,19 @@ class ComputeCapabilitiesFilter(filters.BaseHostFilter):
+                           "'%(req)s' does not match '%(cap)s'",
+                           {'host_state': host_state, 'req': req,
+                            'cap': cap})
++                msg = ("%(host_state)s fails extra_spec requirements. "
++                       "'%(req)s' does not match '%(cap)s'",
++                       {'host_state': host_state, 'req': req,
++                        'cap': cap})
++                self.filter_reject(host_state, spec_obj, msg)
+                 return False
+         return True
+ 
+     def host_passes(self, host_state, spec_obj):
+         """Return a list of hosts that can create instance_type."""
+         instance_type = spec_obj.flavor
+-        if not self._satisfies_extra_specs(host_state, instance_type):
++        if not self._satisfies_extra_specs(host_state, instance_type,
++                                           spec_obj):
+             LOG.debug("%(host_state)s fails instance_type extra_specs "
+                       "requirements", {'host_state': host_state})
+             return False
+diff --git a/nova/scheduler/filters/compute_filter.py b/nova/scheduler/filters/compute_filter.py
+index 259faf4..f0c7f77 100644
+--- a/nova/scheduler/filters/compute_filter.py
++++ b/nova/scheduler/filters/compute_filter.py
+@@ -12,10 +12,16 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2013-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ from oslo_log import log as logging
+ 
+-from nova.i18n import _LW
+ from nova.scheduler import filters
+ from nova import servicegroup
+ 
+@@ -40,10 +46,15 @@ class ComputeFilter(filters.BaseHostFilter):
+             LOG.debug("%(host_state)s is disabled, reason: %(reason)s",
+                       {'host_state': host_state,
+                        'reason': service.get('disabled_reason')})
++            msg = ('host is disabled, reason: %(reason)s' %
++                   {'reason': service.get('disabled_reason')})
++            self.filter_reject(host_state, spec_obj, msg)
+             return False
+         else:
+             if not self.servicegroup_api.service_is_up(service):
+-                LOG.warning(_LW("%(host_state)s has not been heard from in a "
+-                                "while"), {'host_state': host_state})
++                LOG.debug("%(host_state)s has not been heard from in a while",
++                          {'host_state': host_state})
++                msg = 'host has not been heard from in a while'
++                self.filter_reject(host_state, spec_obj, msg)
+                 return False
+         return True
+diff --git a/nova/scheduler/filters/core_filter.py b/nova/scheduler/filters/core_filter.py
+index 30d816f..3a1024f 100644
+--- a/nova/scheduler/filters/core_filter.py
++++ b/nova/scheduler/filters/core_filter.py
+@@ -14,6 +14,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2013-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ from oslo_log import log as logging
+ 
+@@ -61,6 +68,10 @@ class BaseCoreFilter(filters.BaseHostFilter):
+                           {'host_state': host_state,
+                            'instance_vcpus': instance_vcpus,
+                            'cpus': host_state.vcpus_total})
++                msg = ('Insufficient total vcpus: req:%(req)s, '
++                       'avail:%(cpus)s' % {'req': instance_vcpus,
++                       'cpus': host_state.vcpus_total})
++                self.filter_reject(host_state, spec_obj, msg)
+                 return False
+ 
+         free_vcpus = vcpus_total - host_state.vcpus_used
+@@ -71,6 +82,9 @@ class BaseCoreFilter(filters.BaseHostFilter):
+                       {'host_state': host_state,
+                        'instance_vcpus': instance_vcpus,
+                        'free_vcpus': free_vcpus})
++            msg = ('Insufficient vcpus: req:%(req)s, avail:%(avail)s' %
++                   {'req': instance_vcpus, 'avail': free_vcpus})
++            self.filter_reject(host_state, spec_obj, msg)
+             return False
+ 
+         return True
+diff --git a/nova/scheduler/filters/disk_filter.py b/nova/scheduler/filters/disk_filter.py
+index 1c478d6..ec83ae1 100644
+--- a/nova/scheduler/filters/disk_filter.py
++++ b/nova/scheduler/filters/disk_filter.py
+@@ -12,6 +12,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2013-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ from oslo_log import log as logging
+ 
+@@ -68,6 +75,9 @@ class DiskFilter(filters.BaseHostFilter):
+                     "disk.", {'host_state': host_state,
+                                'requested_disk': requested_disk,
+                                'usable_disk_mb': usable_disk_mb})
++            msg = ('Insufficient disk: req:%(req)s, avail:%(avail)s MB' %
++                   {'req': requested_disk, 'avail': usable_disk_mb})
++            self.filter_reject(host_state, spec_obj, msg)
+             return False
+ 
+         disk_gb_limit = disk_mb_limit / 1024
+diff --git a/nova/scheduler/filters/exact_core_filter.py b/nova/scheduler/filters/exact_core_filter.py
+index 6f79f25..3de1c9c 100644
+--- a/nova/scheduler/filters/exact_core_filter.py
++++ b/nova/scheduler/filters/exact_core_filter.py
+@@ -13,6 +13,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2013-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ from oslo_log import log as logging
+ 
+@@ -37,6 +44,8 @@ class ExactCoreFilter(filters.BaseHostFilter):
+         if not host_state.vcpus_total:
+             # Fail safe
+             LOG.warning(_LW("VCPUs not set; assuming CPU collection broken"))
++            msg = "VCPUs not set; assuming CPU collection broken"
++            self.filter_reject(host_state, spec_obj, msg)
+             return False
+ 
+         required_vcpus = spec_obj.vcpus
+@@ -49,6 +58,9 @@ class ExactCoreFilter(filters.BaseHostFilter):
+                       {'host_state': host_state,
+                        'requested_vcpus': required_vcpus,
+                        'usable_vcpus': usable_vcpus})
++            msg = ('vcpus mismatch: req:%(req)s != usable:%(avail)s' %
++                   {'req': required_vcpus, 'avail': usable_vcpus})
++            self.filter_reject(host_state, spec_obj, msg)
+             return False
+ 
+         # NOTE(mgoddard): Setting the limit ensures that it is enforced in
+diff --git a/nova/scheduler/filters/exact_disk_filter.py b/nova/scheduler/filters/exact_disk_filter.py
+index 519dd8c..a496abd 100644
+--- a/nova/scheduler/filters/exact_disk_filter.py
++++ b/nova/scheduler/filters/exact_disk_filter.py
+@@ -12,6 +12,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2013-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ from oslo_log import log as logging
+ 
+@@ -43,6 +50,9 @@ class ExactDiskFilter(filters.BaseHostFilter):
+                       {'host_state': host_state,
+                        'requested_disk': requested_disk,
+                        'usable_disk_mb': host_state.free_disk_mb})
++            msg = ('disk mismatch: req:%(req)s != usable:%(avail)s' %
++                   {'req': requested_disk, 'avail': host_state.free_disk_mb})
++            self.filter_reject(host_state, spec_obj, msg)
+             return False
+ 
+         # NOTE(mgoddard): Setting the limit ensures that it is enforced in
+diff --git a/nova/scheduler/filters/exact_ram_filter.py b/nova/scheduler/filters/exact_ram_filter.py
+index 123a1e1..fe3bd61 100644
+--- a/nova/scheduler/filters/exact_ram_filter.py
++++ b/nova/scheduler/filters/exact_ram_filter.py
+@@ -12,6 +12,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2013-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ from oslo_log import log as logging
+ 
+@@ -40,6 +47,9 @@ class ExactRamFilter(filters.BaseHostFilter):
+                       {'host_state': host_state,
+                        'requested_ram': requested_ram,
+                        'usable_ram': host_state.free_ram_mb})
++            msg = ('Ram mismatch: req:%(req)s != usable:%(avail)s MB' %
++                   {'req': requested_ram, 'avail': host_state.free_ram_mb})
++            self.filter_reject(host_state, spec_obj, msg)
+             return False
+ 
+         # NOTE(mgoddard): Setting the limit ensures that it is enforced in
+diff --git a/nova/scheduler/filters/image_props_filter.py b/nova/scheduler/filters/image_props_filter.py
+index f6977df..d929173 100644
+--- a/nova/scheduler/filters/image_props_filter.py
++++ b/nova/scheduler/filters/image_props_filter.py
+@@ -14,6 +14,14 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2013-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
++
+ from distutils import versionpredicate
+ 
+ from oslo_log import log as logging
+@@ -42,7 +50,7 @@ class ImagePropertiesFilter(filters.BaseHostFilter):
+     run_filter_once_per_request = True
+ 
+     def _instance_supported(self, host_state, image_props,
+-                            hypervisor_version):
++                            hypervisor_version, spec_obj):
+         img_arch = image_props.get('hw_architecture')
+         img_h_type = image_props.get('img_hv_type')
+         img_vm_mode = image_props.get('hw_vm_mode')
+@@ -64,6 +72,8 @@ class ImagePropertiesFilter(filters.BaseHostFilter):
+                         "but no corresponding supported_instances are "
+                         "advertised by the compute node",
+                       {'image_props': image_props})
++            msg = 'No supported instances'
++            self.filter_reject(host_state, spec_obj, msg)
+             return False
+ 
+         def _compare_props(props, other_props):
+@@ -93,6 +103,14 @@ class ImagePropertiesFilter(filters.BaseHostFilter):
+                   {'image_props': image_props,
+                    'supp_instances': supp_instances,
+                    'hypervisor_version': hypervisor_version})
++        msg = ("Instance contains properties %(image_props)s "
++               "that are not provided by the compute node "
++               "supported_instances %(supp_instances)s or "
++               "hypervisor version %(hypervisor_version)s do not match" %
++               {'image_props': image_props,
++                'supp_instances': supp_instances,
++                'hypervisor_version': hypervisor_version})
++        self.filter_reject(host_state, spec_obj, msg)
+         return False
+ 
+     def host_passes(self, host_state, spec_obj):
+@@ -104,7 +122,8 @@ class ImagePropertiesFilter(filters.BaseHostFilter):
+         image_props = spec_obj.image.properties if spec_obj.image else {}
+ 
+         if not self._instance_supported(host_state, image_props,
+-                                        host_state.hypervisor_version):
++                                        host_state.hypervisor_version,
++                                        spec_obj):
+             LOG.debug("%(host_state)s does not support requested "
+                         "instance_properties", {'host_state': host_state})
+             return False
+diff --git a/nova/scheduler/filters/io_ops_filter.py b/nova/scheduler/filters/io_ops_filter.py
+index 0d2190c..e0f8cb5 100644
+--- a/nova/scheduler/filters/io_ops_filter.py
++++ b/nova/scheduler/filters/io_ops_filter.py
+@@ -12,6 +12,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2013-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ from oslo_log import log as logging
+ 
+@@ -46,6 +53,9 @@ class IoOpsFilter(filters.BaseHostFilter):
+                         "is set to %(max_io_ops)s",
+                         {'host_state': host_state,
+                          'max_io_ops': max_io_ops})
++            msg = ('Num IO ops:%(io_ops)s, Max IOs per host:%(max_io_ops)s' %
++                   {'io_ops': num_io_ops, 'max_io_ops': max_io_ops})
++            self.filter_reject(host_state, spec_obj, msg)
+         return passes
+ 
+ 
+diff --git a/nova/scheduler/filters/isolated_hosts_filter.py b/nova/scheduler/filters/isolated_hosts_filter.py
+index 86ab1c4..f3eacfe 100644
+--- a/nova/scheduler/filters/isolated_hosts_filter.py
++++ b/nova/scheduler/filters/isolated_hosts_filter.py
+@@ -12,6 +12,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2013-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ import nova.conf
+ from nova.scheduler import filters
+@@ -56,14 +63,26 @@ class IsolatedHostsFilter(filters.BaseHostFilter):
+             # As there are no images to match, return True if the filter is
+             # not restrictive otherwise return False if the host is in the
+             # isolation list.
+-            return ((not restrict_isolated_hosts_to_isolated_images) or
+-                   (host_state.host not in isolated_hosts))
++            retval = ((not restrict_isolated_hosts_to_isolated_images) or
++                      (host_state.host not in isolated_hosts))
++            if not retval:
++                msg = 'host in isolation'
++                self.filter_reject(host_state, spec_obj, msg)
++            return retval
+ 
+         image_ref = spec_obj.image.id if spec_obj.image else None
+         image_isolated = image_ref in isolated_images
+         host_isolated = host_state.host in isolated_hosts
+ 
+         if restrict_isolated_hosts_to_isolated_images:
+-            return (image_isolated == host_isolated)
++            retval = (image_isolated == host_isolated)
++            if not retval:
++                msg = 'image does not match host in isolation'
++                self.filter_reject(host_state, spec_obj, msg)
++            return retval
+         else:
+-            return (not image_isolated) or host_isolated
++            retval = (not image_isolated) or host_isolated
++            if not retval:
++                msg = 'image isolated or host not isolated'
++                self.filter_reject(host_state, spec_obj, msg)
++            return retval
+diff --git a/nova/scheduler/filters/json_filter.py b/nova/scheduler/filters/json_filter.py
+index 1afabfa..8d435ba 100644
+--- a/nova/scheduler/filters/json_filter.py
++++ b/nova/scheduler/filters/json_filter.py
+@@ -12,6 +12,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2013-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ 
+ import operator
+@@ -147,4 +154,6 @@ class JsonFilter(filters.BaseHostFilter):
+         if result:
+             # Filter it out.
+             return True
++        msg = ('json query: %(query)s' % {'query': query})
++        self.filter_reject(host_state, spec_obj, msg)
+         return False
+diff --git a/nova/scheduler/filters/metrics_filter.py b/nova/scheduler/filters/metrics_filter.py
+index 9b4d630..6bc38e2 100644
+--- a/nova/scheduler/filters/metrics_filter.py
++++ b/nova/scheduler/filters/metrics_filter.py
+@@ -12,6 +12,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2013-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ from oslo_log import log as logging
+ 
+@@ -50,5 +57,8 @@ class MetricsFilter(filters.BaseHostFilter):
+                         "metrics: %(metrics)s",
+                       {'host_state': host_state,
+                        'metrics': ', '.join(unavail)})
++            msg = ('Metrics unavailable: %(metrics)s',
++                   {'metrics': ', '.join(unavail)})
++            self.filter_reject(host_state, spec_obj, msg)
+             return False
+         return True
+diff --git a/nova/scheduler/filters/num_instances_filter.py b/nova/scheduler/filters/num_instances_filter.py
+index 52946fd..e335806 100644
+--- a/nova/scheduler/filters/num_instances_filter.py
++++ b/nova/scheduler/filters/num_instances_filter.py
+@@ -12,6 +12,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2013-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ from oslo_log import log as logging
+ 
+@@ -43,6 +50,9 @@ class NumInstancesFilter(filters.BaseHostFilter):
+                         "instances per host is set to %(max_instances)s",
+                         {'host_state': host_state,
+                          'max_instances': max_instances})
++            msg = ('Num instances:%(num)s, Max per host:%(max)s' %
++                   {'num': num_instances, 'max': max_instances})
++            self.filter_reject(host_state, spec_obj, msg)
+         return passes
+ 
+ 
+diff --git a/nova/scheduler/filters/numa_topology_filter.py b/nova/scheduler/filters/numa_topology_filter.py
+index 10079ce..6688cf7 100644
+--- a/nova/scheduler/filters/numa_topology_filter.py
++++ b/nova/scheduler/filters/numa_topology_filter.py
+@@ -15,6 +15,7 @@ from oslo_log import log as logging
+ from nova import objects
+ from nova.objects import fields
+ from nova.scheduler import filters
++from nova import utils
+ from nova.virt import hardware
+ 
+ LOG = logging.getLogger(__name__)
+@@ -25,7 +26,8 @@ class NUMATopologyFilter(filters.BaseHostFilter):
+ 
+     RUN_ON_REBUILD = True
+ 
+-    def _satisfies_cpu_policy(self, host_state, extra_specs, image_props):
++    def _satisfies_cpu_policy(self, host_state, extra_specs, image_props,
++                              details):
+         """Check that the host_state provided satisfies any available
+         CPU policy requirements.
+         """
+@@ -57,6 +59,11 @@ class NUMATopologyFilter(filters.BaseHostFilter):
+                       "Host does not have hyperthreading or "
+                       "hyperthreading is disabled, but 'require' threads "
+                       "policy was requested.", {'host_state': host_state})
++            msg = ("Requested threads policy: '%s'; from "
++                   "flavor or image is not allowed on "
++                   "non-hyperthreaded host"
++                   % cpu_thread_policy)
++            details = utils.details_append(details, msg)
+             return False
+ 
+         return True
+@@ -69,22 +76,28 @@ class NUMATopologyFilter(filters.BaseHostFilter):
+         # doing this. That's a large, non-backportable cleanup however, so for
+         # now we just duplicate spec_obj to prevent changes propagating to
+         # future filter calls.
+-        spec_obj = spec_obj.obj_clone()
++        # Note that we still need to pass the original spec_obj to
++        # filter_reject so the error message persists.
++        cloned_spec_obj = spec_obj.obj_clone()
+ 
+         ram_ratio = host_state.ram_allocation_ratio
+         cpu_ratio = host_state.cpu_allocation_ratio
+-        extra_specs = spec_obj.flavor.extra_specs
+-        image_props = spec_obj.image.properties
+-        requested_topology = spec_obj.numa_topology
++        extra_specs = cloned_spec_obj.flavor.extra_specs
++        image_props = cloned_spec_obj.image.properties
++        requested_topology = cloned_spec_obj.numa_topology
+         host_topology, _fmt = hardware.host_topology_and_format_from_host(
+                 host_state)
+-        pci_requests = spec_obj.pci_requests
++        pci_requests = cloned_spec_obj.pci_requests
+ 
+         if pci_requests:
+             pci_requests = pci_requests.requests
+ 
++        details = utils.details_initialize(details=None)
++
+         if not self._satisfies_cpu_policy(host_state, extra_specs,
+-                                          image_props):
++                                          image_props, details=details):
++            msg = 'Host not useable. ' + ', '.join(details.get('reason', []))
++            self.filter_reject(host_state, spec_obj, msg)
+             return False
+ 
+         if requested_topology and host_topology:
+@@ -95,13 +108,16 @@ class NUMATopologyFilter(filters.BaseHostFilter):
+                         host_topology, requested_topology,
+                         limits=limits,
+                         pci_requests=pci_requests,
+-                        pci_stats=host_state.pci_stats))
++                        pci_stats=host_state.pci_stats,
++                        details=details))
+             if not instance_topology:
+                 LOG.debug("%(host)s, %(node)s fails NUMA topology "
+                           "requirements. The instance does not fit on this "
+                           "host.", {'host': host_state.host,
+                                     'node': host_state.nodename},
+                           instance_uuid=spec_obj.instance_uuid)
++                msg = details.get('reason', [])
++                self.filter_reject(host_state, spec_obj, msg)
+                 return False
+             host_state.limits['numa_topology'] = limits
+             return True
+@@ -111,6 +127,8 @@ class NUMATopologyFilter(filters.BaseHostFilter):
+                       "one.",
+                       {'host': host_state.host, 'node': host_state.nodename},
+                       instance_uuid=spec_obj.instance_uuid)
++            msg = 'Missing host topology'
++            self.filter_reject(host_state, spec_obj, msg)
+             return False
+         else:
+             return True
+diff --git a/nova/scheduler/filters/pci_passthrough_filter.py b/nova/scheduler/filters/pci_passthrough_filter.py
+index f088995..50f9a15 100644
+--- a/nova/scheduler/filters/pci_passthrough_filter.py
++++ b/nova/scheduler/filters/pci_passthrough_filter.py
+@@ -12,6 +12,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2013-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ from oslo_log import log as logging
+ 
+@@ -52,5 +59,8 @@ class PciPassthroughFilter(filters.BaseHostFilter):
+             LOG.debug("%(host_state)s doesn't have the required PCI devices"
+                       " (%(requests)s)",
+                       {'host_state': host_state, 'requests': pci_requests})
++            msg = ("Required PCI device: '%(req)s' not available"
++                   % {'req': pci_requests})
++            self.filter_reject(host_state, spec_obj, msg)
+             return False
+         return True
+diff --git a/nova/scheduler/filters/ram_filter.py b/nova/scheduler/filters/ram_filter.py
+index 8830b70..5f8db2f 100644
+--- a/nova/scheduler/filters/ram_filter.py
++++ b/nova/scheduler/filters/ram_filter.py
+@@ -13,6 +13,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2013-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ from oslo_log import log as logging
+ 
+@@ -45,6 +52,9 @@ class BaseRamFilter(filters.BaseHostFilter):
+                       {'host_state': host_state,
+                        'requested_ram': requested_ram,
+                        'usable_ram': total_usable_ram_mb})
++            msg = ('Insufficient total RAM: req:%(req)s, avail:%(avail)s MB' %
++                   {'req': requested_ram, 'avail': total_usable_ram_mb})
++            self.filter_reject(host_state, spec_obj, msg)
+             return False
+ 
+         ram_allocation_ratio = self._get_ram_allocation_ratio(host_state,
+@@ -59,6 +69,9 @@ class BaseRamFilter(filters.BaseHostFilter):
+                     {'host_state': host_state,
+                      'requested_ram': requested_ram,
+                      'usable_ram': usable_ram})
++            msg = ('Insufficient usable RAM: req:%(req)s, avail:%(avail)s MB'
++                   % {'req': requested_ram, 'avail': usable_ram})
++            self.filter_reject(host_state, spec_obj, msg)
+             return False
+ 
+         # save oversubscription limit for compute node to test against:
+diff --git a/nova/scheduler/filters/retry_filter.py b/nova/scheduler/filters/retry_filter.py
+index 61ac2af..87ce10d 100644
+--- a/nova/scheduler/filters/retry_filter.py
++++ b/nova/scheduler/filters/retry_filter.py
+@@ -12,6 +12,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2013-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ from oslo_log import log as logging
+ 
+@@ -50,6 +57,8 @@ class RetryFilter(filters.BaseHostFilter):
+         if not passes:
+             LOG.info(_LI("Host %(host)s fails.  Previously tried hosts: "
+                      "%(hosts)s"), {'host': host, 'hosts': hosts})
++            msg = ('Previously tried: %(hosts)s' % {'hosts': hosts})
++            self.filter_reject(host_state, spec_obj, msg, append=True)
+ 
+         # Host passes if it's not in the list of previously attempted hosts:
+         return passes
+diff --git a/nova/scheduler/filters/trusted_filter.py b/nova/scheduler/filters/trusted_filter.py
+index a0ecd3e..f211765 100644
+--- a/nova/scheduler/filters/trusted_filter.py
++++ b/nova/scheduler/filters/trusted_filter.py
+@@ -13,6 +13,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2013-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ """
+ Filter to add support for Trusted Computing Pools (EXPERIMENTAL).
+@@ -249,5 +256,9 @@ class TrustedFilter(filters.BaseHostFilter):
+         trust = extra.get('trust:trusted_host')
+         host = host_state.nodename
+         if trust:
+-            return self.compute_attestation.is_trusted(host, trust)
++            retval = self.compute_attestation.is_trusted(host, trust)
++            if not retval:
++                msg = 'not trusted'
++                self.filter_reject(host_state, spec_obj, msg)
++            return retval
+         return True
+diff --git a/nova/scheduler/filters/type_filter.py b/nova/scheduler/filters/type_filter.py
+index 4248d50..7def667 100644
+--- a/nova/scheduler/filters/type_filter.py
++++ b/nova/scheduler/filters/type_filter.py
+@@ -13,6 +13,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2013-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ from oslo_log import log as logging
+ 
+@@ -53,6 +60,9 @@ class TypeAffinityFilter(filters.BaseHostFilter):
+         instance_type_id = instance_type.id
+         other_types_on_host = utils.other_types_on_host(host_state,
+                                                         instance_type_id)
++        if other_types_on_host:
++            msg = 'found instances of other instance type'
++            self.filter_reject(host_state, spec_obj, msg)
+         return not other_types_on_host
+ 
+ 
+@@ -78,4 +88,8 @@ class AggregateTypeAffinityFilter(filters.BaseHostFilter):
+             if (instance_type.name in
+                     [x.strip() for x in val.split(',')]):
+                 return True
++        if aggregate_vals:
++            msg = ('%(name)s not found in: %(agg)s' %
++                   {'name': instance_type.name, 'agg': aggregate_vals})
++            self.filter_reject(host_state, spec_obj, msg)
+         return not aggregate_vals
+diff --git a/nova/scheduler/filters/vcpu_model_filter.py b/nova/scheduler/filters/vcpu_model_filter.py
+index 07da3a4..9fc3f4a 100644
+--- a/nova/scheduler/filters/vcpu_model_filter.py
++++ b/nova/scheduler/filters/vcpu_model_filter.py
+@@ -60,6 +60,8 @@ class VCpuModelFilter(filters.BaseHostFilter):
+                      "VCPU Passthrough guest migrating from unknown host",
+                      {'host': host_state.host,
+                      'node': host_state.nodename})
++            msg = ("Passthrough cpu model migrating from unknown host")
++            self.filter_reject(host_state, spec_obj, msg)
+             return False
+ 
+         ctxt = context.get_admin_context()
+@@ -72,6 +74,9 @@ class VCpuModelFilter(filters.BaseHostFilter):
+                      {'host': host_state.host,
+                      'node': host_state.nodename,
+                      'h': hints['host'][0], 'n': hints['node'][0]})
++            msg = ("No compute node record found for %(host)s, %(node)s)" %
++                   {'host': hints['host'][0], 'node': hints['node'][0]})
++            self.filter_reject(host_state, spec_obj, msg)
+             return False
+ 
+         source_model = self._get_cpu_model(source_node.cpu_info)
+@@ -89,6 +94,10 @@ class VCpuModelFilter(filters.BaseHostFilter):
+                      'key': key,
+                      'host_model': host_model,
+                      'required': source_model})
++            msg = ("Different VCPU model or cpu features. "
++                   "Host %(host_model)s required %(req)s" %
++                   {'host_model': host_model, 'req': source_model})
++            self.filter_reject(host_state, spec_obj, msg)
+             return False
+ 
+         LOG.info("(%(host)s, %(node)s) "
+@@ -131,7 +140,7 @@ class VCpuModelFilter(filters.BaseHostFilter):
+ 
+         model = flavor_model or image_model
+         if not model:
+-            LOG.info("(%(host)s, %(node)s) PASS: no required vCPU model",
++            LOG.debug("(%(host)s, %(node)s) PASS: no required vCPU model",
+                      {'host': host_state.host,
+                      'node': host_state.nodename})
+             return True
+@@ -142,6 +151,8 @@ class VCpuModelFilter(filters.BaseHostFilter):
+                      "Passthrough VCPU Model only available on 'kvm' hosts",
+                      {'host': host_state.host,
+                      'node': host_state.nodename})
++            msg = "Passthrough VCPU Model only available on 'kvm' hosts"
++            self.filter_reject(host_state, spec_obj, msg)
+             return False
+ 
+         task_state = spec_obj.scheduler_hints.get('task_state')
+@@ -170,4 +181,7 @@ class VCpuModelFilter(filters.BaseHostFilter):
+                      'key': key,
+                      'host_model': host_model,
+                      'required': model})
++            msg = ("Host VCPU model %(host_model)s required %(required)s" %
++                   {'host_model': host_model, 'required': model})
++            self.filter_reject(host_state, spec_obj, msg)
+             return False
+diff --git a/nova/scheduler/host_manager.py b/nova/scheduler/host_manager.py
+index e76256c..4757059 100644
+--- a/nova/scheduler/host_manager.py
++++ b/nova/scheduler/host_manager.py
+@@ -264,10 +264,11 @@ class HostState(object):
+             for m in self.metrics.objects:
+                 if hasattr(m, 'name') and hasattr(m, 'value'):
+                     metrics_.update({m.name: m.value})
+-        LOG.debug('metrics(%s): %s',
+-                  self.hypervisor_hostname,
+-                  ', '.join(['%s=%s' % (k, v) for (k, v) in
+-                             sorted(metrics_.items())]))
++        LOG.info('metrics(%(name)s): %(value)s',
++                 {'name': self.hypervisor_hostname,
++                  'value': ', '.join(['%s=%s' % (k, v) for (k, v) in
++                                      sorted(metrics_.items())]),
++                  })
+ 
+         # update allocation ratios given by the ComputeNode object
+         self.cpu_allocation_ratio = compute.cpu_allocation_ratio
+diff --git a/nova/scheduler/manager.py b/nova/scheduler/manager.py
+index 0db7ddb..cf47290 100644
+--- a/nova/scheduler/manager.py
++++ b/nova/scheduler/manager.py
+@@ -36,6 +36,7 @@ from nova.objects import host_mapping as host_mapping_obj
+ from nova import quota
+ from nova.scheduler import client as scheduler_client
+ from nova.scheduler import utils
++from nova import utils as nova_utils
+ 
+ 
+ LOG = logging.getLogger(__name__)
+diff --git a/nova/scheduler/utils.py b/nova/scheduler/utils.py
+index 80ced8c..d5f29b7 100644
+--- a/nova/scheduler/utils.py
++++ b/nova/scheduler/utils.py
+@@ -52,6 +52,44 @@ GroupDetails = collections.namedtuple('GroupDetails', ['hosts', 'policies',
+                                                        'metadetails'])
+ 
+ 
++# extension - extended rejection error with reasons
++def NoValidHost_extend(filter_properties, reason=None):
++    reject_map = filter_properties.get('reject_map', None)
++
++    if reject_map is None:
++        reject_str = 'No filter information'
++    else:
++        msgs = []
++        for k, v in sorted(reject_map.items()):
++            if isinstance(v, str) or isinstance(v, unicode):
++                msg = ' {}: {}'.format(str(k), str(v))
++                msgs.append(msg)
++            elif isinstance(v, list):
++                msg = ' {}: {}'.format(str(k), ', '.join(str(j) for j in v))
++                msgs.append(msg)
++        reject_str = ', '.join(msgs)
++
++    compute_map = filter_properties.get('compute_failures', None)
++    if compute_map is None:
++        compute_str = ''
++    else:
++        msgs = []
++        for k, v in sorted(compute_map.items()):
++            if isinstance(v, str) or isinstance(v, unicode):
++                msg = ' {}: {}'.format(str(k), str(v))
++                msgs.append(msg)
++            elif isinstance(v, list):
++                msg = ' {}: {}'.format(str(k), ', '.join(str(j) for j in v))
++                msgs.append(msg)
++        compute_str = ', '.join(msgs)
++
++    details = compute_str + reject_str
++    # add the details into reason so that the nested exception's info
++    # is passed back to the user
++    reason = ("" if reason is None else reason) + details
++    raise exception.NoValidHost(reason=reason, code=501, details=details)
++
++
+ def build_request_spec(ctxt, image, instances, instance_type=None):
+     """Build a request_spec for the scheduler.
+ 
+@@ -538,26 +576,29 @@ def _get_group_details(context, instance_uuid, request_spec,
+                     'soft-anti-affinity'))
+ 
+     filter_properties = request_spec.to_legacy_filter_properties_dict()
+-
+     if any((policy in policies) for policy in group.policies):
+         if not _SUPPORTS_AFFINITY and 'affinity' in group.policies:
+             msg = _("ServerGroupAffinityFilter not configured")
+             LOG.error(msg)
+-            raise exception.UnsupportedPolicyException(reason=msg)
++            # extension - extend failure message
++            NoValidHost_extend(filter_properties, reason=msg)
+         if not _SUPPORTS_ANTI_AFFINITY and 'anti-affinity' in group.policies:
+             msg = _("ServerGroupAntiAffinityFilter not configured")
+             LOG.error(msg)
+-            raise exception.UnsupportedPolicyException(reason=msg)
++            # extension - extend failure message
++            NoValidHost_extend(filter_properties, reason=msg)
+         if (not _SUPPORTS_SOFT_AFFINITY
+                 and 'soft-affinity' in group.policies):
+             msg = _("ServerGroupSoftAffinityWeigher not configured")
+             LOG.error(msg)
+-            raise exception.UnsupportedPolicyException(reason=msg)
++            # extension - extend failure message
++            NoValidHost_extend(filter_properties, reason=msg)
+         if (not _SUPPORTS_SOFT_ANTI_AFFINITY
+                 and 'soft-anti-affinity' in group.policies):
+             msg = _("ServerGroupSoftAntiAffinityWeigher not configured")
+             LOG.error(msg)
+-            raise exception.UnsupportedPolicyException(reason=msg)
++            # extension - extend failure message
++            NoValidHost_extend(filter_properties, reason=msg)
+         group_hosts = set(group.get_hosts())
+         user_hosts = set(user_group_hosts) if user_group_hosts else set()
+ 
+diff --git a/nova/tests/unit/compute/test_compute_mgr.py b/nova/tests/unit/compute/test_compute_mgr.py
+index 701dda5..9112476 100644
+--- a/nova/tests/unit/compute/test_compute_mgr.py
++++ b/nova/tests/unit/compute/test_compute_mgr.py
+@@ -4680,7 +4680,8 @@ class ComputeManagerBuildInstanceTestCase(test.NoDBTestCase):
+         mock_notify.assert_has_calls([
+             mock.call(self.context, self.instance, 'create.start',
+                 extra_usage_info={'image_name': self.image.get('name')}),
+-            mock.call(self.context, self.instance, 'create.error', fault=exc)])
++            mock.call(self.context, self.instance, 'create.error', fault=exc,
++                      filter_properties=self.filter_properties)])
+         mock_build.assert_called_once_with(self.context, self.instance,
+             self.requested_networks, self.security_groups)
+         mock_shutdown.assert_called_once_with(self.context, self.instance,
+@@ -5137,7 +5138,7 @@ class ComputeManagerBuildInstanceTestCase(test.NoDBTestCase):
+             mock.call(self.context, self.instance, 'create.start',
+                       extra_usage_info={'image_name': self.image.get('name')}),
+             mock.call(self.context, self.instance, 'create.error',
+-                      fault=exc)])
++                      fault=exc, filter_properties=self.filter_properties)])
+         mock_build.assert_called_once_with(
+             self.context, self.instance, self.requested_networks,
+             self.security_groups)
+@@ -5260,7 +5261,7 @@ class ComputeManagerBuildInstanceTestCase(test.NoDBTestCase):
+                 mock.call(self.context, self.instance, 'create.start',
+                     extra_usage_info={'image_name': self.image.get('name')}),
+                 mock.call(self.context, self.instance, 'create.error',
+-                    fault=exc)])
++                    fault=exc, filter_properties=self.filter_properties)])
+ 
+             mock_notify.assert_has_calls([
+                 mock.call(self.context, self.instance, 'fake-mini',
+@@ -5321,7 +5322,8 @@ class ComputeManagerBuildInstanceTestCase(test.NoDBTestCase):
+         mock_notify.assert_has_calls([
+             mock.call(self.context, self.instance, 'create.start',
+                 extra_usage_info= {'image_name': self.image.get('name')}),
+-            mock.call(self.context, self.instance, 'create.error', fault=exc)])
++            mock.call(self.context, self.instance, 'create.error', fault=exc,
++                      filter_properties=self.filter_properties)])
+         mock_build.assert_called_once_with(self.context, [self.instance],
+                 self.image, self.filter_properties, self.admin_pass,
+                 self.injected_files, self.requested_networks,
+@@ -5352,7 +5354,7 @@ class ComputeManagerBuildInstanceTestCase(test.NoDBTestCase):
+             mock.call(self.context, self.instance, 'create.start',
+                 extra_usage_info={'image_name': self.image.get('name')}),
+             mock.call(self.context, self.instance, 'create.error',
+-                fault=exc)])
++                fault=exc, filter_properties=self.filter_properties)])
+         mock_build.assert_called_once_with(self.context, self.instance,
+             self.requested_networks, self.security_groups,
+             test.MatchType(objects.ImageMeta), self.block_device_mapping)
+@@ -5795,7 +5797,8 @@ class ComputeManagerBuildInstanceTestCase(test.NoDBTestCase):
+                     self.security_groups, self.block_device_mapping, self.node,
+                     self.limits, self.filter_properties)
+             expected_call = mock.call(self.context, self.instance,
+-                    'create.error', fault=exc)
++                    'create.error', fault=exc,
++                    filter_properties=self.filter_properties)
+             create_error_call = mock_notify.call_args_list[
+                     mock_notify.call_count - 1]
+             self.assertEqual(expected_call, create_error_call)
+diff --git a/nova/tests/unit/conductor/test_conductor.py b/nova/tests/unit/conductor/test_conductor.py
+index 8d3baf8..1834022 100644
+--- a/nova/tests/unit/conductor/test_conductor.py
++++ b/nova/tests/unit/conductor/test_conductor.py
+@@ -13,7 +13,7 @@
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
+ #
+-# Copyright (c) 2016-2017 Wind River Systems, Inc.
++# Copyright (c) 2013-2017 Wind River Systems, Inc.
+ #
+ # The right to copy, distribute, modify, or otherwise make use
+ # of this software may be licensed only pursuant to the terms
+@@ -2307,7 +2307,7 @@ class ConductorTaskTestCase(_BaseTaskTestCase, test_compute.BaseTestCase):
+                                     self.conductor._cold_migrate, self.context,
+                                     inst_obj, flavor, {}, [resvs],
+                                     True, fake_spec)
+-            self.assertIn('cold migrate', nvh.message)
++            self.assertIn('No valid host was found', nvh.message)
+ 
+     @mock.patch.object(utils, 'get_image_from_system_metadata')
+     @mock.patch.object(migrate.MigrationTask, 'execute')
+@@ -2503,7 +2503,7 @@ class ConductorTaskTestCase(_BaseTaskTestCase, test_compute.BaseTestCase):
+                                     self.conductor._cold_migrate, self.context,
+                                     inst_obj, flavor_new, {},
+                                     [resvs], True, fake_spec)
+-            self.assertIn('resize', nvh.message)
++            self.assertIn('No valid host was found', nvh.message)
+ 
+     @mock.patch('nova.objects.BuildRequest.get_by_instance_uuid')
+     @mock.patch.object(objects.RequestSpec, 'from_primitives')
+diff --git a/nova/tests/unit/fake_request_spec.py b/nova/tests/unit/fake_request_spec.py
+index c8ea0da..5221e3f 100644
+--- a/nova/tests/unit/fake_request_spec.py
++++ b/nova/tests/unit/fake_request_spec.py
+@@ -95,6 +95,9 @@ def fake_spec_obj(remove_id=False):
+     req_obj.requested_destination = None
+     # add min_num_instances
+     req_obj.min_num_instances = req_obj.num_instances
++    req_obj.display_name = 'fake'
++    req_obj.name = 'instance-00000001'
++    req_obj.reject_map = {}
+     # This should never be a changed field
+     req_obj.obj_reset_changes(['id'])
+     return req_obj
+diff --git a/nova/tests/unit/objects/test_objects.py b/nova/tests/unit/objects/test_objects.py
+index bb43c8a..32b2940 100644
+--- a/nova/tests/unit/objects/test_objects.py
++++ b/nova/tests/unit/objects/test_objects.py
+@@ -1156,7 +1156,7 @@ object_data = {
+     'PowerVMLiveMigrateData': '1.1-ac0fdd26da685f12d7038782cabd393a',
+     'Quotas': '1.3-40fcefe522111dddd3e5e6155702cf4e',
+     'QuotasNoOp': '1.3-347a039fc7cfee7b225b68b5181e0733',
+-    'RequestSpec': '1.8-0eaed565c4ffb365ca9caa16a6086a08',
++    'RequestSpec': '1.8-5929c2b85e8de1a0d7a2641408163acd',
+     'ResourceClass': '1.0-e6b367e2cf1733c5f3526f20a3286fe9',
+     'ResourceClassList': '1.1-15ecf022a68ddbb8c2a6739cfc9f8f5e',
+     'ResourceProvider': '1.4-35e8a41d2ece17a862fac5b07ca966af',
+diff --git a/nova/tests/unit/objects/test_request_spec.py b/nova/tests/unit/objects/test_request_spec.py
+index 79309e4..da70548 100644
+--- a/nova/tests/unit/objects/test_request_spec.py
++++ b/nova/tests/unit/objects/test_request_spec.py
+@@ -11,6 +11,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++#  Copyright (c) 2016-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ import mock
+ from oslo_serialization import jsonutils
+@@ -79,11 +86,16 @@ class _TestRequestSpecObject(object):
+         instance.pci_requests = None
+         instance.project_id = fakes.FAKE_PROJECT_ID
+         instance.availability_zone = 'nova'
++        # extension
++        instance.reject_map = {}
++        instance.id = 1
++        instance.display_name = 'vm-1'
+ 
+         spec = objects.RequestSpec()
+         spec._from_instance(instance)
+         instance_fields = ['numa_topology', 'pci_requests', 'uuid',
+                            'project_id', 'availability_zone']
++        instance_fields.extend(['display_name'])
+         for field in instance_fields:
+             if field == 'uuid':
+                 self.assertEqual(getattr(instance, field),
+@@ -281,7 +293,12 @@ class _TestRequestSpecObject(object):
+                          numa_topology=None,
+                          pci_requests=None,
+                          project_id=1,
+-                         availability_zone='nova')}
++                         availability_zone='nova',
++                         # extension
++                         reject_map={},
++                         id=1,
++                         display_name='vm-1'),
++                     }
+         filt_props = {}
+ 
+         # We seriously don't care about the return values, we just want to make
+diff --git a/nova/tests/unit/scheduler/filters/test_metrics_filters.py b/nova/tests/unit/scheduler/filters/test_metrics_filters.py
+index bea15c0..d0d3a5b 100644
+--- a/nova/tests/unit/scheduler/filters/test_metrics_filters.py
++++ b/nova/tests/unit/scheduler/filters/test_metrics_filters.py
+@@ -9,12 +9,20 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2013-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ import datetime
+ 
+ from nova import objects
+ from nova.scheduler.filters import metrics_filter
+ from nova import test
++from nova.tests.unit import fake_request_spec
+ from nova.tests.unit.scheduler import fakes
+ 
+ 
+@@ -36,7 +44,8 @@ class TestMetricsFilter(test.NoDBTestCase):
+         filt_cls = metrics_filter.MetricsFilter()
+         host = fakes.FakeHostState('host1', 'node1',
+                                    attribute_dict={'metrics': metrics_list})
+-        self.assertTrue(filt_cls.host_passes(host, None))
++        spec_obj = fake_request_spec.fake_spec_obj()
++        self.assertTrue(filt_cls.host_passes(host, spec_obj))
+ 
+     def test_metrics_filter_missing_metrics(self):
+         _ts_now = datetime.datetime(2015, 11, 11, 11, 0, 0)
+@@ -49,4 +58,5 @@ class TestMetricsFilter(test.NoDBTestCase):
+         filt_cls = metrics_filter.MetricsFilter()
+         host = fakes.FakeHostState('host1', 'node1',
+                                    attribute_dict={'metrics': metrics_list})
+-        self.assertFalse(filt_cls.host_passes(host, None))
++        spec_obj = fake_request_spec.fake_spec_obj()
++        self.assertFalse(filt_cls.host_passes(host, spec_obj))
+diff --git a/nova/tests/unit/scheduler/test_caching_scheduler.py b/nova/tests/unit/scheduler/test_caching_scheduler.py
+index b9f597a..f6d580b 100644
+--- a/nova/tests/unit/scheduler/test_caching_scheduler.py
++++ b/nova/tests/unit/scheduler/test_caching_scheduler.py
+@@ -22,6 +22,7 @@
+ 
+ import mock
+ from oslo_utils import timeutils
++import six
+ from six.moves import range
+ 
+ from nova import exception
+@@ -87,10 +88,12 @@ class CachingSchedulerTestCase(test_scheduler.SchedulerTestCase):
+             self.assertTrue(mock_get_hosts.called)
+             self.assertEqual({uuids.cell: [host_state]}, result)
+ 
++    @mock.patch('nova.scheduler.host_manager.HostManager.get_all_host_states')
+     @mock.patch('nova.objects.BuildRequest.get_by_instance_uuid')
+     @mock.patch('nova.objects.Instance.get_by_uuid')
+     def test_select_destination_raises_with_no_hosts(self, mock_get_by_uuid,
+-                                                    mock_get_by_instance_uuid):
++                                                     mock_get_by_instance_uuid,
++                                                     mock_get_all):
+         spec_obj = self._get_fake_request_spec()
+         self.driver.all_host_states = {uuids.cell: []}
+ 
+@@ -99,6 +102,34 @@ class CachingSchedulerTestCase(test_scheduler.SchedulerTestCase):
+                 self.context, spec_obj, [spec_obj.instance_uuid],
+                 {}, {})
+ 
++    @mock.patch('nova.scheduler.host_manager.HostManager.get_all_host_states')
++    @mock.patch('nova.objects.BuildRequest.get_by_instance_uuid')
++    @mock.patch('nova.objects.Instance.get_by_uuid')
++    def test_select_destination_passes_error_msg(self, mock_get_by_uuid,
++                                                 mock_get_by_instance_uuid,
++                                                 mock_get_all):
++        hosts = 2
++        spec_obj = self._get_fake_request_spec()
++        spec_obj.availability_zone = 'not_nova'
++        host_states = []
++        for x in range(hosts):
++            host_state = self._get_fake_host_state(x)
++            host_states.append(host_state)
++        self.driver.all_host_states = {uuids.cell: host_states}
++
++        try:
++            self.driver.select_destinations(
++                    self.context, spec_obj, [spec_obj.instance_uuid], {}, {})
++        except exception.NoValidHost as e:
++            self.assertIn('(AvailabilityZoneFilter) avail zone not_nova '
++                            'not in host AZ: nova', six.text_type(e))
++
++        self.assertIsNotNone(spec_obj.reject_map)
++        self.assertIsInstance(spec_obj.reject_map, dict)
++        self.assertIsNot(spec_obj.reject_map, {})
++        self.assertIn('(AvailabilityZoneFilter) avail zone not_nova '
++                      'not in host AZ: nova', str(spec_obj.reject_map))
++
+     @mock.patch('nova.objects.BuildRequest.get_by_instance_uuid')
+     @mock.patch('nova.objects.Instance.get_by_uuid')
+     @mock.patch('nova.db.instance_extra_get_by_instance_uuid',
+@@ -135,6 +166,7 @@ class CachingSchedulerTestCase(test_scheduler.SchedulerTestCase):
+             ephemeral_gb=1,
+             vcpus=1,
+             swap=0,
++            extra_specs={},
+         )
+         instance_properties = {
+             "os_type": "linux",
+@@ -153,6 +185,9 @@ class CachingSchedulerTestCase(test_scheduler.SchedulerTestCase):
+             pci_requests=None,
+             numa_topology=None,
+             instance_uuid='aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
++            # extension
++            display_name='fake-vm',
++            name='instance-00000001',
+             **instance_properties
+         )
+         return request_spec
+diff --git a/nova/tests/unit/scheduler/test_filter_scheduler.py b/nova/tests/unit/scheduler/test_filter_scheduler.py
+index bcfd900..e1d1aaf 100644
+--- a/nova/tests/unit/scheduler/test_filter_scheduler.py
++++ b/nova/tests/unit/scheduler/test_filter_scheduler.py
+@@ -41,6 +41,10 @@ from nova.tests.unit.scheduler import test_scheduler
+ from nova.tests import uuidsentinel as uuids
+ 
+ 
++from oslo_log import log as logging
++LOG = logging.getLogger(__name__)
++
++
+ def fake_get_filtered_hosts(hosts, filter_properties, index):
+     return list(hosts)
+ 
+@@ -584,7 +588,11 @@ class FilterSchedulerTestCase(test_scheduler.SchedulerTestCase):
+                                   swap=0,
+                                   vcpus=1),
+             project_id=uuids.project_id,
+-            num_instances=1)
++            num_instances=1,
++            instance_uuid=uuids.instance,
++            # extension
++            display_name='fake-vm',
++            name='instance-00000001')
+ 
+         mock_schedule.return_value = [mock.sentinel.hs1]
+ 
+@@ -614,7 +622,11 @@ class FilterSchedulerTestCase(test_scheduler.SchedulerTestCase):
+                                   swap=0,
+                                   vcpus=1),
+             project_id=uuids.project_id,
+-            num_instances=2)
++            num_instances=2,
++            instance_uuid=uuids.instance,
++            # extension
++            display_name='fake-vm',
++            name='instance-00000001')
+ 
+         mock_schedule.return_value = [mock.sentinel.hs1]
+ 
+@@ -628,9 +640,11 @@ class FilterSchedulerTestCase(test_scheduler.SchedulerTestCase):
+ 
+         self.assertEqual([mock.sentinel.hs1], dests)
+ 
++    @mock.patch('nova.scheduler.host_manager.HostManager.get_all_host_states')
+     @mock.patch('nova.scheduler.filter_scheduler.FilterScheduler.'
+                 '_schedule')
+-    def test_select_destinations_fewer_num_instances(self, mock_schedule):
++    def test_select_destinations_fewer_num_instances(self, mock_schedule,
++                                                     mock_get_all):
+         """Tests that the select_destinations() method properly handles
+         resetting host state objects and raising NoValidHost when the
+         _schedule() method returns no host matches.
+@@ -640,7 +654,14 @@ class FilterSchedulerTestCase(test_scheduler.SchedulerTestCase):
+                                   root_gb=512,
+                                   ephemeral_gb=0,
+                                   swap=0,
+-                                  vcpus=1),
++                                  vcpus=1,
++                                  extra_specs={}),
++            image=objects.ImageMeta(properties=objects.ImageMetaProps()),
++            numa_topology=objects.InstanceNUMATopology(
++                cells=[objects.InstanceNUMACell(id=0,
++                                                cpuset=set([1]),
++                                                memory=512),
++                       ]),
+             project_id=uuids.project_id,
+             num_instances=2)
+ 
+@@ -662,11 +683,18 @@ class FilterSchedulerTestCase(test_scheduler.SchedulerTestCase):
+ 
+         with mock.patch.object(self.driver.notifier, 'info') as mock_info:
+             expected = {'num_instances': 1,
+-                        'instance_properties': {'uuid': uuids.instance},
++                        'instance_properties':
++                            {'uuid': uuids.instance,
++                             # extension
++                             'display_name': 'fake-vm',
++                             'name': 'instance-00000001'},
+                         'instance_type': {},
+                         'image': {}}
+             spec_obj = objects.RequestSpec(num_instances=1,
+-                                           instance_uuid=uuids.instance)
++                                           instance_uuid=uuids.instance,
++                                           # extension
++                                           display_name='fake-vm',
++                                           name='instance-00000001')
+ 
+             self.driver.select_destinations(self.context, spec_obj,
+                     [uuids.instance], {}, None)
+@@ -769,7 +797,10 @@ class FilterSchedulerTestCase(test_scheduler.SchedulerTestCase):
+             pci_requests=None,
+             numa_topology=None,
+             instance_group=None,
+-            scheduler_hints=scheduler_hints)
++            scheduler_hints=scheduler_hints,
++            # extension
++            display_name = 'fake-vm',
++            name = 'instance-00000001')
+ 
+         host_state = mock.Mock(spec=host_manager.HostState,
+             host=mock.sentinel.host, uuid=uuids.cn1)
+diff --git a/nova/tests/unit/scheduler/test_scheduler.py b/nova/tests/unit/scheduler/test_scheduler.py
+index d61cf56..6e553e4 100644
+--- a/nova/tests/unit/scheduler/test_scheduler.py
++++ b/nova/tests/unit/scheduler/test_scheduler.py
+@@ -125,11 +125,15 @@ class SchedulerManagerTestCase(test.NoDBTestCase):
+                 mock.sentinel.p_sums)
+             mock_get_ac.assert_called_once_with(mock_rfrs.return_value)
+ 
++    @mock.patch('nova.scheduler.host_manager.HostManager.get_all_host_states')
++    @mock.patch('nova.scheduler.client.report.SchedulerReportClient.'
++                'get_rejection_reasons')
+     @mock.patch('nova.scheduler.utils.resources_from_request_spec')
+     @mock.patch('nova.scheduler.client.report.SchedulerReportClient.'
+                 'get_allocation_candidates')
+     def _test_select_destination(self, get_allocation_candidates_response,
+-                                 mock_get_ac, mock_rfrs):
++                                 mock_get_ac, mock_rfrs,
++                                 mock_get_res, mock_get_all):
+         fake_spec = objects.RequestSpec()
+         fake_spec.instance_uuid = uuids.instance
+         place_res = get_allocation_candidates_response
+diff --git a/nova/tests/unit/scheduler/test_scheduler_utils.py b/nova/tests/unit/scheduler/test_scheduler_utils.py
+index b147dfd..5d7a4b5 100644
+--- a/nova/tests/unit/scheduler/test_scheduler_utils.py
++++ b/nova/tests/unit/scheduler/test_scheduler_utils.py
+@@ -347,7 +347,7 @@ class SchedulerUtilsTestCase(test.NoDBTestCase):
+             scheduler_utils._SUPPORTS_AFFINITY = None
+             scheduler_utils._SUPPORTS_SOFT_AFFINITY = None
+             scheduler_utils._SUPPORTS_SOFT_ANTI_AFFINITY = None
+-            self.assertRaises(exception.UnsupportedPolicyException,
++            self.assertRaises(exception.NoValidHost,
+                               scheduler_utils._get_group_details,
+                               self.context, uuids.instance, spec)
+ 
+diff --git a/nova/tests/unit/volume/test_cinder.py b/nova/tests/unit/volume/test_cinder.py
+index 914d853..506399c 100644
+--- a/nova/tests/unit/volume/test_cinder.py
++++ b/nova/tests/unit/volume/test_cinder.py
+@@ -12,6 +12,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2013-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ from cinderclient import api_versions as cinder_api_versions
+ from cinderclient import exceptions as cinder_exception
+@@ -176,8 +183,8 @@ class CinderApiTestCase(test.NoDBTestCase):
+     def test_create_over_quota_failed(self, mock_cinderclient):
+         mock_cinderclient.return_value.volumes.create.side_effect = (
+             cinder_exception.OverLimit(413))
+-        self.assertRaises(exception.OverQuota, self.api.create, self.ctx,
+-                          1, '', '')
++        self.assertRaises(exception.VolumeLimitExceeded, self.api.create,
++                          self.ctx, 1, '', '')
+         mock_cinderclient.return_value.volumes.create.assert_called_once_with(
+             1, user_id=None, imageRef=None, availability_zone=None,
+             volume_type=None, description='', snapshot_id=None, name='',
+diff --git a/nova/utils.py b/nova/utils.py
+index 792f6d8..a8563ab 100644
+--- a/nova/utils.py
++++ b/nova/utils.py
+@@ -63,6 +63,7 @@ import nova.conf
+ from nova import exception
+ from nova.i18n import _, _LE, _LI, _LW
+ import nova.network
++from nova import objects
+ from nova import safe_utils
+ 
+ profiler = importutils.try_import('osprofiler.profiler')
+@@ -244,6 +245,68 @@ def format_instance_numa_topology(numa_topology=None, instance=None,
+     return '%s' % (delim.join(topology))
+ 
+ 
++# - helper functions to initialize details dictionary
++_DETAILS_INIT = 'Uninitialized'
++
++
++def details_initialize(details=None):
++    if details is None:
++        details = {'reason': [_DETAILS_INIT]}
++    return details
++
++
++# - helper functions to append to details dictionary
++def details_append(details, message):
++    if details is None:
++        details = {'reason': []}
++    if details['reason']:
++        first = details['reason'].pop(0)
++        if first != _DETAILS_INIT:
++            details['reason'].insert(0, first)
++    details['reason'].append(message)
++    return details
++
++
++# - append filter rejection message to RequestSpec object
++def filter_reject(classname, host_obj, spec_obj, description, append=False):
++    if isinstance(spec_obj, objects.RequestSpec):
++        # get the rejection map from the object
++        if spec_obj.obj_attr_is_set('reject_map'):
++            reject_map = spec_obj.reject_map
++        else:
++            spec_obj.reject_map = {}
++            reject_map = spec_obj.reject_map
++    else:
++        # no persistent error messages
++        return
++
++    if hasattr(host_obj, 'nodename'):
++        nodename = str(host_obj.nodename)
++    else:
++        nodename = ''
++
++    if (not append) or (nodename not in reject_map):
++        reject_map[nodename] = []
++
++    if isinstance(description, str) or isinstance(description, unicode):
++        desc = description
++    elif isinstance(description, list):
++        desc = ', '.join(description)
++    else:
++        LOG.error('Invalid filter_reject message = %(msg)r, type = %(typ)s',
++                  {'msg': description, 'typ': type(description)})
++        desc = 'unknown'
++    rmsg = ('(%(class)s) %(desc)s' %
++            {'class': classname,
++             'desc': desc})
++    lmsg = ('%(class)s: (%(node)s) REJECT: %(desc)s' %
++            {'class': classname,
++             'node': nodename,
++             'desc': desc})
++    reject_map[nodename].append(rmsg)
++    LOG.info(lmsg)
++
++
+ def vpn_ping(address, port, timeout=0.05, session_id=None):
+     """Sends a vpn negotiation packet and returns the server session.
+ 
+diff --git a/nova/virt/hardware.py b/nova/virt/hardware.py
+index 21c4ed4..a36352c 100644
+--- a/nova/virt/hardware.py
++++ b/nova/virt/hardware.py
+@@ -678,7 +678,7 @@ def _pack_instance_onto_cores(available_siblings,
+                               host_cell_id,
+                               host_cell_shared_pcpu,
+                               threads_per_core=1,
+-                              num_cpu_reserved=0):
++                              num_cpu_reserved=0, details=None):
+     """Pack an instance onto a set of siblings.
+ 
+     Calculate the pinning for the given instance and its topology,
+@@ -772,7 +772,7 @@ def _pack_instance_onto_cores(available_siblings,
+                                                         threads_per_core))
+ 
+     def _get_pinning(threads_no, sibling_set, instance_cores,
+-                     num_cpu_reserved=0):
++                     num_cpu_reserved=0, details=None):
+         """Determines pCPUs/vCPUs mapping
+ 
+         Determines the pCPUs/vCPUs mapping regarding the number of
+@@ -792,6 +792,14 @@ def _pack_instance_onto_cores(available_siblings,
+         """
+         if threads_no * len(sibling_set) < (
+                 len(instance_cores) + num_cpu_reserved):
++            # add details on failure to pin
++            msg = ("NUMA %(N)d: CPUs requested %(R)d > avail %(A)d with "
++                   "cpu thread policy %(P)s" %
++                   {'N': host_cell_id,
++                    'R': len(instance_cores),
++                    'A': len(sibling_set) * threads_no,
++                    'P': instance_cell.cpu_thread_policy})
++            details = utils.details_append(details, msg)
+             return None, None
+ 
+         # Determines usable cores according the "threads number"
+@@ -817,7 +825,8 @@ def _pack_instance_onto_cores(available_siblings,
+             'usable_cores': usable_cores,
+             'vcpus_pinning': vcpus_pinning,
+         }
+-        LOG.info(msg, msg_args)
++        # demote to debug since this produces noise
++        LOG.debug(msg, msg_args)
+ 
+         cpuset_reserved = None
+         if num_cpu_reserved:
+@@ -842,7 +851,8 @@ def _pack_instance_onto_cores(available_siblings,
+                 'usable_cores': usable_cores,
+                 'cpuset_reserved': cpuset_reserved,
+             }
+-            LOG.info(msg, msg_args)
++            # demote to debug since this produces noise
++            LOG.debug(msg, msg_args)
+ 
+         return vcpus_pinning, cpuset_reserved
+ 
+@@ -869,13 +879,29 @@ def _pack_instance_onto_cores(available_siblings,
+             LOG.debug('Host does not have any fully free thread sibling sets.'
+                       'It is not possible to emulate a non-SMT behavior '
+                       'for the isolate policy without this.')
++            # add details on failure to pin
++            msg = ("NUMA %(N)d: Cannot use %(P)s cpu thread policy as there "
++                   "are no CPUs with all siblings free" %
++                   {'N': host_cell_id,
++                    'P': instance_cell.cpu_thread_policy})
++            details = utils.details_append(details, msg)
+             return
+ 
+         pinning, cpuset_reserved = _get_pinning(
+             1,  # we only want to "use" one thread per core
+             sibling_sets[threads_per_core],
+             instance_cell.cpuset,
+-            num_cpu_reserved=num_cpu_reserved)
++            num_cpu_reserved=num_cpu_reserved, details=details)
++        # add details on failure to pin
++        if not pinning:
++            msg = ("NUMA %(N)d: Cannot use %(P)s cpu thread policy as "
++                   "requested CPUs %(R)d > avail with all siblings "
++                   "free %(A)d" %
++                   {'N': host_cell_id,
++                    'P': instance_cell.cpu_thread_policy,
++                    'R': len(instance_cell),
++                    'A': len(sibling_sets[threads_per_core])})
++            details = utils.details_append(details, msg)
+     else:  # REQUIRE, PREFER (explicit, implicit)
+         # NOTE(ndipanov): We iterate over the sibling sets in descending order
+         # of cores that can be packed. This is an attempt to evenly distribute
+@@ -897,7 +923,7 @@ def _pack_instance_onto_cores(available_siblings,
+             pinning, cpuset_reserved = _get_pinning(
+                 threads_no, sibling_set,
+                 instance_cell.cpuset,
+-                num_cpu_reserved=num_cpu_reserved)
++                num_cpu_reserved=num_cpu_reserved, details=details)
+             if pinning:
+                 break
+ 
+@@ -909,6 +935,13 @@ def _pack_instance_onto_cores(available_siblings,
+                 not pinning):
+             pinning = list(zip(sorted(instance_cell.cpuset),
+                                itertools.chain(*sibling_set)))
++            # add details on failure to pin
++            if not pinning:
++                msg = ("NUMA %(N)d: CPUs requested %(R)d > avail %(A)d" %
++                       {'N': host_cell_id,
++                        'R': len(instance_cell.cpuset),
++                        'A': len(list(itertools.chain(*sibling_set)))})
++                details = utils.details_append(details, msg)
+ 
+         threads_no = _threads(instance_cell, threads_no)
+ 
+@@ -930,7 +963,8 @@ def _pack_instance_onto_cores(available_siblings,
+ 
+ 
+ def _numa_fit_instance_cell_with_pinning(host_cell, instance_cell,
+-                                         num_cpu_reserved=0):
++                                         num_cpu_reserved=0,
++                                         details=None):
+     """Determine if cells can be pinned to a host cell.
+ 
+     :param host_cell: objects.NUMACell instance - the host cell that
+@@ -943,11 +977,15 @@ def _numa_fit_instance_cell_with_pinning(host_cell, instance_cell,
+               or None if instance cannot be pinned to the given host
+     """
+ 
++    details = utils.details_initialize(details=details)
++
+     # exclude cells based on shared_pcpu mismatch
+     if (instance_cell.shared_vcpu is not None and
+         host_cell.shared_pcpu is None):
+-        msg = "Shared not enabled for cell %d" % (instance_cell.id,)
+-        LOG.debug(msg)
++        msg = ("Shared vCPU not enabled on host cell %d, "
++               "required by instance cell %d"
++               % (host_cell.id, instance_cell.id))
++        details = utils.details_append(details, msg)
+         return
+ 
+     # exclude shared_vcpu from cpuset if it exists
+@@ -956,10 +994,10 @@ def _numa_fit_instance_cell_with_pinning(host_cell, instance_cell,
+     # Check for an empty cpuset after removing the shared_vcpu
+     if instance_cell.shared_vcpu is not None and not instance_cell.cpuset:
+         msg = ("(numa:%(id)d shared vcpu with 0 requested "
+-              "dedicated vcpus is not allowed, avail:%(aval)d)" %
+-              {'id': host_cell.id,
+-              'aval': len(host_cell.cpuset)})
+-        LOG.debug(msg)
++               "dedicated vcpus is not allowed, avail:%(avail)d)" %
++               {'id': host_cell.id,
++                'avail': len(host_cell.cpuset)})
++        details = utils.details_append(details, msg)
+         return
+ 
+     if host_cell.avail_cpus < len(instance_cell.cpuset):
+@@ -969,8 +1007,9 @@ def _numa_fit_instance_cell_with_pinning(host_cell, instance_cell,
+                   {'required': len(instance_cell.cpuset),
+                    'actual': host_cell.avail_cpus})
+         msg = "NUMA %d: CPUs avail(%d) < required(%d)" \
+-              % (host_cell.id, host_cell.avail_cpus, len(instance_cell.cpuset))
+-        LOG.debug(msg)
++              % (host_cell.id, host_cell.avail_cpus,
++                 len(instance_cell.cpuset))
++        details = utils.details_append(details, msg)
+         return
+ 
+     required_cpus = len(instance_cell.cpuset) + num_cpu_reserved
+@@ -983,6 +1022,10 @@ def _numa_fit_instance_cell_with_pinning(host_cell, instance_cell,
+                    'vcpus': len(instance_cell.cpuset),
+                    'actual': host_cell.avail_cpus,
+                    'num_cpu_reserved': num_cpu_reserved})
++        msg = "NUMA %d: CPUs avail(%d) < required(%d vcpus + %d reserved)" \
++              % (host_cell.id, host_cell.avail_cpus,
++                 len(instance_cell.cpuset), num_cpu_reserved)
++        details = utils.details_append(details, msg)
+         return
+ 
+     if host_cell.avail_memory < instance_cell.memory:
+@@ -993,7 +1036,7 @@ def _numa_fit_instance_cell_with_pinning(host_cell, instance_cell,
+                    'actual': host_cell.memory})
+         msg = "Memory avail(%d) < requested(%d)" \
+               % (host_cell.avail_memory, instance_cell.memory)
+-        LOG.debug(msg)
++        details = utils.details_append(details, msg)
+         return
+ 
+     if host_cell.siblings:
+@@ -1003,13 +1046,15 @@ def _numa_fit_instance_cell_with_pinning(host_cell, instance_cell,
+             host_cell.free_siblings, instance_cell, host_cell.id,
+             host_cell.shared_pcpu,
+             max(map(len, host_cell.siblings)),
+-            num_cpu_reserved=num_cpu_reserved)
++            num_cpu_reserved=num_cpu_reserved, details=details)
+     else:
+         if (instance_cell.cpu_thread_policy ==
+                 fields.CPUThreadAllocationPolicy.REQUIRE):
+             LOG.info("Host does not support hyperthreading or "
+                      "hyperthreading is disabled, but 'require' "
+                      "threads policy was requested.")
++            msg = "Host does not support 'require' threads policy"
++            details = utils.details_append(details, msg)
+             return
+ 
+         # Straightforward to pin to available cpus when there is no
+@@ -1017,7 +1062,7 @@ def _numa_fit_instance_cell_with_pinning(host_cell, instance_cell,
+         free_cpus = [set([cpu]) for cpu in host_cell.free_cpus]
+         numa_cell = _pack_instance_onto_cores(
+             free_cpus, instance_cell, host_cell.id, host_cell.shared_pcpu,
+-            num_cpu_reserved=num_cpu_reserved)
++            num_cpu_reserved=num_cpu_reserved, details=details)
+ 
+     if not numa_cell:
+         LOG.debug('Failed to map instance cell CPUs to host cell CPUs')
+@@ -1026,7 +1071,7 @@ def _numa_fit_instance_cell_with_pinning(host_cell, instance_cell,
+ 
+ 
+ def _numa_fit_instance_cell(host_cell, instance_cell, limit_cell=None,
+-                            cpuset_reserved=0):
++                            cpuset_reserved=0, details=None):
+     """Ensure an instance cell can fit onto a host cell
+ 
+     Ensure an instance cell can fit onto a host cell and, if so, return
+@@ -1045,12 +1090,16 @@ def _numa_fit_instance_cell(host_cell, instance_cell, limit_cell=None,
+               '%(host_cell)s', {'cell': instance_cell, 'host_cell': host_cell})
+     # NOTE (ndipanov): do not allow an instance to overcommit against
+     # itself on any NUMA cell
++    details = utils.details_initialize(details=details)
+     if instance_cell.memory > host_cell.memory:
+         LOG.debug('Not enough host cell memory to fit instance cell. '
+                   'Required: %(required)d, actual: %(actual)d',
+                   {'required': instance_cell.memory,
+                    'actual': host_cell.memory})
+-        return
++        msg = 'Memory of instance(%d) > host_cell(%d) ' \
++              % (instance_cell.memory, host_cell.memory)
++        details = utils.details_append(details, msg)
++        return None
+ 
+     if len(instance_cell.cpuset) + cpuset_reserved > len(host_cell.cpuset):
+         LOG.debug('Not enough host cell CPUs to fit instance cell. Required: '
+@@ -1059,17 +1108,24 @@ def _numa_fit_instance_cell(host_cell, instance_cell, limit_cell=None,
+                   {'required': len(instance_cell.cpuset),
+                    'actual': len(host_cell.cpuset),
+                    'cpuset_reserved': cpuset_reserved})
+-        return
++        msg = 'Cpu set of instance(%d) > host_cell(%d) ' \
++              % (len(instance_cell.cpuset),
++                 len(host_cell.cpuset))
++        details = utils.details_append(details, msg)
++        return None
+ 
+     # if numa pinning requested confirm correct host numa cell
+     if instance_cell.numa_pinning_requested:
+         if instance_cell.physnode != host_cell.id:
++            msg = "Host NUMA: %d excluded, does not match requested NUMA: %d" \
++                  % (host_cell.id, instance_cell.physnode)
++            details = utils.details_append(details, msg)
+             return None
+ 
+     if instance_cell.cpu_pinning_requested:
+         LOG.debug('Pinning has been requested')
+         new_instance_cell = _numa_fit_instance_cell_with_pinning(
+-            host_cell, instance_cell, cpuset_reserved)
++            host_cell, instance_cell, cpuset_reserved, details=details)
+         if not new_instance_cell:
+             return None
+         new_instance_cell.pagesize = instance_cell.pagesize
+@@ -1082,18 +1138,22 @@ def _numa_fit_instance_cell(host_cell, instance_cell, limit_cell=None,
+         cpu_usage = host_cell.cpu_usage + len(instance_cell.cpuset)
+         cpu_limit = len(host_cell.cpuset) * limit_cell.cpu_allocation_ratio
+         ram_limit = host_cell.memory * limit_cell.ram_allocation_ratio
+-        if memory_usage > ram_limit:
+-            LOG.debug('Host cell has limitations on usable memory. There is '
+-                      'not enough free memory to schedule this instance. '
+-                      'Usage: %(usage)d, limit: %(limit)d',
+-                      {'usage': memory_usage, 'limit': ram_limit})
+-            return
+-        if cpu_usage > cpu_limit:
+-            LOG.debug('Host cell has limitations on usable CPUs. There are '
+-                      'not enough free CPUs to schedule this instance. '
+-                      'Usage: %(usage)d, limit: %(limit)d',
+-                      {'usage': cpu_usage, 'limit': cpu_limit})
+-            return
++        if memory_usage > ram_limit or cpu_usage > cpu_limit:
++            if memory_usage > ram_limit:
++                LOG.debug('Host cell has limitations on usable memory. There '
++                          'is not enough free memory to schedule this '
++                          'instance. Usage: %(usage)d, limit: %(limit)d',
++                          {'usage': memory_usage, 'limit': ram_limit})
++                msg = 'limits: Not enough memory'
++                details = utils.details_append(details, msg)
++            if cpu_usage > cpu_limit:
++                LOG.debug('Host cell has limitations on usable CPUs. There '
++                          'are not enough free CPUs to schedule this '
++                          'instance. Usage: %(usage)d, limit: %(limit)d',
++                          {'usage': cpu_usage, 'limit': cpu_limit})
++                msg = 'limits: Not enough cpus'
++                details = utils.details_append(details, msg)
++            return None
+ 
+     pagesize = None
+     if instance_cell.pagesize:
+@@ -1102,6 +1162,59 @@ def _numa_fit_instance_cell(host_cell, instance_cell, limit_cell=None,
+         if not pagesize:
+             LOG.debug('Host does not support requested memory pagesize. '
+                       'Requested: %d kB', instance_cell.pagesize)
++
++            def page_to_readable_units(pgsize):
++                unit = 'K'
++                size = pgsize
++                if pgsize >= units.Ki and pgsize < units.Mi:
++                    unit = 'M'
++                    size = pgsize / units.Ki
++                elif pgsize >= units.Mi:
++                    unit = 'G'
++                    size = pgsize / units.Mi
++                return {'unit': unit, 'size': size}
++
++            def avail_pagesizes_mem(cell):
++                mem = []
++                for mempage in cell.mempages:
++                    ret = page_to_readable_units(mempage.size_kb)
++                    m = '%(sz)s%(U)s: %(A).0f MiB' % \
++                        {'sz': ret['size'], 'U': ret['unit'],
++                         'A': mempage.size_kb * mempage.free / units.Ki,
++                        }
++                    mem.append(m)
++                return mem
++
++            if instance_cell.pagesize == MEMPAGES_SMALL:
++                pgrequest = 'small'
++                msg = "Not enough memory or not pagesize divisible"
++            elif instance_cell.pagesize == MEMPAGES_LARGE:
++                pgrequest = 'large'
++                msg = "Not enough memory or not pagesize divisible"
++            elif instance_cell.pagesize == MEMPAGES_ANY:
++                pgrequest = 'any'
++                msg = "Not enough memory or not pagesize divisible"
++            else:
++                ret = page_to_readable_units(instance_cell.pagesize)
++                pgrequest = "%(sz)s%(U)s" % {'sz': ret['size'],
++                            'U': ret['unit']}
++                if divmod(instance_cell.memory * units.Ki,
++                          instance_cell.pagesize)[1] > 0:
++                    det = "Not pagesize divisible: numa:%(n)d " \
++                          "page: %(pg)s size: %(A).0f MiB" % \
++                          {'n': host_cell.id, 'pg': pgrequest,
++                           'A': instance_cell.memory}
++                    details = utils.details_append(details, det)
++                    return None
++                msg = "Not enough memory"
++
++            m = avail_pagesizes_mem(host_cell)
++            det = "%(msg)s: numa:%(node)d req: %(pg)s:%(A).0f MiB, " \
++                  "(avail: %(m)s)" % \
++                  {'msg': msg, 'node': host_cell.id,
++                   'pg': pgrequest, 'A': instance_cell.memory,
++                   'm': '; '.join(m)}
++            details = utils.details_append(details, det)
+             return None
+ 
+     instance_cell.id = host_cell.id
+@@ -1651,7 +1764,8 @@ def numa_get_constraints(flavor, image_meta):
+ 
+ def numa_fit_instance_to_host(
+         host_topology, instance_topology, limits=None,
+-        pci_requests=None, pci_stats=None):
++        pci_requests=None, pci_stats=None,
++        details=None):
+     """Fit the instance topology onto the host topology.
+ 
+     Given a host, instance topology, and (optional) limits, attempt to
+@@ -1670,9 +1784,12 @@ def numa_fit_instance_to_host(
+     :returns: objects.InstanceNUMATopology with its cell IDs set to host
+               cell ids of the first successful permutation, or None
+     """
++    details = utils.details_initialize(details=details)
+     if not (host_topology and instance_topology):
+         LOG.debug("Require both a host and instance NUMA topology to "
+                   "fit instance on host.")
++        msg = 'Topology mismatch'
++        details = utils.details_append(details, msg)
+         return
+     elif len(host_topology) < len(instance_topology):
+         LOG.debug("There are not enough NUMA nodes on the system to schedule "
+@@ -1680,6 +1797,12 @@ def numa_fit_instance_to_host(
+                   "%(actual)s",
+                   {'required': len(instance_topology),
+                    'actual': len(host_topology)})
++        msg = ("Not enough free cores to schedule "
++               "the instance. Required: %(required)s, actual: "
++               "%(actual)s" %
++               {'required': len(instance_topology),
++                'actual': len(host_topology)})
++        details = utils.details_append(details, msg)
+         return
+ 
+     emulator_threads_policy = None
+@@ -1713,7 +1836,8 @@ def numa_fit_instance_to_host(
+                     # 0.
+                     cpuset_reserved = 1
+                 got_cell = _numa_fit_instance_cell(
+-                    host_cell, instance_cell, limits, cpuset_reserved)
++                    host_cell, instance_cell, limits, cpuset_reserved,
++                    details=details)
+             except exception.MemoryPageSizeNotSupported:
+                 # This exception will been raised if instance cell's
+                 # custom pagesize is not supported with host cell in
+@@ -1726,11 +1850,18 @@ def numa_fit_instance_to_host(
+         if len(cells) != len(host_cell_perm):
+             continue
+ 
+-        if not pci_requests or ((pci_stats is not None) and
+-                pci_stats.support_requests(pci_requests, cells)):
++        if not pci_requests:
+             return objects.InstanceNUMATopology(
+                 cells=cells,
+                 emulator_threads_policy=emulator_threads_policy)
++        elif pci_stats is not None:
++            if pci_stats.support_requests(pci_requests, cells):
++                return objects.InstanceNUMATopology(
++                    cells=cells,
++                    emulator_threads_policy=emulator_threads_policy)
++            else:
++                details['reason'] = ("- PCI device not found "
++                                     "or already in use")
+ 
+ 
+ def numa_get_reserved_huge_pages():
+diff --git a/nova/volume/cinder.py b/nova/volume/cinder.py
+index 1b6dfc4..2afe15f 100644
+--- a/nova/volume/cinder.py
++++ b/nova/volume/cinder.py
+@@ -266,8 +266,13 @@ def translate_volume_exception(method):
+             res = method(self, ctx, volume_id, *args, **kwargs)
+         except (keystone_exception.NotFound, cinder_exception.NotFound):
+             _reraise(exception.VolumeNotFound(volume_id=volume_id))
++        except keystone_exception.RequestEntityTooLarge as e:
++            _reraise(exception.VolumeLimitExceeded(reason=e.message))
+         except cinder_exception.OverLimit as e:
+-            _reraise(exception.OverQuota(message=e.message))
++            _reraise(exception.VolumeLimitExceeded(reason=e.message))
++        except (cinder_exception.BadRequest,
++                keystone_exception.BadRequest) as e:
++            _reraise(exception.InvalidInput(reason=e))
+         return res
+     return translate_cinder_exception(wrapper)
+ 
+-- 
+2.7.4
+

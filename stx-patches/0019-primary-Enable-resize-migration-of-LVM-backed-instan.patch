@@ -1,0 +1,2046 @@
+From 98f75691dba309ca467b5c503ca56fd0925fec56 Mon Sep 17 00:00:00 2001
+From: Jack Ding <jack.ding@windriver.com>
+Date: Tue, 23 Jan 2018 10:12:31 -0500
+Subject: [PATCH 019/143] primary: Enable resize/migration of LVM backed
+ instances
+
+e5d3345 Enable instance resizing for LVM backed instances
+   Enable instance resizing for LVM backed instances:
+   These changes enable the resize operation surrounding LVM backed
+   instances. If the resize operation is scheduled for the same compute,
+   then the lvresize command is used to resize the disk. If the resize
+   operation is scheduled for another compute (cold migration), then the
+   instance is rebuilt on the new compute with the new size and no local
+   lvm disk resizing will occur.
+
+   Add support for using dd to copy lvm disk images.
+
+   Add LVM support functions needed to support resizing LVM backed
+   instances. This adds rename_volume(), create_duplicate_volume(),
+   resize_volume(), and get_volume_vg().
+
+   Add detection and removal of all LVM disks associated with the
+   instance that end with "_resize". These LVM disks are the original
+   instance disks that are preserved prior to attempting the
+   resize/migration operation performed on the instance. As this
+   operation has been completed, they must be removed.
+
+7c7e36e Fix tox unit test after rebase to stable/mitaka
+   This commit fixes tox unit test failure seen after rebase to latest
+   upstream stable/mitaka and rebase of all R3 commits from mitaka-port
+   branch.  Failed testcase was added upstream since last rebase and is
+   fixed in the same way as other one in commit e5d3345:
+   US55625: Enable instance resizing for LVM backed instancesh
+
+38b78e7 Support for resize/migration of LVM-backed instances.
+   Removes the checks that prevented LVM backed instances from
+   resizing, and fixes related tox testcases.
+   The following commits are ported:
+   commit dabd6bb70ebb0fda201303276d27ee2848f7c256:
+   Adjust LVM migration checks
+   commit c4144a00b88a3b88cfac0fc821cc77fcaf581ece:
+   Fix lvm resize related tox unit tests
+   commit 631993e74307072ae86994af8da5def82951953d:
+   Fix for invalid dest_check_data key
+
+a34d988 Remove unneeded LVM live migration exception path
+   The new code in mitaka already properly handles the LVM case, so
+   we can remove the special-case that we did.  If we don't specify
+   block migration then we must either have shared block storage,
+   shared instance path, or booting from volume with no local disks.
+
+   The above is true for both qcow2 and lvm, so no need to special
+   case the LVM code anymore.
+   Change-Id: I16063cd66e8c2782915b7d9016a35c02f4917534
+
+939f467 Local Storage incorrectly creates
+   /etc/nova/instances/<uuid>/<uuid>_disk
+   Port R2 commit 37c7a0a to Mitaka.  This change adds a check when
+   creating image to only use instance_dir (/etc/nova/instances) if
+   the image backend uses it.  Without this check lvm backed instances
+   will inappropriately create an image in the instance_dir.
+
+4b6bbe4 Cleanup of RBD backed instance info on resize reverts
+   When cold migrations are reverted we must delete the instance
+   directories on the destination host as /etc/nova/instances is local
+   to the compute and not shared between computes.
+
+   Add a an additional check to enable delete_instance_files().
+   Currently there is an underlying assumption that if we have shared
+   storage then we also have shared instance file storage. This is an
+   invalid assumption for TiS as we have shared instance storage with
+   RBD and localized instance file storage (/etc/nova/instances)
+   per compute.
+
+   Port of commit R2 commit be63734 to Mitaka
+   (cherry picked from R3 commit 3520a0d)
+
+3b9ed90 Unexpected <instanceid>_resize file in
+   /etc/nova/instances
+   There is a high probability that a _del/_res file will be left behind
+   if an instance is evacuated during a resize operation.
+
+   _cleanup_left_files() deletes the left behind files from the
+   /etc/nova/instances directory.
+
+   Change-Id: I5831e7c0f61df9a456a19fa6e387494146e73f97
+   (cherry picked from R3 commit 14d7a60)
+
+8c75b4b block live migration not supported for lvm backed
+   instances.
+   Block live migration for LVm backed instances is not supported at
+   this time. The migration will fail, but without actually informing
+   the user or giving a proper error message.
+
+   The solution is to block live migration earlier in the code and give
+   a proper error message.
+
+   Change-Id: I026a4b266ecf50a22d608c65cd9da7d91a336218
+   (cherry picked from R3 commit 6a5f811)
+
+cb179e2 Use thin provisioning for LVM instance backing
+   When using LVM-backed instances it's painful to have to zero out
+   a many-GB rootfs after deleting the image.  (And with the deadline
+   IO scheduler it can have a serious impact on VM IO performance.)
+
+   As a workaround, let's enable support for thinly-provisioned LVM.
+   This will have a (generally small) performance penalty but will
+   dramatically increase the volume deletion speed as well as the
+   volume duplication speed.
+
+   We add a "thin_logical_volumes" option which controls whether thin
+   volumes will be used.  If so, the "thinpool_suffix" option determines
+   the name of the thin pool given the name of the volume group.  At
+   nova-compute startup if the thin pool doesn't exist we create it.  We
+   do like cinder and use 95% of the free space when making the thin
+   pool.
+   When "thin_logical_volumes" is True, we will report the usage of the
+   thin pool rather than the volume group. Like cinder, enabling thin
+   volumes will cause the volume_clear config option to be ignored.
+
+   This is a combination of a number of kilo commits:
+   b7b8030	Use thin provisioning for LVM instance
+                backing
+   f701226	turn thin provisioning off till we fix sysinv
+   1c23163	enable thin provisioning by default
+
+   Change-Id: Ie460e4bc334f744bf3116ed0534ebe06c0dff16e
+
+8367020 Fix LVM resizes to the same host
+   For LVM backed instances, if the resize is to the same host we
+   attempt to preserve the contents of the existing LVM root disk by
+   duplicating the original disk and resize up as necessary.
+   At the point where we attempt to duplicate the volume
+   (via a thin snapshot), we already have disks for the new instance
+   created. This causes an error that the disk already exists.
+
+   This will remove the new volume that was created as part of setting
+   up the instance related to the new flavor so that the volume
+   duplication operation can work as expected.
+
+   This also fixes the snapshot that is created during duplication so
+   that it ignores the activation skip flag on the volume. We need
+   the snapshot activated in order for the resized instance to use it.
+
+976c4a9 Error reporting for non-block live migration
+   Added error message for the case when a Non-block CLI live migration
+   fails because instance is not on shared storage.
+
+ff873e8 Nova cleans up files left in /etc/nova/instances
+   after cold migration
+
+fec3ed3 add nova exceptions to be caught in api _migrate_live
+   and create Some exceptions raised by nova were not caught in
+   ServersController.create()@nova/api/openstack/compute/servers.py
+   and MigrateServerController._migrate_live()@
+   nova/api/openstack/compute/migrate_server.py
+
+   This caused the original exception message to be dropped and a
+   generic "Unexpected exception in API method" error to be returned
+   to the user.
+
+   With this fix, these are the messages now returned through the CLI:
+   $ nova boot --image jiratest --flavor shared
+   --nic net-id=945004ad-a807-437a-a37a-5db2640ebef3 jiratest
+   ERROR (BadRequest): Image property 'hw_cpu_policy' is not permitted
+   to override CPU pinning policy set against the flavor (HTTP 400)
+   (Request-ID: req-ed3e91d0-8193-426b-977b-cfaa723b1068)
+
+   $ nova live-migration 9f854b37-0bd0-4769-820e-aca5918aecc9
+   ERROR (BadRequest): Migration pre-check error no retry: Block live
+   migration is not supported for instances with LVM backed storage.
+   (HTTP 400) (Request-ID: req-2646b26c-faad-4114-b7e4-2c72d3980f04)
+
+57e1105 Check actual amount of free disk space on compute node.
+   Port of R2 commit 4dda75f to Mitaka
+   Currently when using local storage we allocate an "instances_lv"
+   volume from the "nova-local" volume group.  Nova doesn't know
+   anything about it, and doesn't account for it.
+
+   Also, for we made a change to do background zeroing-out of
+   volumes, which means that the space could be consumed for longer than
+   nova knows about.
+
+   For both of these reasons we want to check the actual free/used disk
+   space and correct the values reported to the scheduler.
+
+   Once *both* of the above changes are removed, then this code can
+   be reverted.
+
+   Additional notes for port to mitaka:
+   - convert use compute_node directly in _update_available_resource per
+     upstream change
+   - add free_disk_gb to info log
+
+3ce80d4 Port local storage flavor extra spec to Mitaka
+   This adds the storage extra spec
+   'aggregate_instance_extra_specs:storage'
+   There are three valid types of storage which can be specified in a
+   flavor: remote, local_lvm, and local_image (default).
+
+   Ports R2 commits:
+   ce30958 Enable local storage extra spec on all flavor
+      creations
+   d27ae17 Storage: Optional support for local storage with
+      images
+   cd82e85 Change local storage backend default from lvm to
+      image
+
+b4f9f35 Port fix to is_instance_storage_shared to mitaka
+   The code in _is_instance_storage_shared() is suboptimal. Currently it
+   assumes that shared_storage is true, which means that if the other
+   compute node is also down we'll get the wrong answer.
+
+   In our environment there are two configurations where
+   _is_instance_storage_shared() should return True. The first is the
+   case where instance storage is on Ceph via the Rbd backend. In that
+   case self.driver.check_instance_shared_storage_local() will return
+   None.
+
+   The second case is where we're checking local storage on the current
+   compute node (in which case storage is trivially shared).
+
+   In all other cases _is_instance_storage_shared() should return False.
+
+   The most efficient solution would be to remove the call to
+   self.compute_rpcapi.check_instance_shared_storage() since in our
+   environment it's not actually needed. Instead, just do
+
+   + if host == self.host:
+   +     shared_storage = True
+   + else:
+   +     shared_storage = False
+
+   This ports R2 commits:
+   6af8ad9 Evacuation of VM failed when Management network
+      cable was removed from compute node
+   bcd2828 fix local host implies shared storage
+
+4978e69 etry call to detachDeviceFlags()
+   port of commit fe13b33 to Newton
+   Fix  - "Stack update failed with "Rebuilding server
+   failed, status 'ERROR'" error."
+
+   If while executing
+   nova.virt.libvirt.driver.LibvirtDriver.detach_volume,
+   a domain is shutdown after the flag VIR_DOMAIN_AFFECT_LIVE is
+   calculated, the call to virt_dom.detachDeviceFlags() will return
+   one of the following errors:
+
+   libvirt.VIR_ERR_OPERATION_INVALID or
+   libvirt.VIR_ERR_OPERATION_FAILED.
+
+   In these cases the solution is to re-calculate this flag and retry
+   the call to virt_dom.detachDeviceFlags() via detach_device()
+
+   Note that our changes for fixing  NNNN already fix openstack
+   bug #1642689 ceph: volume detach fails with "libvirtError: operation
+   failed: disk vdb not found".
+   Namely, the fix for that bug makes sure that a
+   VIR_ERR_OPERATION_FAILED
+   is not considered as a real error condition.  The fix
+   already does that for both VIR_ERR_OPERATION_INVALID and
+   VIR_ERR_OPERATION_FAILED
+
+5d336a1 local_gb_used to be updated using the proper root_gb
+   value.
+   When an instance is booted from a Volume, we update its root_gb value
+   to zero, so that the disk size it uses is not reported as if taken
+   locally.
+
+   The problem was that
+   _get_usage_dict()@nova/compute/resource_tracker.py
+   was taking the value of root_gb directly from the flavor instead.
+   This commit fixes  that issue.
+
+8689d90 Pike rebase: bug 258: cold-migration finish with local_lvm
+   This update brings back libvirt driver.py routine
+   _disk_size_from_instance() which was removed in Pike by f780b1d.
+   Our LVM resize code still requires this.
+
+__TYPE_primary
+__TAG_lvm,resize,disk,livemigration,robustness,storage
+__R4_commit_c85027b
+__R3_commit_d8a97c9
+__TC5080,TC5095,TC5110,TC5111,TC5136,TC5155,TC6551,TC6621
+---
+ nova/api/openstack/compute/flavor_manage.py        |  13 +
+ nova/api/openstack/compute/migrate_server.py       |   1 +
+ nova/compute/manager.py                            |  63 ++++-
+ nova/compute/resource_tracker.py                   |  17 +-
+ nova/conductor/manager.py                          |   2 +
+ nova/conf/libvirt.py                               |  11 +
+ nova/exception.py                                  |   4 +
+ .../api/openstack/compute/test_flavor_manage.py    |  13 +
+ nova/tests/unit/compute/test_compute.py            |  11 +-
+ nova/tests/unit/compute/test_resource_tracker.py   |   9 +
+ nova/tests/unit/virt/libvirt/fake_imagebackend.py  |   4 +
+ nova/tests/unit/virt/libvirt/storage/test_lvm.py   |  18 +-
+ nova/tests/unit/virt/libvirt/test_driver.py        | 107 +++++--
+ nova/tests/unit/virt/libvirt/test_guest.py         |  37 ++-
+ nova/tests/unit/virt/test_virt_drivers.py          |  18 +-
+ nova/virt/driver.py                                |   5 +
+ nova/virt/libvirt/driver.py                        | 315 +++++++++++++++++----
+ nova/virt/libvirt/guest.py                         |  45 +--
+ nova/virt/libvirt/imagebackend.py                  |  16 +-
+ nova/virt/libvirt/storage/lvm.py                   | 212 +++++++++++++-
+ 20 files changed, 778 insertions(+), 143 deletions(-)
+
+diff --git a/nova/api/openstack/compute/flavor_manage.py b/nova/api/openstack/compute/flavor_manage.py
+index d03071f..e4635bd 100644
+--- a/nova/api/openstack/compute/flavor_manage.py
++++ b/nova/api/openstack/compute/flavor_manage.py
+@@ -9,6 +9,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2015-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ import webob
+ 
+@@ -99,6 +106,12 @@ class FlavorManageController(wsgi.Controller):
+                                     flavorid=flavorid, swap=swap,
+                                     rxtx_factor=rxtx_factor,
+                                     is_public=is_public)
++
++            # set local storage backend default to local_image
++            flavor.extra_specs = {
++                'aggregate_instance_extra_specs:storage': 'local_image'}
++            flavor.save()
++
+             # NOTE(gmann): For backward compatibility, non public flavor
+             # access is not being added for created tenant. Ref -bug/1209101
+             req.cache_db_flavor(flavor)
+diff --git a/nova/api/openstack/compute/migrate_server.py b/nova/api/openstack/compute/migrate_server.py
+index 2837928..ea4fff7 100644
+--- a/nova/api/openstack/compute/migrate_server.py
++++ b/nova/api/openstack/compute/migrate_server.py
+@@ -109,6 +109,7 @@ class MigrateServerController(wsgi.Controller):
+                 exception.InvalidSharedStorage,
+                 exception.HypervisorUnavailable,
+                 exception.MigrationPreCheckError,
++                exception.MigrationPreCheckErrorNoRetry,
+                 exception.LiveMigrationWithOldNovaNotSupported) as ex:
+             if async:
+                 with excutils.save_and_reraise_exception():
+diff --git a/nova/compute/manager.py b/nova/compute/manager.py
+index a355c4b..68c4b72 100644
+--- a/nova/compute/manager.py
++++ b/nova/compute/manager.py
+@@ -37,6 +37,7 @@ import binascii
+ import contextlib
+ import functools
+ import inspect
++import os
+ import sys
+ import time
+ import traceback
+@@ -721,9 +722,11 @@ class ComputeManager(manager.Manager):
+             data = self.driver.check_instance_shared_storage_local(context,
+                                                        instance)
+             if data:
+-                shared_storage = (self.compute_rpcapi.
+-                                  check_instance_shared_storage(context,
+-                                  instance, data, host=host))
++                # Not using Ceph, so only shared if it's on the same host
++                if host == self.host:
++                    shared_storage = True
++                else:
++                    shared_storage = False
+         except NotImplementedError:
+             LOG.debug('Hypervisor driver does not support '
+                       'instance shared storage check, '
+@@ -3891,16 +3894,6 @@ class ComputeManager(manager.Manager):
+                 self._prep_resize(context, image, instance,
+                                   instance_type, filter_properties,
+                                   node, clean_shutdown)
+-            # NOTE(dgenin): This is thrown in LibvirtDriver when the
+-            #               instance to be migrated is backed by LVM.
+-            #               Remove when LVM migration is implemented.
+-            except exception.MigrationPreCheckError:
+-                # TODO(mriedem): How is it even possible to get here?
+-                # _prep_resize does not call the driver. The resize_instance
+-                # method does, but we RPC cast to the source node to do that
+-                # so we shouldn't even get this exception...
+-                failed = True
+-                raise
+             except Exception:
+                 failed = True
+                 # try to re-schedule the resize elsewhere:
+@@ -7205,6 +7198,50 @@ class ComputeManager(manager.Manager):
+ 
+         self.driver.manage_image_cache(context, filtered_instances)
+ 
++    """There is a high probability that a _del/_res file will be left behind
++    if an instance is evacuated during a resize operation.
++    _cleanup_left_files deletes the left behind files
++    from /etc/nova/instances folder."""
++    @periodic_task.periodic_task(spacing=CONF.instance_delete_interval)
++    def _cleanup_left_files(self, context):
++        inst_path = CONF.instances_path
++        for inst_dir, inst_list, file_list in os.walk(inst_path):
++            for inst_file in inst_list:
++                # find _resize/_del instance files
++                if "_resize" in inst_file or \
++                   "_del" in inst_file:
++                    # Instance uuid has 36 characters.
++                    # When an instance is created, in /etc/nova/instances
++                    # that instance has its own folder named with the
++                    # instance's uuid. Because the instance uuid may have
++                    # only 36 characters it's easy to extract the instance
++                    # uuid from _del/_res folder: first 36 characters represent
++                    # the uuid of the instance.
++                    uuid = inst_file[0:36]
++                    with utils.temporary_mutation(context,
++                                                  read_deleted='yes'):
++                        instance = objects.Instance.get_by_uuid(context, uuid)
++                        # if instance is resizing, _resize file
++                        # should not be deleted
++                        if (instance.task_state in [task_states.MIGRATING,
++                                                task_states.RESIZE_MIGRATING,
++                                                task_states.RESIZE_MIGRATED,
++                                                task_states.RESIZE_FINISH,
++                                                task_states.RESIZE_PREP,
++                                                task_states.RESIZE_REVERTING]
++                                or instance.vm_state in [vm_states.RESIZED]):
++                            continue
++                        # if instance is in deleted/active/error state
++                        # and there are some left behind files,
++                        # these files will be deleted
++                        if instance.vm_state in ['deleted',
++                                             'active', 'error']:
++                            instance_dir = os.path.join(inst_path, inst_file)
++                            utils.execute('rm', '-rf', instance_dir,
++                                          delay_on_retry=True, attempts=5)
++                            self.driver._cleanup_lvm(instance,
++                                         preserve_disk_filter="Non-Resize")
++
+     @periodic_task.periodic_task(spacing=CONF.instance_delete_interval)
+     def _run_pending_deletes(self, context):
+         """Retry any pending instance file deletes."""
+diff --git a/nova/compute/resource_tracker.py b/nova/compute/resource_tracker.py
+index 14a6eb7..e4c3b4d 100644
+--- a/nova/compute/resource_tracker.py
++++ b/nova/compute/resource_tracker.py
+@@ -733,6 +733,19 @@ class ResourceTracker(object):
+         # but it is. This should be changed in ComputeNode
+         cn.metrics = jsonutils.dumps(metrics)
+ 
++        # If the actual free disk space is less than calculated or the
++        # actual used disk space is more than calculated, update it so the
++        # scheduler doesn't think we have more space than we do.
++        local_gb_info = self.driver.get_local_gb_info()
++        local_gb_used = local_gb_info.get('used')
++        if (local_gb_used is not None and
++                    local_gb_used > cn.local_gb_used):
++            cn.local_gb_used = local_gb_used
++        local_gb_free = local_gb_info.get('free')
++        if (local_gb_free is not None and
++                    local_gb_free < cn.free_disk_gb):
++            cn.free_disk_gb = local_gb_free
++
+         # update the compute_node
+         self._update(context, cn)
+         LOG.debug('Compute_service record updated for %(host)s:%(node)s',
+@@ -812,6 +825,7 @@ class ResourceTracker(object):
+                  "used_ram=%(used_ram)sMB "
+                  "phys_disk=%(phys_disk)sGB "
+                  "used_disk=%(used_disk)sGB "
++                 "free_disk=%(free_disk)sGB "
+                  "total_vcpus=%(total_vcpus)s "
+                  "used_vcpus=%(used_vcpus)s "
+                  "pci_stats=%(pci_stats)s",
+@@ -820,6 +834,7 @@ class ResourceTracker(object):
+                   'used_ram': cn.memory_mb_used,
+                   'phys_disk': cn.local_gb,
+                   'used_disk': cn.local_gb_used,
++                  'free_disk': cn.free_disk_gb,
+                   'total_vcpus': tcpu,
+                   'used_vcpus': ucpu,
+                   'pci_stats': pci_stats})
+@@ -1412,7 +1427,7 @@ class ResourceTracker(object):
+         if isinstance(object_or_dict, objects.Instance):
+             usage = {'memory_mb': object_or_dict.flavor.memory_mb,
+                      'vcpus': object_or_dict.flavor.vcpus,
+-                     'root_gb': object_or_dict.flavor.root_gb,
++                     'root_gb': object_or_dict.root_gb,
+                      'ephemeral_gb': object_or_dict.flavor.ephemeral_gb,
+                      'numa_topology': object_or_dict.numa_topology}
+         elif isinstance(object_or_dict, objects.Flavor):
+diff --git a/nova/conductor/manager.py b/nova/conductor/manager.py
+index e29b7e9..4476301 100644
+--- a/nova/conductor/manager.py
++++ b/nova/conductor/manager.py
+@@ -257,6 +257,7 @@ class ComputeTaskManager(base.Base):
+         exception.InstanceInvalidState,
+         exception.MigrationPreCheckError,
+         exception.MigrationPreCheckClientException,
++        exception.MigrationPreCheckErrorNoRetry,
+         exception.LiveMigrationWithOldNovaNotSupported,
+         exception.UnsupportedPolicyException)
+     @targets_cell
+@@ -457,6 +458,7 @@ class ComputeTaskManager(base.Base):
+                 exception.InstanceInvalidState,
+                 exception.MigrationPreCheckError,
+                 exception.MigrationPreCheckClientException,
++                exception.MigrationPreCheckErrorNoRetry,
+                 exception.LiveMigrationWithOldNovaNotSupported,
+                 exception.MigrationSchedulerRPCError) as ex:
+             with excutils.save_and_reraise_exception():
+diff --git a/nova/conf/libvirt.py b/nova/conf/libvirt.py
+index 803d677..5e40998 100644
+--- a/nova/conf/libvirt.py
++++ b/nova/conf/libvirt.py
+@@ -755,6 +755,17 @@ Related options:
+ * volume_clear - must be set and the value must be different than ``none``
+   for this option to have any impact
+ """),
++    cfg.BoolOpt('thin_logical_volumes',
++                default=True,
++                help="""
++Create thin logical volumes if this flag is set to True.  This will also skip
++zeroing/shredding the volume regardless of the volume_clear setting.
++"""),
++    cfg.StrOpt('thinpool_suffix',
++               default='-pool',
++               help="""
++The suffix to generate the thinpool name from the VG.
++"""),
+ ]
+ 
+ libvirt_utils_opts = [
+diff --git a/nova/exception.py b/nova/exception.py
+index 6b19da9..6a460c7 100644
+--- a/nova/exception.py
++++ b/nova/exception.py
+@@ -1309,6 +1309,10 @@ class MigrationPreCheckClientException(MigrationError):
+     msg_fmt = _("Client exception during Migration Pre check: %(reason)s")
+ 
+ 
++class MigrationPreCheckErrorNoRetry(MigrationError):
++    msg_fmt = _("Migration pre-check error no retry: %(reason)s")
++
++
+ class MigrationSchedulerRPCError(MigrationError):
+     msg_fmt = _("Migration select destinations error: %(reason)s")
+ 
+diff --git a/nova/tests/unit/api/openstack/compute/test_flavor_manage.py b/nova/tests/unit/api/openstack/compute/test_flavor_manage.py
+index c4aae37..b3831ac 100644
+--- a/nova/tests/unit/api/openstack/compute/test_flavor_manage.py
++++ b/nova/tests/unit/api/openstack/compute/test_flavor_manage.py
+@@ -12,6 +12,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2015-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ import mock
+ from oslo_serialization import jsonutils
+@@ -41,6 +48,10 @@ def fake_create(newflavor):
+     newflavor["disabled"] = False
+ 
+ 
++def fake_save(context):
++    pass
++
++
+ class FlavorManageTestV21(test.NoDBTestCase):
+     controller = flavormanage_v21.FlavorManageController()
+     validation_error = exception.ValidationError
+@@ -49,6 +60,8 @@ class FlavorManageTestV21(test.NoDBTestCase):
+     def setUp(self):
+         super(FlavorManageTestV21, self).setUp()
+         self.stub_out("nova.objects.Flavor.create", fake_create)
++        # stub out flavor save
++        self.stub_out("nova.objects.Flavor.save", fake_save)
+ 
+         self.request_body = {
+             "flavor": {
+diff --git a/nova/tests/unit/compute/test_compute.py b/nova/tests/unit/compute/test_compute.py
+index 1f6604b..49bb269 100644
+--- a/nova/tests/unit/compute/test_compute.py
++++ b/nova/tests/unit/compute/test_compute.py
+@@ -296,7 +296,7 @@ class BaseTestCase(test.TestCase):
+         inst.ami_launch_index = 0
+         inst.memory_mb = 0
+         inst.vcpus = 0
+-        inst.root_gb = 0
++        inst.root_gb = flavor.get('root_gb', 0)
+         inst.ephemeral_gb = 0
+         inst.architecture = obj_fields.Architecture.X86_64
+         inst.os_type = 'Linux'
+@@ -313,6 +313,7 @@ class BaseTestCase(test.TestCase):
+         inst.new_flavor = None
+         if params:
+             inst.flavor.update(params.pop('flavor', {}))
++            inst.root_gb = inst.flavor.get('root_gb', 0)
+             inst.update(params)
+         if services:
+             _create_service_entries(self.context.elevated(),
+@@ -7286,15 +7287,13 @@ class ComputeTestCase(BaseTestCase,
+                        '_get_instance_block_device_info')
+     @mock.patch.object(fake.FakeDriver,
+                        'check_instance_shared_storage_local')
+-    @mock.patch.object(compute_rpcapi.ComputeAPI,
+-                       'check_instance_shared_storage')
+     @mock.patch.object(fake.FakeDriver,
+                        'check_instance_shared_storage_cleanup')
+     @mock.patch.object(fake.FakeDriver, 'destroy')
+     @mock.patch('nova.objects.MigrationList.get_by_filters')
+     @mock.patch('nova.objects.Migration.save')
+     def test_destroy_evacuated_instance_with_disks(self, mock_save,
+-            mock_get_filter, mock_destroy, mock_check_clean, mock_check,
++            mock_get_filter, mock_destroy, mock_check_clean,
+             mock_check_local, mock_get_blk, mock_get_drv):
+         fake_context = context.get_admin_context()
+ 
+@@ -7320,7 +7319,6 @@ class ComputeTestCase(BaseTestCase,
+         mock_get_drv.return_value = instances
+         mock_get_blk.return_value = 'fake-bdi'
+         mock_check_local.return_value = {'filename': 'tmpfilename'}
+-        mock_check.return_value = False
+ 
+         with mock.patch.object(
+                 self.compute.network_api, 'get_instance_nw_info',
+@@ -7332,9 +7330,6 @@ class ComputeTestCase(BaseTestCase,
+         mock_get_blk.assert_called_once_with(fake_context, evacuated_instance)
+         mock_check_local.assert_called_once_with(fake_context,
+                                                  evacuated_instance)
+-        mock_check.assert_called_once_with(fake_context, evacuated_instance,
+-                                           {'filename': 'tmpfilename'},
+-                                           host=None)
+         mock_check_clean.assert_called_once_with(fake_context,
+                                                  {'filename': 'tmpfilename'})
+         mock_destroy.assert_called_once_with(fake_context, evacuated_instance,
+diff --git a/nova/tests/unit/compute/test_resource_tracker.py b/nova/tests/unit/compute/test_resource_tracker.py
+index 013dd33..e2a2939 100644
+--- a/nova/tests/unit/compute/test_resource_tracker.py
++++ b/nova/tests/unit/compute/test_resource_tracker.py
+@@ -9,6 +9,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++#  Copyright (c) 2015-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ import copy
+ import datetime
+@@ -437,6 +444,8 @@ def setup_rt(hostname, virt_resources=_VIRT_DRIVER_AVAIL_RESOURCES,
+     vd.get_inventory.side_effect = NotImplementedError
+     vd.get_host_ip_addr.return_value = _NODENAME
+     vd.estimate_instance_overhead.side_effect = estimate_overhead
++    # mock a return value of empty dict to give default behaviour.
++    vd.get_local_gb_info.return_value = {}
+ 
+     with test.nested(
+             mock.patch('nova.scheduler.client.SchedulerClient',
+diff --git a/nova/tests/unit/virt/libvirt/fake_imagebackend.py b/nova/tests/unit/virt/libvirt/fake_imagebackend.py
+index 2091aaf..2b6f408 100644
+--- a/nova/tests/unit/virt/libvirt/fake_imagebackend.py
++++ b/nova/tests/unit/virt/libvirt/fake_imagebackend.py
+@@ -180,6 +180,10 @@ class ImageBackendFixture(fixtures.Fixture):
+ 
+             return disk
+ 
++        def mock_function():
++            pass
++
++        image_init.is_file_in_instance_path = mock_function
+         return image_init
+ 
+     def _fake_cache(self, fetch_func, filename, size=None, *args, **kwargs):
+diff --git a/nova/tests/unit/virt/libvirt/storage/test_lvm.py b/nova/tests/unit/virt/libvirt/storage/test_lvm.py
+index eddc640..8b7e84d6 100644
+--- a/nova/tests/unit/virt/libvirt/storage/test_lvm.py
++++ b/nova/tests/unit/virt/libvirt/storage/test_lvm.py
+@@ -12,7 +12,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
+-
++#
++# Copyright (c) 2016-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ import mock
+ from oslo_concurrency import processutils
+ from oslo_config import cfg
+@@ -76,6 +82,16 @@ class LvmTestCase(test.NoDBTestCase):
+                       fake_lvm_size)
+         self.stub_out('nova.utils.execute', fake_execute)
+ 
++        # One test for thin volumes
++        CONF.set_override('thin_logical_volumes', True, 'libvirt')
++        executes = []
++        expected_commands = []
++        lvm.clear_volume('/dev/v1')
++        self.assertEqual(expected_commands, executes)
++
++        # Explicitly set fat volumes for the rest of the tests.
++        CONF.set_override('thin_logical_volumes', False, 'libvirt')
++
+         # Test the correct dd commands are run for various sizes
+         lvm_size = 1
+         executes = []
+diff --git a/nova/tests/unit/virt/libvirt/test_driver.py b/nova/tests/unit/virt/libvirt/test_driver.py
+index 5c6e9be..86c47ff 100755
+--- a/nova/tests/unit/virt/libvirt/test_driver.py
++++ b/nova/tests/unit/virt/libvirt/test_driver.py
+@@ -16443,6 +16443,51 @@ class LibvirtDriverTestCase(test.NoDBTestCase):
+         disk_info_text = jsonutils.dumps(disk_info)
+         self.assertEqual(disk_info_text, out)
+ 
++    # 
++    @mock.patch('nova.virt.libvirt.driver.LibvirtDriver'
++                '.get_host_ip_addr')
++    @mock.patch('nova.utils.execute')
++    @mock.patch('nova.virt.libvirt.driver.LibvirtDriver'
++                '._get_instance_disk_info')
++    @mock.patch('nova.virt.libvirt.driver.LibvirtDriver'
++                '._is_storage_shared_with')
++    def _test_migrate_disk_and_power_off_resize_lvm(self,
++                                                    mock_is_shared_storage,
++                                                    mock_get_disk_info,
++                                                    mock_execute,
++                                                    mock_get_host_ip_addr):
++        instance = self._create_instance()
++        flavor = {'root_gb': 10, 'ephemeral_gb': 20}
++        flavor_obj = objects.Flavor(**flavor)
++        disk_info = [{'type': 'raw', 'path': '/dev/vg/1234_disk',
++                      'disk_size': '83886080'},
++                     {'type': 'raw', 'path': '/dev/vg/1234_disk.local',
++                      'disk_size': '83886080'}]
++
++        mock_get_disk_info.return_value = disk_info
++        mock_is_shared_storage.return_value = True
++        mock_get_host_ip_addr.return_value = '10.0.0.1'
++
++        def fake_execute(*args, **kwargs):
++            pass
++
++        mock_execute.side_effect = fake_execute
++
++        # dest is different host case
++        out = self.drvr.migrate_disk_and_power_off(
++            context.get_admin_context(), instance, '10.0.0.2',
++            flavor_obj, None)
++        self.assertTrue(mock_is_shared_storage.called)
++        disk_info_text = jsonutils.dumps(disk_info)
++        self.assertEqual(out, disk_info_text)
++
++        # dest is same host case
++        out = self.drvr.migrate_disk_and_power_off(
++            context.get_admin_context(), instance, '10.0.0.1',
++            flavor_obj, None)
++        self.assertTrue(mock_is_shared_storage.called)
++        self.assertEqual(out, disk_info_text)
++
+     def _test_migrate_disk_and_power_off_resize_check(self, expected_exc):
+         """Test for nova.virt.libvirt.libvirt_driver.LibvirtConnection
+         .migrate_disk_and_power_off.
+@@ -16469,7 +16514,6 @@ class LibvirtDriverTestCase(test.NoDBTestCase):
+         flavor = {'root_gb': 10, 'ephemeral_gb': 20}
+         flavor_obj = objects.Flavor(**flavor)
+ 
+-        # Migration is not implemented for LVM backed instances
+         self.assertRaises(expected_exc,
+               self.drvr.migrate_disk_and_power_off,
+               None, instance, '10.0.0.1', flavor_obj, None)
+@@ -16524,10 +16568,15 @@ class LibvirtDriverTestCase(test.NoDBTestCase):
+         def fake_execute(*args, **kwargs):
+             pass
+ 
++        def fake_get_volume_vg(path):
++            return path.split('/')[1]
++
+         self.stubs.Set(utils, 'execute', fake_execute)
++        self.stubs.Set(nova.virt.libvirt.storage.lvm,
++                       'get_volume_vg',
++                       fake_get_volume_vg)
+ 
+-        expected_exc = exception.InstanceFaultRollback
+-        self._test_migrate_disk_and_power_off_resize_check(expected_exc)
++        self._test_migrate_disk_and_power_off_resize_lvm()
+ 
+     def test_migrate_disk_and_power_off_resize_cannot_ssh(self):
+         def fake_execute(*args, **kwargs):
+@@ -17091,8 +17140,10 @@ class LibvirtDriverTestCase(test.NoDBTestCase):
+                 mock.patch.object(os.path, 'exists'),
+                 mock.patch.object(libvirt_utils, 'get_instance_path'),
+                 mock.patch.object(utils, 'execute'),
+-                mock.patch.object(shutil, 'rmtree')) as (
+-                mock_exists, mock_get_path, mock_exec, mock_rmtree):
++                mock.patch.object(shutil, 'rmtree'),
++                mock.patch.object(drvr, '_cleanup_lvm')) as (
++                mock_exists, mock_get_path, mock_exec, mock_rmtree,
++                mock_cleanup_lvm):
+             mock_exists.return_value = True
+             mock_get_path.return_value = '/fake/inst'
+ 
+@@ -17102,6 +17153,8 @@ class LibvirtDriverTestCase(test.NoDBTestCase):
+             mock_exec.assert_called_once_with('rm', '-rf', '/fake/inst_resize',
+                                               delay_on_retry=True, attempts=5)
+             mock_rmtree.assert_not_called()
++            mock_cleanup_lvm.assert_called_once_with(
++                ins_ref, preserve_disk_filter="Non-Resize")
+ 
+     def test_cleanup_resize_not_same_host(self):
+         CONF.set_override('policy_dirs', [], group='oslo_policy')
+@@ -17119,24 +17172,27 @@ class LibvirtDriverTestCase(test.NoDBTestCase):
+                            return_value=False),
+                 mock.patch.object(os.path, 'exists'),
+                 mock.patch.object(libvirt_utils, 'get_instance_path'),
+-                mock.patch.object(utils, 'execute'),
+                 mock.patch.object(shutil, 'rmtree'),
+                 mock.patch.object(drvr, '_undefine_domain'),
+                 mock.patch.object(drvr, 'unplug_vifs'),
+-                mock.patch.object(drvr, 'unfilter_instance')
++                mock.patch.object(drvr, 'unfilter_instance'),
++                mock.patch.object(drvr, '_cleanup_lvm'),
++                mock.patch.object(drvr, '_cleanup_target')
+         ) as (mock_volume_backed, mock_exists, mock_get_path,
+-              mock_exec, mock_rmtree, mock_undef, mock_unplug, mock_unfilter):
++              mock_rmtree, mock_undef, mock_unplug, mock_unfilter,
++              mock_cleanup_lvm, mock_cleanup_target):
+             mock_exists.return_value = True
+             mock_get_path.return_value = '/fake/inst'
+ 
+             drvr._cleanup_resize(self.context, ins_ref, fake_net)
+-            mock_get_path.assert_called_once_with(ins_ref)
+-            mock_exec.assert_called_once_with('rm', '-rf', '/fake/inst_resize',
+-                                              delay_on_retry=True, attempts=5)
+             mock_rmtree.assert_called_once_with('/fake/inst')
+             mock_undef.assert_called_once_with(ins_ref)
+             mock_unplug.assert_called_once_with(ins_ref, fake_net)
+             mock_unfilter.assert_called_once_with(ins_ref, fake_net)
++            self.assertEqual(2, mock_get_path.call_count)
++            self.assertEqual(2, mock_cleanup_target.call_count)
++            mock_cleanup_lvm.assert_called_once_with(
++                ins_ref, preserve_disk_filter="Non-Resize")
+ 
+     def test_cleanup_resize_not_same_host_volume_backed(self):
+         """Tests cleaning up after a resize is confirmed with a volume-backed
+@@ -17158,24 +17214,27 @@ class LibvirtDriverTestCase(test.NoDBTestCase):
+                            return_value=True),
+                 mock.patch.object(os.path, 'exists'),
+                 mock.patch.object(libvirt_utils, 'get_instance_path'),
+-                mock.patch.object(utils, 'execute'),
+                 mock.patch.object(shutil, 'rmtree'),
+                 mock.patch.object(drvr, '_undefine_domain'),
+                 mock.patch.object(drvr, 'unplug_vifs'),
+-                mock.patch.object(drvr, 'unfilter_instance')
++                mock.patch.object(drvr, 'unfilter_instance'),
++                mock.patch.object(drvr, '_cleanup_lvm'),
++                mock.patch.object(drvr, '_cleanup_target')
+         ) as (mock_volume_backed, mock_exists, mock_get_path,
+-              mock_exec, mock_rmtree, mock_undef, mock_unplug, mock_unfilter):
++              mock_rmtree, mock_undef, mock_unplug, mock_unfilter,
++              mock_cleanup_lvm, mock_cleanup_target):
+             mock_exists.return_value = True
+             mock_get_path.return_value = '/fake/inst'
+ 
+             drvr._cleanup_resize(self.context, ins_ref, fake_net)
+-            mock_get_path.assert_called_once_with(ins_ref)
+-            mock_exec.assert_called_once_with('rm', '-rf', '/fake/inst_resize',
+-                                              delay_on_retry=True, attempts=5)
+             mock_rmtree.assert_not_called()
+             mock_undef.assert_called_once_with(ins_ref)
+             mock_unplug.assert_called_once_with(ins_ref, fake_net)
+             mock_unfilter.assert_called_once_with(ins_ref, fake_net)
++            self.assertEqual(2, mock_get_path.call_count)
++            self.assertEqual(2, mock_cleanup_target.call_count)
++            mock_cleanup_lvm.assert_called_once_with(
++                ins_ref, preserve_disk_filter="Non-Resize")
+ 
+     def test_cleanup_resize_snap_backend(self):
+         CONF.set_override('policy_dirs', [], group='oslo_policy')
+@@ -17189,9 +17248,10 @@ class LibvirtDriverTestCase(test.NoDBTestCase):
+                 mock.patch.object(libvirt_utils, 'get_instance_path'),
+                 mock.patch.object(utils, 'execute'),
+                 mock.patch.object(shutil, 'rmtree'),
+-                mock.patch.object(drvr.image_backend, 'remove_snap')) as (
++                mock.patch.object(drvr.image_backend, 'remove_snap'),
++                mock.patch.object(drvr, '_cleanup_lvm')) as (
+                 mock_exists, mock_get_path, mock_exec, mock_rmtree,
+-                mock_remove):
++                mock_remove, mock_cleanup_lvm):
+             mock_exists.return_value = True
+             mock_get_path.return_value = '/fake/inst'
+ 
+@@ -17203,6 +17263,8 @@ class LibvirtDriverTestCase(test.NoDBTestCase):
+             mock_remove.assert_called_once_with(
+                     libvirt_utils.RESIZE_SNAPSHOT_NAME, ignore_errors=True)
+             self.assertFalse(mock_rmtree.called)
++            mock_cleanup_lvm.assert_called_once_with(
++                ins_ref, preserve_disk_filter="Non-Resize")
+ 
+     def test_cleanup_resize_snap_backend_image_does_not_exist(self):
+         CONF.set_override('policy_dirs', [], group='oslo_policy')
+@@ -17219,9 +17281,10 @@ class LibvirtDriverTestCase(test.NoDBTestCase):
+                 mock.patch.object(libvirt_utils, 'get_instance_path'),
+                 mock.patch.object(utils, 'execute'),
+                 mock.patch.object(shutil, 'rmtree'),
+-                mock.patch.object(drvr.image_backend, 'remove_snap')) as (
++                mock.patch.object(drvr.image_backend, 'remove_snap'),
++                mock.patch.object(drvr, '_cleanup_lvm')) as (
+                 mock_volume_backed, mock_exists, mock_get_path,
+-                mock_exec, mock_rmtree, mock_remove):
++                mock_exec, mock_rmtree, mock_remove, mock_cleanup_lvm):
+             mock_exists.return_value = True
+             mock_get_path.return_value = '/fake/inst'
+ 
+@@ -17232,6 +17295,8 @@ class LibvirtDriverTestCase(test.NoDBTestCase):
+                                               delay_on_retry=True, attempts=5)
+             self.assertFalse(mock_remove.called)
+             mock_rmtree.called_once_with('/fake/inst')
++            mock_cleanup_lvm.assert_called_once_with(
++                ins_ref, preserve_disk_filter="Non-Resize")
+ 
+     def test_get_instance_disk_info_exception(self):
+         instance = self._create_instance()
+diff --git a/nova/tests/unit/virt/libvirt/test_guest.py b/nova/tests/unit/virt/libvirt/test_guest.py
+index 0bc8273..a0e50b2 100644
+--- a/nova/tests/unit/virt/libvirt/test_guest.py
++++ b/nova/tests/unit/virt/libvirt/test_guest.py
+@@ -20,6 +20,7 @@ import mock
+ from oslo_utils import encodeutils
+ import six
+ 
++from nova.compute import power_state
+ from nova import context
+ from nova import exception
+ from nova import test
+@@ -227,15 +228,18 @@ class GuestTestCase(test.NoDBTestCase):
+             "</xml>", flags=(fakelibvirt.VIR_DOMAIN_AFFECT_CONFIG |
+                              fakelibvirt.VIR_DOMAIN_AFFECT_LIVE))
+ 
+-    def test_detach_device_with_retry_from_transient_domain(self):
++    @mock.patch('nova.virt.libvirt.guest.Guest.get_power_state')
++    def test_detach_device_with_retry_from_transient_domain(
++            self, mock_get_power_state):
+         conf = mock.Mock(spec=vconfig.LibvirtConfigGuestDevice)
+         conf.to_xml.return_value = "</xml>"
+         get_config = mock.Mock()
+         get_config.side_effect = [conf, conf, None]
+         dev_path = "/dev/vdb"
+         self.domain.isPersistent.return_value = False
++        mock_get_power_state.return_value = power_state.RUNNING
+         retry_detach = self.guest.detach_device_with_retry(
+-            get_config, dev_path, live=True, inc_sleep_time=.01)
++            get_config, dev_path, self.host, inc_sleep_time=.01)
+         self.domain.detachDeviceFlags.assert_called_once_with(
+             "</xml>", flags=fakelibvirt.VIR_DOMAIN_AFFECT_LIVE)
+         self.domain.detachDeviceFlags.reset_mock()
+@@ -250,9 +254,10 @@ class GuestTestCase(test.NoDBTestCase):
+         get_config.side_effect = [conf, conf, conf, None]
+         dev_path = "/dev/vdb"
+         self.domain.isPersistent.return_value = True
++        self.domain.info.return_value = (1, 2, 3, 4, 5)
+ 
+         retry_detach = self.guest.detach_device_with_retry(
+-            get_config, dev_path, live=True, inc_sleep_time=.01)
++            get_config, dev_path, self.host, inc_sleep_time=.01)
+         # Ensure we've only done the initial detach call
+         self.domain.detachDeviceFlags.assert_called_once_with(
+             "</xml>", flags=(fakelibvirt.VIR_DOMAIN_AFFECT_CONFIG |
+@@ -272,9 +277,10 @@ class GuestTestCase(test.NoDBTestCase):
+         # Continue to return some value for the disk config
+         get_config = mock.Mock(return_value=conf)
+         self.domain.isPersistent.return_value = True
++        self.domain.info.return_value = (1, 2, 3, 4, 5)
+ 
+         retry_detach = self.guest.detach_device_with_retry(
+-            get_config, "/dev/vdb", live=True, inc_sleep_time=.01,
++            get_config, "/dev/vdb", self.host, inc_sleep_time=.01,
+             max_retry_count=3)
+         # Ensure we've only done the initial detach call
+         self.domain.detachDeviceFlags.assert_called_once_with(
+@@ -290,18 +296,20 @@ class GuestTestCase(test.NoDBTestCase):
+     def test_detach_device_with_retry_device_not_found(self):
+         get_config = mock.Mock(return_value=None)
+         self.domain.isPersistent.return_value = True
++        self.domain.info.return_value = (1, 2, 3, 4, 5)
+         ex = self.assertRaises(
+             exception.DeviceNotFound, self.guest.detach_device_with_retry,
+-            get_config, "/dev/vdb", live=True)
++            get_config, "/dev/vdb", self.host)
+         self.assertIn("/dev/vdb", six.text_type(ex))
+ 
+     def test_detach_device_with_retry_device_not_found_alt_name(self):
+         """Tests to make sure we use the alternative name in errors."""
+         get_config = mock.Mock(return_value=None)
+         self.domain.isPersistent.return_value = True
++        self.domain.info.return_value = (1, 2, 3, 4, 5)
+         ex = self.assertRaises(
+             exception.DeviceNotFound, self.guest.detach_device_with_retry,
+-            get_config, mock.sentinel.device, live=True,
++            get_config, mock.sentinel.device, self.host,
+             alternative_device_name='foo')
+         self.assertIn('foo', six.text_type(ex))
+ 
+@@ -321,11 +329,12 @@ class GuestTestCase(test.NoDBTestCase):
+             error_code=fakelibvirt.VIR_ERR_OPERATION_FAILED,
+             error_domain=fakelibvirt.VIR_FROM_DOMAIN)
+         mock_detach.side_effect = [None, fake_exc]
++        self.domain.info.return_value = (1, 2, 3, 4, 5)
+         retry_detach = self.guest.detach_device_with_retry(
+-            get_config, fake_device, live=True,
++            get_config, fake_device, self.host,
+             inc_sleep_time=.01, max_retry_count=3)
+         # Some time later, we can do the wait/retry to ensure detach
+-        self.assertRaises(exception.DeviceNotFound, retry_detach)
++        self.assertRaises(StopIteration, retry_detach)
+ 
+     def test_detach_device_with_retry_invalid_argument(self):
+         # This simulates a persistent domain detach failing because
+@@ -333,6 +342,7 @@ class GuestTestCase(test.NoDBTestCase):
+         conf = mock.Mock(spec=vconfig.LibvirtConfigGuestDevice)
+         conf.to_xml.return_value = "</xml>"
+         self.domain.isPersistent.return_value = True
++        self.domain.info.return_value = (1, 2, 3, 4, 5)
+ 
+         get_config = mock.Mock()
+         # Simulate the persistent domain attach attempt followed by the live
+@@ -347,7 +357,7 @@ class GuestTestCase(test.NoDBTestCase):
+         # Detach from persistent raises not found, detach from live succeeds
+         self.domain.detachDeviceFlags.side_effect = [fake_exc, None]
+         retry_detach = self.guest.detach_device_with_retry(get_config,
+-            fake_device, live=True, inc_sleep_time=.01, max_retry_count=3)
++            fake_device, self.host, inc_sleep_time=.01, max_retry_count=3)
+         # We should have tried to detach from the persistent domain
+         self.domain.detachDeviceFlags.assert_called_once_with(
+             "</xml>", flags=(fakelibvirt.VIR_DOMAIN_AFFECT_CONFIG |
+@@ -359,12 +369,15 @@ class GuestTestCase(test.NoDBTestCase):
+         self.domain.detachDeviceFlags.assert_called_once_with(
+             "</xml>", flags=fakelibvirt.VIR_DOMAIN_AFFECT_LIVE)
+ 
+-    def test_detach_device_with_retry_invalid_argument_no_live(self):
++    @mock.patch('nova.virt.libvirt.guest.Guest.get_power_state')
++    def test_detach_device_with_retry_invalid_argument_no_live(
++            self, mock_get_power_state):
+         # This simulates a persistent domain detach failing because
+         # the device is not found
+         conf = mock.Mock(spec=vconfig.LibvirtConfigGuestDevice)
+         conf.to_xml.return_value = "</xml>"
+         self.domain.isPersistent.return_value = True
++        self.domain.info.return_value = (1, 2, 3, 4, 5)
+ 
+         get_config = mock.Mock()
+         # Simulate the persistent domain attach attempt
+@@ -377,9 +390,11 @@ class GuestTestCase(test.NoDBTestCase):
+             error_domain=fakelibvirt.VIR_FROM_DOMAIN)
+         # Detach from persistent raises not found
+         self.domain.detachDeviceFlags.side_effect = fake_exc
++        # set host to not live
++        mock_get_power_state.return_value = None
+         self.assertRaises(exception.DeviceNotFound,
+             self.guest.detach_device_with_retry, get_config,
+-            fake_device, live=False, inc_sleep_time=.01, max_retry_count=3)
++            fake_device, self.host, inc_sleep_time=.01, max_retry_count=3)
+         # We should have tried to detach from the persistent domain
+         self.domain.detachDeviceFlags.assert_called_once_with(
+             "</xml>", flags=fakelibvirt.VIR_DOMAIN_AFFECT_CONFIG)
+diff --git a/nova/tests/unit/virt/test_virt_drivers.py b/nova/tests/unit/virt/test_virt_drivers.py
+index a996950..c1aeab5 100644
+--- a/nova/tests/unit/virt/test_virt_drivers.py
++++ b/nova/tests/unit/virt/test_virt_drivers.py
+@@ -28,6 +28,7 @@ from oslo_utils import timeutils
+ import six
+ 
+ from nova.compute import manager
++from nova.compute import power_state
+ from nova.console import type as ctype
+ from nova import context
+ from nova import exception
+@@ -136,7 +137,10 @@ class _FakeDriverBackendTestCase(object):
+             pass
+ 
+         def fake_detach_device_with_retry(_self, get_device_conf_func, device,
+-                                          live, *args, **kwargs):
++                                          host, *args, **kwargs):
++            state = _self.get_power_state(host)
++            live = state in (power_state.RUNNING, power_state.PAUSED)
++
+             # Still calling detach, but instead of returning function
+             # that actually checks if device is gone from XML, just continue
+             # because XML never gets updated in these tests
+@@ -252,6 +256,18 @@ class _VirtDriverTestCase(_FakeDriverBackendTestCase):
+ 
+     @catch_notimplementederror
+     def test_init_host(self):
++        def fake_backend(self):
++            class FakeImage(imagebackend.Image):
++                def create_image(self, prepare_template, base,
++                                 size, *args, **kwargs):
++                    pass
++
++                def resize_image(self, size):
++                    pass
++            return FakeImage
++
++        self.stubs.Set(imagebackend.Backend, 'backend',
++                       fake_backend)
+         self.connection.init_host('myhostname')
+ 
+     @catch_notimplementederror
+diff --git a/nova/virt/driver.py b/nova/virt/driver.py
+index 9502667..17ea01f 100644
+--- a/nova/virt/driver.py
++++ b/nova/virt/driver.py
+@@ -1634,6 +1634,11 @@ class ComputeDriver(object):
+         """
+         raise NotImplementedError()
+ 
++    # This is used in resource tracker.
++    # Default of empty dict gives original behaviour for testing.
++    def get_local_gb_info(self):
++        return {}
++
+ 
+ def load_compute_driver(virtapi, compute_driver=None):
+     """Load a compute driver module.
+diff --git a/nova/virt/libvirt/driver.py b/nova/virt/libvirt/driver.py
+index 45387b3..9a9db0f 100644
+--- a/nova/virt/libvirt/driver.py
++++ b/nova/virt/libvirt/driver.py
+@@ -459,6 +459,7 @@ class LibvirtDriver(driver.ComputeDriver):
+ 
+     def init_host(self, host):
+         self._host.initialize()
++        self.image_backend.backend().init_host()
+ 
+         self._do_quality_warnings()
+ 
+@@ -939,6 +940,12 @@ class LibvirtDriver(driver.ComputeDriver):
+         self._destroy(instance)
+         self.cleanup(context, instance, network_info, block_device_info,
+                      destroy_disks)
++        # If we arrived here from revert_resize and have shared
++        # instance storage, destroy_disks will be false, but we need
++        # to remove the volumes that were created so that we can
++        # rename the _resize volumes to revert the resize/migration.
++        if not destroy_disks:
++            self._cleanup_lvm(instance, preserve_disk_filter="Resize")
+ 
+     def _undefine_domain(self, instance):
+         try:
+@@ -1048,7 +1055,9 @@ class LibvirtDriver(driver.ComputeDriver):
+         is_shared_block_storage = False
+         if migrate_data and 'is_shared_block_storage' in migrate_data:
+             is_shared_block_storage = migrate_data.is_shared_block_storage
+-        if destroy_disks or is_shared_block_storage:
++        if (destroy_disks or is_shared_block_storage or
++            (migrate_data is None and
++             CONF.libvirt.images_type == 'rbd')):
+             attempts = int(instance.system_metadata.get('clean_attempts',
+                                                         '0'))
+             success = self.delete_instance_files(instance)
+@@ -1119,14 +1128,30 @@ class LibvirtDriver(driver.ComputeDriver):
+             filter_fn = lambda disk: disk.startswith(instance.uuid)
+         LibvirtDriver._get_rbd_driver().cleanup_volumes(filter_fn)
+ 
+-    def _cleanup_lvm(self, instance, block_device_info):
++    def _cleanup_lvm(self, instance, block_device_info=None,
++                     preserve_disk_filter=None):
+         """Delete all LVM disks for given instance object."""
+         if instance.get('ephemeral_key_uuid') is not None:
+             self._detach_encrypted_volumes(instance, block_device_info)
+ 
+         disks = self._lvm_disks(instance)
+-        if disks:
++        if disks and not preserve_disk_filter:
++            # This will remove all all LVM disks for this instance
+             lvm.remove_volumes(disks)
++        else:
++            # When resizing on the same compute we will have a 2x the
++            # LVM disks some with _resize extensions. When reverting
++            # or confirming a resize we need to apply a filter on
++            # which volumes to remove.
++            remove_lvs = []
++            for lv in disks:
++                if (preserve_disk_filter == "Resize" and
++                        not lv.endswith('_resize')):
++                    remove_lvs.append(lv)
++                if (preserve_disk_filter == "Non-Resize" and
++                        lv.endswith('_resize')):
++                    remove_lvs.append(lv)
++            lvm.remove_volumes(remove_lvs)
+ 
+     def _lvm_disks(self, instance):
+         """Returns all LVM disks for given instance object."""
+@@ -1157,10 +1182,8 @@ class LibvirtDriver(driver.ComputeDriver):
+             enforce_multipath=True,
+             host=CONF.host)
+ 
+-    def _cleanup_resize(self, context, instance, network_info):
+-        inst_base = libvirt_utils.get_instance_path(instance)
+-        target = inst_base + '_resize'
+-
++    def _cleanup_target(self, target):
++        """If the target path exists, remove all its content."""
+         if os.path.exists(target):
+             # Deletion can fail over NFS, so retry the deletion as required.
+             # Set maximum attempt as 5, most test can remove the directory
+@@ -1168,6 +1191,12 @@ class LibvirtDriver(driver.ComputeDriver):
+             utils.execute('rm', '-rf', target, delay_on_retry=True,
+                           attempts=5)
+ 
++    def _cleanup_resize(self, context, instance, network_info):
++        inst_base = libvirt_utils.get_instance_path(instance)
++        target = inst_base + '_resize'
++
++        self._cleanup_target(target)
++
+         root_disk = self.image_backend.by_name(instance, 'disk')
+         # TODO(nic): Set ignore_errors=False in a future release.
+         # It is set to True here to avoid any upgrade issues surrounding
+@@ -1195,11 +1224,21 @@ class LibvirtDriver(driver.ComputeDriver):
+                 if e.errno != errno.ENOENT:
+                     raise
+ 
++        # Check if the instance has migrated.
+         if instance.host != CONF.host:
+             self._undefine_domain(instance)
+             self.unplug_vifs(instance, network_info)
+             self.unfilter_instance(instance, network_info)
+ 
++            # Obtain the instance's path and if needed, remove any files
++            # belonging to it, from the source host.
++            instance_nova_path = libvirt_utils.get_instance_path(instance)
++            self._cleanup_target(instance_nova_path)
++
++        # Resize is complete. Remove any _resize volumes associated
++        # with the instance
++        self._cleanup_lvm(instance, preserve_disk_filter="Non-Resize")
++
+     def _get_volume_driver(self, connection_info):
+         driver_type = connection_info.get('driver_volume_type')
+         if driver_type not in self.volume_drivers:
+@@ -1425,15 +1464,12 @@ class LibvirtDriver(driver.ComputeDriver):
+         try:
+             guest = self._host.get_guest(instance)
+ 
+-            state = guest.get_power_state(self._host)
+-            live = state in (power_state.RUNNING, power_state.PAUSED)
+-
+             # The volume must be detached from the VM before disconnecting it
+             # from its encryptor. Otherwise, the encryptor may report that the
+             # volume is still in use.
+             wait_for_detach = guest.detach_device_with_retry(guest.get_disk,
+                                                              disk_dev,
+-                                                             live=live)
++                                                             self._host)
+             wait_for_detach()
+ 
+             if encryption:
+@@ -1559,12 +1595,10 @@ class LibvirtDriver(driver.ComputeDriver):
+                             {'mac': mac}, instance=instance)
+                 return
+ 
+-            state = guest.get_power_state(self._host)
+-            live = state in (power_state.RUNNING, power_state.PAUSED)
+             # Now we are going to loop until the interface is detached or we
+             # timeout.
+             wait_for_detach = guest.detach_device_with_retry(
+-                guest.get_interface_by_cfg, cfg, live=live,
++                guest.get_interface_by_cfg, cfg, self._host,
+                 alternative_device_name=self.vif_driver.get_vif_devname(vif))
+             wait_for_detach()
+         except exception.DeviceDetachFailed:
+@@ -5463,6 +5497,12 @@ class LibvirtDriver(driver.ComputeDriver):
+                                       "out of hypervisor cpu range."))
+         return len(available_ids)
+ 
++    # We want to get the actual free disk information to correct the
++    # usage in the resource tracker.  We allocate an additional volume and
++    # do background deletion of LVs so the stats need correcting.
++    def get_local_gb_info(self):
++        return self._get_local_gb_info()
++
+     @staticmethod
+     def _get_local_gb_info():
+         """Get local storage info of the compute node in GB.
+@@ -6014,6 +6054,11 @@ class LibvirtDriver(driver.ComputeDriver):
+         :param disk_over_commit: if true, allow disk over commit
+         :returns: a LibvirtLiveMigrateData object
+         """
++        if block_migration and CONF.libvirt.images_type == 'lvm':
++            reason = _("Block live migration is not supported "
++                           "for hosts with LVM backed storage.")
++            raise exception.MigrationPreCheckError(reason=reason)
++
+         disk_available_gb = dst_compute_info['disk_available_least']
+         disk_available_mb = (
+             (disk_available_gb * units.Ki) - CONF.reserved_host_disk_mb)
+@@ -6091,10 +6136,24 @@ class LibvirtDriver(driver.ComputeDriver):
+                                           block_device_info))
+ 
+         if 'block_migration' not in dest_check_data:
++            block_migration_explicit = False
+             dest_check_data.block_migration = (
+                 not dest_check_data.is_on_shared_storage())
++        else:
++            block_migration_explicit = True
+ 
+         if dest_check_data.block_migration:
++            if CONF.libvirt.images_type == 'lvm':
++                if block_migration_explicit:
++                    reason = _("Block live migration is not supported "
++                               "for instances with LVM backed storage.")
++                else:
++                    reason = _("Live migration can not be used "
++                               "with LVM backed storage except "
++                               "a booted from volume VM which "
++                               "does not have a local disk.")
++                raise exception.MigrationPreCheckErrorNoRetry(reason=reason)
++
+             # TODO(eliqiao): Once block_migration flag is removed from the API
+             # we can safely remove the if condition
+             if dest_check_data.is_on_shared_storage():
+@@ -6175,9 +6234,15 @@ class LibvirtDriver(driver.ComputeDriver):
+             return True
+ 
+         if (dest_check_data.is_shared_instance_path and
+-                self.image_backend.backend().is_file_in_instance_path()):
++                self.image_backend.backend().is_file_in_instance_path() and
++                CONF.libvirt.images_type != 'lvm'):
+             # NOTE(angdraug): file based image backends (Flat, Qcow2)
+             # place block device files under the instance path
++
++            # Add an additional check to see if local disks are backed
++            # by lvm. These are not shared, so fail this check. Below
++            # we will allow instances backed by volume but without
++            # local disks to pass.
+             return True
+ 
+         if (dest_check_data.is_volume_backed and
+@@ -7191,10 +7256,12 @@ class LibvirtDriver(driver.ComputeDriver):
+             disk_info = []
+ 
+         for info in disk_info:
+-            base = os.path.basename(info['path'])
+-            # Get image type and create empty disk image, and
+-            # create backing file in case of qcow2.
+-            instance_disk = os.path.join(instance_dir, base)
++            instance_disk = info['path']
++            if self.image_backend.backend().is_file_in_instance_path():
++                base = os.path.basename(info['path'])
++                # Get image type and create empty disk image, and
++                # create backing file in case of qcow2.
++                instance_disk = os.path.join(instance_dir, base)
+             if not info['backing_file'] and not os.path.exists(instance_disk):
+                 libvirt_utils.create_image(info['type'], instance_disk,
+                                            info['virt_disk_size'])
+@@ -7603,11 +7670,12 @@ class LibvirtDriver(driver.ComputeDriver):
+             raise exception.InstanceFaultRollback(
+                 exception.ResizeError(reason=reason))
+ 
++        # allow migration of LVM backed instances
+         # NOTE(dgenin): Migration is not implemented for LVM backed instances.
+-        if CONF.libvirt.images_type == 'lvm' and not booted_from_volume:
+-            reason = _("Migration is not supported for LVM backed instances")
+-            raise exception.InstanceFaultRollback(
+-                exception.MigrationPreCheckError(reason=reason))
++        # if CONF.libvirt.images_type == 'lvm' and not booted_from_volume:
++        #     reason = _("Migration is not supported for LVM backed instances")
++        #     raise exception.InstanceFaultRollback(
++        #         exception.MigrationPreCheckError(reason=reason))
+ 
+         # copy disks to destination
+         # rename instance dir to +_resize at first for using
+@@ -7656,21 +7724,37 @@ class LibvirtDriver(driver.ComputeDriver):
+                 # assume inst_base == dirname(info['path'])
+                 img_path = info['path']
+                 fname = os.path.basename(img_path)
+-                from_path = os.path.join(inst_base_resize, fname)
+-
+-                # We will not copy over the swap disk here, and rely on
+-                # finish_migration to re-create it for us. This is ok because
+-                # the OS is shut down, and as recreating a swap disk is very
+-                # cheap it is more efficient than copying either locally or
+-                # over the network. This also means we don't have to resize it.
+-                if fname == 'disk.swap':
+-                    continue
+ 
+-                compression = info['type'] not in NO_COMPRESSION_TYPES
+-                libvirt_utils.copy_image(from_path, img_path, host=dest,
+-                                         on_execute=on_execute,
+-                                         on_completion=on_completion,
+-                                         compression=compression)
++                # Enable instance resizing for LVM backed instances
++                # Check to see if the disk is an lvm disk
++                if (CONF.libvirt.images_type == 'lvm' and
++                    libvirt_utils.get_disk_type_from_path(img_path) == 'lvm'):
++                    # Preserve the original volumes for reverting by
++                    # renaming. At this point we do not know if the
++                    # scheduler will select this compute or another
++                    # compute to perform the resize on, so do not
++                    # perform any lvm disk copies at this point. We
++                    # will defer the resize operations until the
++                    # resize is confirmed.
++                    lv_preserve_path = img_path + "_resize"
++                    lvm.rename_volume(img_path, lv_preserve_path)
++                else:
++                    from_path = os.path.join(inst_base_resize, fname)
++
++                    # We will not copy over the swap disk here, and rely on
++                    # finish_migration to re-create it for us. This is ok
++                    # because the OS is shut down, and as recreating a swap
++                    # disk is very cheap it is more efficient than copying
++                    # either locally or over the network.
++                    # This also means we don't have to resize it.
++                    if fname == 'disk.swap':
++                        continue
++
++                    compression = info['type'] not in NO_COMPRESSION_TYPES
++                    libvirt_utils.copy_image(from_path, img_path, host=dest,
++                                             on_execute=on_execute,
++                                             on_completion=on_completion,
++                                             compression=compression)
+ 
+             # Ensure disk.info is written to the new path to avoid disks being
+             # reinspected and potentially changing format.
+@@ -7697,6 +7781,27 @@ class LibvirtDriver(driver.ComputeDriver):
+             raise loopingcall.LoopingCallDone()
+ 
+     @staticmethod
++    def _disk_size_from_instance(instance, disk_name):
++        """Determines the disk size from instance properties
++
++        Returns the disk size by using the disk name to determine whether it
++        is a root or an ephemeral disk, then by checking properties of the
++        instance returns the size converted to bytes.
++
++        Returns 0 if the disk name not match (disk, disk.local).
++        """
++        if disk_name == 'disk':
++            size = instance.flavor.root_gb
++        elif disk_name == 'disk.local':
++            size = instance.flavor.ephemeral_gb
++        # N.B. We don't handle ephemeral disks named disk.ephN here,
++        # which is almost certainly a bug. It's not clear what this function
++        # should return if an instance has multiple ephemeral disks.
++        else:
++            size = 0
++        return size * units.Gi
++
++    @staticmethod
+     def _disk_raw_to_qcow2(path):
+         """Converts a raw disk to qcow2."""
+         path_qcow = path + '_qcow'
+@@ -7720,6 +7825,40 @@ class LibvirtDriver(driver.ComputeDriver):
+                           '-O', 'raw', path, path_raw)
+         utils.execute('mv', path_raw, path)
+ 
++    # Enable instance resizing for LVM backed instances
++    def _disk_resize_lvm(self, info, size):
++        """Attempts to resize an lvm disk to size
++
++        Attempts to resize an lvm disk by checking the capabilities and
++        preparing the format, then calling disk.api.extend.
++
++        """
++        try:
++            base, ext = os.path.splitext(info['path'])
++            # Ignore swap/ephemeral disks (i.e. .local or .swap
++            # extensions). They currently get regenerated regardless
++            # of resizing.
++            if not ext:
++                # An instance has already been spun up at this point but since
++                # we are resizing to the same host we would like to preserve
++                # the contents of the original LVM disk. So nuke the new disk
++                # and copy the original volume
++                lvm.remove_volumes([info['path']])
++
++                # Make a duplicate volume of the same size which we
++                # will use for resizing. This preserves the original
++                # for reverting if resize fails
++                lvm.create_duplicate_volume(
++                    info['path'] + "_resize",
++                    info['path'])
++                if size:
++                    lvm.resize_volume(info['path'], size)
++        except exception.ResizeError as e:
++            # Allow resize errors if they are a result of attempting
++            # to resize the volume to the same size
++            if "matches existing size" not in e.message:
++                raise
++
+     def finish_migration(self, context, migration, instance, disk_info,
+                          network_info, image_meta, resize_instance,
+                          block_device_info=None, power_on=True):
+@@ -7765,31 +7904,70 @@ class LibvirtDriver(driver.ComputeDriver):
+             # appropriately between them as long as disk.info exists and is
+             # correctly populated, which it is because Qcow2 writes to
+             # disk.info.
++            # For lvm backed images check to see if we are migrating.
+             #
+-            # In general, we do not yet support format conversion during
+-            # migration. For example:
+-            #   * Converting from use_cow_images=True to use_cow_images=False
+-            #     isn't handled. This isn't a security bug, but is almost
+-            #     certainly buggy in other cases, as the 'Raw' backend doesn't
+-            #     expect a backing file.
+-            #   * Converting to/from lvm and rbd backends is not supported.
++            # If we are migrating, avoid resizing as we do not have
++            # shared lvm storage and have not migrated the local disk
++            # data from the source compute. Avoiding the resize
++            # operation will rebuild in the instance in the
++            # _create_image call.
+             #
+-            # This behaviour is inconsistent, and therefore undesirable for
+-            # users. It is tightly-coupled to implementation quirks of 2
+-            # out of 5 backends in imagebackend and defends against a severe
+-            # security flaw which is not at all obvious without deep analysis,
+-            # and is therefore undesirable to developers. We should aim to
+-            # remove it. This will not be possible, though, until we can
+-            # represent the storage layout of a specific instance
+-            # independent of the default configuration of the local compute
+-            # host.
+-
+-            # Config disks are hard-coded to be raw even when
+-            # use_cow_images=True (see _get_disk_config_image_type),so don't
+-            # need to be converted.
+-            if (disk_name != 'disk.config' and
+-                        info['type'] == 'raw' and CONF.use_cow_images):
+-                self._disk_raw_to_qcow2(info['path'])
++            # If we are not migrating, then call the _disk_resize_lvm
++            # function to copy and resize the lvm disks
++            if libvirt_utils.get_disk_type_from_path(info['path']) == 'lvm':
++                # Adjust the file name if the disk is lvm based filename is of
++                # the format <UUID>_disk, <UUID>_disk.local, or
++                # <UUID>_disk.swap
++                disk_name = disk_name.split('_')[1]
++                size = self._disk_size_from_instance(instance, disk_name)
++
++                if (resize_instance and
++                        (migration['dest_compute'] ==
++                         migration['source_compute'])):
++                    self._disk_resize_lvm(info, size)
++            else:
++                # NOTE(mdbooth): The code below looks wrong, but is actually
++                # required to prevent a security hole when migrating from a
++                # host with use_cow_images=False to one with
++                # use_cow_images=True.
++                # Imagebackend uses use_cow_images to select between the
++                # atrociously-named-Raw and Qcow2 backends. The Qcow2 backend
++                # writes to disk.info, but does not read it as it assumes
++                # qcow2.
++                # Therefore if we don't convert raw to qcow2 here, a raw disk
++                # will be incorrectly assumed to be qcow2, which is a severe
++                # security flaw.
++                # The reverse is not true, because the atrociously-named-Raw
++                # backend supports both qcow2 and raw disks, and will choose
++                # appropriately between them as long as disk.info exists and
++                # is correctly populated, which it is because Qcow2 writes to
++                # disk.info.
++                #
++                # In general, we do not yet support format conversion during
++                # migration. For example:
++                #   * Converting from use_cow_images=True to
++                #     use_cow_images=False isn't handled. This isn't a
++                #     security bug, but is almost certainly buggy in other
++                #     cases, as the 'Raw' backend doesn't expect a backing
++                #     file.
++                #   * Converting to/from lvm and rbd backends is not supported.
++                #
++                # This behaviour is inconsistent, and therefore undesirable for
++                # users. It is tightly-coupled to implementation quirks of 2
++                # out of 5 backends in imagebackend and defends against a
++                # severe security flaw which is not at all obvious without
++                # deep analysis, and is therefore undesirable to developers.
++                # We should aim to remove it. This will not be possible
++                # though, until we can represent the storage layout of a
++                # specific instance independent of the default configuration
++                # of the local compute host.
++
++                # Config disks are hard-coded to be raw even when
++                # use_cow_images=True (see _get_disk_config_image_type),so
++                # don't need to be converted.
++                if (disk_name != 'disk.config' and
++                            info['type'] == 'raw' and CONF.use_cow_images):
++                    self._disk_raw_to_qcow2(info['path'])
+ 
+         xml = self._get_guest_xml(context, instance, network_info,
+                                   block_disk_info, image_meta,
+@@ -7826,6 +8004,20 @@ class LibvirtDriver(driver.ComputeDriver):
+             if e.errno != errno.ENOENT:
+                 raise
+ 
++    # Enable instance resizing for LVM backed instances
++    def _cleanup_lvm_rename_resize(self, instance):
++        # Go through all the lvm disks for the instance and identify
++        # those that should be renamed for reinstatement
++        rename_lvs = []
++        lvm_disks = self._lvm_disks(instance)
++        for lv in lvm_disks:
++            if lv.endswith('_resize'):
++                rename_lvs.append(lv)
++
++        # Reinstate the volume copies with the original sizes
++        for lv_path in rename_lvs:
++            lvm.rename_volume(lv_path, lv_path[:-7])
++
+     def finish_revert_migration(self, context, instance, network_info,
+                                 block_device_info=None, power_on=True):
+         LOG.debug("Starting finish_revert_migration",
+@@ -7842,6 +8034,9 @@ class LibvirtDriver(driver.ComputeDriver):
+             self._cleanup_failed_migration(inst_base)
+             utils.execute('mv', inst_base_resize, inst_base)
+ 
++        # Rename any _resize volumes to complete the reversion
++        self._cleanup_lvm_rename_resize(instance)
++
+         root_disk = self.image_backend.by_name(instance, 'disk')
+         # Once we rollback, the snapshot is no longer needed, so remove it
+         # TODO(nic): Remove the try/except/finally in a future release
+diff --git a/nova/virt/libvirt/guest.py b/nova/virt/libvirt/guest.py
+index 4539826..f8d83b0 100755
+--- a/nova/virt/libvirt/guest.py
++++ b/nova/virt/libvirt/guest.py
+@@ -401,7 +401,7 @@ class Guest(object):
+                 devs.append(dev)
+         return devs
+ 
+-    def detach_device_with_retry(self, get_device_conf_func, device, live,
++    def detach_device_with_retry(self, get_device_conf_func, device, host,
+                                  max_retry_count=7, inc_sleep_time=2,
+                                  max_sleep_time=30,
+                                  alternative_device_name=None):
+@@ -413,8 +413,7 @@ class Guest(object):
+         :param get_device_conf_func: function which takes device as a parameter
+                                      and returns the configuration for device
+         :param device: device to detach
+-        :param live: bool to indicate whether it affects the guest in running
+-                     state
++        :param host: host.Host object for guest attached to device
+         :param max_retry_count: number of times the returned function will
+                                 retry a detach before failing
+         :param inc_sleep_time: incremental time to sleep in seconds between
+@@ -428,7 +427,11 @@ class Guest(object):
+         """
+         alternative_device_name = alternative_device_name or device
+ 
+-        def _try_detach_device(conf, persistent=False, live=False):
++        def _try_detach_device(conf, persistent=False, host=None):
++            # live flag is recalculated because the domain may have
++            # changed state.
++            state = self.get_power_state(host)
++            live = state in (power_state.RUNNING, power_state.PAUSED)
+             # Raise DeviceNotFound if the device isn't found during detach
+             try:
+                 self.detach_device(conf, persistent=persistent, live=live)
+@@ -436,22 +439,18 @@ class Guest(object):
+                           'Persistent? %s. Live? %s',
+                           device, persistent, live)
+             except libvirt.libvirtError as ex:
+-                with excutils.save_and_reraise_exception():
+-                    errcode = ex.get_error_code()
+-                    if errcode == libvirt.VIR_ERR_OPERATION_FAILED:
+-                        errmsg = ex.get_error_message()
+-                        if 'not found' in errmsg:
+-                            # This will be raised if the live domain
+-                            # detach fails because the device is not found
+-                            raise exception.DeviceNotFound(
+-                                device=alternative_device_name)
+-                    elif errcode == libvirt.VIR_ERR_INVALID_ARG:
+-                        errmsg = ex.get_error_message()
+-                        if 'no target device' in errmsg:
+-                            # This will be raised if the persistent domain
+-                            # detach fails because the device is not found
+-                            raise exception.DeviceNotFound(
+-                                device=alternative_device_name)
++                errcode = ex.get_error_code()
++                # if the state of the domain changed, we need to retry
++                if errcode not in (libvirt.VIR_ERR_OPERATION_INVALID,
++                                   libvirt.VIR_ERR_OPERATION_FAILED):
++                    with excutils.save_and_reraise_exception():
++                        if errcode == libvirt.VIR_ERR_INVALID_ARG:
++                            errmsg = ex.get_error_message()
++                            if 'no target device' in errmsg:
++                                # This will be raised if the persistent domain
++                                # detach fails because the device is not found
++                                raise exception.DeviceNotFound(
++                                    device=alternative_device_name)
+ 
+         conf = get_device_conf_func(device)
+         if conf is None:
+@@ -462,7 +461,7 @@ class Guest(object):
+         LOG.debug('Attempting initial detach for device %s',
+                   alternative_device_name)
+         try:
+-            _try_detach_device(conf, persistent, live)
++            _try_detach_device(conf, persistent, host)
+         except exception.DeviceNotFound:
+             # NOTE(melwitt): There are effectively two configs for an instance.
+             # The persistent config (affects instance upon next boot) and the
+@@ -471,6 +470,8 @@ class Guest(object):
+             # persistent config and a live config. If we tried to detach the
+             # device with persistent=True and live=True and it was not found,
+             # we should still try to detach from the live config, so continue.
++            state = self.get_power_state(host)
++            live = state in (power_state.RUNNING, power_state.PAUSED)
+             if persistent and live:
+                 pass
+             else:
+@@ -487,7 +488,7 @@ class Guest(object):
+             if config is not None:
+                 # Device is already detached from persistent domain
+                 # and only transient domain needs update
+-                _try_detach_device(config, persistent=False, live=live)
++                _try_detach_device(config, persistent=False, host=host)
+ 
+                 reason = _("Unable to detach from guest transient domain.")
+                 raise exception.DeviceDetachFailed(
+diff --git a/nova/virt/libvirt/imagebackend.py b/nova/virt/libvirt/imagebackend.py
+index 4b75b00..fb6f5f1 100644
+--- a/nova/virt/libvirt/imagebackend.py
++++ b/nova/virt/libvirt/imagebackend.py
+@@ -12,7 +12,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
+-
++#
++# Copyright (c) 2016-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ import abc
+ import base64
+ import contextlib
+@@ -472,6 +478,10 @@ class Image(object):
+         """
+         pass
+ 
++    @staticmethod
++    def init_host():
++        pass
++
+ 
+ class Flat(Image):
+     """The Flat backend uses either raw or qcow2 storage. It never uses
+@@ -784,6 +794,10 @@ class Lvm(Image):
+     def get_model(self, connection):
+         return imgmodel.LocalBlockImage(self.path)
+ 
++    @staticmethod
++    def init_host():
++        lvm.create_thinpool_if_needed(CONF.libvirt.images_volume_group)
++
+ 
+ class Rbd(Image):
+ 
+diff --git a/nova/virt/libvirt/storage/lvm.py b/nova/virt/libvirt/storage/lvm.py
+index ca8ffe1..4507faf 100644
+--- a/nova/virt/libvirt/storage/lvm.py
++++ b/nova/virt/libvirt/storage/lvm.py
+@@ -18,7 +18,14 @@
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
+ #
++# Copyright (c) 2016-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
++import os.path
+ from oslo_concurrency import processutils
+ from oslo_log import log as logging
+ from oslo_utils import units
+@@ -33,17 +40,80 @@ CONF = nova.conf.CONF
+ LOG = logging.getLogger(__name__)
+ 
+ 
++def create_thinpool_if_needed(vg):
++    if CONF.libvirt.thin_logical_volumes is False:
++        return
++
++    poolname = vg + CONF.libvirt.thinpool_suffix
++    # Do we need to worry about resizing the VG and thinpool?
++    if poolname in list_volumes(vg):
++        return
++    # Create thinpool.  Leave 5% of free space for metadata.
++    size = _get_volume_group_info(vg)['free'] * 0.95
++    # Round down to the nearest GiB like cinder.  This also means we don't
++    # need to worry about being a multiple of the chunk size.
++    size = int(size) >> 30 << 30
++    create_volume(vg, poolname, size)
++
++
++def thin_copy_volume(lv_src, lv_dest, vg, size):
++    """Copies a thin-provisioned volume.
++
++    Because we know we're dealing with thin-provisioned volumes, we can just
++    do a snapshot.  (As long as there's enough free space.)
++
++    :param lv_src: source thin volume
++    :param lv_dest: dest thin volume
++    :param vg: volume group
++    :param size: size of the volume being copied
++
++    This duplicates some code from create_duplicate_volume() and from
++    create_volume(), the alternative would be to mangle create_volume() to
++    also handle snapshots and then tweak a bunch of unit tests.
++    """
++    thinpool = vg + CONF.libvirt.thinpool_suffix
++    vg_info = _get_thinpool_info(vg, thinpool)
++    free_space = vg_info['free']
++    if size > free_space:
++        raise RuntimeError(_('Insufficient Space on Volume Group %(vg)s.'
++                             ' Only %(free_space)db available,'
++                             ' but %(size)db required'
++                             ' by thin volume %(lv)s.') %
++                           {'vg': vg,
++                            'free_space': free_space,
++                            'size': size,
++                            'lv': lv_dest})
++    cmd = ('lvcreate', '-s', '-kn', '-n', lv_dest, '%s/%s' % (vg, lv_src))
++    utils.execute(*cmd, run_as_root=True, attempts=3)
++
++
+ def create_volume(vg, lv, size, sparse=False):
+     """Create LVM image.
+ 
+     Creates a LVM image with given size.
+ 
+     :param vg: existing volume group which should hold this image
+-    :param lv: name for this image (logical volume)
++    :param lv: name for this volume (logical volume)
+     :size: size of image in bytes
+     :sparse: create sparse logical volume
+     """
+-    vg_info = get_volume_group_info(vg)
++
++    # Figure out thinpool name and type of volume to create.
++    thinpool = vg + CONF.libvirt.thinpool_suffix
++    if CONF.libvirt.thin_logical_volumes:
++        if lv == thinpool:
++            vtype = 'thinpool'
++        else:
++            vtype = 'thin'
++    else:
++        vtype = 'default'
++
++    # Can't call get_volume_group_info() because we want to do special
++    # handling when creating the thinpool itself.
++    if vtype == 'thin':
++        vg_info = _get_thinpool_info(vg, thinpool)
++    else:
++        vg_info = _get_volume_group_info(vg)
+     free_space = vg_info['free']
+ 
+     def check_size(vg, lv, size):
+@@ -75,11 +145,49 @@ def create_volume(vg, lv, size, sparse=False):
+                 '--virtualsize', '%db' % size, '-n', lv, vg)
+     else:
+         check_size(vg, lv, size)
+-        cmd = ('lvcreate', '-L', '%db' % size, '-n', lv, vg)
++        if vtype == 'default':
++            cmd = ('lvcreate', '-L', '%db' % size, '-n', lv, vg)
++        elif vtype == 'thinpool':
++            cmd = ('lvcreate', '-L', '%db' % size, '-T', '%s/%s' % (vg, lv))
++        elif vtype == 'thin':
++            cmd = ('lvcreate', '-V', '%db' % size, '-T',
++                   '%s/%s' % (vg, thinpool), '-n', lv)
++
+     utils.execute(*cmd, run_as_root=True, attempts=3)
+ 
+ 
+-def get_volume_group_info(vg):
++def _get_thinpool_info(vg, thinpool):
++    """Return free/used/total space info for a thinpool in the specified vg
++
++    :param vg: volume group name
++    :param thinpool: thin pool name
++    :returns: A dict containing:
++             :total: How big the filesystem is (in bytes)
++             :free: How much space is free (in bytes)
++             :used: How much space is used (in bytes)
++    """
++    thinpool_used = 0
++    thinpool_size = 0
++    out, err = utils.execute('vgs', '--noheadings', '--nosuffix',
++                       '--separator', '|',
++                       '--units', 'b', '-o', 'lv_name,lv_size,pool_lv', vg,
++                       run_as_root=True)
++    for line in out.splitlines():
++        lvinfo = line.split('|')
++        lv_name = lvinfo[0].strip()
++        lv_size = int(lvinfo[1])
++        lv_pool = lvinfo[2]
++        if lv_name == thinpool:
++            thinpool_size = lv_size
++        elif lv_pool == thinpool:
++            # Account for total size of all volumes in the thin pool.
++            thinpool_used += lv_size
++    return {'total': thinpool_size,
++            'free': thinpool_size - thinpool_used,
++            'used': thinpool_used}
++
++
++def _get_volume_group_info(vg):
+     """Return free/used/total space info for a volume group in bytes
+ 
+     :param vg: volume group name
+@@ -103,6 +211,19 @@ def get_volume_group_info(vg):
+             'used': int(info[0]) - int(info[1])}
+ 
+ 
++def get_volume_group_info(vg):
++    """Return free/used/total space info in bytes
++
++    If thin provisioning is enabled then return data for the thin pool,
++    otherwise return data for the volume group.
++    """
++    if CONF.libvirt.thin_logical_volumes:
++        thinpool = vg + CONF.libvirt.thinpool_suffix
++        return _get_thinpool_info(vg, thinpool)
++    else:
++        return _get_volume_group_info(vg)
++
++
+ def list_volumes(vg):
+     """List logical volumes paths for given volume group.
+ 
+@@ -199,6 +320,10 @@ def clear_volume(path):
+ 
+     :param path: logical volume path
+     """
++    # If using thin volumes it doesn't make sense to clear them.
++    if CONF.libvirt.thin_logical_volumes:
++        return
++
+     volume_clear = CONF.libvirt.volume_clear
+ 
+     if volume_clear == 'none':
+@@ -237,3 +362,82 @@ def remove_volumes(paths):
+             errors.append(six.text_type(exp))
+     if errors:
+         raise exception.VolumesNotRemoved(reason=(', ').join(errors))
++
++
++# Enable instance resizing for LVM backed instances
++def get_volume_vg(path):
++    """Get logical volume's volume group name.
++
++    :param path: logical volume path
++    """
++    lv_info = volume_info(path)
++    vg = lv_info['VG']
++    return vg
++
++
++def rename_volume(lv_name, lv_new_name):
++    """Rename an LVM image.
++
++    Rename an LVM image.
++
++    :param vg: existing volume group which holds the image volume
++    :param lv_name: current name for this image (logical volume)
++    :param lv_new_name: bew name for this image (logical volume)
++    """
++    vg = get_volume_vg(lv_name)
++    errors = []
++    lvrename = ('lvrename', vg, lv_name, lv_new_name)
++    try:
++        utils.execute(*lvrename, run_as_root=True, attempts=3)
++    except processutils.ProcessExecutionError as exp:
++        errors.append(six.text_type(exp))
++        if errors:
++            raise exception.ResizeError(reason=(', ').join(errors))
++
++
++def create_duplicate_volume(lv_name, lv_new_name):
++    """Duplicate a reference logical volume.
++
++    Creates an LVM volume the same size as a reference volume and with the
++    same contents.
++
++    :param lv_name: path of the reference image (logical volume)
++    :param lv_new_name: path for the new logical volume
++    """
++    vg = get_volume_vg(lv_name)
++    size = get_volume_size(lv_name)
++    errors = []
++    try:
++        if CONF.libvirt.thin_logical_volumes:
++            # Special-case for thin volumes
++            name = os.path.basename(lv_name)
++            new_name = os.path.basename(lv_new_name)
++            thin_copy_volume(name, new_name, vg, size)
++        else:
++            create_volume(vg, lv_new_name, size, sparse=False)
++
++            # copy the preserved volume contents to the new volume
++            utils.copy_image(lv_name, lv_new_name)
++    except processutils.ProcessExecutionError as exp:
++        errors.append(six.text_type(exp))
++        if errors:
++            raise exception.ResizeError(reason=(', ').join(errors))
++
++
++def resize_volume(lv_name, size):
++    """Resizes an LVM image.
++
++    Resizes an LVM image to the requested new size.
++
++    :param lv_name: name for the image to be resized (logical volume)
++    :param size: new size in bytes for the image (logical volume)
++    """
++    sizeInMB = size / units.Mi
++    errors = []
++    lvresize = ('lvresize', '--size', sizeInMB, lv_name)
++    try:
++        utils.execute(*lvresize, attempts=3, run_as_root=True)
++    except processutils.ProcessExecutionError as exp:
++        errors.append(six.text_type(exp))
++        if errors:
++            raise exception.ResizeError(reason=(', ').join(errors))
+-- 
+2.7.4
+

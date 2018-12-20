@@ -1,0 +1,41 @@
+From 6877ac56014add7eef377cca2774f419f7a27eda Mon Sep 17 00:00:00 2001
+From: Joseph Richard <joseph.richard@windriver.com>
+Date: Tue, 8 Sep 2015 16:37:46 -0400
+Subject: [PATCH] Fix enabling mac_filtering for instances
+
+During a previous commit, the port attribute 'binding:mac_filtering'
+was changed to 'wrs-binding:mac_filtering' in order to comply with
+the REST API specification for the wrs-port-binding extension.  In
+Nova, a reference to the old attribute remained when reading the
+network information from the port to set it for the instance.  This
+commit fixes that code to use the new attribute name.
+---
+ nova/network/neutronv2/api.py       | 2 +-
+ nova/network/neutronv2/constants.py | 1 +
+ 2 files changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/nova/network/neutronv2/api.py b/nova/network/neutronv2/api.py
+index 0574d20..c147644 100644
+--- a/nova/network/neutronv2/api.py
++++ b/nova/network/neutronv2/api.py
+@@ -1645,7 +1645,7 @@ class API(base_api.NetworkAPI):
+                     ovs_interfaceid=ovs_interfaceid,
+                     devname=devname,
+                     mac_filter=current_neutron_port.get(
+-                        'binding:mac_filtering', False),
++                        constants.PORT_MAC_FILTERING, False),
+                     active=vif_active,
+                     preserve_on_delete=preserve_on_delete))
+ 
+diff --git a/nova/network/neutronv2/constants.py b/nova/network/neutronv2/constants.py
+index 57251c6..80b0c5d 100644
+--- a/nova/network/neutronv2/constants.py
++++ b/nova/network/neutronv2/constants.py
+@@ -17,3 +17,4 @@ QOS_QUEUE = 'QoS Queue'
+ NET_EXTERNAL = 'router:external'
+ PORTBINDING_EXT = 'Port Binding'
+ PORT_VIF_MODEL = 'wrs-binding:vif_model'
++PORT_MAC_FILTERING = 'wrs-binding:mac_filtering'
+-- 
+2.7.4
+

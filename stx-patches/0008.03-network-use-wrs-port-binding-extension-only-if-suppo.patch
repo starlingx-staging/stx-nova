@@ -1,0 +1,118 @@
+From d396881319bddd057216fc697bb6b91862e9c93c Mon Sep 17 00:00:00 2001
+From: Allain Legacy <allain.legacy@windriver.com>
+Date: Wed, 16 Sep 2015 14:52:42 -0400
+Subject: [PATCH] network: use port binding extension only if supported
+
+This update modifies the neutron API wrapper to only pass certain  port
+binding attributes to the neutron API if those attributes are reported in the
+neutron extension list.  The reason for this change is that we need to support
+two different operating environments; one where the neutron implementation is
+our own and own where the neutron implementation is a vanilla version
+(HP).
+
+Some of the extensions that we reference are read only ('wrs-binding:mtu' and
+'wrs-binding:mac_filtering').  For simplicity those references are left as
+is since the end result is that they will be seen as "None" anyway.
+
+The attribute that is being excluded from being set is 'wrs-binding:vif_model'
+and where possible we have converted any read operations on this attribute to
+other (equivalent) means of determining the same information.  For instance,
+when we set "vif-model=pci-sriov" we also set "vnic_type=direct" which also
+happens when a user manually creates an SRIOV neutron port so from the Nova API
+perspective that IF statement should resolve the same way regardless of who
+created the port.
+---
+ nova/network/neutronv2/api.py             | 18 ++++++++++++++----
+ nova/network/neutronv2/constants.py       |  1 +
+ nova/tests/unit/network/test_neutronv2.py |  6 ++++++
+ 3 files changed, 21 insertions(+), 4 deletions(-)
+
+diff --git a/nova/network/neutronv2/api.py b/nova/network/neutronv2/api.py
+index 29bf7fa..74e7e37 100644
+--- a/nova/network/neutronv2/api.py
++++ b/nova/network/neutronv2/api.py
+@@ -621,6 +621,7 @@ class API(base_api.NetworkAPI):
+         created_port_ids = []
+         ports_in_requested_order = []
+         nets_in_requested_order = []
++        has_wrs_port_binding = self._has_wrs_port_binding_extension(context)
+         for request in ordered_networks:
+             # Network lookup for available network_id
+             network = None
+@@ -646,11 +647,14 @@ class API(base_api.NetworkAPI):
+ 
+                 raise exception.SecurityGroupCannotBeApplied()
+             zone = 'compute:%s' % instance.availability_zone
+-            # extension: add vif_model
+             port_req_body = {'port': {'device_id': instance.uuid,
+-                                      'device_owner': zone,
+-                                      constants.PORT_VIF_MODEL:
+-                                          request.vif_model}}
++                                      'device_owner': zone}}
++
++            # extension: add vif_model
++            if has_wrs_port_binding:
++                port_req_body['port'].update({constants.PORT_VIF_MODEL:
++                                              request.vif_model})
++
+             if request.vif_model == network_model.VIF_MODEL_PCI_SRIOV:
+                 port_req_body['port'].update({'binding:vnic_type': 'direct'})
+             if request.vif_model == network_model.VIF_MODEL_PCI_PASSTHROUGH:
+@@ -718,6 +722,12 @@ class API(base_api.NetworkAPI):
+             self._refresh_neutron_extensions_cache(context, neutron=neutron)
+         return constants.PORTBINDING_EXT in self.extensions
+ 
++    def _has_wrs_port_binding_extension(self, context, refresh_cache=False,
++                                        neutron=None):
++        if refresh_cache:
++            self._refresh_neutron_extensions_cache(context, neutron=neutron)
++        return constants.WRS_PORTBINDING_EXT in self.extensions
++
+     # add vif_pci_address
+     @staticmethod
+     def _populate_neutron_binding_profile(instance, pci_request_id,
+diff --git a/nova/network/neutronv2/constants.py b/nova/network/neutronv2/constants.py
+index 9c7beea..46ce96f 100644
+--- a/nova/network/neutronv2/constants.py
++++ b/nova/network/neutronv2/constants.py
+@@ -25,5 +25,6 @@ NET_EXTERNAL = 'router:external'
+ PORTBINDING_EXT = 'Port Binding'
+ VNIC_INDEX_EXT = 'VNIC Index'
+ DNS_INTEGRATION = 'DNS Integration'
++WRS_PORTBINDING_EXT = "wrs-port-binding"
+ PORT_VIF_MODEL = 'wrs-binding:vif_model'
+ PORT_MAC_FILTERING = 'wrs-binding:mac_filtering'
+diff --git a/nova/tests/unit/network/test_neutronv2.py b/nova/tests/unit/network/test_neutronv2.py
+index 8ac9239..062a553 100644
+--- a/nova/tests/unit/network/test_neutronv2.py
++++ b/nova/tests/unit/network/test_neutronv2.py
+@@ -515,6 +515,8 @@ class TestNeutronv2Base(test.TestCase):
+         preexisting_port_ids = []
+         ports_in_requested_net_order = []
+         nets_in_requested_net_order = []
++        self.mox.StubOutWithMock(api, '_has_wrs_port_binding_extension')
++        api._has_wrs_port_binding_extension(mox.IgnoreArg()).AndReturn(True)
+         for request in ordered_networks:
+             port_req_body = {
+                 'port': {
+@@ -1173,6 +1175,8 @@ class TestNeutronv2(TestNeutronv2Base):
+                      for net in (self.nets2[0], self.nets2[1])])
+         self.moxed_client.list_networks(
+             id=['my_netid1', 'my_netid2']).AndReturn({'networks': self.nets2})
++        self.mox.StubOutWithMock(api, '_has_wrs_port_binding_extension')
++        api._has_wrs_port_binding_extension(mox.IgnoreArg()).AndReturn(True)
+         index = 0
+         for network in self.nets2:
+             binding_port_req_body = {
+@@ -1233,6 +1237,8 @@ class TestNeutronv2(TestNeutronv2Base):
+                      for net in (self.nets2[0], self.nets2[1])])
+         self.moxed_client.list_networks(
+             id=['my_netid1', 'my_netid2']).AndReturn({'networks': self.nets2})
++        self.mox.StubOutWithMock(api, '_has_wrs_port_binding_extension')
++        api._has_wrs_port_binding_extension(mox.IgnoreArg()).AndReturn(True)
+         binding_port_req_body = {
+             'port': {
+                 'device_id': self.instance.uuid,
+-- 
+2.7.4
+

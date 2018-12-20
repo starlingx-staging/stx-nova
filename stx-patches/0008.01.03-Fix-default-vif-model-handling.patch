@@ -1,0 +1,127 @@
+From 3019232ffe36771f6d7ef7f430c0a44a3274a962 Mon Sep 17 00:00:00 2001
+From: Chris Friesen <chris.friesen@windriver.com>
+Date: Tue, 14 Jul 2015 15:52:47 -0600
+Subject: [PATCH] Fix default vif model handling
+
+The previous iteration of code to deal with 
+unconditionally changed behaviour and broke unit tests.  This is
+an attempt to clean things up.
+
+The code in get_base_config() is reverted back to the original, with
+the addition of the check for the vif_model in the vif itself.  The
+default will still be to use virtio for kvm/qemu due to the
+"use_virtio_for_bridges" config option which defaults to True.
+
+The _get_hw_vif_model() function is no longer used and has been
+removed.
+
+The novirtio and xen vif tests are reverted back to their original
+forms since we shouldn't be using virtio for either of them.
+
+Finally, the unused "default_vif_model" is removed from the v3
+servers.py.
+---
+ nova/api/openstack/compute/plugins/v3/servers.py |  1 -
+ nova/tests/unit/virt/libvirt/test_vif.py         |  4 +--
+ nova/virt/libvirt/vif.py                         | 35 +++++++++++++-----------
+ 3 files changed, 21 insertions(+), 19 deletions(-)
+
+diff --git a/nova/api/openstack/compute/plugins/v3/servers.py b/nova/api/openstack/compute/plugins/v3/servers.py
+index 6f91d8b..699b7bc 100644
+--- a/nova/api/openstack/compute/plugins/v3/servers.py
++++ b/nova/api/openstack/compute/plugins/v3/servers.py
+@@ -55,7 +55,6 @@ ALIAS = 'servers'
+ CONF = cfg.CONF
+ CONF.import_opt('enable_instance_password',
+                 'nova.api.openstack.compute.servers')
+-CONF.import_opt('default_vif_model', 'nova.compute.api')
+ CONF.import_opt('network_api_class', 'nova.network')
+ CONF.import_opt('reclaim_instance_interval', 'nova.compute.manager')
+ CONF.import_opt('extensions_blacklist', 'nova.api.openstack', group='osapi_v3')
+diff --git a/nova/tests/unit/virt/libvirt/test_vif.py b/nova/tests/unit/virt/libvirt/test_vif.py
+index 5b383d2..612efa3 100644
+--- a/nova/tests/unit/virt/libvirt/test_vif.py
++++ b/nova/tests/unit/virt/libvirt/test_vif.py
+@@ -453,7 +453,7 @@ class LibvirtVifTestCase(test.NoDBTestCase):
+ 
+         d = vif.LibvirtGenericVIFDriver()
+         xml = self._get_instance_xml(d, self.vif_bridge)
+-        self._assertModel(xml, network_model.VIF_MODEL_VIRTIO)
++        self._assertModel(xml)
+ 
+     def test_model_kvm(self):
+         self.flags(use_virtio_for_bridges=True,
+@@ -559,7 +559,7 @@ class LibvirtVifTestCase(test.NoDBTestCase):
+ 
+         d = vif.LibvirtGenericVIFDriver()
+         xml = self._get_instance_xml(d, self.vif_bridge)
+-        self._assertModel(xml, network_model.VIF_MODEL_VIRTIO)
++        self._assertModel(xml)
+ 
+     def test_generic_driver_none(self):
+         d = vif.LibvirtGenericVIFDriver()
+diff --git a/nova/virt/libvirt/vif.py b/nova/virt/libvirt/vif.py
+index fc50af3..821e7ed 100644
+--- a/nova/virt/libvirt/vif.py
++++ b/nova/virt/libvirt/vif.py
+@@ -44,7 +44,6 @@ libvirt_vif_opts = [
+ CONF = cfg.CONF
+ CONF.register_opts(libvirt_vif_opts, 'libvirt')
+ CONF.import_opt('use_ipv6', 'nova.netconf')
+-CONF.import_opt('default_vif_model', 'nova.compute.api')
+ 
+ DEV_PREFIX_ETH = 'eth'
+ 
+@@ -86,20 +85,6 @@ def is_vif_model_valid_for_virt(virt_type, vif_model):
+ class LibvirtGenericVIFDriver(object):
+     """Generic VIF driver for libvirt networking."""
+ 
+-    def _get_hw_vif_model(self, vif, image_meta):
+-        """Extract the hardware vif model from the vif description or the
+-        image meta data.  The vif description must take precedence over the
+-        stored image meta data.
+-        """
+-        vif_model = vif.get('vif_model')
+-        if not vif_model and image_meta:
+-            properties = image_meta.get('properties')
+-            if properties:
+-                vif_model = properties.get('hw_vif_model')
+-        if vif_model is not None:
+-            return vif_model
+-        return CONF.default_vif_model
+-
+     def _normalize_vif_type(self, vif_type):
+         return vif_type.replace('2.1q', '2q')
+ 
+@@ -116,9 +101,27 @@ class LibvirtGenericVIFDriver(object):
+                         inst_type, virt_type):
+         conf = vconfig.LibvirtConfigGuestInterface()
+         # Default to letting libvirt / the hypervisor choose the model
+-        model = self._get_hw_vif_model(vif, image_meta)
++        model = None
+         driver = None
+ 
++        # If the user has specified a model in the vif itself, use it
++        model = vif.get('vif_model')
++
++        # If the user has specified a 'vif_model' against the
++        # image then honour that model
++        if model is None and image_meta:
++            vif_model = image_meta.get('properties',
++                                       {}).get('hw_vif_model')
++            if vif_model is not None:
++                model = vif_model
++
++        # Else if the virt type is KVM/QEMU, use virtio according
++        # to the global config parameter
++        if (model is None and
++            virt_type in ('kvm', 'qemu') and
++                    CONF.libvirt.use_virtio_for_bridges):
++            model = network_model.VIF_MODEL_VIRTIO
++
+         # Workaround libvirt bug, where it mistakenly
+         # enables vhost mode, even for non-KVM guests
+         if (model == network_model.VIF_MODEL_VIRTIO and
+-- 
+2.7.4
+

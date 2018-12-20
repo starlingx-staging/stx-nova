@@ -1,0 +1,135 @@
+From 57e1105ec81f1f7d463ad2e6e9bc0809f90de70a Mon Sep 17 00:00:00 2001
+From: Gerry Kopec <Gerry.Kopec@windriver.com>
+Date: Wed, 15 Jun 2016 19:47:37 -0400
+Subject: [PATCH] Check actual amount of free disk space on compute node.
+
+Port of commit 4dda75f to Mitaka
+
+Currently when using local storage we allocate an "instances_lv" volume
+from the "nova-local" volume group.  Nova doesn't know anything about
+it, and doesn't account for it.
+
+Also, we made a change to do background zeroing-out of
+volumes, which means that the space could be consumed for longer than
+nova knows about.
+
+For both of these reasons we want to check the actual free/used disk
+space and correct the values reported to the scheduler.
+
+Once *both* of the above changes are removed, then this code can
+be reverted.
+
+Additional notes for port to mitaka:
+- convert use compute_node directly in _update_available_resource per
+  upstream change
+- add free_disk_gb to info log
+---
+ nova/compute/resource_tracker.py        | 15 +++++++++++++++
+ nova/tests/unit/compute/test_tracker.py |  9 +++++++++
+ nova/virt/driver.py                     |  5 +++++
+ nova/virt/libvirt/driver.py             |  6 ++++++
+ 4 files changed, 35 insertions(+)
+
+diff --git a/nova/compute/resource_tracker.py b/nova/compute/resource_tracker.py
+index e42cd30..1386990 100644
+--- a/nova/compute/resource_tracker.py
++++ b/nova/compute/resource_tracker.py
+@@ -675,6 +675,19 @@ class ResourceTracker(object):
+         # but it is. This should be changed in ComputeNode
+         self.compute_node.metrics = jsonutils.dumps(metrics)
+ 
++        # If the actual free disk space is less than calculated or the
++        # actual used disk space is more than calculated, update it so the
++        # scheduler doesn't think we have more space than we do.
++        local_gb_info = self.driver.get_local_gb_info()
++        local_gb_used = local_gb_info.get('used')
++        if (local_gb_used is not None and
++                    local_gb_used > self.compute_node.local_gb_used):
++            self.compute_node.local_gb_used = local_gb_used
++        local_gb_free = local_gb_info.get('free')
++        if (local_gb_free is not None and
++                    local_gb_free < self.compute_node.free_disk_gb):
++            self.compute_node.free_disk_gb = local_gb_free
++
+         # update the compute_node
+         self._update(context)
+         LOG.info(_LI('Compute_service record updated for %(host)s:%(node)s'),
+@@ -762,6 +775,7 @@ class ResourceTracker(object):
+                      "used_ram=%(used_ram)sMB "
+                      "phys_disk=%(phys_disk)sGB "
+                      "used_disk=%(used_disk)sGB "
++                     "free_disk=%(free_disk)sGB "
+                      "total_vcpus=%(total_vcpus)s "
+                      "used_vcpus=%(used_vcpus)s "
+                      "pci_stats=%(pci_stats)s"),
+@@ -770,6 +784,7 @@ class ResourceTracker(object):
+                   'used_ram': self.compute_node.memory_mb_used,
+                   'phys_disk': self.compute_node.local_gb,
+                   'used_disk': self.compute_node.local_gb_used,
++                  'free_disk': self.compute_node.free_disk_gb,
+                   'total_vcpus': tcpu,
+                   'used_vcpus': ucpu,
+                   'pci_stats': pci_stats})
+diff --git a/nova/tests/unit/compute/test_tracker.py b/nova/tests/unit/compute/test_tracker.py
+index e2b6026..6c6be67 100644
+--- a/nova/tests/unit/compute/test_tracker.py
++++ b/nova/tests/unit/compute/test_tracker.py
+@@ -9,6 +9,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2015-2016 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ import copy
+ 
+@@ -398,6 +405,8 @@ def setup_rt(hostname, nodename, virt_resources=_VIRT_DRIVER_AVAIL_RESOURCES,
+     virt_resources = copy.deepcopy(virt_resources)
+     vd.get_available_resource.return_value = virt_resources
+     vd.estimate_instance_overhead.side_effect = estimate_overhead
++    # mock a return value of empty dict to give default behaviour.
++    vd.get_local_gb_info.return_value = {}
+ 
+     with test.nested(
+             mock.patch('nova.scheduler.client.SchedulerClient',
+diff --git a/nova/virt/driver.py b/nova/virt/driver.py
+index cfa41e8..2ce9098 100644
+--- a/nova/virt/driver.py
++++ b/nova/virt/driver.py
+@@ -1626,6 +1626,11 @@ class ComputeDriver(object):
+         """
+         raise NotImplementedError()
+ 
++    # This is used in resource tracker.
++    # Default of empty dict gives original behaviour for testing.
++    def get_local_gb_info(self):
++        return {}
++
+ 
+ def load_compute_driver(virtapi, compute_driver=None):
+     """Load a compute driver module.
+diff --git a/nova/virt/libvirt/driver.py b/nova/virt/libvirt/driver.py
+index 691e516..afe2687 100644
+--- a/nova/virt/libvirt/driver.py
++++ b/nova/virt/libvirt/driver.py
+@@ -5221,6 +5221,12 @@ class LibvirtDriver(driver.ComputeDriver):
+                                       "out of hypervisor cpu range."))
+         return len(available_ids)
+ 
++    # We want to get the actual free disk information to correct the
++    # usage in the resource tracker.  We allocate an additional volume and
++    # do background deletion of LVs so the stats need correcting.
++    def get_local_gb_info(self):
++        return self._get_local_gb_info()
++
+     @staticmethod
+     def _get_local_gb_info():
+         """Get local storage info of the compute node in GB.
+-- 
+2.7.4
+

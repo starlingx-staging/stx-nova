@@ -1,0 +1,133 @@
+From 308edebbf4fbe5fffadda3d41c055b518ff65418 Mon Sep 17 00:00:00 2001
+From: Joseph Richard <Joseph.Richard@windriver.com>
+Date: Thu, 19 Mar 2015 00:03:51 -0400
+Subject: [PATCH] Fix always setting default vif_model value
+
+This commit moves the setting of the vif_model to the
+default value only after checking for an assigned value
+from the image.  This fixes the issue of setting the
+vif_model to the default value if it is not specified
+for the NIC directly.  This also fixes the issue with
+avp hw_vif_model with a different vif_model specified
+for a specific port.
+---
+ nova/api/openstack/compute/plugins/v3/servers.py |  3 +--
+ nova/api/openstack/compute/servers.py            |  3 +--
+ nova/virt/libvirt/vif.py                         | 33 ++++++++++++------------
+ nova/virt/wrs/libvirt/vif.py                     | 12 ---------
+ 4 files changed, 19 insertions(+), 32 deletions(-)
+
+diff --git a/nova/api/openstack/compute/plugins/v3/servers.py b/nova/api/openstack/compute/plugins/v3/servers.py
+index 1182726..b206219 100644
+--- a/nova/api/openstack/compute/plugins/v3/servers.py
++++ b/nova/api/openstack/compute/plugins/v3/servers.py
+@@ -450,8 +450,7 @@ class ServersController(wsgi.Controller):
+ 
+                 if utils.is_neutron():
+                     # vif_model is optional
+-                    vif_model = network.get('vif_model',
+-                                            CONF.default_vif_model)
++                    vif_model = network.get('vif_model', None)
+                     request.vif_model = vif_model
+ 
+                 # duplicate networks are allowed only for neutron v2.0
+diff --git a/nova/api/openstack/compute/servers.py b/nova/api/openstack/compute/servers.py
+index 408d5d9..3e0d0cd 100644
+--- a/nova/api/openstack/compute/servers.py
++++ b/nova/api/openstack/compute/servers.py
+@@ -339,8 +339,7 @@ class Controller(wsgi.Controller):
+ 
+                 # vif_model is optional
+                 if utils.is_neutron():
+-                    request.vif_model = network.get('vif_model',
+-                                                    CONF.default_vif_model)
++                    request.vif_model = network.get('vif_model', None)
+ 
+                 # duplicate networks are allowed only for neutron v2.0
+                 if (not utils.is_neutron() and request.network_id and
+diff --git a/nova/virt/libvirt/vif.py b/nova/virt/libvirt/vif.py
+index 2d79dea..b4599fb 100644
+--- a/nova/virt/libvirt/vif.py
++++ b/nova/virt/libvirt/vif.py
+@@ -44,6 +44,8 @@ libvirt_vif_opts = [
+ CONF = cfg.CONF
+ CONF.register_opts(libvirt_vif_opts, 'libvirt')
+ CONF.import_opt('use_ipv6', 'nova.netconf')
++CONF.import_opt('default_vif_model',
++                'nova.api.openstack.compute.servers')
+ 
+ DEV_PREFIX_ETH = 'eth'
+ 
+@@ -83,6 +85,20 @@ def is_vif_model_valid_for_virt(virt_type, vif_model):
+ class LibvirtGenericVIFDriver(object):
+     """Generic VIF driver for libvirt networking."""
+ 
++    def _get_hw_vif_model(self, vif, image_meta):
++        """Extract the hardware vif model from the vif description or the
++        image meta data.  The vif description must take precedence over the
++        stored image meta data.
++        """
++        vif_model = vif.get('vif_model')
++        if not vif_model and image_meta:
++            properties = image_meta.get('properties')
++            if properties:
++                vif_model = properties.get('hw_vif_model')
++        if vif_model is not None:
++            return vif_model
++        return CONF.default_vif_model
++
+     def _normalize_vif_type(self, vif_type):
+         return vif_type.replace('2.1q', '2q')
+ 
+@@ -99,24 +115,9 @@ class LibvirtGenericVIFDriver(object):
+                         inst_type, virt_type):
+         conf = vconfig.LibvirtConfigGuestInterface()
+         # Default to letting libvirt / the hypervisor choose the model
+-        model = None
++        model = self._get_hw_vif_model(vif, image_meta)
+         driver = None
+ 
+-        # If the user has specified a 'vif_model' against the
+-        # image then honour that model
+-        if image_meta:
+-            vif_model = image_meta.get('properties',
+-                                       {}).get('hw_vif_model')
+-            if vif_model is not None:
+-                model = vif_model
+-
+-        # Else if the virt type is KVM/QEMU, use virtio according
+-        # to the global config parameter
+-        if (model is None and
+-            virt_type in ('kvm', 'qemu') and
+-                    CONF.libvirt.use_virtio_for_bridges):
+-            model = network_model.VIF_MODEL_VIRTIO
+-
+         # Workaround libvirt bug, where it mistakenly
+         # enables vhost mode, even for non-KVM guests
+         if (model == network_model.VIF_MODEL_VIRTIO and
+diff --git a/nova/virt/wrs/libvirt/vif.py b/nova/virt/wrs/libvirt/vif.py
+index a6d203b..586b644 100644
+--- a/nova/virt/wrs/libvirt/vif.py
++++ b/nova/virt/wrs/libvirt/vif.py
+@@ -30,18 +30,6 @@ class LibvirtGenericVIFDriver(vif.LibvirtGenericVIFDriver):
+     def __init__(self):
+         self.vswitch_api = vswitch_api.VSwitchManagementAPI()
+ 
+-    def _get_hw_vif_model(self, vif, image_meta):
+-        """Extract the hardware vif model from the vif description or the
+-        image meta data.  The vif description must take precedence over the
+-        stored image meta data.
+-        """
+-        vif_model = vif.get('vif_model')
+-        if not vif_model and image_meta:
+-            properties = image_meta.get('properties')
+-            if properties:
+-                vif_model = properties.get('hw_vif_model')
+-        return vif_model
+-
+     def _get_config_vswitch_avp(self, vif):
+         """Setup a vswitch shared memory device to be mapped directly in
+         to a guest.
+-- 
+2.7.4
+

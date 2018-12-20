@@ -1,0 +1,39 @@
+From d8ac0273041ff5d48fa5fa4659bc45ba320f22b8 Mon Sep 17 00:00:00 2001
+From: Jim Gauld <james.gauld@windriver.com>
+Date: Fri, 23 Sep 2016 23:50:58 -0400
+Subject: [PATCH] Limit flavor vcpus to 128 to prevent Horizon
+ memory bottleneck
+
+This limits flavor create vcpus between 1 and 128.
+
+Note that a fix in Horizon was previously made to limit to
+128. Setting to larger (eg, > 180) caused cpu hog issue and memory
+growth due to how the form iterates over each vcpu. It was triggering
+OOM on CPE systems. Architects agreed that we could limit to 128 as
+maximum supported value.
+
+(cherry picked from commit 916aa8d)
+---
+ nova/api/openstack/compute/schemas/flavor_manage.py | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/nova/api/openstack/compute/schemas/flavor_manage.py b/nova/api/openstack/compute/schemas/flavor_manage.py
+index 5eb5326..15a0db9 100644
+--- a/nova/api/openstack/compute/schemas/flavor_manage.py
++++ b/nova/api/openstack/compute/schemas/flavor_manage.py
+@@ -32,7 +32,11 @@ create = {
+                     'pattern': '^(?! )[a-zA-Z0-9. _-]+(?<! )$'
+                 },
+                 'ram': parameter_types.flavor_param_positive,
+-                'vcpus': parameter_types.flavor_param_positive,
++                'vcpus': {
++                    'type': ['integer'],
++                    'minimum': 0, 'exclusiveMinimum': True,
++                    'maximum': 128
++                },
+                 'disk': parameter_types.flavor_param_non_negative,
+                 'OS-FLV-EXT-DATA:ephemeral':
+                     parameter_types.flavor_param_non_negative,
+-- 
+2.7.4
+

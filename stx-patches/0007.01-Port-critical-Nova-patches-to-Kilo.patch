@@ -1,0 +1,3335 @@
+From 3dc761cc287c027671af94feb6d55745da0e2d9c Mon Sep 17 00:00:00 2001
+From: Chris Friesen <chris.friesen@windriver.com>
+Date: Tue, 13 Jan 2015 16:45:55 -0600
+Subject: [PATCH] Port critical Nova patches to Kilo
+
+Porting the following commits:
+c2c456c	 Added MTU attribute to VIF model entity
+fbbb969	 Added mac filter attribute to VIF meta data
+66fa547	 disable security groups by default
+d5ba4a8	 Sanity: wrl5-avp Guest failed to acquire IP address at boot
+f7534b6	 Added vif-model as an optional VM boot attribute
+74fd86a	 Neutron port binding API has been updated
+ab8a105	 Updated instance API to return non empty address list
+8f34160	 remove security group extension for list operations
+
+Note: this does not include the regenerated api_samples, that will come
+in a separate commit.
+
+(cherry picked from commit 59b4cd8f4b328851901ed52c8c5dc2264cd34)
+
+Conflicts:
+	nova/api/openstack/common.py
+	nova/api/openstack/compute/servers.py
+	nova/compute/rpcapi.py
+	nova/tests/unit/compute/test_rpcapi.py
+---
+ nova/api/openstack/common.py                       |  19 +++-
+ .../openstack/compute/contrib/security_groups.py   |  13 ++-
+ nova/api/openstack/compute/plugins/v3/servers.py   |  17 +++-
+ nova/api/openstack/compute/servers.py              |  23 ++++-
+ nova/api/openstack/compute/views/addresses.py      |  23 ++++-
+ nova/api/openstack/compute/views/nics.py           |  66 ++++++++++++++
+ nova/api/openstack/compute/views/servers.py        |  17 ++++
+ nova/compute/api.py                                |   4 +-
+ nova/compute/rpcapi.py                             |   4 +-
+ nova/network/model.py                              |   3 +
+ nova/network/neutronv2/api.py                      |  33 ++++++-
+ nova/objects/network_request.py                    |  30 ++++--
+ .../OS-DCF/list-servers-detail-get.json.tpl        |  12 ++-
+ .../OS-DCF/server-action-rebuild-resp.json.tpl     |  12 ++-
+ .../api_samples/OS-DCF/server-get-resp.json.tpl    |  12 ++-
+ .../OS-DCF/server-update-put-resp.json.tpl         |  12 ++-
+ .../api_samples/OS-EXT-AZ/server-get-resp.json.tpl |  12 ++-
+ .../OS-EXT-AZ/servers-detail-resp.json.tpl         |  12 ++-
+ .../OS-EXT-IPS-MAC/server-get-resp.json.tpl        |  12 ++-
+ .../OS-EXT-IPS-MAC/servers-detail-resp.json.tpl    |  12 ++-
+ .../OS-EXT-IPS/server-get-resp.json.tpl            |  12 ++-
+ .../OS-EXT-IPS/servers-detail-resp.json.tpl        |  12 ++-
+ .../OS-EXT-SRV-ATTR/server-get-resp.json.tpl       |  12 ++-
+ .../OS-EXT-SRV-ATTR/servers-detail-resp.json.tpl   |  12 ++-
+ .../OS-EXT-STS/server-get-resp.json.tpl            |  12 ++-
+ .../OS-EXT-STS/servers-detail-resp.json.tpl        |  12 ++-
+ .../OS-SRV-USG/server-get-resp.json.tpl            |  12 ++-
+ .../OS-SRV-USG/servers-detail-resp.json.tpl        |  12 ++-
+ .../server-action-rebuild-resp.json.tpl            |  12 ++-
+ .../all_extensions/server-get-resp.json.tpl        |  17 ++--
+ .../all_extensions/server-post-resp.json.tpl       |   5 -
+ .../all_extensions/servers-details-resp.json.tpl   |  17 ++--
+ .../server-config-drive-get-resp.json.tpl          |  12 ++-
+ .../servers-config-drive-details-resp.json.tpl     |  12 ++-
+ .../server-get-resp-rescue.json.tpl                |  12 ++-
+ .../os-extended-volumes/server-get-resp.json.tpl   |  10 ++
+ .../servers-detail-resp.json.tpl                   |  10 ++
+ .../server-get-resp.json.tpl                       |  11 ++-
+ .../servers-details-resp.json.tpl                  |  11 ++-
+ .../server-action-rebuild-resp.json.tpl            |  12 ++-
+ .../os-rescue/server-get-resp-rescue.json.tpl      |  12 ++-
+ .../os-rescue/server-get-resp-unrescue.json.tpl    |  12 ++-
+ .../os-security-groups/server-post-resp.json.tpl   |   5 -
+ .../servers/server-action-rebuild-resp.json.tpl    |  12 ++-
+ .../api_samples/servers/server-get-resp.json.tpl   |  12 ++-
+ .../servers/server-ips-network-resp.json.tpl       |   1 +
+ .../api_samples/servers/server-ips-resp.json.tpl   |   1 +
+ .../servers/servers-details-resp.json.tpl          |  12 ++-
+ nova/tests/functional/test_api_samples.py          |  17 ++++
+ .../all_extensions/server-get-resp.json.tpl        |  17 ++--
+ .../all_extensions/server-post-resp.json.tpl       |   2 +
+ .../all_extensions/servers-details-resp.json.tpl   |  17 ++--
+ .../server-action-rebuild-resp.json.tpl            |  12 ++-
+ .../os-access-ips/server-get-resp.json.tpl         |  12 ++-
+ .../os-access-ips/server-put-resp.json.tpl         |  12 ++-
+ .../os-access-ips/servers-details-resp.json.tpl    |  12 ++-
+ .../server-config-drive-get-resp.json.tpl          |  12 ++-
+ .../servers-config-drive-details-resp.json.tpl     |  12 ++-
+ .../server-get-resp.json.tpl                       |  12 ++-
+ .../servers-detail-resp.json.tpl                   |  12 ++-
+ .../server-get-resp.json.tpl                       |  12 ++-
+ .../servers-detail-resp.json.tpl                   |  12 ++-
+ .../os-extended-status/server-get-resp.json.tpl    |  12 ++-
+ .../servers-detail-resp.json.tpl                   |  12 ++-
+ .../os-extended-volumes/server-get-resp.json.tpl   |  12 ++-
+ .../servers-detail-resp.json.tpl                   |  12 ++-
+ .../server-get-resp.json.tpl                       |  11 ++-
+ .../servers-details-resp.json.tpl                  |  11 ++-
+ .../v3/api_samples/os-pci/server-get-resp.json.tpl |  12 ++-
+ .../os-pci/servers-detail-resp.json.tpl            |  12 ++-
+ .../os-rescue/server-get-resp-rescue.json.tpl      |  12 ++-
+ .../os-rescue/server-get-resp-unrescue.json.tpl    |  12 ++-
+ .../os-security-groups/server-get-resp.json.tpl    |  12 ++-
+ .../servers-detail-resp.json.tpl                   |  12 ++-
+ .../os-server-usage/server-get-resp.json.tpl       |  12 ++-
+ .../os-server-usage/servers-detail-resp.json.tpl   |  12 ++-
+ .../server-ips/server-ips-network-resp.json.tpl    |   1 +
+ .../server-ips/server-ips-resp.json.tpl            |   1 +
+ .../servers/server-action-rebuild-resp.json.tpl    |  12 ++-
+ .../api_samples/servers/server-get-resp.json.tpl   |  12 ++-
+ .../servers/servers-details-resp.json.tpl          |  12 ++-
+ .../contrib/test_neutron_security_groups.py        |   9 +-
+ .../openstack/compute/plugins/v3/test_servers.py   | 101 ++++++++++++++++-----
+ .../unit/api/openstack/compute/test_servers.py     |  66 ++++++++++----
+ nova/tests/unit/compute/test_compute_mgr.py        |   2 +-
+ nova/tests/unit/compute/test_rpcapi.py             |   5 +-
+ nova/tests/unit/network/test_neutronv2.py          |  44 +++++----
+ nova/tests/unit/objects/test_network_request.py    |  15 ++-
+ nova/tests/unit/objects/test_objects.py            |   4 +-
+ nova/virt/libvirt/vif.py                           |   2 +-
+ 90 files changed, 1089 insertions(+), 188 deletions(-)
+ create mode 100644 nova/api/openstack/compute/views/nics.py
+
+diff --git a/nova/api/openstack/common.py b/nova/api/openstack/common.py
+index 7b13aef..d06bae4 100644
+--- a/nova/api/openstack/common.py
++++ b/nova/api/openstack/common.py
+@@ -12,6 +12,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2013-2014 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ import collections
+ import functools
+@@ -357,12 +364,17 @@ def dict_to_query_str(params):
+ 
+ def get_networks_for_instance_from_nw_info(nw_info):
+     networks = collections.OrderedDict()
+-    for vif in nw_info:
++    for index, vif in enumerate(nw_info):
+         ips = vif.fixed_ips()
+         floaters = vif.floating_ips()
+         label = vif['network']['label']
+         if label not in networks:
+             networks[label] = {'ips': [], 'floating_ips': []}
++
++        networks[label]['index'] = index + 1
++        networks[label]['port_id'] = vif['id']
++        networks[label]['vif_model'] = vif['vif_model']
++        networks[label]['mtu'] = vif['mtu']
+         for ip in itertools.chain(ips, floaters):
+             ip['mac_address'] = vif['address']
+         networks[label]['ips'].extend(ips)
+@@ -375,7 +387,10 @@ def get_networks_for_instance(context, instance):
+ 
+     We end up with a data structure like::
+ 
+-        {'public': {'ips': [{'address': '10.0.0.1',
++        {'public': {'port_id': 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
++                    'vif_model': 'virtio',
++                    'mtu': 1500,
++                    'ips': [{'address': '10.0.0.1',
+                              'version': 4,
+                              'mac_address': 'aa:aa:aa:aa:aa:aa'},
+                             {'address': '2001::1',
+diff --git a/nova/api/openstack/compute/contrib/security_groups.py b/nova/api/openstack/compute/contrib/security_groups.py
+index e17a4b2..707d74e 100644
+--- a/nova/api/openstack/compute/contrib/security_groups.py
++++ b/nova/api/openstack/compute/contrib/security_groups.py
+@@ -420,10 +420,15 @@ class SecurityGroupsOutputController(wsgi.Controller):
+                         self.security_group_api
+                         .get_instances_security_groups_bindings(context,
+                                                                 servers))
+-                for server in servers:
+-                    groups = sg_instance_bindings.get(server['id'])
+-                    if groups:
+-                        server[key] = groups
++                # only get the security groups if doing a detailed show of a
++                # specific instance, otherwise the retrieval of the port list
++                # from neutron causes a neutron CPU usage to spike when there
++                # are a large number of ports
++                if len(servers) == 1:
++                    for server in servers:
++                        groups = sg_instance_bindings.get(server['id'])
++                        if groups:
++                            server[key] = groups
+ 
+             # In this section of code len(servers) == 1 as you can only POST
+             # one server in an API request.
+diff --git a/nova/api/openstack/compute/plugins/v3/servers.py b/nova/api/openstack/compute/plugins/v3/servers.py
+index 6d526cc..64ce38a 100644
+--- a/nova/api/openstack/compute/plugins/v3/servers.py
++++ b/nova/api/openstack/compute/plugins/v3/servers.py
+@@ -13,6 +13,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2013-2014 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ import base64
+ import re
+@@ -48,6 +55,8 @@ ALIAS = 'servers'
+ CONF = cfg.CONF
+ CONF.import_opt('enable_instance_password',
+                 'nova.api.openstack.compute.servers')
++CONF.import_opt('default_vif_model',
++                'nova.api.openstack.compute.servers')
+ CONF.import_opt('network_api_class', 'nova.network')
+ CONF.import_opt('reclaim_instance_interval', 'nova.compute.manager')
+ CONF.import_opt('extensions_blacklist', 'nova.api.openstack', group='osapi_v3')
+@@ -439,8 +448,14 @@ class ServersController(wsgi.Controller):
+                                 "(%s)") % request.network_id
+                         raise exc.HTTPBadRequest(explanation=msg)
+ 
++                if utils.is_neutron():
++                    # vif_model is optional
++                    vif_model = network.get('vif_model',
++                                            CONF.default_vif_model)
++                    request.vif_model = vif_model
++
+                 # duplicate networks are allowed only for neutron v2.0
+-                if (not utils.is_neutron() and request.network_id and
++                if (request.network_id and
+                         request.network_id in network_uuids):
+                     expl = (_("Duplicate networks"
+                               " (%s) are not allowed") %
+diff --git a/nova/api/openstack/compute/servers.py b/nova/api/openstack/compute/servers.py
+index d3d52ae..5982e14 100644
+--- a/nova/api/openstack/compute/servers.py
++++ b/nova/api/openstack/compute/servers.py
+@@ -13,6 +13,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2013-2014 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ import base64
+ import os
+@@ -51,6 +58,10 @@ server_opts = [
+                      ' or rescue, If the hypervisor does not support'
+                      ' password injection then the password returned will'
+                      ' not be correct'),
++    cfg.StrOpt('default_vif_model',
++               default='virtio',
++               help='Name of default emulated VIF hardware type (e.g., '
++                    'virtio, e1000, etc...)'),
+ ]
+ CONF = cfg.CONF
+ CONF.register_opts(server_opts)
+@@ -322,8 +333,13 @@ class Controller(wsgi.Controller):
+                     msg = _("Invalid fixed IP address (%s)") % request.address
+                     raise exc.HTTPBadRequest(explanation=msg)
+ 
++                # vif_model is optional
++                if utils.is_neutron():
++                    request.vif_model = network.get('vif_model',
++                                                    CONF.default_vif_model)
++
+                 # duplicate networks are allowed only for neutron v2.0
+-                if (not utils.is_neutron() and request.network_id and
++                if (request.network_id and
+                         request.network_id in network_uuids):
+                     expl = (_("Duplicate networks"
+                               " (%s) are not allowed") %
+@@ -529,8 +545,9 @@ class Controller(wsgi.Controller):
+                                'message': ''
+                            }
+                     raise exc.HTTPBadRequest(explanation=msg)
+-        if not sg_names:
+-            sg_names.append('default')
++        # DO NOT SET A DEFAULT SECURITY GROUP
++        # if not sg_names:
++        #    sg_names.append('default')
+ 
+         sg_names = list(set(sg_names))
+ 
+diff --git a/nova/api/openstack/compute/views/addresses.py b/nova/api/openstack/compute/views/addresses.py
+index 894d436..a1c1938 100644
+--- a/nova/api/openstack/compute/views/addresses.py
++++ b/nova/api/openstack/compute/views/addresses.py
+@@ -12,6 +12,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2013-2014 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ import collections
+ import itertools
+@@ -24,17 +31,26 @@ class ViewBuilder(common.ViewBuilder):
+ 
+     _collection_name = "addresses"
+ 
+-    def basic(self, ip, extend_address=False):
++    def basic(self, ip, index, extend_address=False):
+         """Return a dictionary describing an IP address."""
+         return {
++            "index": index,
+             "version": ip["version"],
+             "addr": ip["address"],
+         }
+ 
++    def default(self, index):
++        """Return a default dictionary for when no address is assigned."""
++        return {
++            "index": index,
++            "addr": None,
++        }
++
+     def show(self, network, label, extend_address=False):
+         """Returns a dictionary describing a network."""
+         all_ips = itertools.chain(network["ips"], network["floating_ips"])
+-        return {label: [self.basic(ip, extend_address) for ip in all_ips]}
++        return {label: [self.basic(ip, network["index"], extend_address) for ip in all_ips] or
++                       [self.default(network["index"])]}
+ 
+     def index(self, networks, extend_address=False):
+         """Return a dictionary describing a list of networks."""
+@@ -47,9 +63,10 @@ class ViewBuilder(common.ViewBuilder):
+ 
+ class ViewBuilderV3(ViewBuilder):
+     """Models server addresses as a dictionary."""
+-    def basic(self, ip, extend_address=False):
++    def basic(self, ip, index, extend_address=False):
+         """Return a dictionary describing an IP address."""
+         address = {
++            "index": index,
+             "version": ip["version"],
+             "addr": ip["address"],
+         }
+diff --git a/nova/api/openstack/compute/views/nics.py b/nova/api/openstack/compute/views/nics.py
+new file mode 100644
+index 0000000..90ca22a
+--- /dev/null
++++ b/nova/api/openstack/compute/views/nics.py
+@@ -0,0 +1,66 @@
++# Copyright 2010-2011 OpenStack Foundation
++# All Rights Reserved.
++#
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++#
++# Copyright (c) 2013-2014 Wind River Systems, Inc.
++#
++#
++#
++#
++#
++
++
++from nova.api.openstack import common
++
++
++class ViewBuilder(common.ViewBuilder):
++    """Models server nics as a list."""
++
++    _collection_name = "nics"
++
++    def basic(self, network, label):
++        """Return a dictionary describing a server nic."""
++        return {
++            "network": label,
++            "port_id": network["port_id"],
++            "vif_model": network["vif_model"],
++            "mtu": network["mtu"],
++        }
++
++    def show(self, network, label):
++        """Returns a dictionary describing a nic."""
++        return {"nic" + str(network["index"]): self.basic(network, label)}
++
++    def index(self, networks):
++        """Return a dictionary describing a list of nics."""
++        nics = []
++        for label, network in networks.items():
++            nics.append(self.show(network, label))
++        return dict(nics=nics)
++
++
++class ViewBuilderV3(ViewBuilder):
++    """Models server nics as a list."""
++    def __init__(self):
++        super(ViewBuilderV3, self).__init__()
++
++    def basic(self, network, label):
++        """Return a dictionary describing a server nic."""
++        return {
++            "network": label,
++            "port_id": network["port_id"],
++            "vif_model": network["vif_model"],
++            "mac_addr": network["mac_address"],
++            "mtu": network["mtu"],
++        }
+diff --git a/nova/api/openstack/compute/views/servers.py b/nova/api/openstack/compute/views/servers.py
+index 005f228..c86bb31 100644
+--- a/nova/api/openstack/compute/views/servers.py
++++ b/nova/api/openstack/compute/views/servers.py
+@@ -13,6 +13,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2013-2014 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ import hashlib
+ 
+@@ -23,6 +30,8 @@ from nova.api.openstack import common
+ from nova.api.openstack.compute.views import addresses as views_addresses
+ from nova.api.openstack.compute.views import flavors as views_flavors
+ from nova.api.openstack.compute.views import images as views_images
++from nova.api.openstack.compute.views import nics as views_nics
++from nova.compute import flavors
+ from nova.i18n import _LW
+ from nova.objects import base as obj_base
+ from nova import utils
+@@ -55,6 +64,7 @@ class ViewBuilder(common.ViewBuilder):
+         self._address_builder = views_addresses.ViewBuilder()
+         self._flavor_builder = views_flavors.ViewBuilder()
+         self._image_builder = views_images.ViewBuilder()
++        self._nic_builder = views_nics.ViewBuilder()
+ 
+     def create(self, request, instance):
+         """View that should be returned when an instance is created."""
+@@ -97,6 +107,7 @@ class ViewBuilder(common.ViewBuilder):
+                 "created": timeutils.isotime(instance["created_at"]),
+                 "updated": timeutils.isotime(instance["updated_at"]),
+                 "addresses": self._get_addresses(request, instance),
++                "nics": self._get_nics(request, instance),
+                 "accessIPv4": str(ip_v4) if ip_v4 is not None else '',
+                 "accessIPv6": str(ip_v6) if ip_v6 is not None else '',
+                 "links": self._get_links(request,
+@@ -176,6 +187,11 @@ class ViewBuilder(common.ViewBuilder):
+         return self._address_builder.index(networks,
+                                            extend_address)["addresses"]
+ 
++    def _get_nics(self, request, instance):
++        context = request.environ["nova.context"]
++        networks = common.get_networks_for_instance(context, instance)
++        return self._nic_builder.index(networks)["nics"]
++
+     def _get_image(self, request, instance):
+         image_ref = instance["image_ref"]
+         if image_ref:
+@@ -267,6 +283,7 @@ class ViewBuilderV3(ViewBuilder):
+                 "updated": timeutils.isotime(instance["updated_at"]),
+                 "addresses": self._get_addresses(request, instance,
+                                                  extend_address),
++                "nics": self._get_nics(request, instance),
+                 "links": self._get_links(request,
+                                          instance["uuid"],
+                                          self._collection_name),
+diff --git a/nova/compute/api.py b/nova/compute/api.py
+index 069c0c0..61b2fc4 100644
+--- a/nova/compute/api.py
++++ b/nova/compute/api.py
+@@ -1073,7 +1073,9 @@ class API(base.Base):
+         # Normalize and setup some parameters
+         if reservation_id is None:
+             reservation_id = utils.generate_uid('r')
+-        security_groups = security_groups or ['default']
++        # DO NOT SET A DEFAULT SECURITY GROUP
++        # security_groups = security_groups or ['default']
++        security_groups = security_groups or []
+         min_count = min_count or 1
+         max_count = max_count or min_count
+         block_device_mapping = block_device_mapping or []
+diff --git a/nova/compute/rpcapi.py b/nova/compute/rpcapi.py
+index c2be3eb..903e60c 100644
+--- a/nova/compute/rpcapi.py
++++ b/nova/compute/rpcapi.py
+@@ -1022,8 +1022,8 @@ class ComputeAPI(object):
+             version = '3.23'
+             if requested_networks is not None:
+                 if utils.is_neutron():
+-                    requested_networks = [(network_id, address, port_id)
+-                        for (network_id, address, port_id, _) in
++                    requested_networks = [(network_id, address, port_id, vif_model)
++                        for (network_id, address, port_id, vif_model, _) in
+                             requested_networks.as_tuples()]
+                 else:
+                     requested_networks = [(network_id, address)
+diff --git a/nova/network/model.py b/nova/network/model.py
+index 2a888ca..e3002aa 100644
+--- a/nova/network/model.py
++++ b/nova/network/model.py
+@@ -309,6 +309,7 @@ class VIF(Model):
+                  details=None, devname=None, ovs_interfaceid=None,
+                  qbh_params=None, qbg_params=None, active=False,
+                  vnic_type=VNIC_TYPE_NORMAL, profile=None,
++                 mtu=None, vif_model=None,
+                  preserve_on_delete=False, **kwargs):
+         super(VIF, self).__init__()
+ 
+@@ -326,6 +327,8 @@ class VIF(Model):
+         self['vnic_type'] = vnic_type
+         self['profile'] = profile
+         self['preserve_on_delete'] = preserve_on_delete
++        self['mtu'] = mtu
++        self['vif_model'] = vif_model
+ 
+         self._set_meta(kwargs)
+ 
+diff --git a/nova/network/neutronv2/api.py b/nova/network/neutronv2/api.py
+index 1f96360..93449be 100644
+--- a/nova/network/neutronv2/api.py
++++ b/nova/network/neutronv2/api.py
+@@ -14,6 +14,12 @@
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
+ #
++# Copyright (c) 2013-2014 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ import time
+ import uuid
+@@ -374,7 +380,7 @@ class API(base_api.NetworkAPI):
+         :param context: The request context.
+         :param instance: nova.objects.instance.Instance object.
+         :param requested_networks: optional value containing
+-            network_id, fixed_ip, and port_id
++            network_id, fixed_ip, port_id, vif_model
+         :param security_groups: security groups to allocate for instance
+         :param macs: None or a set of MAC addresses that the instance
+             should use. macs is supplied by the hypervisor driver (contrast
+@@ -419,6 +425,7 @@ class API(base_api.NetworkAPI):
+         requested_networks = kwargs.get('requested_networks')
+         dhcp_opts = kwargs.get('dhcp_options', None)
+         ports = {}
++        vif_models = {}
+         net_ids = []
+         ordered_networks = []
+         if requested_networks:
+@@ -449,6 +456,7 @@ class API(base_api.NetworkAPI):
+                 if request.network_id:
+                     net_ids.append(request.network_id)
+                     ordered_networks.append(request)
++                vif_models[request.network_id] = request.vif_model
+ 
+         nets = self._get_available_networks(context, instance.project_id,
+                                             net_ids, neutron=neutron)
+@@ -548,9 +556,11 @@ class API(base_api.NetworkAPI):
+ 
+                 raise exception.SecurityGroupCannotBeApplied()
+             request.network_id = network['id']
++            request.vif_model = vif_models.get(request.network_id)
+             zone = 'compute:%s' % instance.availability_zone
+             port_req_body = {'port': {'device_id': instance.uuid,
+-                                      'device_owner': zone}}
++                                      'device_owner': zone,
++                                      'binding:vif_model': request.vif_model}}
+             try:
+                 self._populate_neutron_extension_values(context,
+                                                         instance,
+@@ -680,6 +690,15 @@ class API(base_api.NetworkAPI):
+         # in which case requested_networks is not provided.
+         ports_to_skip |= set(self._get_preexisting_port_ids(instance))
+         ports = set(ports) - ports_to_skip
++        # Reset device_id and device_owner for the ports that are skipped
++        for port in ports_to_skip:
++            port_req_body = {'port': {'device_id': '', 'device_owner': ''}}
++            try:
++                get_client(context).update_port(port,
++                                                          port_req_body)
++            except Exception:
++                LOG.info(_LI('Unable to reset device ID for port %s'), port,
++                         instance=instance)
+ 
+         # Reset device_id and device_owner for the ports that are skipped
+         self._unbind_ports(context, ports_to_skip, neutron)
+@@ -694,13 +713,15 @@ class API(base_api.NetworkAPI):
+                                             network_model.NetworkInfo([]))
+ 
+     def allocate_port_for_instance(self, context, instance, port_id,
+-                                   network_id=None, requested_ip=None):
++                                   network_id=None, requested_ip=None,
++                                   vif_model=None):
+         """Allocate a port for the instance."""
+         requested_networks = objects.NetworkRequestList(
+             objects=[objects.NetworkRequest(network_id=network_id,
+                                             address=requested_ip,
+                                             port_id=port_id,
+-                                            pci_request_id=None)])
++                                            pci_request_id=None,
++                                            vif_model=vif_model)])
+         return self.allocate_for_instance(context, instance,
+                 requested_networks=requested_networks)
+ 
+@@ -1565,9 +1586,13 @@ class API(base_api.NetworkAPI):
+                         network_model.VNIC_TYPE_NORMAL),
+                     type=current_neutron_port.get('binding:vif_type'),
+                     profile=current_neutron_port.get('binding:profile'),
++                    mtu=current_neutron_port.get('binding:mtu'),
++                    vif_model=current_neutron_port.get('binding:vif_model'),
+                     details=current_neutron_port.get('binding:vif_details'),
+                     ovs_interfaceid=ovs_interfaceid,
+                     devname=devname,
++                    mac_filter=current_neutron_port.get(
++                        'binding:mac_filtering', False),
+                     active=vif_active,
+                     preserve_on_delete=preserve_on_delete))
+ 
+diff --git a/nova/objects/network_request.py b/nova/objects/network_request.py
+index 405c3c0..809b307 100644
+--- a/nova/objects/network_request.py
++++ b/nova/objects/network_request.py
+@@ -11,6 +11,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2013-2014 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ from nova.objects import base as obj_base
+ from nova.objects import fields
+@@ -22,12 +29,14 @@ class NetworkRequest(obj_base.NovaObject,
+                      obj_base.NovaObjectDictCompat):
+     # Version 1.0: Initial version
+     # Version 1.1: Added pci_request_id
+-    VERSION = '1.1'
++    # Version 1.2: Added vif_model
++    VERSION = '1.2'
+     fields = {
+         'network_id': fields.StringField(nullable=True),
+         'address': fields.IPAddressField(nullable=True),
+         'port_id': fields.UUIDField(nullable=True),
+         'pci_request_id': fields.UUIDField(nullable=True),
++        'vif_model': fields.StringField(nullable=True),
+     }
+ 
+     def obj_load_attr(self, attr):
+@@ -36,22 +45,24 @@ class NetworkRequest(obj_base.NovaObject,
+     def to_tuple(self):
+         address = str(self.address) if self.address is not None else None
+         if utils.is_neutron():
+-            return self.network_id, address, self.port_id, self.pci_request_id
++            return (self.network_id, address, self.port_id,
++                    self.pci_request_id, self.vif_model)
+         else:
+             return self.network_id, address
+ 
+     @classmethod
+     def from_tuple(cls, net_tuple):
+-        if len(net_tuple) == 4:
+-            network_id, address, port_id, pci_request_id = net_tuple
++        if len(net_tuple) == 5:
++            network_id, address, port_id, pci_request_id, vif_model = net_tuple
+             return cls(network_id=network_id, address=address,
+-                       port_id=port_id, pci_request_id=pci_request_id)
+-        elif len(net_tuple) == 3:
++                       port_id=port_id, pci_request_id=pci_request_id,
++                       vif_model=vif_model)
++        elif len(net_tuple) == 4:
+             # NOTE(alex_xu): This is only for compatible with icehouse , and
+             # should be removed in the next cycle.
+-            network_id, address, port_id = net_tuple
++            network_id, address, port_id, vif_model = net_tuple
+             return cls(network_id=network_id, address=address,
+-                       port_id=port_id)
++                       port_id=port_id, vif_model=vif_model)
+         else:
+             network_id, address = net_tuple
+             return cls(network_id=network_id, address=address)
+@@ -65,8 +76,9 @@ class NetworkRequestList(obj_base.ObjectListBase, obj_base.NovaObject):
+     child_versions = {
+         '1.0': '1.0',
+         '1.1': '1.1',
++        '1.2': '1.2',
+         }
+-    VERSION = '1.1'
++    VERSION = '1.2'
+ 
+     def as_tuples(self):
+         return [x.to_tuple() for x in self.objects]
+diff --git a/nova/tests/functional/api_samples/OS-DCF/list-servers-detail-get.json.tpl b/nova/tests/functional/api_samples/OS-DCF/list-servers-detail-get.json.tpl
+index 37c8e57..066f49d 100644
+--- a/nova/tests/functional/api_samples/OS-DCF/list-servers-detail-get.json.tpl
++++ b/nova/tests/functional/api_samples/OS-DCF/list-servers-detail-get.json.tpl
+@@ -7,6 +7,7 @@
+             "addresses": {
+                 "private": [
+                     {
++                        "index": 1,
+                         "addr": "%(ip)s",
+                         "version": 4
+                     }
+@@ -51,7 +52,16 @@
+             "status": "ACTIVE",
+             "tenant_id": "openstack",
+             "updated": "%(isotime)s",
+-            "user_id": "fake"
++            "user_id": "fake",
++            "nics": [
++                {
++                    "nic1":
++                        {"vif_model": null,
++                         "port_id": 1,
++                         "network": "private",
++                         "mtu": null}
++                }
++            ]
+         }
+     ]
+ }
+diff --git a/nova/tests/functional/api_samples/OS-DCF/server-action-rebuild-resp.json.tpl b/nova/tests/functional/api_samples/OS-DCF/server-action-rebuild-resp.json.tpl
+index 9b9f188..eff6ea7 100644
+--- a/nova/tests/functional/api_samples/OS-DCF/server-action-rebuild-resp.json.tpl
++++ b/nova/tests/functional/api_samples/OS-DCF/server-action-rebuild-resp.json.tpl
+@@ -6,6 +6,7 @@
+         "addresses": {
+             "private": [
+                 {
++                    "index": 1,
+                     "addr": "%(ip)s",
+                     "version": 4
+                 }
+@@ -51,6 +52,15 @@
+         "status": "ACTIVE",
+         "tenant_id": "openstack",
+         "updated": "%(isotime)s",
+-        "user_id": "fake"
++        "user_id": "fake",
++        "nics": [
++            {
++                "nic1":
++                    {"vif_model": null,
++                     "port_id": 1,
++                     "network": "private",
++                     "mtu": null}
++            }
++        ]
+     }
+ }
+diff --git a/nova/tests/functional/api_samples/OS-DCF/server-get-resp.json.tpl b/nova/tests/functional/api_samples/OS-DCF/server-get-resp.json.tpl
+index d9cc795..a694bda 100644
+--- a/nova/tests/functional/api_samples/OS-DCF/server-get-resp.json.tpl
++++ b/nova/tests/functional/api_samples/OS-DCF/server-get-resp.json.tpl
+@@ -6,6 +6,7 @@
+         "addresses": {
+             "private": [
+                 {
++                    "index": 1,
+                     "addr": "%(ip)s",
+                     "version": 4
+                 }
+@@ -50,6 +51,15 @@
+         "status": "ACTIVE",
+         "tenant_id": "openstack",
+         "updated": "%(isotime)s",
+-        "user_id": "fake"
++        "user_id": "fake",
++        "nics": [
++            {
++                "nic1":
++                    {"vif_model": null,
++                     "port_id": 1,
++                     "network": "private",
++                     "mtu": null}
++            }
++        ]
+     }
+ }
+diff --git a/nova/tests/functional/api_samples/OS-DCF/server-update-put-resp.json.tpl b/nova/tests/functional/api_samples/OS-DCF/server-update-put-resp.json.tpl
+index d9cc795..a694bda 100644
+--- a/nova/tests/functional/api_samples/OS-DCF/server-update-put-resp.json.tpl
++++ b/nova/tests/functional/api_samples/OS-DCF/server-update-put-resp.json.tpl
+@@ -6,6 +6,7 @@
+         "addresses": {
+             "private": [
+                 {
++                    "index": 1,
+                     "addr": "%(ip)s",
+                     "version": 4
+                 }
+@@ -50,6 +51,15 @@
+         "status": "ACTIVE",
+         "tenant_id": "openstack",
+         "updated": "%(isotime)s",
+-        "user_id": "fake"
++        "user_id": "fake",
++        "nics": [
++            {
++                "nic1":
++                    {"vif_model": null,
++                     "port_id": 1,
++                     "network": "private",
++                     "mtu": null}
++            }
++        ]
+     }
+ }
+diff --git a/nova/tests/functional/api_samples/OS-EXT-AZ/server-get-resp.json.tpl b/nova/tests/functional/api_samples/OS-EXT-AZ/server-get-resp.json.tpl
+index a852da1..f3ae23f 100644
+--- a/nova/tests/functional/api_samples/OS-EXT-AZ/server-get-resp.json.tpl
++++ b/nova/tests/functional/api_samples/OS-EXT-AZ/server-get-resp.json.tpl
+@@ -8,6 +8,7 @@
+         "addresses": {
+             "private": [
+                 {
++                    "index": 1,
+                     "addr": "%(ip)s",
+                     "version": 4
+                 }
+@@ -50,6 +51,15 @@
+         "progress": 0,
+         "status": "ACTIVE",
+         "tenant_id": "openstack",
+-        "user_id": "fake"
++        "user_id": "fake",
++        "nics": [
++            {
++                "nic1":
++                    {"vif_model": null,
++                     "port_id": 1,
++                     "network": "private",
++                     "mtu": null}
++            }
++        ]
+     }
+ }
+diff --git a/nova/tests/functional/api_samples/OS-EXT-AZ/servers-detail-resp.json.tpl b/nova/tests/functional/api_samples/OS-EXT-AZ/servers-detail-resp.json.tpl
+index b0ddc7c..a50ca69 100644
+--- a/nova/tests/functional/api_samples/OS-EXT-AZ/servers-detail-resp.json.tpl
++++ b/nova/tests/functional/api_samples/OS-EXT-AZ/servers-detail-resp.json.tpl
+@@ -9,6 +9,7 @@
+             "addresses": {
+                 "private": [
+                     {
++                        "index": 1,
+                         "addr": "%(ip)s",
+                         "version": 4
+                     }
+@@ -51,7 +52,16 @@
+             "progress": 0,
+             "status": "ACTIVE",
+             "tenant_id": "openstack",
+-            "user_id": "fake"
++            "user_id": "fake",
++            "nics": [
++                {
++                    "nic1":
++                        {"vif_model": null,
++                         "port_id": 1,
++                         "network": "private",
++                         "mtu": null}
++                }
++            ]
+         }
+     ]
+ }
+diff --git a/nova/tests/functional/api_samples/OS-EXT-IPS-MAC/server-get-resp.json.tpl b/nova/tests/functional/api_samples/OS-EXT-IPS-MAC/server-get-resp.json.tpl
+index 7b9f1ba..dc1b5b1 100644
+--- a/nova/tests/functional/api_samples/OS-EXT-IPS-MAC/server-get-resp.json.tpl
++++ b/nova/tests/functional/api_samples/OS-EXT-IPS-MAC/server-get-resp.json.tpl
+@@ -5,6 +5,7 @@
+         "addresses": {
+             "private": [
+                 {
++                    "index": 1,
+                     "addr": "%(ip)s",
+                     "version": 4,
+                     "OS-EXT-IPS-MAC:mac_addr": "%(mac_addr)s"
+@@ -50,6 +51,15 @@
+         "status": "ACTIVE",
+         "tenant_id": "openstack",
+         "updated": "%(isotime)s",
+-        "user_id": "fake"
++        "user_id": "fake",
++        "nics": [
++            {
++                "nic1":
++                    {"vif_model": null,
++                     "port_id": 1,
++                     "network": "private",
++                     "mtu": null}
++            }
++        ]
+     }
+ }
+diff --git a/nova/tests/functional/api_samples/OS-EXT-IPS-MAC/servers-detail-resp.json.tpl b/nova/tests/functional/api_samples/OS-EXT-IPS-MAC/servers-detail-resp.json.tpl
+index 743abc7..2324d41 100644
+--- a/nova/tests/functional/api_samples/OS-EXT-IPS-MAC/servers-detail-resp.json.tpl
++++ b/nova/tests/functional/api_samples/OS-EXT-IPS-MAC/servers-detail-resp.json.tpl
+@@ -7,6 +7,7 @@
+             "addresses": {
+                 "private": [
+                     {
++                        "index": 1,
+                         "addr": "%(ip)s",
+                         "version": 4,
+                         "OS-EXT-IPS-MAC:mac_addr": "%(mac_addr)s"
+@@ -51,6 +52,15 @@
+             "hostId": "%(hostid)s",
+             "metadata": {
+                 "My Server Name": "Apache1"
+-            }
++            },
++            "nics": [
++                {
++                    "nic1":
++                        {"vif_model": null,
++                         "port_id": 1,
++                         "network": "private",
++                         "mtu": null}
++                }
++            ]
+     }]
+ }
+diff --git a/nova/tests/functional/api_samples/OS-EXT-IPS/server-get-resp.json.tpl b/nova/tests/functional/api_samples/OS-EXT-IPS/server-get-resp.json.tpl
+index acc784f..996b4e5 100644
+--- a/nova/tests/functional/api_samples/OS-EXT-IPS/server-get-resp.json.tpl
++++ b/nova/tests/functional/api_samples/OS-EXT-IPS/server-get-resp.json.tpl
+@@ -5,6 +5,7 @@
+         "addresses": {
+             "private": [
+                 {
++                    "index": 1,
+                     "OS-EXT-IPS:type": "fixed",
+                     "addr": "%(ip)s",
+                     "version": 4
+@@ -50,6 +51,15 @@
+         "status": "ACTIVE",
+         "tenant_id": "openstack",
+         "updated": "%(isotime)s",
+-        "user_id": "fake"
++        "user_id": "fake",
++        "nics": [
++            {
++                "nic1":
++                    {"vif_model": null,
++                     "port_id": 1,
++                     "network": "private",
++                     "mtu": null}
++            }
++        ]
+     }
+ }
+diff --git a/nova/tests/functional/api_samples/OS-EXT-IPS/servers-detail-resp.json.tpl b/nova/tests/functional/api_samples/OS-EXT-IPS/servers-detail-resp.json.tpl
+index 26d812c..4873d4d 100644
+--- a/nova/tests/functional/api_samples/OS-EXT-IPS/servers-detail-resp.json.tpl
++++ b/nova/tests/functional/api_samples/OS-EXT-IPS/servers-detail-resp.json.tpl
+@@ -7,6 +7,7 @@
+             "addresses": {
+                 "private": [
+                     {
++                        "index": 1,
+                         "OS-EXT-IPS:type": "fixed",
+                         "addr": "%(ip)s",
+                         "version": 4
+@@ -51,6 +52,15 @@
+             "hostId": "%(hostid)s",
+             "metadata": {
+                 "My Server Name": "Apache1"
+-            }
++            },
++            "nics": [
++                {
++                    "nic1":
++                        {"vif_model": null,
++                         "port_id": 1,
++                         "network": "private",
++                         "mtu": null}
++                }
++            ]
+     }]
+ }
+diff --git a/nova/tests/functional/api_samples/OS-EXT-SRV-ATTR/server-get-resp.json.tpl b/nova/tests/functional/api_samples/OS-EXT-SRV-ATTR/server-get-resp.json.tpl
+index 398f0f7..1eb9ca1 100644
+--- a/nova/tests/functional/api_samples/OS-EXT-SRV-ATTR/server-get-resp.json.tpl
++++ b/nova/tests/functional/api_samples/OS-EXT-SRV-ATTR/server-get-resp.json.tpl
+@@ -8,6 +8,7 @@
+         "addresses": {
+             "private": [
+                 {
++                    "index": 1,
+                     "addr": "%(ip)s",
+                     "version": 4
+                 }
+@@ -52,6 +53,15 @@
+         "status": "ACTIVE",
+         "tenant_id": "openstack",
+         "updated": "%(isotime)s",
+-        "user_id": "fake"
++        "user_id": "fake",
++        "nics": [
++            {
++                "nic1":
++                    {"vif_model": null,
++                     "port_id": 1,
++                     "network": "private",
++                     "mtu": null}
++            }
++        ]
+     }
+ }
+\ No newline at end of file
+diff --git a/nova/tests/functional/api_samples/OS-EXT-SRV-ATTR/servers-detail-resp.json.tpl b/nova/tests/functional/api_samples/OS-EXT-SRV-ATTR/servers-detail-resp.json.tpl
+index 81f2471..af0eb79 100644
+--- a/nova/tests/functional/api_samples/OS-EXT-SRV-ATTR/servers-detail-resp.json.tpl
++++ b/nova/tests/functional/api_samples/OS-EXT-SRV-ATTR/servers-detail-resp.json.tpl
+@@ -9,6 +9,7 @@
+             "addresses": {
+                 "private": [
+                     {
++                        "index": 1,
+                         "addr": "%(ip)s",
+                         "version": 4
+                     }
+@@ -53,7 +54,16 @@
+             "status": "ACTIVE",
+             "tenant_id": "openstack",
+             "updated": "%(isotime)s",
+-            "user_id": "fake"
++            "user_id": "fake",
++            "nics": [
++                {
++                    "nic1":
++                        {"vif_model": null,
++                         "port_id": 1,
++                         "network": "private",
++                         "mtu": null}
++                }
++            ]
+         }
+     ]
+ }
+\ No newline at end of file
+diff --git a/nova/tests/functional/api_samples/OS-EXT-STS/server-get-resp.json.tpl b/nova/tests/functional/api_samples/OS-EXT-STS/server-get-resp.json.tpl
+index fc48b73..c39bd38 100644
+--- a/nova/tests/functional/api_samples/OS-EXT-STS/server-get-resp.json.tpl
++++ b/nova/tests/functional/api_samples/OS-EXT-STS/server-get-resp.json.tpl
+@@ -8,6 +8,7 @@
+         "addresses": {
+             "private": [
+                 {
++                    "index": 1,
+                     "addr": "%(ip)s",
+                     "version": 4
+                 }
+@@ -52,6 +53,15 @@
+         "status": "ACTIVE",
+         "tenant_id": "openstack",
+         "updated": "%(isotime)s",
+-        "user_id": "fake"
++        "user_id": "fake",
++        "nics": [
++            {
++                "nic1":
++                    {"vif_model": null,
++                     "port_id": 1,
++                     "network": "private",
++                     "mtu": null}
++            }
++        ]
+     }
+ }
+diff --git a/nova/tests/functional/api_samples/OS-EXT-STS/servers-detail-resp.json.tpl b/nova/tests/functional/api_samples/OS-EXT-STS/servers-detail-resp.json.tpl
+index 94b3e22..ebd1660 100644
+--- a/nova/tests/functional/api_samples/OS-EXT-STS/servers-detail-resp.json.tpl
++++ b/nova/tests/functional/api_samples/OS-EXT-STS/servers-detail-resp.json.tpl
+@@ -8,6 +8,7 @@
+             "addresses": {
+                 "private": [
+                     {
++                        "index": 1,
+                         "addr": "%(ip)s",
+                         "version": 4
+                     }
+@@ -53,6 +54,15 @@
+             "hostId": "%(hostid)s",
+             "metadata": {
+                 "My Server Name": "Apache1"
+-            }
++            },
++            "nics": [
++                {
++                    "nic1":
++                        {"vif_model": null,
++                         "port_id": 1,
++                         "network": "private",
++                         "mtu": null}
++                }
++            ]
+     }]
+ }
+diff --git a/nova/tests/functional/api_samples/OS-SRV-USG/server-get-resp.json.tpl b/nova/tests/functional/api_samples/OS-SRV-USG/server-get-resp.json.tpl
+index 2b2121d..da47f1b 100644
+--- a/nova/tests/functional/api_samples/OS-SRV-USG/server-get-resp.json.tpl
++++ b/nova/tests/functional/api_samples/OS-SRV-USG/server-get-resp.json.tpl
+@@ -7,6 +7,7 @@
+         "addresses": {
+             "private": [
+                 {
++                    "index": 1,
+                     "addr": "%(ip)s",
+                     "version": 4
+                 }
+@@ -51,6 +52,15 @@
+         "status": "ACTIVE",
+         "tenant_id": "openstack",
+         "updated": "%(isotime)s",
+-        "user_id": "fake"
++        "user_id": "fake",
++        "nics": [
++            {
++                "nic1":
++                    {"vif_model": null,
++                     "port_id": 1,
++                     "network": "private",
++                     "mtu": null}
++            }
++        ]
+     }
+ }
+diff --git a/nova/tests/functional/api_samples/OS-SRV-USG/servers-detail-resp.json.tpl b/nova/tests/functional/api_samples/OS-SRV-USG/servers-detail-resp.json.tpl
+index bef5a20..112a186 100644
+--- a/nova/tests/functional/api_samples/OS-SRV-USG/servers-detail-resp.json.tpl
++++ b/nova/tests/functional/api_samples/OS-SRV-USG/servers-detail-resp.json.tpl
+@@ -8,6 +8,7 @@
+             "addresses": {
+                 "private": [
+                     {
++                        "index": 1,
+                         "addr": "%(ip)s",
+                         "version": 4
+                     }
+@@ -52,6 +53,15 @@
+             "hostId": "%(hostid)s",
+             "metadata": {
+                 "My Server Name": "Apache1"
+-            }
++            },
++            "nics": [
++                {
++                    "nic1":
++                        {"vif_model": null,
++                         "port_id": 1,
++                         "network": "private",
++                         "mtu": null}
++                }
++            ]
+     }]
+ }
+diff --git a/nova/tests/functional/api_samples/all_extensions/server-action-rebuild-resp.json.tpl b/nova/tests/functional/api_samples/all_extensions/server-action-rebuild-resp.json.tpl
+index 8705a87..9835978 100644
+--- a/nova/tests/functional/api_samples/all_extensions/server-action-rebuild-resp.json.tpl
++++ b/nova/tests/functional/api_samples/all_extensions/server-action-rebuild-resp.json.tpl
+@@ -6,6 +6,7 @@
+         "addresses": {
+             "private": [
+                 {
++                    "index": 1,
+                     "addr": "%(ip)s",
+                     "version": 4
+                 }
+@@ -51,6 +52,15 @@
+         "status": "ACTIVE",
+         "tenant_id": "openstack",
+         "updated": "%(isotime)s",
+-        "user_id": "fake"
++        "user_id": "fake",
++        "nics": [
++            {
++                "nic1":
++                    {"vif_model": null,
++                     "port_id": 1,
++                     "network": "private",
++                     "mtu": null}
++            }
++        ]
+     }
+ }
+diff --git a/nova/tests/functional/api_samples/all_extensions/server-get-resp.json.tpl b/nova/tests/functional/api_samples/all_extensions/server-get-resp.json.tpl
+index c83ab91..584f894 100644
+--- a/nova/tests/functional/api_samples/all_extensions/server-get-resp.json.tpl
++++ b/nova/tests/functional/api_samples/all_extensions/server-get-resp.json.tpl
+@@ -15,6 +15,7 @@
+         "addresses": {
+             "private": [
+                 {
++                    "index": 1,
+                     "OS-EXT-IPS:type": "fixed",
+                     "addr": "%(ip)s",
+                     "version": 4,
+@@ -60,15 +61,19 @@
+         },
+         "name": "new-server-test",
+         "progress": 0,
+-        "security_groups": [
+-            {
+-                "name": "default"
+-            }
+-        ],
+         "status": "ACTIVE",
+         "tenant_id": "openstack",
+         "updated": "%(isotime)s",
+         "user_id": "fake",
+-        "os-extended-volumes:volumes_attached": []
++        "os-extended-volumes:volumes_attached": [],
++        "nics": [
++            {
++                "nic1":
++                    {"vif_model": null,
++                     "port_id": 1,
++                     "network": "private",
++                     "mtu": null}
++            }
++        ]
+     }
+ }
+diff --git a/nova/tests/functional/api_samples/all_extensions/server-post-resp.json.tpl b/nova/tests/functional/api_samples/all_extensions/server-post-resp.json.tpl
+index c931eb3..7c8371f 100644
+--- a/nova/tests/functional/api_samples/all_extensions/server-post-resp.json.tpl
++++ b/nova/tests/functional/api_samples/all_extensions/server-post-resp.json.tpl
+@@ -12,11 +12,6 @@
+                 "href": "%(host)s/openstack/servers/%(uuid)s",
+                 "rel": "bookmark"
+             }
+-        ],
+-        "security_groups": [
+-            {
+-                "name": "default"
+-            }
+         ]
+     }
+ }
+diff --git a/nova/tests/functional/api_samples/all_extensions/servers-details-resp.json.tpl b/nova/tests/functional/api_samples/all_extensions/servers-details-resp.json.tpl
+index d2aea31..f626b26 100644
+--- a/nova/tests/functional/api_samples/all_extensions/servers-details-resp.json.tpl
++++ b/nova/tests/functional/api_samples/all_extensions/servers-details-resp.json.tpl
+@@ -16,6 +16,7 @@
+             "addresses": {
+                 "private": [
+                     {
++                        "index": 1,
+                         "OS-EXT-IPS:type": "fixed",
+                         "addr": "%(ip)s",
+                         "version": 4,
+@@ -61,16 +62,20 @@
+             },
+             "name": "new-server-test",
+             "progress": 0,
+-            "security_groups": [
+-                {
+-                    "name": "default"
+-                }
+-            ],
+             "status": "ACTIVE",
+             "tenant_id": "openstack",
+             "updated": "%(isotime)s",
+             "user_id": "fake",
+-            "os-extended-volumes:volumes_attached": []
++            "os-extended-volumes:volumes_attached": [],
++            "nics": [
++                {
++                    "nic1":
++                        {"vif_model": null,
++                         "port_id": 1,
++                         "network": "private",
++                         "mtu": null}
++                }
++            ]
+         }
+     ]
+ }
+diff --git a/nova/tests/functional/api_samples/os-config-drive/server-config-drive-get-resp.json.tpl b/nova/tests/functional/api_samples/os-config-drive/server-config-drive-get-resp.json.tpl
+index 723714b..58427d6 100644
+--- a/nova/tests/functional/api_samples/os-config-drive/server-config-drive-get-resp.json.tpl
++++ b/nova/tests/functional/api_samples/os-config-drive/server-config-drive-get-resp.json.tpl
+@@ -5,6 +5,7 @@
+         "addresses": {
+             "private": [
+                 {
++                    "index": 1,
+                     "addr": "%(ip)s",
+                     "version": 4
+                 }
+@@ -50,6 +51,15 @@
+         "status": "ACTIVE",
+         "tenant_id": "openstack",
+         "updated": "%(isotime)s",
+-        "user_id": "fake"
++        "user_id": "fake",
++        "nics": [
++            {
++                "nic1":
++                    {"vif_model": null,
++                     "port_id": 1,
++                     "network": "private",
++                     "mtu": null}
++            }
++        ]
+     }
+ }
+diff --git a/nova/tests/functional/api_samples/os-config-drive/servers-config-drive-details-resp.json.tpl b/nova/tests/functional/api_samples/os-config-drive/servers-config-drive-details-resp.json.tpl
+index f3ae979..532641f 100644
+--- a/nova/tests/functional/api_samples/os-config-drive/servers-config-drive-details-resp.json.tpl
++++ b/nova/tests/functional/api_samples/os-config-drive/servers-config-drive-details-resp.json.tpl
+@@ -6,6 +6,7 @@
+             "addresses": {
+                 "private": [
+                     {
++                        "index": 1,
+                         "addr": "%(ip)s",
+                         "version": 4
+                     }
+@@ -51,7 +52,16 @@
+             "status": "ACTIVE",
+             "tenant_id": "openstack",
+             "updated": "%(isotime)s",
+-            "user_id": "fake"
++            "user_id": "fake",
++            "nics": [
++                {
++                    "nic1":
++                        {"vif_model": null,
++                         "port_id": 1,
++                         "network": "private",
++                         "mtu": null}
++                }
++            ]
+         }
+     ]
+ }
+diff --git a/nova/tests/functional/api_samples/os-extended-rescue-with-image/server-get-resp-rescue.json.tpl b/nova/tests/functional/api_samples/os-extended-rescue-with-image/server-get-resp-rescue.json.tpl
+index d9a3553..b81d8e5 100755
+--- a/nova/tests/functional/api_samples/os-extended-rescue-with-image/server-get-resp-rescue.json.tpl
++++ b/nova/tests/functional/api_samples/os-extended-rescue-with-image/server-get-resp-rescue.json.tpl
+@@ -5,6 +5,7 @@
+         "addresses": {
+             "private": [
+                 {
++                    "index": 1,
+                     "addr": "%(ip)s",
+                     "version": 4
+                 }
+@@ -48,6 +49,15 @@
+         "status": "%(status)s",
+         "tenant_id": "openstack",
+         "updated": "%(isotime)s",
+-        "user_id": "fake"
++        "user_id": "fake",
++        "nics": [
++            {
++                "nic1":
++                    {"vif_model": null,
++                     "port_id": 1,
++                     "network": "private",
++                     "mtu": null}
++            }
++        ]
+     }
+ }
+diff --git a/nova/tests/functional/api_samples/os-extended-volumes/server-get-resp.json.tpl b/nova/tests/functional/api_samples/os-extended-volumes/server-get-resp.json.tpl
+index 70b1dea..4aa30a5 100644
+--- a/nova/tests/functional/api_samples/os-extended-volumes/server-get-resp.json.tpl
++++ b/nova/tests/functional/api_samples/os-extended-volumes/server-get-resp.json.tpl
+@@ -5,6 +5,7 @@
+         "addresses": {
+             "private": [
+                 {
++                    "index": 1,
+                     "addr": "%(ip)s",
+                     "version": 4
+                 }
+@@ -53,6 +54,15 @@
+         "os-extended-volumes:volumes_attached": [
+             {"id": "volume_id1"},
+             {"id": "volume_id2"}
++        ],
++        "nics": [
++            {
++                "nic1":
++                    {"vif_model": null,
++                     "port_id": 1,
++                     "network": "private",
++                     "mtu": null}
++            }
+         ]
+     }
+ }
+diff --git a/nova/tests/functional/api_samples/os-extended-volumes/servers-detail-resp.json.tpl b/nova/tests/functional/api_samples/os-extended-volumes/servers-detail-resp.json.tpl
+index 1962d6a..08b9e71 100644
+--- a/nova/tests/functional/api_samples/os-extended-volumes/servers-detail-resp.json.tpl
++++ b/nova/tests/functional/api_samples/os-extended-volumes/servers-detail-resp.json.tpl
+@@ -7,6 +7,7 @@
+             "addresses": {
+                 "private": [
+                     {
++                        "index": 1,
+                         "addr": "%(ip)s",
+                         "version": 4
+                     }
+@@ -54,6 +55,15 @@
+             "os-extended-volumes:volumes_attached": [
+                 {"id": "volume_id1"},
+                 {"id": "volume_id2"}
++            ],
++            "nics": [
++                {
++                    "nic1":
++                        {"vif_model": null,
++                         "port_id": 1,
++                         "network": "private",
++                         "mtu": null}
++                }
+             ]
+     }]
+ }
+diff --git a/nova/tests/functional/api_samples/os-hide-server-addresses/server-get-resp.json.tpl b/nova/tests/functional/api_samples/os-hide-server-addresses/server-get-resp.json.tpl
+index c880d6a..d41c61e 100644
+--- a/nova/tests/functional/api_samples/os-hide-server-addresses/server-get-resp.json.tpl
++++ b/nova/tests/functional/api_samples/os-hide-server-addresses/server-get-resp.json.tpl
+@@ -42,6 +42,15 @@
+         "status": "ACTIVE",
+         "tenant_id": "openstack",
+         "updated": "%(isotime)s",
+-        "user_id": "fake"
++        "user_id": "fake",
++        "nics": [
++            {
++                "nic1":
++                    {"vif_model": null,
++                     "port_id": 1,
++                     "network": "private",
++                     "mtu": null}
++            }
++        ]
+     }
+ }
+diff --git a/nova/tests/functional/api_samples/os-hide-server-addresses/servers-details-resp.json.tpl b/nova/tests/functional/api_samples/os-hide-server-addresses/servers-details-resp.json.tpl
+index 988a21c..0e07961 100644
+--- a/nova/tests/functional/api_samples/os-hide-server-addresses/servers-details-resp.json.tpl
++++ b/nova/tests/functional/api_samples/os-hide-server-addresses/servers-details-resp.json.tpl
+@@ -43,7 +43,16 @@
+             "status": "ACTIVE",
+             "tenant_id": "openstack",
+             "updated": "%(isotime)s",
+-            "user_id": "fake"
++            "user_id": "fake",
++            "nics": [
++                {
++                    "nic1":
++                        {"vif_model": null,
++                         "port_id": 1,
++                         "network": "private",
++                         "mtu": null}
++                }
++            ]
+         }
+     ]
+ }
+diff --git a/nova/tests/functional/api_samples/os-preserve-ephemeral-rebuild/server-action-rebuild-resp.json.tpl b/nova/tests/functional/api_samples/os-preserve-ephemeral-rebuild/server-action-rebuild-resp.json.tpl
+index cd7fdcf..e735975 100644
+--- a/nova/tests/functional/api_samples/os-preserve-ephemeral-rebuild/server-action-rebuild-resp.json.tpl
++++ b/nova/tests/functional/api_samples/os-preserve-ephemeral-rebuild/server-action-rebuild-resp.json.tpl
+@@ -5,6 +5,7 @@
+         "addresses": {
+             "private": [
+                 {
++                    "index": 1,
+                     "addr": "%(ip)s",
+                     "version": 4
+                 }
+@@ -50,6 +51,15 @@
+         "status": "ACTIVE",
+         "tenant_id": "openstack",
+         "updated": "%(isotime)s",
+-        "user_id": "fake"
++        "user_id": "fake",
++        "nics": [
++            {
++                "nic1":
++                    {"vif_model": null,
++                     "port_id": 1,
++                     "network": "private",
++                     "mtu": null}
++            }
++        ]
+     }
+ }
+diff --git a/nova/tests/functional/api_samples/os-rescue/server-get-resp-rescue.json.tpl b/nova/tests/functional/api_samples/os-rescue/server-get-resp-rescue.json.tpl
+index d9a3553..b81d8e5 100644
+--- a/nova/tests/functional/api_samples/os-rescue/server-get-resp-rescue.json.tpl
++++ b/nova/tests/functional/api_samples/os-rescue/server-get-resp-rescue.json.tpl
+@@ -5,6 +5,7 @@
+         "addresses": {
+             "private": [
+                 {
++                    "index": 1,
+                     "addr": "%(ip)s",
+                     "version": 4
+                 }
+@@ -48,6 +49,15 @@
+         "status": "%(status)s",
+         "tenant_id": "openstack",
+         "updated": "%(isotime)s",
+-        "user_id": "fake"
++        "user_id": "fake",
++        "nics": [
++            {
++                "nic1":
++                    {"vif_model": null,
++                     "port_id": 1,
++                     "network": "private",
++                     "mtu": null}
++            }
++        ]
+     }
+ }
+diff --git a/nova/tests/functional/api_samples/os-rescue/server-get-resp-unrescue.json.tpl b/nova/tests/functional/api_samples/os-rescue/server-get-resp-unrescue.json.tpl
+index 5a017d8..eefda2a 100644
+--- a/nova/tests/functional/api_samples/os-rescue/server-get-resp-unrescue.json.tpl
++++ b/nova/tests/functional/api_samples/os-rescue/server-get-resp-unrescue.json.tpl
+@@ -5,6 +5,7 @@
+         "addresses": {
+             "private": [
+                 {
++                    "index": 1,
+                     "addr": "%(ip)s",
+                     "version": 4
+                 }
+@@ -49,6 +50,15 @@
+         "status": "%(status)s",
+         "tenant_id": "openstack",
+         "updated": "%(isotime)s",
+-        "user_id": "fake"
++        "user_id": "fake",
++        "nics": [
++            {
++                "nic1":
++                    {"vif_model": null,
++                     "port_id": 1,
++                     "network": "private",
++                     "mtu": null}
++            }
++        ]
+     }
+ }
+diff --git a/nova/tests/functional/api_samples/os-security-groups/server-post-resp.json.tpl b/nova/tests/functional/api_samples/os-security-groups/server-post-resp.json.tpl
+index 2133d3f..d5f030c 100644
+--- a/nova/tests/functional/api_samples/os-security-groups/server-post-resp.json.tpl
++++ b/nova/tests/functional/api_samples/os-security-groups/server-post-resp.json.tpl
+@@ -11,11 +11,6 @@
+                 "href": "%(host)s/openstack/servers/%(uuid)s",
+                 "rel": "bookmark"
+             }
+-        ],
+-        "security_groups": [
+-            {
+-                "name": "default"
+-            }
+         ]
+     }
+ }
+diff --git a/nova/tests/functional/api_samples/servers/server-action-rebuild-resp.json.tpl b/nova/tests/functional/api_samples/servers/server-action-rebuild-resp.json.tpl
+index cd7fdcf..e735975 100644
+--- a/nova/tests/functional/api_samples/servers/server-action-rebuild-resp.json.tpl
++++ b/nova/tests/functional/api_samples/servers/server-action-rebuild-resp.json.tpl
+@@ -5,6 +5,7 @@
+         "addresses": {
+             "private": [
+                 {
++                    "index": 1,
+                     "addr": "%(ip)s",
+                     "version": 4
+                 }
+@@ -50,6 +51,15 @@
+         "status": "ACTIVE",
+         "tenant_id": "openstack",
+         "updated": "%(isotime)s",
+-        "user_id": "fake"
++        "user_id": "fake",
++        "nics": [
++            {
++                "nic1":
++                    {"vif_model": null,
++                     "port_id": 1,
++                     "network": "private",
++                     "mtu": null}
++            }
++        ]
+     }
+ }
+diff --git a/nova/tests/functional/api_samples/servers/server-get-resp.json.tpl b/nova/tests/functional/api_samples/servers/server-get-resp.json.tpl
+index 4ac6374..36b4cc5 100644
+--- a/nova/tests/functional/api_samples/servers/server-get-resp.json.tpl
++++ b/nova/tests/functional/api_samples/servers/server-get-resp.json.tpl
+@@ -5,6 +5,7 @@
+         "addresses": {
+             "private": [
+                 {
++                    "index": 1,
+                     "addr": "%(ip)s",
+                     "version": 4
+                 }
+@@ -49,6 +50,15 @@
+         "status": "ACTIVE",
+         "tenant_id": "openstack",
+         "updated": "%(isotime)s",
+-        "user_id": "fake"
++        "user_id": "fake",
++        "nics": [
++            {
++                "nic1":
++                    {"vif_model": null,
++                     "port_id": 1,
++                     "network": "private",
++                     "mtu": null}
++            }
++        ]
+     }
+ }
+diff --git a/nova/tests/functional/api_samples/servers/server-ips-network-resp.json.tpl b/nova/tests/functional/api_samples/servers/server-ips-network-resp.json.tpl
+index 29d2370..aaae395 100644
+--- a/nova/tests/functional/api_samples/servers/server-ips-network-resp.json.tpl
++++ b/nova/tests/functional/api_samples/servers/server-ips-network-resp.json.tpl
+@@ -1,6 +1,7 @@
+ {
+     "private": [
+         {
++            "index": 1,
+             "addr": "%(ip)s",
+             "version": 4
+         }
+diff --git a/nova/tests/functional/api_samples/servers/server-ips-resp.json.tpl b/nova/tests/functional/api_samples/servers/server-ips-resp.json.tpl
+index 259eabe..6b3ec06 100644
+--- a/nova/tests/functional/api_samples/servers/server-ips-resp.json.tpl
++++ b/nova/tests/functional/api_samples/servers/server-ips-resp.json.tpl
+@@ -2,6 +2,7 @@
+     "addresses": {
+         "private": [
+             {
++                "index": 1,
+                 "addr": "%(ip)s",
+                 "version": 4
+             }
+diff --git a/nova/tests/functional/api_samples/servers/servers-details-resp.json.tpl b/nova/tests/functional/api_samples/servers/servers-details-resp.json.tpl
+index 81afe43..e2c43f3 100644
+--- a/nova/tests/functional/api_samples/servers/servers-details-resp.json.tpl
++++ b/nova/tests/functional/api_samples/servers/servers-details-resp.json.tpl
+@@ -6,6 +6,7 @@
+             "addresses": {
+                 "private": [
+                     {
++                        "index": 1,
+                         "addr": "%(ip)s",
+                         "version": 4
+                     }
+@@ -50,7 +51,16 @@
+             "status": "ACTIVE",
+             "tenant_id": "openstack",
+             "updated": "%(isotime)s",
+-            "user_id": "fake"
++            "user_id": "fake",
++            "nics": [
++                {
++                    "nic1":
++                        {"vif_model": null,
++                         "port_id": 1,
++                         "network": "private",
++                         "mtu": null}
++                }
++            ]
+         }
+     ]
+ }
+diff --git a/nova/tests/functional/test_api_samples.py b/nova/tests/functional/test_api_samples.py
+index 7b5ee1e..68bb383 100644
+--- a/nova/tests/functional/test_api_samples.py
++++ b/nova/tests/functional/test_api_samples.py
+@@ -12,6 +12,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2013-2014 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ import base64
+ import datetime
+@@ -621,6 +628,13 @@ class SecurityGroupsSampleJsonTest(ServersSampleBase):
+         return self._do_post('servers/%s/action' % uuid,
+                              'security-group-add-post-req', subs)
+ 
++    def _add_default_group(self, uuid):
++        subs = {
++                'group_name': 'default'
++        }
++        return self._do_post('servers/%s/action' % uuid,
++                             'security-group-add-post-req', subs)
++
+     def test_security_group_create(self):
+         response = self._create_security_group()
+         subs = self._get_create_subs()
+@@ -644,6 +658,9 @@ class SecurityGroupsSampleJsonTest(ServersSampleBase):
+     def test_security_groups_list_server(self):
+         # Get api sample of security groups for a specific server.
+         uuid = self._post_server(use_common_server_api_samples=False)
++        # Add the default security group. TS disabled the default, but the
++        # test is expecting it.
++        self._add_default_group(uuid)
+         response = self._do_get('servers/%s/os-security-groups' % uuid)
+         subs = self._get_regexes()
+         self._verify_response('server-security-groups-list-resp',
+diff --git a/nova/tests/functional/v3/api_samples/all_extensions/server-get-resp.json.tpl b/nova/tests/functional/v3/api_samples/all_extensions/server-get-resp.json.tpl
+index ec85e8f..d064228 100644
+--- a/nova/tests/functional/v3/api_samples/all_extensions/server-get-resp.json.tpl
++++ b/nova/tests/functional/v3/api_samples/all_extensions/server-get-resp.json.tpl
+@@ -5,6 +5,7 @@
+         "addresses": {
+             "private": [
+                 {
++                    "index": 1,
+                     "addr": "%(ip)s",
+                     "OS-EXT-IPS-MAC:mac_addr": "aa:bb:cc:dd:ee:ff",
+                     "OS-EXT-IPS:type": "fixed",
+@@ -61,14 +62,18 @@
+         "OS-SRV-USG:launched_at": "%(strtime)s",
+         "OS-SRV-USG:terminated_at": null,
+         "progress": 0,
+-        "security_groups": [
+-            {
+-                "name": "default"
+-            }
+-        ],
+         "status": "ACTIVE",
+         "tenant_id": "openstack",
+         "updated": "%(isotime)s",
+-        "user_id": "fake"
++        "user_id": "fake",
++        "nics": [
++            {
++                "nic1":
++                    {"vif_model": null,
++                     "port_id": 1,
++                     "network": "private",
++                     "mtu": null}
++            }
++        ]
+     }
+ }
+diff --git a/nova/tests/functional/v3/api_samples/all_extensions/server-post-resp.json.tpl b/nova/tests/functional/v3/api_samples/all_extensions/server-post-resp.json.tpl
+index 6c1ef7c..fabc2d1 100644
+--- a/nova/tests/functional/v3/api_samples/all_extensions/server-post-resp.json.tpl
++++ b/nova/tests/functional/v3/api_samples/all_extensions/server-post-resp.json.tpl
+@@ -1,6 +1,8 @@
+ {
+     "server": {
+         "OS-DCF:diskConfig": "AUTO",
++        "accessIPv4": "",
++        "accessIPv6": "",
+         "adminPass": "%(password)s",
+         "id": "%(id)s",
+         "links": [
+diff --git a/nova/tests/functional/v3/api_samples/all_extensions/servers-details-resp.json.tpl b/nova/tests/functional/v3/api_samples/all_extensions/servers-details-resp.json.tpl
+index bd377aa..b31dfa8 100644
+--- a/nova/tests/functional/v3/api_samples/all_extensions/servers-details-resp.json.tpl
++++ b/nova/tests/functional/v3/api_samples/all_extensions/servers-details-resp.json.tpl
+@@ -6,6 +6,7 @@
+             "addresses": {
+                 "private": [
+                     {
++                        "index": 1,
+                         "addr": "%(ip)s",
+                         "OS-EXT-IPS-MAC:mac_addr": "aa:bb:cc:dd:ee:ff",
+                         "OS-EXT-IPS:type": "fixed",
+@@ -62,15 +63,19 @@
+             "OS-SRV-USG:launched_at": "%(strtime)s",
+             "OS-SRV-USG:terminated_at": null,
+             "progress": 0,
+-            "security_groups": [
+-                {
+-                    "name": "default"
+-                }
+-            ],
+             "status": "ACTIVE",
+             "tenant_id": "openstack",
+             "updated": "%(isotime)s",
+-            "user_id": "fake"
++            "user_id": "fake",
++            "nics": [
++                {
++                    "nic1":
++                        {"vif_model": null,
++                         "port_id": 1,
++                         "network": "private",
++                         "mtu": null}
++                }
++            ]
+         }
+     ]
+ }
+diff --git a/nova/tests/functional/v3/api_samples/os-access-ips/server-action-rebuild-resp.json.tpl b/nova/tests/functional/v3/api_samples/os-access-ips/server-action-rebuild-resp.json.tpl
+index b8756e0..b92a641 100644
+--- a/nova/tests/functional/v3/api_samples/os-access-ips/server-action-rebuild-resp.json.tpl
++++ b/nova/tests/functional/v3/api_samples/os-access-ips/server-action-rebuild-resp.json.tpl
+@@ -3,6 +3,7 @@
+         "addresses": {
+             "private": [
+                 {
++                    "index": 1,
+                     "addr": "%(ip)s",
+                     "version": 4
+                 }
+@@ -50,6 +51,15 @@
+         "updated": "%(isotime)s",
+         "user_id": "fake",
+         "accessIPv4": "%(access_ip_v4)s",
+-        "accessIPv6": "%(access_ip_v6)s"
++        "accessIPv6": "%(access_ip_v6)s",
++        "nics": [
++            {
++                "nic1":
++                    {"vif_model": null,
++                     "port_id": 1,
++                     "network": "private",
++                     "mtu": null}
++            }
++        ]
+     }
+ }
+diff --git a/nova/tests/functional/v3/api_samples/os-access-ips/server-get-resp.json.tpl b/nova/tests/functional/v3/api_samples/os-access-ips/server-get-resp.json.tpl
+index efe7801..c576006 100644
+--- a/nova/tests/functional/v3/api_samples/os-access-ips/server-get-resp.json.tpl
++++ b/nova/tests/functional/v3/api_samples/os-access-ips/server-get-resp.json.tpl
+@@ -5,6 +5,7 @@
+         "addresses": {
+             "private": [
+                 {
++                    "index": 1,
+                     "addr": "%(ip)s",
+                     "OS-EXT-IPS-MAC:mac_addr": "aa:bb:cc:dd:ee:ff",
+                     "OS-EXT-IPS:type": "fixed",
+@@ -52,6 +53,15 @@
+         "tenant_id": "openstack",
+         "updated": "%(isotime)s",
+         "user_id": "fake",
+-        "key_name": null
++        "key_name": null,
++        "nics": [
++            {
++                "nic1":
++                    {"vif_model": null,
++                     "port_id": 1,
++                     "network": "private",
++                     "mtu": null}
++            }
++        ]
+     }
+ }
+diff --git a/nova/tests/functional/v3/api_samples/os-access-ips/server-put-resp.json.tpl b/nova/tests/functional/v3/api_samples/os-access-ips/server-put-resp.json.tpl
+index 302bccd..cfa1624 100644
+--- a/nova/tests/functional/v3/api_samples/os-access-ips/server-put-resp.json.tpl
++++ b/nova/tests/functional/v3/api_samples/os-access-ips/server-put-resp.json.tpl
+@@ -5,6 +5,7 @@
+         "addresses": {
+             "private": [
+                 {
++                    "index": 1,
+                     "addr": "%(ip)s",
+                     "version": 4
+                 }
+@@ -49,6 +50,15 @@
+         "status": "ACTIVE",
+         "tenant_id": "openstack",
+         "updated": "%(isotime)s",
+-        "user_id": "fake"
++        "user_id": "fake",
++        "nics": [
++            {
++                "nic1":
++                    {"vif_model": null,
++                     "port_id": 1,
++                     "network": "private",
++                     "mtu": null}
++            }
++        ]
+     }
+ }
+diff --git a/nova/tests/functional/v3/api_samples/os-access-ips/servers-details-resp.json.tpl b/nova/tests/functional/v3/api_samples/os-access-ips/servers-details-resp.json.tpl
+index 041f1a1..1071de8 100644
+--- a/nova/tests/functional/v3/api_samples/os-access-ips/servers-details-resp.json.tpl
++++ b/nova/tests/functional/v3/api_samples/os-access-ips/servers-details-resp.json.tpl
+@@ -6,6 +6,7 @@
+             "addresses": {
+                 "private": [
+                     {
++                        "index": 1,
+                         "addr": "%(ip)s",
+                         "OS-EXT-IPS-MAC:mac_addr": "aa:bb:cc:dd:ee:ff",
+                         "OS-EXT-IPS:type": "fixed",
+@@ -53,7 +54,16 @@
+             "tenant_id": "openstack",
+             "updated": "%(isotime)s",
+             "user_id": "fake",
+-            "key_name": null
++            "key_name": null,
++            "nics": [
++                {
++                    "nic1":
++                        {"vif_model": null,
++                         "port_id": 1,
++                         "network": "private",
++                         "mtu": null}
++                }
++            ]
+         }
+     ]
+ }
+diff --git a/nova/tests/functional/v3/api_samples/os-config-drive/server-config-drive-get-resp.json.tpl b/nova/tests/functional/v3/api_samples/os-config-drive/server-config-drive-get-resp.json.tpl
+index a9e9bc6..1b14063 100644
+--- a/nova/tests/functional/v3/api_samples/os-config-drive/server-config-drive-get-resp.json.tpl
++++ b/nova/tests/functional/v3/api_samples/os-config-drive/server-config-drive-get-resp.json.tpl
+@@ -4,6 +4,7 @@
+         "addresses": {
+             "private": [
+                 {
++                    "index": 1,
+                     "addr": "%(ip)s",
+                     "OS-EXT-IPS-MAC:mac_addr": "aa:bb:cc:dd:ee:ff",
+                     "OS-EXT-IPS:type": "fixed",
+@@ -51,6 +52,15 @@
+         "tenant_id": "openstack",
+         "updated": "%(isotime)s",
+         "user_id": "fake",
+-        "key_name": null
++        "key_name": null,
++        "nics": [
++            {
++                "nic1":
++                    {"vif_model": null,
++                     "port_id": 1,
++                     "network": "private",
++                     "mtu": null}
++            }
++        ]
+     }
+ }
+diff --git a/nova/tests/functional/v3/api_samples/os-config-drive/servers-config-drive-details-resp.json.tpl b/nova/tests/functional/v3/api_samples/os-config-drive/servers-config-drive-details-resp.json.tpl
+index 21ed41c..1225857 100644
+--- a/nova/tests/functional/v3/api_samples/os-config-drive/servers-config-drive-details-resp.json.tpl
++++ b/nova/tests/functional/v3/api_samples/os-config-drive/servers-config-drive-details-resp.json.tpl
+@@ -5,6 +5,7 @@
+             "addresses": {
+                 "private": [
+                     {
++                        "index": 1,
+                         "addr": "%(ip)s",
+                         "OS-EXT-IPS-MAC:mac_addr": "aa:bb:cc:dd:ee:ff",
+                         "OS-EXT-IPS:type": "fixed",
+@@ -52,7 +53,16 @@
+             "tenant_id": "openstack",
+             "updated": "%(isotime)s",
+             "user_id": "fake",
+-            "key_name": null
++            "key_name": null,
++            "nics": [
++                {
++                    "nic1":
++                        {"vif_model": null,
++                         "port_id": 1,
++                         "network": "private",
++                         "mtu": null}
++                }
++            ]
+         }
+     ]
+ }
+diff --git a/nova/tests/functional/v3/api_samples/os-extended-availability-zone/server-get-resp.json.tpl b/nova/tests/functional/v3/api_samples/os-extended-availability-zone/server-get-resp.json.tpl
+index d643673..04ce38e 100644
+--- a/nova/tests/functional/v3/api_samples/os-extended-availability-zone/server-get-resp.json.tpl
++++ b/nova/tests/functional/v3/api_samples/os-extended-availability-zone/server-get-resp.json.tpl
+@@ -6,6 +6,7 @@
+         "addresses": {
+             "private": [
+                 {
++                    "index": 1,
+                     "addr": "%(ip)s",
+                     "version": 4,
+                     "OS-EXT-IPS-MAC:mac_addr": "aa:bb:cc:dd:ee:ff",
+@@ -51,6 +52,15 @@
+         "status": "ACTIVE",
+         "tenant_id": "openstack",
+         "user_id": "fake",
+-        "key_name": null
++        "key_name": null,
++        "nics": [
++            {
++                "nic1":
++                    {"vif_model": null,
++                     "port_id": 1,
++                     "network": "private",
++                     "mtu": null}
++            }
++        ]
+     }
+ }
+diff --git a/nova/tests/functional/v3/api_samples/os-extended-availability-zone/servers-detail-resp.json.tpl b/nova/tests/functional/v3/api_samples/os-extended-availability-zone/servers-detail-resp.json.tpl
+index c81acaf..6cf07b8 100644
+--- a/nova/tests/functional/v3/api_samples/os-extended-availability-zone/servers-detail-resp.json.tpl
++++ b/nova/tests/functional/v3/api_samples/os-extended-availability-zone/servers-detail-resp.json.tpl
+@@ -7,6 +7,7 @@
+             "addresses": {
+                 "private": [
+                     {
++                        "index": 1,
+                         "addr": "%(ip)s",
+                         "version": 4,
+                         "OS-EXT-IPS-MAC:mac_addr": "aa:bb:cc:dd:ee:ff",
+@@ -52,7 +53,16 @@
+             "status": "ACTIVE",
+             "tenant_id": "openstack",
+             "user_id": "fake",
+-            "key_name": null
++            "key_name": null,
++            "nics": [
++                {
++                    "nic1":
++                        {"vif_model": null,
++                         "port_id": 1,
++                         "network": "private",
++                         "mtu": null}
++                }
++            ]
+         }
+     ]
+ }
+diff --git a/nova/tests/functional/v3/api_samples/os-extended-server-attributes/server-get-resp.json.tpl b/nova/tests/functional/v3/api_samples/os-extended-server-attributes/server-get-resp.json.tpl
+index a4c68a3..08070c6 100644
+--- a/nova/tests/functional/v3/api_samples/os-extended-server-attributes/server-get-resp.json.tpl
++++ b/nova/tests/functional/v3/api_samples/os-extended-server-attributes/server-get-resp.json.tpl
+@@ -8,6 +8,7 @@
+         "addresses": {
+             "private": [
+                 {
++                    "index": 1,
+                     "addr": "%(ip)s",
+                     "version": 4,
+                     "OS-EXT-IPS-MAC:mac_addr": "aa:bb:cc:dd:ee:ff",
+@@ -53,6 +54,15 @@
+         "status": "ACTIVE",
+         "tenant_id": "openstack",
+         "user_id": "fake",
+-        "key_name": null
++        "key_name": null,
++        "nics": [
++            {
++                "nic1":
++                    {"vif_model": null,
++                     "port_id": 1,
++                     "network": "private",
++                     "mtu": null}
++            }
++        ]
+     }
+ }
+diff --git a/nova/tests/functional/v3/api_samples/os-extended-server-attributes/servers-detail-resp.json.tpl b/nova/tests/functional/v3/api_samples/os-extended-server-attributes/servers-detail-resp.json.tpl
+index 8fc7dbc..7f76a5d 100644
+--- a/nova/tests/functional/v3/api_samples/os-extended-server-attributes/servers-detail-resp.json.tpl
++++ b/nova/tests/functional/v3/api_samples/os-extended-server-attributes/servers-detail-resp.json.tpl
+@@ -9,6 +9,7 @@
+             "addresses": {
+                 "private": [
+                     {
++                        "index": 1,
+                         "addr": "%(ip)s",
+                         "version": 4,
+                         "OS-EXT-IPS-MAC:mac_addr": "aa:bb:cc:dd:ee:ff",
+@@ -54,7 +55,16 @@
+             "status": "ACTIVE",
+             "tenant_id": "openstack",
+             "user_id": "fake",
+-            "key_name": null
++            "key_name": null,
++            "nics": [
++                {
++                    "nic1":
++                        {"vif_model": null,
++                         "port_id": 1,
++                         "network": "private",
++                         "mtu": null}
++                }
++            ]
+         }
+     ]
+ }
+diff --git a/nova/tests/functional/v3/api_samples/os-extended-status/server-get-resp.json.tpl b/nova/tests/functional/v3/api_samples/os-extended-status/server-get-resp.json.tpl
+index 5593eea..4ef70c8 100644
+--- a/nova/tests/functional/v3/api_samples/os-extended-status/server-get-resp.json.tpl
++++ b/nova/tests/functional/v3/api_samples/os-extended-status/server-get-resp.json.tpl
+@@ -8,6 +8,7 @@
+         "addresses": {
+             "private": [
+                 {
++                    "index": 1,
+                     "addr": "%(ip)s",
+                     "version": 4,
+                     "OS-EXT-IPS-MAC:mac_addr": "aa:bb:cc:dd:ee:ff",
+@@ -53,7 +54,16 @@
+         "status": "ACTIVE",
+         "tenant_id": "openstack",
+         "user_id": "fake",
+-        "key_name": null
++        "key_name": null,
++        "nics": [
++            {
++                "nic1":
++                    {"vif_model": null,
++                     "port_id": 1,
++                     "network": "private",
++                     "mtu": null}
++            }
++        ]
+     }
+ }
+ 
+diff --git a/nova/tests/functional/v3/api_samples/os-extended-status/servers-detail-resp.json.tpl b/nova/tests/functional/v3/api_samples/os-extended-status/servers-detail-resp.json.tpl
+index de4492b..cd72b41 100644
+--- a/nova/tests/functional/v3/api_samples/os-extended-status/servers-detail-resp.json.tpl
++++ b/nova/tests/functional/v3/api_samples/os-extended-status/servers-detail-resp.json.tpl
+@@ -9,6 +9,7 @@
+             "addresses": {
+                 "private": [
+                     {
++                        "index": 1,
+                         "addr": "%(ip)s",
+                         "version": 4,
+                         "OS-EXT-IPS-MAC:mac_addr": "aa:bb:cc:dd:ee:ff",
+@@ -54,6 +55,15 @@
+             "status": "ACTIVE",
+             "tenant_id": "openstack",
+             "user_id": "fake",
+-            "key_name": null
++            "key_name": null,
++            "nics": [
++                {
++                    "nic1":
++                        {"vif_model": null,
++                         "port_id": 1,
++                         "network": "private",
++                         "mtu": null}
++                }
++            ]
+     }]
+ }
+diff --git a/nova/tests/functional/v3/api_samples/os-extended-volumes/server-get-resp.json.tpl b/nova/tests/functional/v3/api_samples/os-extended-volumes/server-get-resp.json.tpl
+index 1a28dd8..6e2c612 100644
+--- a/nova/tests/functional/v3/api_samples/os-extended-volumes/server-get-resp.json.tpl
++++ b/nova/tests/functional/v3/api_samples/os-extended-volumes/server-get-resp.json.tpl
+@@ -3,6 +3,7 @@
+         "addresses": {
+             "private": [
+                 {
++                    "index": 1,
+                     "addr": "%(ip)s",
+                     "OS-EXT-IPS-MAC:mac_addr": "aa:bb:cc:dd:ee:ff",
+                     "OS-EXT-IPS:type": "fixed",
+@@ -54,6 +55,15 @@
+             {"id": "volume_id1"},
+             {"id": "volume_id2"}
+         ],
+-        "key_name": null
++        "key_name": null,
++        "nics": [
++            {
++                "nic1":
++                    {"vif_model": null,
++                     "port_id": 1,
++                     "network": "private",
++                     "mtu": null}
++            }
++        ]
+     }
+ }
+diff --git a/nova/tests/functional/v3/api_samples/os-extended-volumes/servers-detail-resp.json.tpl b/nova/tests/functional/v3/api_samples/os-extended-volumes/servers-detail-resp.json.tpl
+index bb8a9bb..426b3b4 100644
+--- a/nova/tests/functional/v3/api_samples/os-extended-volumes/servers-detail-resp.json.tpl
++++ b/nova/tests/functional/v3/api_samples/os-extended-volumes/servers-detail-resp.json.tpl
+@@ -6,6 +6,7 @@
+             "addresses": {
+                 "private": [
+                     {
++                        "index": 1,
+                         "addr": "%(ip)s",
+                         "version": 4,
+                         "OS-EXT-IPS-MAC:mac_addr": "aa:bb:cc:dd:ee:ff",
+@@ -55,6 +56,15 @@
+                 {"id": "volume_id1"},
+                 {"id": "volume_id2"}
+             ],
+-            "key_name": null
++            "key_name": null,
++            "nics": [
++                {
++                    "nic1":
++                        {"vif_model": null,
++                         "port_id": 1,
++                         "network": "private",
++                         "mtu": null}
++                }
++            ]
+     }]
+ }
+diff --git a/nova/tests/functional/v3/api_samples/os-hide-server-addresses/server-get-resp.json.tpl b/nova/tests/functional/v3/api_samples/os-hide-server-addresses/server-get-resp.json.tpl
+index 3a69fcd..f20f728 100644
+--- a/nova/tests/functional/v3/api_samples/os-hide-server-addresses/server-get-resp.json.tpl
++++ b/nova/tests/functional/v3/api_samples/os-hide-server-addresses/server-get-resp.json.tpl
+@@ -42,6 +42,15 @@
+         "status": "ACTIVE",
+         "tenant_id": "openstack",
+         "updated": "%(isotime)s",
+-        "user_id": "fake"
++        "user_id": "fake",
++        "nics": [
++            {
++                "nic1":
++                    {"vif_model": null,
++                     "port_id": 1,
++                     "network": "private",
++                     "mtu": null}
++            }
++        ]
+     }
+ }
+diff --git a/nova/tests/functional/v3/api_samples/os-hide-server-addresses/servers-details-resp.json.tpl b/nova/tests/functional/v3/api_samples/os-hide-server-addresses/servers-details-resp.json.tpl
+index 353d29f..ceb54e4 100644
+--- a/nova/tests/functional/v3/api_samples/os-hide-server-addresses/servers-details-resp.json.tpl
++++ b/nova/tests/functional/v3/api_samples/os-hide-server-addresses/servers-details-resp.json.tpl
+@@ -42,7 +42,16 @@
+             "status": "ACTIVE",
+             "tenant_id": "openstack",
+             "updated": "%(isotime)s",
+-            "user_id": "fake"
++            "user_id": "fake",
++            "nics": [
++                {
++                    "nic1":
++                        {"vif_model": null,
++                         "port_id": 1,
++                         "network": "private",
++                         "mtu": null}
++                }
++            ]
+         }
+     ]
+ }
+diff --git a/nova/tests/functional/v3/api_samples/os-pci/server-get-resp.json.tpl b/nova/tests/functional/v3/api_samples/os-pci/server-get-resp.json.tpl
+index b94f013..3f46782 100644
+--- a/nova/tests/functional/v3/api_samples/os-pci/server-get-resp.json.tpl
++++ b/nova/tests/functional/v3/api_samples/os-pci/server-get-resp.json.tpl
+@@ -3,6 +3,7 @@
+         "addresses": {
+             "private": [
+                 {
++                    "index": 1,
+                     "addr": "%(ip)s",
+                     "OS-EXT-IPS-MAC:mac_addr": "aa:bb:cc:dd:ee:ff",
+                     "OS-EXT-IPS:type": "fixed",
+@@ -55,6 +56,15 @@
+         "status": "ACTIVE",
+         "tenant_id": "openstack",
+         "updated": "%(isotime)s",
+-        "user_id": "fake"
++        "user_id": "fake",
++        "nics": [
++            {
++                "nic1":
++                    {"vif_model": null,
++                     "port_id": 1,
++                     "network": "private",
++                     "mtu": null}
++            }
++        ]
+     }
+ }
+diff --git a/nova/tests/functional/v3/api_samples/os-pci/servers-detail-resp.json.tpl b/nova/tests/functional/v3/api_samples/os-pci/servers-detail-resp.json.tpl
+index d152ae3..5bca97c 100644
+--- a/nova/tests/functional/v3/api_samples/os-pci/servers-detail-resp.json.tpl
++++ b/nova/tests/functional/v3/api_samples/os-pci/servers-detail-resp.json.tpl
+@@ -4,6 +4,7 @@
+             "addresses": {
+                 "private": [
+                     {
++                        "index": 1,
+                         "addr": "%(ip)s",
+                         "OS-EXT-IPS-MAC:mac_addr": "aa:bb:cc:dd:ee:ff",
+                         "OS-EXT-IPS:type": "fixed",
+@@ -56,7 +57,16 @@
+             "status": "ACTIVE",
+             "tenant_id": "openstack",
+             "updated": "%(isotime)s",
+-            "user_id": "fake"
++            "user_id": "fake",
++            "nics": [
++                {
++                    "nic1":
++                        {"vif_model": null,
++                         "port_id": 1,
++                         "network": "private",
++                         "mtu": null}
++                }
++            ]
+         }
+     ]
+ }
+diff --git a/nova/tests/functional/v3/api_samples/os-rescue/server-get-resp-rescue.json.tpl b/nova/tests/functional/v3/api_samples/os-rescue/server-get-resp-rescue.json.tpl
+index 02547e9..8690ac5 100644
+--- a/nova/tests/functional/v3/api_samples/os-rescue/server-get-resp-rescue.json.tpl
++++ b/nova/tests/functional/v3/api_samples/os-rescue/server-get-resp-rescue.json.tpl
+@@ -3,6 +3,7 @@
+         "addresses": {
+             "private": [
+                 {
++                    "index": 1,
+                     "addr": "%(ip)s",
+                     "version": 4,
+                     "OS-EXT-IPS-MAC:mac_addr": "aa:bb:cc:dd:ee:ff",
+@@ -49,6 +50,15 @@
+         "tenant_id": "openstack",
+         "updated": "%(isotime)s",
+         "user_id": "fake",
+-        "key_name": null
++        "key_name": null,
++        "nics": [
++            {
++                "nic1":
++                    {"vif_model": null,
++                     "port_id": 1,
++                     "network": "private",
++                     "mtu": null}
++            }
++        ]
+     }
+ }
+diff --git a/nova/tests/functional/v3/api_samples/os-rescue/server-get-resp-unrescue.json.tpl b/nova/tests/functional/v3/api_samples/os-rescue/server-get-resp-unrescue.json.tpl
+index cd6ded9..1c04868 100644
+--- a/nova/tests/functional/v3/api_samples/os-rescue/server-get-resp-unrescue.json.tpl
++++ b/nova/tests/functional/v3/api_samples/os-rescue/server-get-resp-unrescue.json.tpl
+@@ -3,6 +3,7 @@
+         "addresses": {
+             "private": [
+                 {
++                    "index": 1,
+                     "addr": "%(ip)s",
+                     "version": 4,
+                     "OS-EXT-IPS-MAC:mac_addr": "aa:bb:cc:dd:ee:ff",
+@@ -50,6 +51,15 @@
+         "tenant_id": "openstack",
+         "updated": "%(isotime)s",
+         "user_id": "fake",
+-        "key_name": null
++        "key_name": null,
++        "nics": [
++            {
++                "nic1":
++                    {"vif_model": null,
++                     "port_id": 1,
++                     "network": "private",
++                     "mtu": null}
++            }
++        ]
+     }
+ }
+diff --git a/nova/tests/functional/v3/api_samples/os-security-groups/server-get-resp.json.tpl b/nova/tests/functional/v3/api_samples/os-security-groups/server-get-resp.json.tpl
+index 47ed3c1..3257c07 100644
+--- a/nova/tests/functional/v3/api_samples/os-security-groups/server-get-resp.json.tpl
++++ b/nova/tests/functional/v3/api_samples/os-security-groups/server-get-resp.json.tpl
+@@ -3,6 +3,7 @@
+         "addresses": {
+             "private": [
+                 {
++                    "index": 1,
+                     "addr": "%(ip)s",
+                     "OS-EXT-IPS-MAC:mac_addr": "aa:bb:cc:dd:ee:ff",
+                     "OS-EXT-IPS:type": "fixed",
+@@ -51,6 +52,15 @@
+         "updated": "%(isotime)s",
+         "user_id": "fake",
+         "security_groups": [{"name": "test"}],
+-        "key_name": null
++        "key_name": null,
++        "nics": [
++            {
++                "nic1":
++                    {"vif_model": null,
++                     "port_id": 1,
++                     "network": "private",
++                     "mtu": null}
++            }
++        ]
+     }
+ }
+diff --git a/nova/tests/functional/v3/api_samples/os-security-groups/servers-detail-resp.json.tpl b/nova/tests/functional/v3/api_samples/os-security-groups/servers-detail-resp.json.tpl
+index 519292d..f75d6b0 100644
+--- a/nova/tests/functional/v3/api_samples/os-security-groups/servers-detail-resp.json.tpl
++++ b/nova/tests/functional/v3/api_samples/os-security-groups/servers-detail-resp.json.tpl
+@@ -6,6 +6,7 @@
+             "addresses": {
+                 "private": [
+                     {
++                        "index": 1,
+                         "addr": "%(ip)s",
+                         "version": 4,
+                         "OS-EXT-IPS-MAC:mac_addr": "aa:bb:cc:dd:ee:ff",
+@@ -52,6 +53,15 @@
+             "tenant_id": "openstack",
+             "user_id": "fake",
+             "security_groups": [{"name": "test"}],
+-            "key_name": null
++            "key_name": null,
++            "nics": [
++                {
++                    "nic1":
++                        {"vif_model": null,
++                         "port_id": 1,
++                         "network": "private",
++                         "mtu": null}
++                }
++            ]
+     }]
+ }
+diff --git a/nova/tests/functional/v3/api_samples/os-server-usage/server-get-resp.json.tpl b/nova/tests/functional/v3/api_samples/os-server-usage/server-get-resp.json.tpl
+index 90e7594..3afa322 100644
+--- a/nova/tests/functional/v3/api_samples/os-server-usage/server-get-resp.json.tpl
++++ b/nova/tests/functional/v3/api_samples/os-server-usage/server-get-resp.json.tpl
+@@ -5,6 +5,7 @@
+         "addresses": {
+             "private": [
+                 {
++                    "index": 1,
+                     "addr": "%(ip)s",
+                     "OS-EXT-IPS-MAC:mac_addr": "aa:bb:cc:dd:ee:ff",
+                     "OS-EXT-IPS:type": "fixed",
+@@ -52,6 +53,15 @@
+         "status": "ACTIVE",
+         "tenant_id": "openstack",
+         "updated": "%(isotime)s",
+-        "user_id": "fake"
++        "user_id": "fake",
++        "nics": [
++            {
++                "nic1":
++                    {"vif_model": null,
++                     "port_id": 1,
++                     "network": "private",
++                     "mtu": null}
++            }
++        ]
+     }
+ }
+diff --git a/nova/tests/functional/v3/api_samples/os-server-usage/servers-detail-resp.json.tpl b/nova/tests/functional/v3/api_samples/os-server-usage/servers-detail-resp.json.tpl
+index ae20daa..56f0d73 100644
+--- a/nova/tests/functional/v3/api_samples/os-server-usage/servers-detail-resp.json.tpl
++++ b/nova/tests/functional/v3/api_samples/os-server-usage/servers-detail-resp.json.tpl
+@@ -8,6 +8,7 @@
+             "addresses": {
+                 "private": [
+                     {
++                        "index": 1,
+                         "addr": "%(ip)s",
+                         "OS-EXT-IPS-MAC:mac_addr": "aa:bb:cc:dd:ee:ff",
+                         "OS-EXT-IPS:type": "fixed",
+@@ -53,6 +54,15 @@
+             "hostId": "%(hostid)s",
+             "metadata": {
+                 "My Server Name": "Apache1"
+-            }
++            },
++            "nics": [
++                {
++                    "nic1":
++                        {"vif_model": null,
++                         "port_id": 1,
++                         "network": "private",
++                         "mtu": null}
++                }
++            ]
+     }]
+ }
+diff --git a/nova/tests/functional/v3/api_samples/server-ips/server-ips-network-resp.json.tpl b/nova/tests/functional/v3/api_samples/server-ips/server-ips-network-resp.json.tpl
+index 29d2370..aaae395 100644
+--- a/nova/tests/functional/v3/api_samples/server-ips/server-ips-network-resp.json.tpl
++++ b/nova/tests/functional/v3/api_samples/server-ips/server-ips-network-resp.json.tpl
+@@ -1,6 +1,7 @@
+ {
+     "private": [
+         {
++            "index": 1,
+             "addr": "%(ip)s",
+             "version": 4
+         }
+diff --git a/nova/tests/functional/v3/api_samples/server-ips/server-ips-resp.json.tpl b/nova/tests/functional/v3/api_samples/server-ips/server-ips-resp.json.tpl
+index 259eabe..6b3ec06 100644
+--- a/nova/tests/functional/v3/api_samples/server-ips/server-ips-resp.json.tpl
++++ b/nova/tests/functional/v3/api_samples/server-ips/server-ips-resp.json.tpl
+@@ -2,6 +2,7 @@
+     "addresses": {
+         "private": [
+             {
++                "index": 1,
+                 "addr": "%(ip)s",
+                 "version": 4
+             }
+diff --git a/nova/tests/functional/v3/api_samples/servers/server-action-rebuild-resp.json.tpl b/nova/tests/functional/v3/api_samples/servers/server-action-rebuild-resp.json.tpl
+index 01f4c7d..443f062 100644
+--- a/nova/tests/functional/v3/api_samples/servers/server-action-rebuild-resp.json.tpl
++++ b/nova/tests/functional/v3/api_samples/servers/server-action-rebuild-resp.json.tpl
+@@ -3,6 +3,7 @@
+         "addresses": {
+             "private": [
+                 {
++                    "index": 1,
+                     "addr": "%(ip)s",
+                     "version": 4
+                 }
+@@ -48,6 +49,15 @@
+         "status": "ACTIVE",
+         "tenant_id": "openstack",
+         "updated": "%(isotime)s",
+-        "user_id": "fake"
++        "user_id": "fake",
++        "nics": [
++            {
++                "nic1":
++                    {"vif_model": null,
++                     "port_id": 1,
++                     "network": "private",
++                     "mtu": null}
++            }
++        ]
+     }
+ }
+diff --git a/nova/tests/functional/v3/api_samples/servers/server-get-resp.json.tpl b/nova/tests/functional/v3/api_samples/servers/server-get-resp.json.tpl
+index 3c7cc62..83c38d5 100644
+--- a/nova/tests/functional/v3/api_samples/servers/server-get-resp.json.tpl
++++ b/nova/tests/functional/v3/api_samples/servers/server-get-resp.json.tpl
+@@ -3,6 +3,7 @@
+         "addresses": {
+             "private": [
+                 {
++                    "index": 1,
+                     "addr": "%(ip)s",
+                     "OS-EXT-IPS-MAC:mac_addr": "aa:bb:cc:dd:ee:ff",
+                     "OS-EXT-IPS:type": "fixed",
+@@ -50,6 +51,15 @@
+         "status": "ACTIVE",
+         "tenant_id": "openstack",
+         "updated": "%(isotime)s",
+-        "user_id": "fake"
++        "user_id": "fake",
++        "nics": [
++            {
++                "nic1":
++                    {"vif_model": null,
++                     "port_id": 1,
++                     "network": "private",
++                     "mtu": null}
++            }
++        ]
+     }
+ }
+diff --git a/nova/tests/functional/v3/api_samples/servers/servers-details-resp.json.tpl b/nova/tests/functional/v3/api_samples/servers/servers-details-resp.json.tpl
+index 1d4f8d9..b97c139 100644
+--- a/nova/tests/functional/v3/api_samples/servers/servers-details-resp.json.tpl
++++ b/nova/tests/functional/v3/api_samples/servers/servers-details-resp.json.tpl
+@@ -4,6 +4,7 @@
+             "addresses": {
+                 "private": [
+                     {
++                        "index": 1,
+                         "addr": "%(ip)s",
+                         "OS-EXT-IPS-MAC:mac_addr": "aa:bb:cc:dd:ee:ff",
+                         "OS-EXT-IPS:type": "fixed",
+@@ -51,7 +52,16 @@
+             "status": "ACTIVE",
+             "tenant_id": "openstack",
+             "updated": "%(isotime)s",
+-            "user_id": "fake"
++            "user_id": "fake",
++            "nics": [
++                {
++                    "nic1":
++                        {"vif_model": null,
++                         "port_id": 1,
++                         "network": "private",
++                         "mtu": null}
++                }
++            ]
+         }
+     ]
+ }
+diff --git a/nova/tests/unit/api/openstack/compute/contrib/test_neutron_security_groups.py b/nova/tests/unit/api/openstack/compute/contrib/test_neutron_security_groups.py
+index 9f63c0d..e75b6f7 100644
+--- a/nova/tests/unit/api/openstack/compute/contrib/test_neutron_security_groups.py
++++ b/nova/tests/unit/api/openstack/compute/contrib/test_neutron_security_groups.py
+@@ -591,10 +591,11 @@ class TestNeutronSecurityGroupsOutputTest(TestNeutronSecurityGroupsTestCase):
+         res = self._make_request(url)
+ 
+         self.assertEqual(res.status_int, 200)
+-        for i, server in enumerate(self._get_servers(res.body)):
+-            for j, group in enumerate(self._get_groups(server)):
+-                name = 'fake-%s-%s' % (i, j)
+-                self.assertEqual(group.get('name'), name)
++        # Security groups are not returned when there are multiple servers
++        # for i, server in enumerate(self._get_servers(res.body)):
++        #     for j, group in enumerate(self._get_groups(server)):
++        #         name = 'fake-%s-%s' % (i, j)
++        #         self.assertEqual(group.get('name'), name)
+ 
+     def test_no_instance_passthrough_404(self):
+ 
+diff --git a/nova/tests/unit/api/openstack/compute/plugins/v3/test_servers.py b/nova/tests/unit/api/openstack/compute/plugins/v3/test_servers.py
+index 448b908..a79cbc4 100644
+--- a/nova/tests/unit/api/openstack/compute/plugins/v3/test_servers.py
++++ b/nova/tests/unit/api/openstack/compute/plugins/v3/test_servers.py
+@@ -13,6 +13,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2013-2014 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ import base64
+ import collections
+@@ -214,14 +221,16 @@ class ServersControllerTest(ControllerTest):
+         port = 'eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee'
+         requested_networks = [{'port': port}]
+         res = self.controller._get_requested_networks(requested_networks)
+-        self.assertEqual([(None, None, port, None)], res.as_tuples())
++        self.assertEqual([(None, None, port, None, 'virtio')],
++                         res.as_tuples())
+ 
+     def test_requested_networks_neutronv2_enabled_with_network(self):
+         self.flags(network_api_class='nova.network.neutronv2.api.API')
+         network = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
+         requested_networks = [{'uuid': network}]
+         res = self.controller._get_requested_networks(requested_networks)
+-        self.assertEqual([(network, None, None, None)], res.as_tuples())
++        self.assertEqual([(network, None, None, None, 'virtio')],
++                         res.as_tuples())
+ 
+     def test_requested_networks_neutronv2_enabled_with_network_and_port(self):
+         self.flags(network_api_class='nova.network.neutronv2.api.API')
+@@ -229,7 +238,8 @@ class ServersControllerTest(ControllerTest):
+         port = 'eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee'
+         requested_networks = [{'uuid': network, 'port': port}]
+         res = self.controller._get_requested_networks(requested_networks)
+-        self.assertEqual([(None, None, port, None)], res.as_tuples())
++        self.assertEqual([(None, None, port, None, 'virtio')],
++                         res.as_tuples())
+ 
+     def test_requested_networks_with_duplicate_networks(self):
+         # duplicate networks are allowed only for nova neutron v2.0
+@@ -276,7 +286,8 @@ class ServersControllerTest(ControllerTest):
+         port = 'eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee'
+         requested_networks = [{'uuid': network, 'port': port}]
+         res = self.controller._get_requested_networks(requested_networks)
+-        self.assertEqual([(None, None, port, None)], res.as_tuples())
++        self.assertEqual([(None, None, port, None, 'virtio')],
++                         res.as_tuples())
+ 
+     def test_requested_networks_neutronv2_subclass_with_port(self):
+         cls = ('nova.tests.unit.api.openstack.compute' +
+@@ -285,7 +296,8 @@ class ServersControllerTest(ControllerTest):
+         port = 'eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee'
+         requested_networks = [{'port': port}]
+         res = self.controller._get_requested_networks(requested_networks)
+-        self.assertEqual([(None, None, port, None)], res.as_tuples())
++        self.assertEqual([(None, None, port, None, 'virtio')],
++                         res.as_tuples())
+ 
+     def test_get_server_by_uuid(self):
+         req = fakes.HTTPRequestV3.blank('/servers/%s' % FAKE_UUID)
+@@ -362,10 +374,10 @@ class ServersControllerTest(ControllerTest):
+                 },
+                 "addresses": {
+                     'test1': [
+-                        {'version': 4, 'addr': '192.168.1.100',
++                        {'index': 1, 'version': 4, 'addr': '192.168.1.100',
+                          'OS-EXT-IPS:type': 'fixed',
+                          'OS-EXT-IPS-MAC:mac_addr': 'aa:aa:aa:aa:aa:aa'},
+-                        {'version': 6, 'addr': '2001:db8:0:1::1',
++                        {'index': 1, 'index': 1, 'version': 6, 'addr': '2001:db8:0:1::1',
+                          'OS-EXT-IPS:type': 'fixed',
+                          'OS-EXT-IPS-MAC:mac_addr': 'aa:aa:aa:aa:aa:aa'}
+                     ]
+@@ -383,6 +395,15 @@ class ServersControllerTest(ControllerTest):
+                         "href": "http://localhost/servers/%s" % uuid,
+                     },
+                 ],
++                "nics": [
++                    {
++                        "nic1":
++                            {'vif_model': None,
++                             'port_id': 1,
++                             'network': u'test1',
++                             'mtu': None}
++                    }
++                ],
+             }
+         }
+ 
+@@ -477,14 +498,14 @@ class ServersControllerTest(ControllerTest):
+         expected = {
+             'addresses': {
+                 'private': [
+-                    {'version': 4, 'addr': '192.168.0.3'},
+-                    {'version': 4, 'addr': '192.168.0.4'},
++                    {'index': 2, 'version': 4, 'addr': '192.168.0.3'},
++                    {'index': 2, 'version': 4, 'addr': '192.168.0.4'},
+                 ],
+                 'public': [
+-                    {'version': 4, 'addr': '172.19.0.1'},
+-                    {'version': 4, 'addr': '172.19.0.2'},
+-                    {'version': 4, 'addr': '1.2.3.4'},
+-                    {'version': 6, 'addr': 'b33f::fdee:ddff:fecc:bbaa'},
++                    {'index': 1, 'version': 4, 'addr': '172.19.0.1'},
++                    {'index': 1, 'version': 4, 'addr': '172.19.0.2'},
++                    {'index': 1, 'version': 4, 'addr': '1.2.3.4'},
++                    {'index': 1, 'version': 6, 'addr': 'b33f::fdee:ddff:fecc:bbaa'},
+                 ],
+             },
+         }
+@@ -2178,7 +2199,7 @@ class ServersControllerCreateTest(test.TestCase):
+ 
+         def create(*args, **kwargs):
+             result = [('76fa36fc-c930-4bf3-8c8a-ea2a2420deb6', None,
+-                       None, None)]
++                       None, None, 'virtio')]
+             self.assertEqual(result, kwargs['requested_networks'].as_tuples())
+             return old_create(*args, **kwargs)
+ 
+@@ -2918,10 +2939,10 @@ class ServersViewBuilderTest(test.TestCase):
+                 },
+                 "addresses": {
+                     'test1': [
+-                        {'version': 4, 'addr': '192.168.1.100',
++                        {'index': 1, 'version': 4, 'addr': '192.168.1.100',
+                          'OS-EXT-IPS:type': 'fixed',
+                          'OS-EXT-IPS-MAC:mac_addr': 'aa:aa:aa:aa:aa:aa'},
+-                        {'version': 6, 'addr': '2001:db8:0:1::1',
++                        {'index': 1, 'version': 6, 'addr': '2001:db8:0:1::1',
+                          'OS-EXT-IPS:type': 'fixed',
+                          'OS-EXT-IPS-MAC:mac_addr': 'aa:aa:aa:aa:aa:aa'},
+                         {'version': 4, 'addr': '192.168.2.100',
+@@ -2945,6 +2966,15 @@ class ServersViewBuilderTest(test.TestCase):
+                         "href": bookmark_link,
+                     },
+                 ],
++                "nics": [
++                    {
++                        "nic1":
++                            {'vif_model': None,
++                             'port_id': 1,
++                             'network': u'test1',
++                             'mtu': None}
++                    }
++                ],
+             }
+         }
+ 
+@@ -2990,10 +3020,10 @@ class ServersViewBuilderTest(test.TestCase):
+                 },
+                 "addresses": {
+                     'test1': [
+-                        {'version': 4, 'addr': '192.168.1.100',
++                        {'index': 1, 'version': 4, 'addr': '192.168.1.100',
+                          'OS-EXT-IPS:type': 'fixed',
+                          'OS-EXT-IPS-MAC:mac_addr': 'aa:aa:aa:aa:aa:aa'},
+-                        {'version': 6, 'addr': '2001:db8:0:1::1',
++                        {'index': 1, 'version': 6, 'addr': '2001:db8:0:1::1',
+                          'OS-EXT-IPS:type': 'fixed',
+                          'OS-EXT-IPS-MAC:mac_addr': 'aa:aa:aa:aa:aa:aa'},
+                         {'version': 4, 'addr': '192.168.2.100',
+@@ -3023,6 +3053,15 @@ class ServersViewBuilderTest(test.TestCase):
+                     "message": "HTTPNotFound",
+                     "details": "Stock details for test",
+                 },
++                "nics": [
++                    {
++                        "nic1":
++                            {'vif_model': None,
++                             'port_id': 1,
++                             'network': u'test1',
++                             'mtu': None}
++                    }
++                ],
+             }
+         }
+ 
+@@ -3150,10 +3189,10 @@ class ServersViewBuilderTest(test.TestCase):
+                 },
+                 "addresses": {
+                     'test1': [
+-                        {'version': 4, 'addr': '192.168.1.100',
++                        {'index': 1, 'version': 4, 'addr': '192.168.1.100',
+                          'OS-EXT-IPS:type': 'fixed',
+                          'OS-EXT-IPS-MAC:mac_addr': 'aa:aa:aa:aa:aa:aa'},
+-                        {'version': 6, 'addr': '2001:db8:0:1::1',
++                        {'index': 1, 'version': 6, 'addr': '2001:db8:0:1::1',
+                          'OS-EXT-IPS:type': 'fixed',
+                          'OS-EXT-IPS-MAC:mac_addr': 'aa:aa:aa:aa:aa:aa'},
+                         {'version': 4, 'addr': '192.168.2.100',
+@@ -3177,6 +3216,15 @@ class ServersViewBuilderTest(test.TestCase):
+                         "href": bookmark_link,
+                     },
+                 ],
++                "nics": [
++                    {
++                        "nic1":
++                            {'vif_model': None,
++                             'port_id': 1,
++                             'network': u'test1',
++                             'mtu': None}
++                    }
++                ],
+             }
+         }
+ 
+@@ -3225,10 +3273,10 @@ class ServersViewBuilderTest(test.TestCase):
+                 },
+                 "addresses": {
+                     'test1': [
+-                        {'version': 4, 'addr': '192.168.1.100',
++                        {'index': 1, 'version': 4, 'addr': '192.168.1.100',
+                          'OS-EXT-IPS:type': 'fixed',
+                          'OS-EXT-IPS-MAC:mac_addr': 'aa:aa:aa:aa:aa:aa'},
+-                        {'version': 6, 'addr': '2001:db8:0:1::1',
++                        {'index': 1, 'version': 6, 'addr': '2001:db8:0:1::1',
+                          'OS-EXT-IPS:type': 'fixed',
+                          'OS-EXT-IPS-MAC:mac_addr': 'aa:aa:aa:aa:aa:aa'},
+                         {'version': 4, 'addr': '192.168.2.100',
+@@ -3252,6 +3300,15 @@ class ServersViewBuilderTest(test.TestCase):
+                         "href": bookmark_link,
+                     },
+                 ],
++                "nics": [
++                    {
++                        "nic1":
++                            {'vif_model': None,
++                             'port_id': 1,
++                             'network': u'test1',
++                             'mtu': None}
++                    }
++                ],
+             }
+         }
+ 
+diff --git a/nova/tests/unit/api/openstack/compute/test_servers.py b/nova/tests/unit/api/openstack/compute/test_servers.py
+index c891a8c..6550926 100644
+--- a/nova/tests/unit/api/openstack/compute/test_servers.py
++++ b/nova/tests/unit/api/openstack/compute/test_servers.py
+@@ -14,6 +14,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2013-2014 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ import base64
+ import collections
+@@ -208,14 +215,16 @@ class ServersControllerTest(ControllerTest):
+         port = 'eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee'
+         requested_networks = [{'port': port}]
+         res = self.controller._get_requested_networks(requested_networks)
+-        self.assertEqual([(None, None, port, None)], res.as_tuples())
++        self.assertEqual([(None, None, port, None, 'virtio')],
++                         res.as_tuples())
+ 
+     def test_requested_networks_neutronv2_enabled_with_network(self):
+         self.flags(network_api_class='nova.network.neutronv2.api.API')
+         network = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
+         requested_networks = [{'uuid': network}]
+         res = self.controller._get_requested_networks(requested_networks)
+-        self.assertEqual([(network, None, None, None)], res.as_tuples())
++        self.assertEqual([(network, None, None, None, 'virtio')],
++                         res.as_tuples())
+ 
+     def test_requested_networks_neutronv2_enabled_with_network_and_port(self):
+         self.flags(network_api_class='nova.network.neutronv2.api.API')
+@@ -223,7 +232,8 @@ class ServersControllerTest(ControllerTest):
+         port = 'eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee'
+         requested_networks = [{'uuid': network, 'port': port}]
+         res = self.controller._get_requested_networks(requested_networks)
+-        self.assertEqual([(None, None, port, None)], res.as_tuples())
++        self.assertEqual([(None, None, port, None, 'virtio')],
++                         res.as_tuples())
+ 
+     def test_requested_networks_with_duplicate_networks(self):
+         # duplicate networks are allowed only for nova neutron v2.0
+@@ -257,7 +267,8 @@ class ServersControllerTest(ControllerTest):
+         port = 'eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee'
+         requested_networks = [{'uuid': network, 'port': port}]
+         res = self.controller._get_requested_networks(requested_networks)
+-        self.assertEqual([(None, None, port, None)], res.as_tuples())
++        self.assertEqual([(None, None, port, None, 'virtio')],
++                         res.as_tuples())
+ 
+     def test_requested_networks_neutronv2_subclass_with_port(self):
+         cls = ('nova.tests.unit.api.openstack.compute' +
+@@ -266,7 +277,8 @@ class ServersControllerTest(ControllerTest):
+         port = 'eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee'
+         requested_networks = [{'port': port}]
+         res = self.controller._get_requested_networks(requested_networks)
+-        self.assertEqual([(None, None, port, None)], res.as_tuples())
++        self.assertEqual([(None, None, port, None, 'virtio')],
++                         res.as_tuples())
+ 
+     def test_get_server_by_uuid(self):
+         req = fakes.HTTPRequest.blank('/fake/servers/%s' % FAKE_UUID)
+@@ -330,8 +342,8 @@ class ServersControllerTest(ControllerTest):
+                 },
+                 "addresses": {
+                     'test1': [
+-                        {'version': 4, 'addr': '192.168.1.100'},
+-                        {'version': 6, 'addr': '2001:db8:0:1::1'}
++                        {'index': 1, 'version': 4, 'addr': '192.168.1.100'},
++                        {'index': 1, 'version': 6, 'addr': '2001:db8:0:1::1'}
+                     ]
+                 },
+                 "metadata": {
+@@ -347,6 +359,15 @@ class ServersControllerTest(ControllerTest):
+                         "href": "http://localhost/fake/servers/%s" % uuid,
+                     },
+                 ],
++                "nics": [
++                    {
++                        "nic1":
++                            {'vif_model': None,
++                             'port_id': 1,
++                             'network': u'test1',
++                             'mtu': None}
++                    }
++                ],
+             }
+         }
+ 
+@@ -439,14 +460,15 @@ class ServersControllerTest(ControllerTest):
+         expected = {
+             'addresses': {
+                 'private': [
+-                    {'version': 4, 'addr': '192.168.0.3'},
+-                    {'version': 4, 'addr': '192.168.0.4'},
++                    {'index': 2, 'version': 4, 'addr': '192.168.0.3'},
++                    {'index': 2, 'version': 4, 'addr': '192.168.0.4'},
+                 ],
+                 'public': [
+-                    {'version': 4, 'addr': '172.19.0.1'},
+-                    {'version': 4, 'addr': '172.19.0.2'},
+-                    {'version': 4, 'addr': '1.2.3.4'},
+-                    {'version': 6, 'addr': 'b33f::fdee:ddff:fecc:bbaa'},
++                    {'index': 1, 'version': 4, 'addr': '172.19.0.1'},
++                    {'index': 1, 'version': 4, 'addr': '172.19.0.2'},
++                    {'index': 1, 'version': 4, 'addr': '1.2.3.4'},
++                    {'index': 1, 'version': 6,
++                     'addr': 'b33f::fdee:ddff:fecc:bbaa'},
+                 ],
+             },
+         }
+@@ -2417,7 +2439,8 @@ class ServersControllerCreateTest(test.TestCase):
+             # NOTE(vish): if the security groups extension is not
+             #             enabled, then security groups passed in
+             #             are ignored.
+-            self.assertEqual(kwargs['security_group'], ['default'])
++            # TS has disabled the default security group
++            # self.assertEqual(kwargs['security_group'], ['default'])
+             return old_create(*args, **kwargs)
+ 
+         self.stubs.Set(compute_api.API, 'create', create)
+@@ -2699,7 +2722,7 @@ class ServersControllerCreateTest(test.TestCase):
+ 
+         def create(*args, **kwargs):
+             result = [('76fa36fc-c930-4bf3-8c8a-ea2a2420deb6', None,
+-                       None, None)]
++                       None, None, 'virtio')]
+             self.assertEqual(result, kwargs['requested_networks'].as_tuples())
+             return old_create(*args, **kwargs)
+ 
+@@ -2993,8 +3016,8 @@ class ServersViewBuilderTest(test.TestCase):
+                 },
+                 "addresses": {
+                     'test1': [
+-                        {'version': 4, 'addr': '192.168.1.100'},
+-                        {'version': 6, 'addr': '2001:db8:0:1::1'}
++                        {'index': 1, 'version': 4, 'addr': '192.168.1.100'},
++                        {'index': 1, 'version': 6, 'addr': '2001:db8:0:1::1'}
+                     ]
+                 },
+                 "metadata": {},
+@@ -3008,6 +3031,15 @@ class ServersViewBuilderTest(test.TestCase):
+                         "href": self.bookmark_link,
+                     },
+                 ],
++                "nics": [
++                    {
++                        "nic1":
++                            {'vif_model': None,
++                             'port_id': 1,
++                             'network': u'test1',
++                             'mtu': None}
++                    }
++                ],
+             }
+         }
+ 
+diff --git a/nova/tests/unit/compute/test_compute_mgr.py b/nova/tests/unit/compute/test_compute_mgr.py
+index b52c632..d57e3dd 100644
+--- a/nova/tests/unit/compute/test_compute_mgr.py
++++ b/nova/tests/unit/compute/test_compute_mgr.py
+@@ -2569,7 +2569,7 @@ class ComputeManagerBuildInstanceTestCase(test.NoDBTestCase):
+                 injected_files=self.injected_files,
+                 admin_password=self.admin_pass,
+                 requested_networks=[('fake_network_id', '10.0.0.1',
+-                                     'fake_port_id')],
++                                     'fake_port_id', None)],
+                 security_groups=self.security_groups,
+                 block_device_mapping=self.block_device_mapping, node=self.node,
+                 limits=self.limits)
+diff --git a/nova/tests/unit/compute/test_rpcapi.py b/nova/tests/unit/compute/test_rpcapi.py
+index 89c5b29..5d01d00 100644
+--- a/nova/tests/unit/compute/test_rpcapi.py
++++ b/nova/tests/unit/compute/test_rpcapi.py
+@@ -80,7 +80,8 @@ class ComputeRpcAPITestCase(test.NoDBTestCase):
+                     expected_kwargs['requested_networks'].append(
+                         (requested_network.network_id,
+                          str(requested_network.address),
+-                         requested_network.port_id))
++                         requested_network.port_id,
++                         requested_network.vif_model))
+                 else:
+                     expected_kwargs['requested_networks'].append(
+                         (requested_network.network_id,
+@@ -950,7 +951,7 @@ class ComputeRpcAPITestCase(test.NoDBTestCase):
+                 requested_networks= objects_network_request.NetworkRequestList(
+                     objects=[objects_network_request.NetworkRequest(
+                         network_id="fake_network_id", address="10.0.0.1",
+-                        port_id="fake_port_id")]),
++                        port_id="fake_port_id", vif_model=None)]),
+                 security_groups=None,
+                 block_device_mapping=None, node='node', limits={},
+                 version='3.23')
+diff --git a/nova/tests/unit/network/test_neutronv2.py b/nova/tests/unit/network/test_neutronv2.py
+index 1f791cc..efd7fc5 100644
+--- a/nova/tests/unit/network/test_neutronv2.py
++++ b/nova/tests/unit/network/test_neutronv2.py
+@@ -13,6 +13,12 @@
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
+ #
++# Copyright (c) 2013-2014 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ import collections
+ import contextlib
+@@ -466,7 +472,8 @@ class TestNeutronv2Base(test.TestCase):
+             return api
+ 
+         if (('requested_networks' not in kwargs or
+-             kwargs['requested_networks'].as_tuples() == [(None, None, None)])
++             kwargs['requested_networks'].as_tuples() == [(None, None, None,
++                                                          None)])
+             and len(nets) > 1):
+                 self.mox.ReplayAll()
+                 return api
+@@ -479,6 +486,7 @@ class TestNeutronv2Base(test.TestCase):
+                 'port': {
+                     'device_id': self.instance.uuid,
+                     'device_owner': 'compute:nova',
++                    'binding:vif_model': None,
+                 },
+             }
+             # Network lookup for available network_id
+@@ -1063,6 +1071,7 @@ class TestNeutronv2(TestNeutronv2Base):
+                 'port': {
+                     'device_id': self.instance.uuid,
+                     'device_owner': 'compute:nova',
++                    'binding:vif_model': None,
+                 },
+             }
+             port_req_body = {
+@@ -1119,6 +1128,7 @@ class TestNeutronv2(TestNeutronv2Base):
+             'port': {
+                 'device_id': self.instance.uuid,
+                 'device_owner': 'compute:nova',
++                'binding:vif_model': None,
+             },
+         }
+         port_req_body = {
+@@ -1276,7 +1286,7 @@ class TestNeutronv2(TestNeutronv2Base):
+                 # NOTE(danms): Temporary and transitional
+                 with mock.patch('nova.utils.is_neutron', return_value=True):
+                     requested_networks = requested_networks.as_tuples()
+-            for net, fip, port, request_id in requested_networks:
++            for net, fip, port, request_id, vif_model in requested_networks:
+                 ret_data.append({'network_id': net,
+                                  'device_id': self.instance.uuid,
+                                  'device_owner': 'compute:nova',
+@@ -1290,7 +1300,7 @@ class TestNeutronv2(TestNeutronv2Base):
+                 {'ports': ret_data})
+         self.moxed_client.list_extensions().AndReturn({'extensions': []})
+         if requested_networks:
+-            for net, fip, port, request_id in requested_networks:
++            for net, fip, port, request_id, vif_model in requested_networks:
+                 self.moxed_client.update_port(port)
+         for port in ports:
+             self.moxed_client.delete_port(port)
+@@ -1422,8 +1432,8 @@ class TestNeutronv2(TestNeutronv2Base):
+         neutronapi.API().show_port(self.context, 'foo')
+ 
+     def test_validate_networks(self):
+-        requested_networks = [('my_netid1', None, None, None),
+-                              ('my_netid2', None, None, None)]
++        requested_networks = [('my_netid1', None, None, None, None),
++                              ('my_netid2', None, None, None, None)]
+         ids = ['my_netid1', 'my_netid2']
+         self.moxed_client.list_networks(
+             id=mox.SameElementsAs(ids)).AndReturn(
+@@ -1438,8 +1448,8 @@ class TestNeutronv2(TestNeutronv2Base):
+         api.validate_networks(self.context, requested_networks, 1)
+ 
+     def test_validate_networks_without_port_quota_on_network_side(self):
+-        requested_networks = [('my_netid1', None, None, None),
+-                              ('my_netid2', None, None, None)]
++        requested_networks = [('my_netid1', None, None, None, None),
++                              ('my_netid2', None, None, None, None)]
+         ids = ['my_netid1', 'my_netid2']
+         self.moxed_client.list_networks(
+             id=mox.SameElementsAs(ids)).AndReturn(
+@@ -1454,7 +1464,7 @@ class TestNeutronv2(TestNeutronv2Base):
+         api.validate_networks(self.context, requested_networks, 1)
+ 
+     def test_validate_networks_ex_1(self):
+-        requested_networks = [('my_netid1', None, None, None)]
++        requested_networks = [('my_netid1', None, None, None, None)]
+         self.moxed_client.list_networks(
+             id=mox.SameElementsAs(['my_netid1'])).AndReturn(
+                 {'networks': self.nets1})
+@@ -1471,9 +1481,9 @@ class TestNeutronv2(TestNeutronv2Base):
+             self.assertIn("my_netid2", six.text_type(ex))
+ 
+     def test_validate_networks_ex_2(self):
+-        requested_networks = [('my_netid1', None, None, None),
+-                              ('my_netid2', None, None, None),
+-                              ('my_netid3', None, None, None)]
++        requested_networks = [('my_netid1', None, None, None, None),
++                              ('my_netid2', None, None, None, None),
++                              ('my_netid3', None, None, None, None)]
+         ids = ['my_netid1', 'my_netid2', 'my_netid3']
+         self.moxed_client.list_networks(
+             id=mox.SameElementsAs(ids)).AndReturn(
+@@ -1491,8 +1501,8 @@ class TestNeutronv2(TestNeutronv2Base):
+         network ids are passed to validate_networks, when nova config flag
+         allow_duplicate_networks is set to its default value: False
+         """
+-        requested_networks = [('my_netid1', None, None, None),
+-                              ('my_netid1', None, None, None)]
++        requested_networks = [('my_netid1', None, None, None, None),
++                              ('my_netid1', None, None, None, None)]
+         self.mox.ReplayAll()
+         # Expected call from setUp.
+         neutronapi.get_client(None)
+@@ -2878,7 +2888,7 @@ class TestNeutronv2WithMock(test.TestCase):
+                   'subnets': ['mysubnid1'],
+                   'tenant_id': 'fake-project'}]
+ 
+-        requested_networks = [('my_netid1', '10.0.1.2', None, None)]
++        requested_networks = [('my_netid1', '10.0.1.2', None, None, None)]
+         ids = ['my_netid1']
+         list_port_values = [({'network_id': 'my_netid1',
+                               'fixed_ips': 'ip_address=10.0.1.2',
+@@ -2902,8 +2912,8 @@ class TestNeutronv2WithMock(test.TestCase):
+                   'subnets': ['mysubnid2'],
+                   'tenant_id': 'fake-project'}]
+ 
+-        requested_networks = [('my_netid1', '10.0.1.2', None, None),
+-                              ('my_netid2', '10.0.1.3', None, None)]
++        requested_networks = [('my_netid1', '10.0.1.2', None, None, None),
++                              ('my_netid2', '10.0.1.3', None, None, None)]
+         ids = ['my_netid1', 'my_netid2']
+         list_port_values = [({'network_id': 'my_netid1',
+                               'fixed_ips': 'ip_address=10.0.1.2',
+@@ -2924,7 +2934,7 @@ class TestNeutronv2WithMock(test.TestCase):
+         # Test validation for a request for a network with a
+         # fixed ip that is already in use
+ 
+-        requested_networks = [('my_netid1', '10.0.1.2', None, None)]
++        requested_networks = [('my_netid1', '10.0.1.2', None, None, None)]
+         list_port_mock_params = {'network_id': 'my_netid1',
+                                  'fixed_ips': 'ip_address=10.0.1.2',
+                                  'fields': 'device_id'}
+diff --git a/nova/tests/unit/objects/test_network_request.py b/nova/tests/unit/objects/test_network_request.py
+index bbe6010..f8e4908 100644
+--- a/nova/tests/unit/objects/test_network_request.py
++++ b/nova/tests/unit/objects/test_network_request.py
+@@ -11,6 +11,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2013-2014 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ import mock
+ 
+@@ -38,7 +45,7 @@ class _TestNetworkRequestObject(object):
+                                          port_id=FAKE_UUID,
+                                      )
+         with mock.patch('nova.utils.is_neutron', return_value=True):
+-            self.assertEqual(('123', '1.2.3.4', FAKE_UUID, None),
++            self.assertEqual(('123', '1.2.3.4', FAKE_UUID, None, None),
+                              request.to_tuple())
+ 
+     def test_to_tuple_nova(self):
+@@ -51,14 +58,14 @@ class _TestNetworkRequestObject(object):
+ 
+     def test_from_tuple_neutron(self):
+         request = objects.NetworkRequest.from_tuple(
+-            ('123', '1.2.3.4', FAKE_UUID, None))
++            ('123', '1.2.3.4', FAKE_UUID, None, None))
+         self.assertEqual('123', request.network_id)
+         self.assertEqual('1.2.3.4', str(request.address))
+         self.assertEqual(FAKE_UUID, request.port_id)
+ 
+     def test_from_tuple_neutron_without_pci_request_id(self):
+         request = objects.NetworkRequest.from_tuple(
+-            ('123', '1.2.3.4', FAKE_UUID))
++            ('123', '1.2.3.4', FAKE_UUID, None))
+         self.assertEqual('123', request.network_id)
+         self.assertEqual('1.2.3.4', str(request.address))
+         self.assertEqual(FAKE_UUID, request.port_id)
+@@ -76,7 +83,7 @@ class _TestNetworkRequestObject(object):
+             objects=[objects.NetworkRequest(network_id='123'),
+                      objects.NetworkRequest(network_id='456')])
+         self.assertEqual(
+-            [('123', None, None, None), ('456', None, None, None)],
++            [('123', None, None, None, None), ('456', None, None, None, None)],
+              requests.as_tuples())
+ 
+     def test_is_single_unspecified(self):
+diff --git a/nova/tests/unit/objects/test_objects.py b/nova/tests/unit/objects/test_objects.py
+index f4a378e..f3eeb8d 100644
+--- a/nova/tests/unit/objects/test_objects.py
++++ b/nova/tests/unit/objects/test_objects.py
+@@ -1248,8 +1248,8 @@ object_data = {
+     'NUMATopologyLimits': '1.0-201845851897940c0a300e3d14ebf04a',
+     'Network': '1.2-141c797b794a4f8dbe251f929dc15268',
+     'NetworkList': '1.2-aa4ad23f035b97a41732ea8b3445fc5e',
+-    'NetworkRequest': '1.1-f31192f5a725017707f989585e12d7dc',
+-    'NetworkRequestList': '1.1-beeab521ac9450f1f5ef4eaa945a783c',
++    'NetworkRequest': '1.2-924c35cfde8d73d07d4853cc65237cf5',
++    'NetworkRequestList': '1.2-88802cfb1f4487cca3f8561d3db51859',
+     'PciDevice': '1.3-6d37f795ee934e7db75b5a6a1926def0',
+     'PciDeviceList': '1.1-38cbe2d3c23b9e46f7a74b486abcad85',
+     'PciDevicePool': '1.1-2f352e08e128ec5bc84bc3007936cc6d',
+diff --git a/nova/virt/libvirt/vif.py b/nova/virt/libvirt/vif.py
+index 9f4fba6..6fabe3a 100644
+--- a/nova/virt/libvirt/vif.py
++++ b/nova/virt/libvirt/vif.py
+@@ -404,7 +404,7 @@ class LibvirtGenericVIFDriver(object):
+         """Determine which type of vswitch interface to publish to the guest.
+         """
+         model = self.get_hw_vif_model(vif, image_meta)
+-        if model and model == 'avp':
++        if model and model == network_model.VIF_MODEL_AVP:
+             return self._get_config_vswitch_avp(
+                 instance, vif, image_meta, inst_type)
+         else:
+-- 
+2.7.4
+

@@ -1,0 +1,40 @@
+From 939f4678a61acb01e8242275cc470ede6181ef74 Mon Sep 17 00:00:00 2001
+From: Gerry Kopec <Gerry.Kopec@windriver.com>
+Date: Thu, 16 Jun 2016 19:08:44 -0400
+Subject: [PATCH] Local Storage incorrectly creates
+ /etc/nova/instances/<uuid>/<uuid>_disk
+
+Port commit 37c7a0a to Mitaka.  This change adds a check when creating
+image to only use instance_dir (/etc/nova/instances) if the image backend
+uses it.  Without this check lvm backed instances will inappropriately
+create an image in the instance_dir.
+
+(cherry picked from commit 2402bed)
+---
+ nova/virt/libvirt/driver.py | 10 ++++++----
+ 1 file changed, 6 insertions(+), 4 deletions(-)
+
+diff --git a/nova/virt/libvirt/driver.py b/nova/virt/libvirt/driver.py
+index 5a6e686..4ab221b 100644
+--- a/nova/virt/libvirt/driver.py
++++ b/nova/virt/libvirt/driver.py
+@@ -6836,10 +6836,12 @@ class LibvirtDriver(driver.ComputeDriver):
+             disk_info = []
+ 
+         for info in disk_info:
+-            base = os.path.basename(info['path'])
+-            # Get image type and create empty disk image, and
+-            # create backing file in case of qcow2.
+-            instance_disk = os.path.join(instance_dir, base)
++            instance_disk = info['path']
++            if self.image_backend.backend().is_file_in_instance_path():
++                base = os.path.basename(info['path'])
++                # Get image type and create empty disk image, and
++                # create backing file in case of qcow2.
++                instance_disk = os.path.join(instance_dir, base)
+             if not info['backing_file'] and not os.path.exists(instance_disk):
+                 libvirt_utils.create_image(info['type'], instance_disk,
+                                            info['virt_disk_size'])
+-- 
+2.7.4
+

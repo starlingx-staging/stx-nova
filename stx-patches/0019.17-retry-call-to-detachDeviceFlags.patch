@@ -1,0 +1,240 @@
+From 4978e69e7333d62ad755cd2edfa4fdb0d5b2d275 Mon Sep 17 00:00:00 2001
+From: Daniel Chavolla <daniel.chavolla@windriver.com>
+Date: Mon, 27 Mar 2017 22:14:26 -0400
+Subject: [PATCH] retry call to detachDeviceFlags()
+
+port of commit fe13b33 to Newton
+
+Fix for "Stack update failed with "Rebuilding server failed,
+status 'ERROR'" error."
+
+If while executing nova.virt.libvirt.driver.LibvirtDriver.detach_volume,
+a domain is shutdown after the flag VIR_DOMAIN_AFFECT_LIVE is calculated,
+the call to virt_dom.detachDeviceFlags() will return one of the
+following errors:
+
+libvirt.VIR_ERR_OPERATION_INVALID or
+libvirt.VIR_ERR_OPERATION_FAILED.
+
+In these cases the solution is to re-calculate this flag and retry the
+call to virt_dom.detachDeviceFlags() via detach_device()
+
+Note that our changes  already fix openstack
+bug #1642689 ceph: volume detach fails with "libvirtError: operation
+failed: disk vdb not found".
+Namely, the fix for that bug makes sure that a VIR_ERR_OPERATION_FAILED
+is not considered as a real error condition.  The fix 
+already does that for both VIR_ERR_OPERATION_INVALID and
+VIR_ERR_OPERATION_FAILED
+---
+ nova/tests/unit/virt/libvirt/test_guest.py | 17 +++++++-----
+ nova/tests/unit/virt/test_virt_drivers.py  |  6 ++++-
+ nova/virt/libvirt/driver.py                |  7 ++---
+ nova/virt/libvirt/guest.py                 | 42 +++++++++++++++---------------
+ 4 files changed, 39 insertions(+), 33 deletions(-)
+
+diff --git a/nova/tests/unit/virt/libvirt/test_guest.py b/nova/tests/unit/virt/libvirt/test_guest.py
+index 55e8b27..df92cf4 100644
+--- a/nova/tests/unit/virt/libvirt/test_guest.py
++++ b/nova/tests/unit/virt/libvirt/test_guest.py
+@@ -239,9 +239,10 @@ class GuestTestCase(test.NoDBTestCase):
+         # Force multiple retries of detach
+         get_config.side_effect = [conf, conf, conf, None]
+         dev_path = "/dev/vdb"
++        self.domain.info.return_value = (1, 2, 3, 4, 5)
+ 
+         retry_detach = self.guest.detach_device_with_retry(
+-            get_config, dev_path, persistent=True, live=True,
++            get_config, dev_path, self.host, persistent=True,
+             inc_sleep_time=.01)
+         # Ensure we've only done the initial detach call
+         self.domain.detachDeviceFlags.assert_called_once_with(
+@@ -261,9 +262,10 @@ class GuestTestCase(test.NoDBTestCase):
+         conf.to_xml.return_value = "</xml>"
+         # Continue to return some value for the disk config
+         get_config = mock.Mock(return_value=conf)
++        self.domain.info.return_value = (1, 2, 3, 4, 5)
+ 
+         retry_detach = self.guest.detach_device_with_retry(
+-            get_config, "/dev/vdb", persistent=True, live=True,
++            get_config, "/dev/vdb", self.host, persistent=True,
+             inc_sleep_time=.01, max_retry_count=3)
+         # Ensure we've only done the initial detach call
+         self.domain.detachDeviceFlags.assert_called_once_with(
+@@ -278,9 +280,10 @@ class GuestTestCase(test.NoDBTestCase):
+ 
+     def test_detach_device_with_retry_device_not_found(self):
+         get_config = mock.Mock(return_value=None)
++        self.domain.info.return_value = (1, 2, 3, 4, 5)
+         self.assertRaises(
+             exception.DeviceNotFound, self.guest.detach_device_with_retry,
+-            get_config, "/dev/vdb", persistent=True, live=True)
++            get_config, "/dev/vdb", self.host, persistent=True)
+ 
+     @mock.patch.object(libvirt_guest.Guest, "detach_device")
+     def test_detach_device_with_retry_operation_failed(self, mock_detach):
+@@ -296,11 +299,12 @@ class GuestTestCase(test.NoDBTestCase):
+             error_code=fakelibvirt.VIR_ERR_OPERATION_FAILED,
+             error_domain=fakelibvirt.VIR_FROM_DOMAIN)
+         mock_detach.side_effect = [None, fake_exc]
++        self.domain.info.return_value = (1, 2, 3, 4, 5)
+         retry_detach = self.guest.detach_device_with_retry(
+-            get_config, fake_device, persistent=True, live=True,
++            get_config, fake_device, self.host, persistent=True,
+             inc_sleep_time=.01, max_retry_count=3)
+         # Some time later, we can do the wait/retry to ensure detach
+-        self.assertRaises(exception.DeviceNotFound, retry_detach)
++        self.assertRaises(StopIteration, retry_detach)
+ 
+     @mock.patch.object(libvirt_guest.Guest, "detach_device")
+     def test_detach_device_with_retry_invalid_argument(self, mock_detach):
+@@ -316,9 +320,10 @@ class GuestTestCase(test.NoDBTestCase):
+             error_code=fakelibvirt.VIR_ERR_INVALID_ARG,
+             error_domain=fakelibvirt.VIR_FROM_DOMAIN)
+         mock_detach.side_effect = fake_exc
++        self.domain.info.return_value = (1, 2, 3, 4, 5)
+         self.assertRaises(exception.DeviceNotFound,
+             self.guest.detach_device_with_retry,
+-            get_config, fake_device, persistent=True, live=True,
++            get_config, fake_device, self.host, persistent=True,
+             inc_sleep_time=.01, max_retry_count=3)
+ 
+     def test_get_xml_desc(self):
+diff --git a/nova/tests/unit/virt/test_virt_drivers.py b/nova/tests/unit/virt/test_virt_drivers.py
+index 41e1a5c..652bcba 100644
+--- a/nova/tests/unit/virt/test_virt_drivers.py
++++ b/nova/tests/unit/virt/test_virt_drivers.py
+@@ -35,6 +35,7 @@ import six
+ 
+ from nova.compute import cgcs_messaging
+ from nova.compute import manager
++from nova.compute import power_state
+ from nova.console import type as ctype
+ from nova import context
+ from nova import exception
+@@ -191,10 +192,13 @@ class _FakeDriverBackendTestCase(object):
+             pass
+ 
+         def fake_detach_device_with_retry(_self, get_device_conf_func, device,
+-                                          persistent, live,
++                                          host, persistent,
+                                           max_retry_count=7,
+                                           inc_sleep_time=2,
+                                           max_sleep_time=30):
++            state = _self.get_power_state(host)
++            live = state in (power_state.RUNNING, power_state.PAUSED)
++
+             # Still calling detach, but instead of returning function
+             # that actually checks if device is gone from XML, just continue
+             # because XML never gets updated in these tests
+diff --git a/nova/virt/libvirt/driver.py b/nova/virt/libvirt/driver.py
+index 303e98d..4343950 100644
+--- a/nova/virt/libvirt/driver.py
++++ b/nova/virt/libvirt/driver.py
+@@ -1440,16 +1440,13 @@ class LibvirtDriver(driver.ComputeDriver):
+         try:
+             guest = self._host.get_guest(instance)
+ 
+-            state = guest.get_power_state(self._host)
+-            live = state in (power_state.RUNNING, power_state.PAUSED)
+-
+             # The volume must be detached from the VM before disconnecting it
+             # from its encryptor. Otherwise, the encryptor may report that the
+             # volume is still in use.
+             wait_for_detach = guest.detach_device_with_retry(guest.get_disk,
+                                                              disk_dev,
+-                                                             persistent=True,
+-                                                             live=live)
++                                                             self._host,
++                                                             persistent=True)
+             wait_for_detach()
+ 
+             if encryption:
+diff --git a/nova/virt/libvirt/guest.py b/nova/virt/libvirt/guest.py
+index 3348b0f..ce65949 100644
+--- a/nova/virt/libvirt/guest.py
++++ b/nova/virt/libvirt/guest.py
+@@ -390,8 +390,8 @@ class Guest(object):
+                 devs.append(dev)
+         return devs
+ 
+-    def detach_device_with_retry(self, get_device_conf_func, device,
+-                                 persistent, live, max_retry_count=7,
++    def detach_device_with_retry(self, get_device_conf_func, device, host,
++                                 persistent, max_retry_count=7,
+                                  inc_sleep_time=2,
+                                  max_sleep_time=30):
+         """Detaches a device from the guest. After the initial detach request,
+@@ -402,10 +402,9 @@ class Guest(object):
+         :param get_device_conf_func: function which takes device as a parameter
+                                      and returns the configuration for device
+         :param device: device to detach
++        :param host: host.Host object for guest attached to device
+         :param persistent: bool to indicate whether the change is
+                            persistent or not
+-        :param live: bool to indicate whether it affects the guest in running
+-                     state
+         :param max_retry_count: number of times the returned function will
+                                 retry a detach before failing
+         :param inc_sleep_time: incremental time to sleep in seconds between
+@@ -415,31 +414,32 @@ class Guest(object):
+                                inc_sleep_time. On reaching this threshold,
+                                max_sleep_time will be used as the sleep time.
+         """
+-        def _try_detach_device(conf, persistent=False, live=False):
++        def _try_detach_device(conf, persistent=False, host=None):
++            # live flag is recalculated because the domain may have
++            # changed state.
++            state = self.get_power_state(host)
++            live = state in (power_state.RUNNING, power_state.PAUSED)
+             # Raise DeviceNotFound if the device isn't found during detach
+             try:
+                 self.detach_device(conf, persistent=persistent, live=live)
+             except libvirt.libvirtError as ex:
+-                with excutils.save_and_reraise_exception():
+-                    errcode = ex.get_error_code()
+-                    if errcode == libvirt.VIR_ERR_OPERATION_FAILED:
+-                        errmsg = ex.get_error_message()
+-                        if 'not found' in errmsg:
+-                            # This will be raised if the live domain
+-                            # detach fails because the device is not found
+-                            raise exception.DeviceNotFound(device=device)
+-                    elif errcode == libvirt.VIR_ERR_INVALID_ARG:
+-                        errmsg = ex.get_error_message()
+-                        if 'no target device' in errmsg:
+-                            # This will be raised if the persistent domain
+-                            # detach fails because the device is not found
+-                            raise exception.DeviceNotFound(device=device)
++                errcode = ex.get_error_code()
++                # if the state of the domain changed, we need to retry
++                if errcode not in (libvirt.VIR_ERR_OPERATION_INVALID,
++                                   libvirt.VIR_ERR_OPERATION_FAILED):
++                    with excutils.save_and_reraise_exception():
++                        if errcode == libvirt.VIR_ERR_INVALID_ARG:
++                            errmsg = ex.get_error_message()
++                            if 'no target device' in errmsg:
++                                # This will be raised if the persistent domain
++                                # detach fails because the device is not found
++                                raise exception.DeviceNotFound(device=device)
+ 
+         conf = get_device_conf_func(device)
+         if conf is None:
+             raise exception.DeviceNotFound(device=device)
+ 
+-        _try_detach_device(conf, persistent, live)
++        _try_detach_device(conf, persistent, host)
+ 
+         @loopingcall.RetryDecorator(max_retry_count=max_retry_count,
+                                     inc_sleep_time=inc_sleep_time,
+@@ -450,7 +450,7 @@ class Guest(object):
+             if config is not None:
+                 # Device is already detached from persistent domain
+                 # and only transient domain needs update
+-                _try_detach_device(config, persistent=False, live=live)
++                _try_detach_device(config, persistent=False, host=host)
+ 
+                 reason = _("Unable to detach from guest transient domain.")
+                 raise exception.DeviceDetachFailed(device=device,
+-- 
+2.7.4
+

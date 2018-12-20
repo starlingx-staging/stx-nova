@@ -1,0 +1,27 @@
+From 9979b0f2ee1cf5deeb641759abdd17a3ac592f4b Mon Sep 17 00:00:00 2001
+From: Joseph Richard <Joseph.Richard@windriver.com>
+Date: Wed, 22 Apr 2015 17:49:18 -0400
+Subject: [PATCH] Fix namespace on call to mtu
+
+This replaces a call to binding:mtu with
+a call to wrs-binding:mtu.
+---
+ nova/network/neutronv2/api.py | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/nova/network/neutronv2/api.py b/nova/network/neutronv2/api.py
+index 54863f7..c6f08bd 100644
+--- a/nova/network/neutronv2/api.py
++++ b/nova/network/neutronv2/api.py
+@@ -1590,7 +1590,7 @@ class API(base_api.NetworkAPI):
+                         network_model.VNIC_TYPE_NORMAL),
+                     type=current_neutron_port.get('binding:vif_type'),
+                     profile=current_neutron_port.get('binding:profile'),
+-                    mtu=current_neutron_port.get('binding:mtu'),
++                    mtu=current_neutron_port.get('wrs-binding:mtu'),
+                     vif_model=
+                         current_neutron_port.get(constants.PORT_VIF_MODEL),
+                     details=current_neutron_port.get('binding:vif_details'),
+-- 
+2.7.4
+

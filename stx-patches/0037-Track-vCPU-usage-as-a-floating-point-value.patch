@@ -1,0 +1,1839 @@
+From c5a0ceee3ac838a6f6fa517c610c1319996a1304 Mon Sep 17 00:00:00 2001
+From: Chris Friesen <chris.friesen@windriver.com>
+Date: Mon, 6 Jun 2016 16:18:30 -0600
+Subject: [PATCH 037/143] Track vCPU usage as a floating-point value.
+
+The 'vcpus' attribute reports on the total number of vcpus available from a
+host. These are the physical cpus that can be reserved for VM instances. That
+is, not platform shared and not vswitch reserved cpus.
+
+The 'vcpu_used' attribute upstream reports on the total number of vcpus
+assigned to VM instances and includes floating vcpus, and the vcpus that are
+pinned to the platform shared cpu. Because this attribute includes different
+types of vcpu usages it creates conditions where the total used count can
+exceed the total available count.
+
+This update modifies the semantics of the 'vcpus_used' in two ways:
+1) it excludes the shared platform cpu if an instance uses it
+2) it counts float vcpus as fractions of a pcpu by dividing by the
+cpu_allocation_ratio (overcommit) for individual host NUMA nodes
+as well as the host as a whole.
+
+The end result is that 'vcpus_used' is reported as floating number, as is
+'avail_cpus' for host NUMA nodes.
+
+Note: because we report the vcpu usage with the cpu_allocation_ratio
+already factored in we can't easily support the AggregateCoreFilter
+since it wants to have different ratios per host aggregate and the
+compute node doesn't know what aggregate(s) it's in.
+
+This is ported from ceef0b6b in kilo, except that I modified the
+original havana DB migration since in mitaka they no longer support
+DB "alter" statements.  Also the resource tracker now knows its own
+cpu_allocation_ratio, there is no default value in the scheduler.
+It also includes changes from eb61b082 and 20f9e2a2, as well as most of
+4652078 and lastly 776ea06.
+
+This commit also adds the function normalized_vcpus to adjust the
+correct calculation of vcpus used on a host based on an instances
+settings in flavor extra specs or image properties:
+- if cpu policy is dedicated, do not apply cpu_allocation_ratio
+- if cpu policy is dedicated and cpu thread policy is isolate, add
+  sibling reserved cpus based on instance and host numa topology
+- if shared cpu used, do not count it
+normalized_vcpus is used by the scheduler and resource tracker.
+The resource tracker wrapper adds code to derive correct input
+parameters as it can be called by instance/migration tracking/claim
+with different information provided.
+
+A check is also added when doing fallthrough linear core packing to
+ensure that requested CPUs are less than or equal to available
+otherwise the function will pass and provide insufficient CPUs.
+This is a failsafe if there are issues with the vcpus used calculation.
+
+Change-Id: Iee4b2be5520215910f189f67f8d71c3611ab3af8
+
+This commit merges the following R3 commits:
+e86bade Track vCPU usage as a floating-point value.
+e620b59 Fix floating point cpu usage over resize/move
+4da3122 Fix up unit tests for floating point cpu usage
+3e7ff66 normalize vcpu usage in Claim.vcpus()
+e1a6520 vcpus_used accounting fix for HT isolate policy and image properties
+a051630 Allow linear packing of cores on HT computes
+
+Also includes R4 commits:
+996c3cf Fix resource accounting if cpu policy only set in image
+    This fixes issue in resource accounting where vcpus_used value would
+    account for number of cpus as floating (ie. #vcpus/16) after successful
+    migrate if cpu_policy and/or cpu_thread_policy were only set in the image
+    properties and not in the flavor.  This would last until the next resource
+    audit run on the compute.
+
+    Current implementation requires system metadata in Instance object to
+    provide image properties but on migrates that is not included as part of
+    usage dictionary.  However we can use policy values in numa_topology.
+
+abd3c3b add instance's cpu_policy to extra_specs when not present.
+    When cpu_policy is not set neither in the flavor nor the image, the
+    nova-conductor sets the instance's cpu_policy to dedicated if NUMA
+    pinning is enabled. This is done in hardware._add_cpu_pinning_constraint().
+    The problem is that this info is not taken into consideration in the
+    compute when is_cpu_policy_dedicated() is called. This is because this
+    routine only gets its input from extra_specs and the image, which neither
+    of them has cpu_policy set in this case.
+    The solution is, in normalized_vcpus(), to add instance's cpu_policy
+    to extra_specs when it is not already set.
+
+For port to Newton:
+- cpu_allocation_ratio option was moved to compute conf file.
+- upstream changed resource_tracker _get_usage_dict in case of Instance
+  object to only copy over selected fields vs. whole object.  We need to
+  add back in flavor and system_metadata to use in our normalized vcpu
+  usage calculation.
+
+__TYPE_primary
+__TAG_floatcpus,db,scheduler,api
+__R4_commit_39d03d5
+__R3_commit_7ed30c2
+__TC5067
+---
+ nova/compute/claims.py                             |   9 +-
+ nova/compute/resource_tracker.py                   |  81 +++++++++-
+ nova/conf/compute.py                               |   5 +-
+ nova/db/sqlalchemy/api.py                          |   6 +-
+ .../sqlalchemy/migrate_repo/versions/216_havana.py |   9 +-
+ nova/db/sqlalchemy/models.py                       |   2 +-
+ nova/objects/compute_node.py                       |   8 +-
+ nova/objects/numa.py                               |   5 +-
+ nova/scheduler/filters/core_filter.py              |  39 +++--
+ nova/scheduler/host_manager.py                     |  20 ++-
+ nova/tests/unit/compute/test_claims.py             |  13 +-
+ nova/tests/unit/compute/test_compute.py            |  14 +-
+ nova/tests/unit/compute/test_resource_tracker.py   |  44 +++---
+ nova/tests/unit/objects/test_objects.py            |   4 +-
+ .../unit/scheduler/filters/test_core_filters.py    | 127 +++++++++-------
+ .../tests/unit/scheduler/test_caching_scheduler.py |   3 +-
+ nova/tests/unit/scheduler/test_host_manager.py     |  18 ++-
+ nova/tests/unit/virt/test_hardware.py              | 153 ++++++++++++-------
+ nova/virt/hardware.py                              | 169 ++++++++++++++++++++-
+ 19 files changed, 561 insertions(+), 168 deletions(-)
+
+diff --git a/nova/compute/claims.py b/nova/compute/claims.py
+index a376606..2ed737a 100644
+--- a/nova/compute/claims.py
++++ b/nova/compute/claims.py
+@@ -116,7 +116,8 @@ class Claim(NopClaim):
+ 
+     @property
+     def vcpus(self):
+-        return self.instance.flavor.vcpus
++        retval = self.tracker.normalized_vcpus(self.instance, self.nodename)
++        return retval
+ 
+     @property
+     def numa_topology(self):
+@@ -157,7 +158,7 @@ class Claim(NopClaim):
+ 
+         LOG.info("Attempting claim on node %(node)s: "
+                  "memory %(memory_mb)d MB, "
+-                 "disk %(disk_gb)d GB, vcpus %(vcpus)d CPU",
++                 "disk %(disk_gb)d GB, vcpus %(vcpus)s CPU",
+                  {'node': self.nodename, 'memory_mb': self.memory_mb,
+                   'disk_gb': self.disk_gb, 'vcpus': self.vcpus},
+                  instance=self.instance)
+@@ -344,7 +345,9 @@ class MoveClaim(Claim):
+ 
+     @property
+     def vcpus(self):
+-        return self.instance_type.vcpus
++        retval = self.tracker.normalized_vcpus(self.instance_type,
++                                               self.nodename)
++        return retval
+ 
+     @property
+     def numa_topology(self):
+diff --git a/nova/compute/resource_tracker.py b/nova/compute/resource_tracker.py
+index f6ee7aa..8d95a5a 100644
+--- a/nova/compute/resource_tracker.py
++++ b/nova/compute/resource_tracker.py
+@@ -42,6 +42,7 @@ from nova.compute import task_states
+ from nova.compute import utils as compute_utils
+ from nova.compute import vm_states
+ import nova.conf
++import nova.context
+ from nova import exception
+ from nova.i18n import _
+ from nova import objects
+@@ -1137,6 +1138,78 @@ class ResourceTracker(object):
+         if self.pci_tracker:
+             self.pci_tracker.save(context)
+ 
++    # extension - normalized vCPU accounting
++    def normalized_vcpus(self, usage, nodename):
++        """Return normalized vCPUs
++
++        Determine the fractional number of vCPUs used for an instance
++        based on normalized accounting.
++        """
++        cn = self.compute_nodes[nodename]
++        vcpus = float(usage.get('vcpus', 0))
++        if vcpus == 0:
++            return 0
++
++        # 'usage' can be instance or flavor, want to get at
++        # extra_specs as efficiently as possible.
++        if 'extra_specs' in usage:
++            extra_specs = usage['extra_specs']
++        else:
++            if 'flavor' in usage:
++                extra_specs = usage['flavor'].get('extra_specs', {})
++            elif 'instance_type_id' in usage:
++                flavor = objects.Flavor.get_by_id(
++                    nova.context.get_admin_context(read_deleted='yes'),
++                    usage['instance_type_id'])
++                extra_specs = flavor.extra_specs
++            else:
++                extra_specs = {}
++
++        # Get instance numa topology
++        instance_numa_topology = None
++        if 'numa_topology' in usage:
++            instance_numa_topology = usage.get('numa_topology')
++
++        if 'hw:cpu_policy' not in extra_specs \
++            and instance_numa_topology \
++            and instance_numa_topology.cells[0].cpu_policy:
++            extra_specs['hw:cpu_policy'] = \
++                instance_numa_topology.cells[0].cpu_policy
++
++        # When called from _update_usage_from_migration(), the 'usage'
++        # arg comes from a flavor, so it doesn't have system_metadata.
++        # However in that case numa_topology will have the correct cpu_policy
++        # and cpu_thread_policy so add them to image properties.
++        image_props = {}
++        if 'system_metadata' in usage:
++            system_metadata = usage['system_metadata']
++            image_meta = utils.get_image_from_system_metadata(system_metadata)
++            image_props = image_meta.get('properties', {})
++        elif instance_numa_topology:
++            image_props['hw_cpu_policy'] = \
++                instance_numa_topology.cells[0].cpu_policy
++            image_props['hw_cpu_thread_policy'] = \
++                instance_numa_topology.cells[0].cpu_thread_policy
++
++        # Get host numa topology
++        host_numa_topology, _fmt = hardware.host_topology_and_format_from_host(
++            cn)
++
++        # Get set of reserved thread sibling pcpus that cannot be allocated
++        # when using 'isolate' cpu_thread_policy.
++        reserved = hardware.get_reserved_thread_sibling_pcpus(
++                instance_numa_topology, host_numa_topology)
++        threads_per_core = hardware._get_threads_per_core(host_numa_topology)
++
++        # Normalize vcpus accounting
++        vcpus = hardware.normalized_vcpus(vcpus=vcpus,
++                                          reserved=reserved,
++                                          extra_specs=extra_specs,
++                                          image_props=image_props,
++                                          ratio=CONF.cpu_allocation_ratio,
++                                          threads_per_core=threads_per_core)
++        return vcpus
++
+     def _update_usage(self, usage, nodename, sign=1):
+         # tracker debug logging
+         if CONF.compute_resource_debug:
+@@ -1189,7 +1262,7 @@ class ResourceTracker(object):
+ 
+         mem_usage = usage['memory_mb']
+         disk_usage = usage.get('root_gb', 0)
+-        vcpus_usage = usage.get('vcpus', 0)
++        vcpus_usage = self.normalized_vcpus(usage, nodename)
+ 
+         overhead = self.driver.estimate_instance_overhead(usage)
+         mem_usage += overhead['memory_mb']
+@@ -1874,6 +1947,12 @@ class ResourceTracker(object):
+                      'ephemeral_gb': object_or_dict.flavor.ephemeral_gb,
+                      'numa_topology': object_or_dict.numa_topology}
+ 
++            # need to add in flavor and system_metadata so we
++            # can properly normalize vcpu usage
++            usage['flavor'] = object_or_dict.flavor
++            if 'system_metadata' in object_or_dict:
++                usage['system_metadata'] = object_or_dict.system_metadata
++
+             for field in ['host', 'name', 'display_name', 'min_vcpus',
+                           'max_vcpus', 'instance_type_id', 'old_flavor',
+                           'new_flavor', 'vm_mode', 'task_state', 'vm_state',
+diff --git a/nova/conf/compute.py b/nova/conf/compute.py
+index 0d2ecfa..86df5fb 100644
+--- a/nova/conf/compute.py
++++ b/nova/conf/compute.py
+@@ -471,8 +471,11 @@ Possible values:
+ ]
+ 
+ allocation_ratio_opts = [
++    # Setting cpu_allocation_ratio default to 16 is a hack to make unit
++    # tests pass.  In the field all our compute nodes are explicitly set to
++    # 16 anyway.
+     cfg.FloatOpt('cpu_allocation_ratio',
+-        default=0.0,
++        default=16.0,
+         min=0.0,
+         help="""
+ This option helps you specify virtual CPU to physical CPU allocation ratio.
+diff --git a/nova/db/sqlalchemy/api.py b/nova/db/sqlalchemy/api.py
+index 47fe653..fefde60 100644
+--- a/nova/db/sqlalchemy/api.py
++++ b/nova/db/sqlalchemy/api.py
+@@ -850,10 +850,12 @@ def compute_node_statistics(context):
+     fields = ('count', 'vcpus', 'memory_mb', 'local_gb', 'vcpus_used',
+               'memory_mb_used', 'local_gb_used', 'free_ram_mb', 'free_disk_gb',
+               'current_workload', 'running_vms', 'disk_available_least')
+-    results = {field: int(results[idx] or 0)
++    stats = {field: int(results[idx] or 0)
+                for idx, field in enumerate(fields)}
++    # vcpus_used is now floating-point.
++    stats['vcpus_used'] = results[fields.index('vcpus_used')] or 0
+     conn.close()
+-    return results
++    return stats
+ 
+ 
+ ###################
+diff --git a/nova/db/sqlalchemy/migrate_repo/versions/216_havana.py b/nova/db/sqlalchemy/migrate_repo/versions/216_havana.py
+index efb29a4..5d57d94 100644
+--- a/nova/db/sqlalchemy/migrate_repo/versions/216_havana.py
++++ b/nova/db/sqlalchemy/migrate_repo/versions/216_havana.py
+@@ -11,6 +11,12 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2016-2017 Wind River Systems, Inc.
++#
++#
++#
++#
+ 
+ from migrate.changeset import UniqueConstraint
+ from migrate import ForeignKeyConstraint
+@@ -262,7 +268,8 @@ def upgrade(migrate_engine):
+         Column('vcpus', Integer, nullable=False),
+         Column('memory_mb', Integer, nullable=False),
+         Column('local_gb', Integer, nullable=False),
+-        Column('vcpus_used', Integer, nullable=False),
++        # changed vcpus_used to float
++        Column('vcpus_used', Float, nullable=False),
+         Column('memory_mb_used', Integer, nullable=False),
+         Column('local_gb_used', Integer, nullable=False),
+         Column('hypervisor_type', MediumText(), nullable=False),
+diff --git a/nova/db/sqlalchemy/models.py b/nova/db/sqlalchemy/models.py
+index f9e720f..24563f0 100644
+--- a/nova/db/sqlalchemy/models.py
++++ b/nova/db/sqlalchemy/models.py
+@@ -137,7 +137,7 @@ class ComputeNode(BASE, NovaBase, models.SoftDeleteMixin):
+     vcpus = Column(Integer, nullable=False)
+     memory_mb = Column(Integer, nullable=False)
+     local_gb = Column(Integer, nullable=False)
+-    vcpus_used = Column(Integer, nullable=False)
++    vcpus_used = Column(Float, nullable=False)
+     memory_mb_used = Column(Integer, nullable=False)
+     local_gb_used = Column(Integer, nullable=False)
+     hypervisor_type = Column(MediumText(), nullable=False)
+diff --git a/nova/objects/compute_node.py b/nova/objects/compute_node.py
+index 742c7bd..9a9f847 100644
+--- a/nova/objects/compute_node.py
++++ b/nova/objects/compute_node.py
+@@ -11,6 +11,12 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2016-2017 Wind River Systems, Inc.
++#
++#
++#
++#
+ 
+ 
+ from oslo_serialization import jsonutils
+@@ -60,7 +66,7 @@ class ComputeNode(base.NovaPersistentObject, base.NovaObject):
+         'vcpus': fields.IntegerField(),
+         'memory_mb': fields.IntegerField(),
+         'local_gb': fields.IntegerField(),
+-        'vcpus_used': fields.IntegerField(),
++        'vcpus_used': fields.FloatField(),
+         'memory_mb_used': fields.IntegerField(),
+         'local_gb_used': fields.IntegerField(),
+         'hypervisor_type': fields.StringField(),
+diff --git a/nova/objects/numa.py b/nova/objects/numa.py
+index 483b499..c7473a3 100644
+--- a/nova/objects/numa.py
++++ b/nova/objects/numa.py
+@@ -54,7 +54,7 @@ class NUMACell(base.NovaObject):
+         'id': fields.IntegerField(read_only=True),
+         'cpuset': fields.SetOfIntegersField(),
+         'memory': fields.IntegerField(),
+-        'cpu_usage': fields.IntegerField(default=0),
++        'cpu_usage': fields.FloatField(default=0),
+         'memory_usage': fields.IntegerField(default=0),
+         'pinned_cpus': fields.SetOfIntegersField(),
+         'siblings': fields.ListOfSetsOfIntegersField(),
+@@ -85,7 +85,8 @@ class NUMACell(base.NovaObject):
+ 
+     @property
+     def avail_cpus(self):
+-        return len(self.free_cpus)
++        cpu_usage = self.cpu_usage if ('cpu_usage' in self) else 0
++        return len(self.cpuset) - cpu_usage
+ 
+     @property
+     def avail_memory(self):
+diff --git a/nova/scheduler/filters/core_filter.py b/nova/scheduler/filters/core_filter.py
+index 3a1024f..90b1bde 100644
+--- a/nova/scheduler/filters/core_filter.py
++++ b/nova/scheduler/filters/core_filter.py
+@@ -27,6 +27,7 @@ from oslo_log import log as logging
+ from nova.i18n import _LW
+ from nova.scheduler import filters
+ from nova.scheduler.filters import utils
++from nova.virt import hardware
+ 
+ LOG = logging.getLogger(__name__)
+ 
+@@ -53,7 +54,11 @@ class BaseCoreFilter(filters.BaseHostFilter):
+         instance_vcpus = spec_obj.vcpus
+         cpu_allocation_ratio = self._get_cpu_allocation_ratio(host_state,
+                                                               spec_obj)
+-        vcpus_total = host_state.vcpus_total * cpu_allocation_ratio
++        vcpus_total = host_state.vcpus_total
++
++        # this will be needed further down
++        extra_specs = spec_obj.flavor.extra_specs
++        image_props = spec_obj.image.properties
+ 
+         # Only provide a VCPU limit to compute if the virt driver is reporting
+         # an accurate count of installed VCPUs. (XenServer driver does not)
+@@ -62,12 +67,14 @@ class BaseCoreFilter(filters.BaseHostFilter):
+ 
+             # Do not allow an instance to overcommit against itself, only
+             # against other instances.
+-            if instance_vcpus > host_state.vcpus_total:
++            unshared_vcpus = hardware.unshared_vcpus(instance_vcpus,
++                                                     extra_specs)
++            if unshared_vcpus > host_state.vcpus_total:
+                 LOG.debug("%(host_state)s does not have %(instance_vcpus)d "
+-                          "total cpus before overcommit, it only has %(cpus)d",
+-                          {'host_state': host_state,
+-                           'instance_vcpus': instance_vcpus,
+-                           'cpus': host_state.vcpus_total})
++                      "unshared cpus before overcommit, it only has %(cpus)d",
++                      {'host_state': host_state,
++                       'instance_vcpus': unshared_vcpus,
++                       'cpus': host_state.vcpus_total})
+                 msg = ('Insufficient total vcpus: req:%(req)s, '
+                        'avail:%(cpus)s' % {'req': instance_vcpus,
+                        'cpus': host_state.vcpus_total})
+@@ -75,12 +82,24 @@ class BaseCoreFilter(filters.BaseHostFilter):
+                 return False
+ 
+         free_vcpus = vcpus_total - host_state.vcpus_used
+-        if free_vcpus < instance_vcpus:
+-            LOG.debug("%(host_state)s does not have %(instance_vcpus)d "
+-                      "usable vcpus, it only has %(free_vcpus)d usable "
++        # extension - normalized vCPU accounting.  host_state.vcpus_used
++        # is now reported in floating-point.
++        host_numa_topology, _fmt = hardware.host_topology_and_format_from_host(
++            host_state)
++        threads_per_core = hardware._get_threads_per_core(host_numa_topology)
++        normalized_instance_vcpus = hardware.normalized_vcpus(
++            vcpus=instance_vcpus,
++            reserved=set(),
++            extra_specs=extra_specs,
++            image_props=image_props,
++            ratio=cpu_allocation_ratio,
++            threads_per_core=threads_per_core)
++        if free_vcpus < normalized_instance_vcpus:
++            LOG.debug("%(host_state)s does not have %(instance_vcpus)f "
++                      "usable vcpus, it only has %(free_vcpus)f usable "
+                       "vcpus",
+                       {'host_state': host_state,
+-                       'instance_vcpus': instance_vcpus,
++                       'instance_vcpus': normalized_instance_vcpus,
+                        'free_vcpus': free_vcpus})
+             msg = ('Insufficient vcpus: req:%(req)s, avail:%(avail)s' %
+                    {'req': instance_vcpus, 'avail': free_vcpus})
+diff --git a/nova/scheduler/host_manager.py b/nova/scheduler/host_manager.py
+index 04b6d8a..a471d37 100644
+--- a/nova/scheduler/host_manager.py
++++ b/nova/scheduler/host_manager.py
+@@ -295,9 +295,10 @@ class HostState(object):
+         vcpus = spec_obj.vcpus
+         self.free_ram_mb -= ram_mb
+         self.free_disk_mb -= disk_mb
+-        self.vcpus_used += vcpus
+-        # - numa affinity requires extra_specs
++
++        # - extra_specs are needed in multiple places below
+         extra_specs = spec_obj.flavor.extra_specs
++        image_props = spec_obj.image.properties
+ 
+         # Track number of instances on host
+         self.num_instances += 1
+@@ -341,6 +342,21 @@ class HostState(object):
+         self.numa_topology = hardware.get_host_numa_usage_from_instance(
+                 self, instance)
+ 
++        # Get set of reserved thread sibling pcpus that cannot be allocated
++        # when using 'isolate' cpu_thread_policy.
++        reserved = hardware.get_reserved_thread_sibling_pcpus(
++            instance_numa_topology, host_numa_topology)
++        threads_per_core = hardware._get_threads_per_core(host_numa_topology)
++
++        # - normalized vCPU accounting
++        vcpus = hardware.normalized_vcpus(vcpus=vcpus,
++                                          reserved=reserved,
++                                          extra_specs=extra_specs,
++                                          image_props=image_props,
++                                          ratio=self.cpu_allocation_ratio,
++                                          threads_per_core=threads_per_core)
++        self.vcpus_used += vcpus
++
+         # NOTE(sbauza): By considering all cases when the scheduler is called
+         # and when consume_from_request() is run, we can safely say that there
+         # is always an IO operation because we want to move the instance
+diff --git a/nova/tests/unit/compute/test_claims.py b/nova/tests/unit/compute/test_claims.py
+index 55fa959..d8e64fd 100644
+--- a/nova/tests/unit/compute/test_claims.py
++++ b/nova/tests/unit/compute/test_claims.py
+@@ -12,6 +12,12 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2016-2017 Wind River Systems, Inc.
++#
++#
++#
++#
+ 
+ """Tests for resource tracker claims."""
+ 
+@@ -58,6 +64,10 @@ class DummyTracker(object):
+         ctxt = context.RequestContext('testuser', 'testproject')
+         self.pci_tracker = pci_manager.PciDevTracker(ctxt)
+ 
++    def normalized_vcpus(self, usage, nodename):
++        retval = usage.get('vcpus', 0)
++        return retval
++
+ 
+ class ClaimTestCase(test.NoDBTestCase):
+ 
+@@ -118,7 +128,8 @@ class ClaimTestCase(test.NoDBTestCase):
+             'memory_mb': 1024,
+             'vcpus': 1,
+             'root_gb': 10,
+-            'ephemeral_gb': 5
++            'ephemeral_gb': 5,
++            'extra_specs': {}
+         }
+         instance_type.update(**kwargs)
+         return objects.Flavor(**instance_type)
+diff --git a/nova/tests/unit/compute/test_compute.py b/nova/tests/unit/compute/test_compute.py
+index f7fb1b5..2457b9e 100644
+--- a/nova/tests/unit/compute/test_compute.py
++++ b/nova/tests/unit/compute/test_compute.py
+@@ -1787,7 +1787,7 @@ class ComputeTestCase(BaseTestCase,
+ 
+         self.flags(reserved_host_disk_mb=0, reserved_host_memory_mb=0)
+         self.rt.update_available_resource(self.context.elevated(), NODENAME)
+-        limits = {'vcpu': 3}
++        limits = {'vcpu': 3 / self.rt.cpu_allocation_ratio}
+         filter_properties = {'limits': limits}
+ 
+         # get total memory as reported by virt driver:
+@@ -1807,7 +1807,7 @@ class ComputeTestCase(BaseTestCase,
+                 filter_properties, block_device_mapping=[])
+ 
+         cn = self.rt.compute_nodes[NODENAME]
+-        self.assertEqual(2, cn.vcpus_used)
++        self.assertEqual(2 / self.rt.cpu_allocation_ratio, cn.vcpus_used)
+ 
+         # create one more instance:
+         params = {"flavor": {"memory_mb": 10, "root_gb": 1,
+@@ -1818,13 +1818,13 @@ class ComputeTestCase(BaseTestCase,
+         self.compute.build_and_run_instance(self.context, instance, {}, {},
+                 filter_properties, block_device_mapping=[])
+ 
+-        self.assertEqual(3, cn.vcpus_used)
++        self.assertEqual(3 / self.rt.cpu_allocation_ratio, cn.vcpus_used)
+ 
+         # delete the instance:
+         instance['vm_state'] = vm_states.DELETED
+         self.rt.update_usage(self.context, instance, NODENAME)
+ 
+-        self.assertEqual(2, cn.vcpus_used)
++        self.assertEqual(2 / self.rt.cpu_allocation_ratio, cn.vcpus_used)
+ 
+         # now oversubscribe vcpus and fail:
+         params = {"flavor": {"memory_mb": 10, "root_gb": 1,
+@@ -1832,7 +1832,7 @@ class ComputeTestCase(BaseTestCase,
+         instance = self._create_fake_instance_obj(params)
+         instance.vcpus = 2
+ 
+-        limits = {'vcpu': 3}
++        limits = {'vcpu': 3 / self.rt.cpu_allocation_ratio}
+         self.compute.build_and_run_instance(self.context, instance, {}, {},
+                 {}, block_device_mapping=[], limits=limits)
+         self.assertEqual(vm_states.ERROR, instance.vm_state)
+@@ -7534,7 +7534,7 @@ class ComputeTestCase(BaseTestCase,
+         instance.vcpus = 1
+ 
+         rt.instance_claim(admin_context, instance, NODENAME)
+-        self.assertEqual(1, cn.vcpus_used)
++        self.assertEqual(1 / rt.cpu_allocation_ratio, cn.vcpus_used)
+ 
+         self.compute.terminate_instance(admin_context, instance, [], [])
+         self.assertEqual(0, cn.vcpus_used)
+@@ -7559,7 +7559,7 @@ class ComputeTestCase(BaseTestCase,
+ 
+         rt.instance_claim(admin_context, instance, NODENAME)
+         self.compute._init_instance(admin_context, instance)
+-        self.assertEqual(1, cn.vcpus_used)
++        self.assertEqual(1 / rt.cpu_allocation_ratio, cn.vcpus_used)
+ 
+         instance.vm_state = vm_states.DELETED
+         self.compute._init_instance(admin_context, instance)
+diff --git a/nova/tests/unit/compute/test_resource_tracker.py b/nova/tests/unit/compute/test_resource_tracker.py
+index a9bfb79..f9e24c9 100644
+--- a/nova/tests/unit/compute/test_resource_tracker.py
++++ b/nova/tests/unit/compute/test_resource_tracker.py
+@@ -459,7 +459,8 @@ def setup_rt(hostname, virt_resources=_VIRT_DRIVER_AVAIL_RESOURCES,
+ 
+ 
+ def compute_update_usage(resources, flavor, sign=1):
+-    resources.vcpus_used += sign * flavor.vcpus
++    cpu_allocation_ratio = resource_tracker.CONF.cpu_allocation_ratio
++    resources.vcpus_used += sign * (flavor.vcpus / cpu_allocation_ratio)
+     resources.memory_mb_used += sign * flavor.memory_mb
+     resources.local_gb_used += sign * (flavor.root_gb + flavor.ephemeral_gb)
+     resources.free_ram_mb = resources.memory_mb - resources.memory_mb_used
+@@ -656,7 +657,7 @@ class TestUpdateAvailableResources(BaseTestCase):
+             'local_gb': 6,
+             'free_ram_mb': 384,  # 512 - 128 used
+             'memory_mb_used': 128,
+-            'vcpus_used': 1,
++            'vcpus_used': 1 / self.rt.cpu_allocation_ratio,
+             'local_gb_used': 1,
+             'memory_mb': 512,
+             'current_workload': 0,
+@@ -781,7 +782,7 @@ class TestUpdateAvailableResources(BaseTestCase):
+             'local_gb': 6,
+             'free_ram_mb': 384,  # 512 total - 128 for possible revert of orig
+             'memory_mb_used': 128,  # 128 possible revert amount
+-            'vcpus_used': 1,
++            'vcpus_used': 1 / self.rt.cpu_allocation_ratio,
+             'local_gb_used': 1,
+             'memory_mb': 512,
+             'current_workload': 0,
+@@ -816,8 +817,9 @@ class TestUpdateAvailableResources(BaseTestCase):
+ 
+         # Setup virt resources to match used resources to number
+         # of defined instances on the hypervisor
++        cpu_allocation_ratio = resource_tracker.CONF.cpu_allocation_ratio
+         virt_resources = copy.deepcopy(_VIRT_DRIVER_AVAIL_RESOURCES)
+-        virt_resources.update(vcpus_used=2,
++        virt_resources.update(vcpus_used=2 / cpu_allocation_ratio,
+                               memory_mb_used=256,
+                               local_gb_used=5)
+         self._setup_rt(virt_resources=virt_resources)
+@@ -840,7 +842,7 @@ class TestUpdateAvailableResources(BaseTestCase):
+             'local_gb': 6,
+             'free_ram_mb': 256,  # 512 total - 256 for possible confirm of new
+             'memory_mb_used': 256,  # 256 possible confirmed amount
+-            'vcpus_used': 2,
++            'vcpus_used': 2 / self.rt.cpu_allocation_ratio,
+             'local_gb_used': 5,
+             'memory_mb': 512,
+             'current_workload': 0,
+@@ -872,8 +874,9 @@ class TestUpdateAvailableResources(BaseTestCase):
+ 
+         # Setup virt resources to match used resources to number
+         # of defined instances on the hypervisor
++        cpu_allocation_ratio = resource_tracker.CONF.cpu_allocation_ratio
+         virt_resources = copy.deepcopy(_VIRT_DRIVER_AVAIL_RESOURCES)
+-        virt_resources.update(vcpus_used=2,
++        virt_resources.update(vcpus_used=2 / cpu_allocation_ratio,
+                               memory_mb_used=256,
+                               local_gb_used=5)
+         self._setup_rt(virt_resources=virt_resources)
+@@ -895,7 +898,7 @@ class TestUpdateAvailableResources(BaseTestCase):
+             'free_disk_gb': 1,
+             'free_ram_mb': 256,  # 512 total - 256 for possible confirm of new
+             'memory_mb_used': 256,  # 256 possible confirmed amount
+-            'vcpus_used': 2,
++            'vcpus_used': 2 / self.rt.cpu_allocation_ratio,
+             'local_gb_used': 5,
+             'memory_mb': 512,
+             'current_workload': 0,
+@@ -933,8 +936,9 @@ class TestUpdateAvailableResources(BaseTestCase):
+ 
+         # Setup virt resources to match used resources to number
+         # of defined instances on the hypervisor
++        cpu_allocation_ratio = resource_tracker.CONF.cpu_allocation_ratio
+         virt_resources = copy.deepcopy(_VIRT_DRIVER_AVAIL_RESOURCES)
+-        virt_resources.update(vcpus_used=4,
++        virt_resources.update(vcpus_used=4 / cpu_allocation_ratio,
+                               memory_mb_used=512,
+                               local_gb_used=7)
+         self._setup_rt(virt_resources=virt_resources)
+@@ -963,7 +967,7 @@ class TestUpdateAvailableResources(BaseTestCase):
+             # 512 total - 128 existing - 256 new flav - 128 old flav
+             'free_ram_mb': 0,
+             'memory_mb_used': 512,  # 128 exist + 256 new flav + 128 old flav
+-            'vcpus_used': 4,
++            'vcpus_used': 4 / self.rt.cpu_allocation_ratio,
+             'local_gb_used': 7,  # 1G existing, 5G new flav + 1 old flav
+             'memory_mb': 512,
+             'current_workload': 1,  # One migrating instance...
+@@ -1419,7 +1423,7 @@ class TestInstanceClaim(BaseTestCase):
+             'free_disk_gb': expected.local_gb - disk_used,
+             "free_ram_mb": expected.memory_mb - self.instance.memory_mb,
+             'running_vms': 1,
+-            'vcpus_used': 1,
++            'vcpus_used': 1 / self.rt.cpu_allocation_ratio,
+             'pci_device_pools': objects.PciDevicePoolList(),
+         }
+         _update_compute_node(expected, **vals)
+@@ -1446,7 +1450,7 @@ class TestInstanceClaim(BaseTestCase):
+             'free_disk_gb': expected.local_gb - disk_used,
+             "free_ram_mb": expected.memory_mb - self.instance.memory_mb,
+             'running_vms': 1,
+-            'vcpus_used': 1,
++            'vcpus_used': 1 / self.rt.cpu_allocation_ratio,
+             'pci_device_pools': objects.PciDevicePoolList(),
+         }
+         _update_compute_node(expected, **vals)
+@@ -1483,7 +1487,7 @@ class TestInstanceClaim(BaseTestCase):
+             'free_disk_gb': expected.local_gb - disk_used,
+             "free_ram_mb": expected.memory_mb - self.instance.memory_mb,
+             'running_vms': 1,
+-            'vcpus_used': 1,
++            'vcpus_used': 1 / self.rt.cpu_allocation_ratio,
+             'pci_device_pools': objects.PciDevicePoolList(),
+         }
+         _update_compute_node(expected, **vals)
+@@ -1532,7 +1536,7 @@ class TestInstanceClaim(BaseTestCase):
+             'free_disk_gb': expected.local_gb - disk_used,
+             "free_ram_mb": expected.memory_mb - self.instance.memory_mb,
+             'running_vms': 1,
+-            'vcpus_used': 1,
++            'vcpus_used': 1 / self.rt.cpu_allocation_ratio,
+             'pci_device_pools': objects.PciDevicePoolList(),
+         }
+         _update_compute_node(expected, **vals)
+@@ -1660,7 +1664,7 @@ class TestInstanceClaim(BaseTestCase):
+         expected_numa = copy.deepcopy(host_topology)
+         for cell in expected_numa.cells:
+             cell.memory_usage += _2MB
+-            cell.cpu_usage += 1
++            cell.cpu_usage += 1 / self.rt.cpu_allocation_ratio
+         with mock.patch.object(self.rt, '_update') as update_mock:
+             with mock.patch.object(self.instance, 'save'):
+                 self.rt.instance_claim(self.ctx, self.instance, _NODENAME,
+@@ -1694,8 +1698,9 @@ class TestResize(BaseTestCase):
+         # already had its "current" flavor set to the new flavor.
+         self.flags(reserved_host_disk_mb=0,
+                    reserved_host_memory_mb=0)
++        cpu_allocation_ratio = resource_tracker.CONF.cpu_allocation_ratio
+         virt_resources = copy.deepcopy(_VIRT_DRIVER_AVAIL_RESOURCES)
+-        virt_resources.update(vcpus_used=1,
++        virt_resources.update(vcpus_used=1 / cpu_allocation_ratio,
+                               memory_mb_used=128,
+                               local_gb_used=1)
+         self._setup_rt(virt_resources=virt_resources)
+@@ -1732,7 +1737,7 @@ class TestResize(BaseTestCase):
+ 
+         expected = self.rt.compute_nodes[_NODENAME].obj_clone()
+         expected.vcpus_used = (expected.vcpus_used +
+-                               new_flavor.vcpus)
++                               new_flavor.vcpus / cpu_allocation_ratio)
+         expected.memory_mb_used = (expected.memory_mb_used +
+                                    new_flavor.memory_mb)
+         expected.free_ram_mb = expected.memory_mb - expected.memory_mb_used
+@@ -1769,7 +1774,7 @@ class TestResize(BaseTestCase):
+             claim.abort()
+         drop_migr_mock.assert_called_once_with()
+ 
+-        self.assertEqual(1, cn.vcpus_used)
++        self.assertEqual(1 / cpu_allocation_ratio, cn.vcpus_used)
+         self.assertEqual(1, cn.local_gb_used)
+         self.assertEqual(128, cn.memory_mb_used)
+         self.assertEqual(0, len(self.rt.tracked_migrations))
+@@ -2134,7 +2139,7 @@ class TestResize(BaseTestCase):
+         expected = self.rt.compute_nodes[_NODENAME].obj_clone()
+         expected.vcpus_used = (expected.vcpus_used +
+                                flavor1.vcpus +
+-                               flavor2.vcpus)
++                               flavor2.vcpus) / self.rt.cpu_allocation_ratio
+         expected.memory_mb_used = (expected.memory_mb_used +
+                                    flavor1.memory_mb +
+                                    flavor2.memory_mb)
+@@ -2196,8 +2201,9 @@ class TestRebuild(BaseTestCase):
+         # Starting state for the destination node of the rebuild claim is the
+         # normal compute node fixture containing a single active running VM
+         # having instance type #1.
++        cpu_allocation_ratio = resource_tracker.CONF.cpu_allocation_ratio
+         virt_resources = copy.deepcopy(_VIRT_DRIVER_AVAIL_RESOURCES)
+-        virt_resources.update(vcpus_used=1,
++        virt_resources.update(vcpus_used=1 / cpu_allocation_ratio,
+                               memory_mb_used=128,
+                               local_gb_used=1)
+         self._setup_rt(virt_resources=virt_resources)
+diff --git a/nova/tests/unit/objects/test_objects.py b/nova/tests/unit/objects/test_objects.py
+index 0705c32..7224d07 100644
+--- a/nova/tests/unit/objects/test_objects.py
++++ b/nova/tests/unit/objects/test_objects.py
+@@ -1079,7 +1079,7 @@ object_data = {
+     'BuildRequestList': '1.0-cd95608eccb89fbc702c8b52f38ec738',
+     'CellMapping': '1.0-7f1a7e85a22bbb7559fc730ab658b9bd',
+     'CellMappingList': '1.0-4ee0d9efdfd681fed822da88376e04d2',
+-    'ComputeNode': '1.18-431fafd8ac4a5f3559bd9b1f1332cc22',
++    'ComputeNode': '1.18-1cbe482ea7af04e8e1facc47382ac2b5',
+     'ComputeNodeList': '1.17-52f3b0962b1c86b98590144463ebb192',
+     'CpuDiagnostics': '1.0-d256f2e442d1b837735fd17dfe8e3d47',
+     'DNSDomain': '1.0-7b0b2dab778454b6a7b6c66afe163a1a',
+@@ -1139,7 +1139,7 @@ object_data = {
+     'MonitorMetric': '1.1-0fc771d8b3f29946f43a72547ceb07f9',
+     'MonitorMetricList': '1.1-15ecf022a68ddbb8c2a6739cfc9f8f5e',
+     'NicDiagnostics': '1.0-895e9ad50e0f56d5258585e3e066aea5',
+-    'NUMACell': '1.2-632c5185f7f0533b56df397ae07608fb',
++    'NUMACell': '1.2-861855e70b6f06080da5d1aebade8b63',
+     'NUMAPagesTopology': '1.1-edab9fa2dc43c117a38d600be54b4542',
+     'NUMATopology': '1.2-c63fad38be73b6afd04715c9c1b29220',
+     'NUMATopologyLimits': '1.0-9463e0edd40f64765ae518a539b9dfd2',
+diff --git a/nova/tests/unit/scheduler/filters/test_core_filters.py b/nova/tests/unit/scheduler/filters/test_core_filters.py
+index 44dff60..1589e1d 100644
+--- a/nova/tests/unit/scheduler/filters/test_core_filters.py
++++ b/nova/tests/unit/scheduler/filters/test_core_filters.py
+@@ -9,86 +9,111 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2016-2017 Wind River Systems, Inc.
++#
++#
++#
++#
+ 
+-import mock
++# import mock
+ 
+ from nova import objects
+ from nova.scheduler.filters import core_filter
+ from nova import test
+ from nova.tests.unit.scheduler import fakes
+ 
++FLAVOR_1 = objects.Flavor(vcpus=1, extra_specs={})
++FLAVOR_2 = objects.Flavor(vcpus=2, extra_specs={})
++IMAGE_PROPS = objects.ImageMeta(properties=objects.ImageMetaProps())
++
+ 
+ class TestCoreFilter(test.NoDBTestCase):
+ 
+     def test_core_filter_passes(self):
+         self.filt_cls = core_filter.CoreFilter()
+-        spec_obj = objects.RequestSpec(flavor=objects.Flavor(vcpus=1))
++        spec_obj = objects.RequestSpec(flavor=objects.Flavor(vcpus=1,
++                                                             extra_specs={}),
++                                       image=IMAGE_PROPS)
++        cpu_allocation_ratio = 2
+         host = fakes.FakeHostState('host1', 'node1',
+-                {'vcpus_total': 4, 'vcpus_used': 7,
+-                 'cpu_allocation_ratio': 2})
++                {'vcpus_total': 4, 'vcpus_used': 7 / cpu_allocation_ratio,
++                 'cpu_allocation_ratio': cpu_allocation_ratio})
+         self.assertTrue(self.filt_cls.host_passes(host, spec_obj))
+ 
+     def test_core_filter_fails_safe(self):
+         self.filt_cls = core_filter.CoreFilter()
+-        spec_obj = objects.RequestSpec(flavor=objects.Flavor(vcpus=1))
++        spec_obj = objects.RequestSpec(flavor=objects.Flavor(vcpus=1,
++                                                             extra_specs={}),
++                                       image=IMAGE_PROPS)
+         host = fakes.FakeHostState('host1', 'node1', {})
+         self.assertTrue(self.filt_cls.host_passes(host, spec_obj))
+ 
+     def test_core_filter_fails(self):
+         self.filt_cls = core_filter.CoreFilter()
+-        spec_obj = objects.RequestSpec(flavor=objects.Flavor(vcpus=1))
++        spec_obj = objects.RequestSpec(flavor=objects.Flavor(vcpus=1,
++                                                             extra_specs={}),
++                                       image=IMAGE_PROPS)
++        cpu_allocation_ratio = 2
+         host = fakes.FakeHostState('host1', 'node1',
+-                {'vcpus_total': 4, 'vcpus_used': 8,
+-                 'cpu_allocation_ratio': 2})
++                {'vcpus_total': 4, 'vcpus_used': 8 / cpu_allocation_ratio,
++                 'cpu_allocation_ratio': cpu_allocation_ratio})
+         self.assertFalse(self.filt_cls.host_passes(host, spec_obj))
+ 
+     def test_core_filter_single_instance_overcommit_fails(self):
+         self.filt_cls = core_filter.CoreFilter()
+-        spec_obj = objects.RequestSpec(flavor=objects.Flavor(vcpus=2))
++        spec_obj = objects.RequestSpec(flavor=objects.Flavor(vcpus=2,
++                                                             extra_specs={}),
++                                       image=IMAGE_PROPS)
+         host = fakes.FakeHostState('host1', 'node1',
+                 {'vcpus_total': 1, 'vcpus_used': 0,
+                  'cpu_allocation_ratio': 2})
+         self.assertFalse(self.filt_cls.host_passes(host, spec_obj))
+ 
+-    @mock.patch('nova.scheduler.filters.utils.aggregate_values_from_key')
+-    def test_aggregate_core_filter_value_error(self, agg_mock):
+-        self.filt_cls = core_filter.AggregateCoreFilter()
+-        spec_obj = objects.RequestSpec(
+-            context=mock.sentinel.ctx, flavor=objects.Flavor(vcpus=1))
+-        host = fakes.FakeHostState('host1', 'node1',
+-                {'vcpus_total': 4, 'vcpus_used': 7,
+-                 'cpu_allocation_ratio': 2})
+-        agg_mock.return_value = set(['XXX'])
+-        self.assertTrue(self.filt_cls.host_passes(host, spec_obj))
+-        agg_mock.assert_called_once_with(host, 'cpu_allocation_ratio')
+-        self.assertEqual(4 * 2, host.limits['vcpu'])
+-
+-    @mock.patch('nova.scheduler.filters.utils.aggregate_values_from_key')
+-    def test_aggregate_core_filter_default_value(self, agg_mock):
+-        self.filt_cls = core_filter.AggregateCoreFilter()
+-        spec_obj = objects.RequestSpec(
+-            context=mock.sentinel.ctx, flavor=objects.Flavor(vcpus=1))
+-        host = fakes.FakeHostState('host1', 'node1',
+-                {'vcpus_total': 4, 'vcpus_used': 8,
+-                 'cpu_allocation_ratio': 2})
+-        agg_mock.return_value = set([])
+-        # False: fallback to default flag w/o aggregates
+-        self.assertFalse(self.filt_cls.host_passes(host, spec_obj))
+-        agg_mock.assert_called_once_with(host, 'cpu_allocation_ratio')
+-        # True: use ratio from aggregates
+-        agg_mock.return_value = set(['3'])
+-        self.assertTrue(self.filt_cls.host_passes(host, spec_obj))
+-        self.assertEqual(4 * 3, host.limits['vcpu'])
+-
+-    @mock.patch('nova.scheduler.filters.utils.aggregate_values_from_key')
+-    def test_aggregate_core_filter_conflict_values(self, agg_mock):
+-        self.filt_cls = core_filter.AggregateCoreFilter()
+-        spec_obj = objects.RequestSpec(
+-            context=mock.sentinel.ctx, flavor=objects.Flavor(vcpus=1))
+-        host = fakes.FakeHostState('host1', 'node1',
+-                {'vcpus_total': 4, 'vcpus_used': 8,
+-                 'cpu_allocation_ratio': 1})
+-        agg_mock.return_value = set(['2', '3'])
+-        # use the minimum ratio from aggregates
+-        self.assertFalse(self.filt_cls.host_passes(host, spec_obj))
+-        self.assertEqual(4 * 2, host.limits['vcpu'])
++    # we do not support AggregateCoreFilter since we report the
++    # "vcpus_used" value with the cpu_allocation_ratio already factored-in.
++    # This makes it difficult to account for per-aggregate ratios.
++    #
++    # @mock.patch('nova.scheduler.filters.utils.aggregate_values_from_key')
++    # def test_aggregate_core_filter_value_error(self, agg_mock):
++    #     self.filt_cls = core_filter.AggregateCoreFilter()
++    #     spec_obj = objects.RequestSpec(
++    #         context=mock.sentinel.ctx, flavor=objects.Flavor(vcpus=1,
++    #                                                          extra_specs={}))
++    #     host = fakes.FakeHostState('host1', 'node1',
++    #             {'vcpus_total': 4, 'vcpus_used': 7,
++    #              'cpu_allocation_ratio': 2})
++    #     agg_mock.return_value = set(['XXX'])
++    #     self.assertTrue(self.filt_cls.host_passes(host, spec_obj))
++    #     agg_mock.assert_called_once_with(host, 'cpu_allocation_ratio')
++    #     self.assertEqual(4 * 2, host.limits['vcpu'])
++    #
++    # @mock.patch('nova.scheduler.filters.utils.aggregate_values_from_key')
++    # def test_aggregate_core_filter_default_value(self, agg_mock):
++    #     self.filt_cls = core_filter.AggregateCoreFilter()
++    #     spec_obj = objects.RequestSpec(
++    #         context=mock.sentinel.ctx, flavor=objects.Flavor(vcpus=1))
++    #     host = fakes.FakeHostState('host1', 'node1',
++    #             {'vcpus_total': 4, 'vcpus_used': 8,
++    #              'cpu_allocation_ratio': 2})
++    #     agg_mock.return_value = set([])
++    #     # False: fallback to default flag w/o aggregates
++    #     self.assertFalse(self.filt_cls.host_passes(host, spec_obj))
++    #     agg_mock.assert_called_once_with(host, 'cpu_allocation_ratio')
++    #     # True: use ratio from aggregates
++    #     agg_mock.return_value = set(['3'])
++    #     self.assertTrue(self.filt_cls.host_passes(host, spec_obj))
++    #     self.assertEqual(4 * 3, host.limits['vcpu'])
++    #
++    # @mock.patch('nova.scheduler.filters.utils.aggregate_values_from_key')
++    # def test_aggregate_core_filter_conflict_values(self, agg_mock):
++    #     self.filt_cls = core_filter.AggregateCoreFilter()
++    #     spec_obj = objects.RequestSpec(
++    #         context=mock.sentinel.ctx, flavor=objects.Flavor(vcpus=1))
++    #     host = fakes.FakeHostState('host1', 'node1',
++    #             {'vcpus_total': 4, 'vcpus_used': 8,
++    #              'cpu_allocation_ratio': 1})
++    #     agg_mock.return_value = set(['2', '3'])
++    #     # use the minimum ratio from aggregates
++    #     self.assertFalse(self.filt_cls.host_passes(host, spec_obj))
++    #     self.assertEqual(4 * 2, host.limits['vcpu'])
+diff --git a/nova/tests/unit/scheduler/test_caching_scheduler.py b/nova/tests/unit/scheduler/test_caching_scheduler.py
+index f6d580b..eaec7a9 100644
+--- a/nova/tests/unit/scheduler/test_caching_scheduler.py
++++ b/nova/tests/unit/scheduler/test_caching_scheduler.py
+@@ -168,6 +168,7 @@ class CachingSchedulerTestCase(test_scheduler.SchedulerTestCase):
+             swap=0,
+             extra_specs={},
+         )
++        image_props = objects.ImageMeta(properties=objects.ImageMetaProps())
+         instance_properties = {
+             "os_type": "linux",
+             "project_id": "1234",
+@@ -180,7 +181,7 @@ class CachingSchedulerTestCase(test_scheduler.SchedulerTestCase):
+             force_nodes=None,
+             retry=None,
+             availability_zone=None,
+-            image=None,
++            image=image_props,
+             instance_group=None,
+             pci_requests=None,
+             numa_topology=None,
+diff --git a/nova/tests/unit/scheduler/test_host_manager.py b/nova/tests/unit/scheduler/test_host_manager.py
+index 0d7c6c9..cd02365 100644
+--- a/nova/tests/unit/scheduler/test_host_manager.py
++++ b/nova/tests/unit/scheduler/test_host_manager.py
+@@ -1207,7 +1207,8 @@ class HostStateTestCase(test.NoDBTestCase):
+                                             sync_mock):
+         fake_numa_topology = objects.InstanceNUMATopology(
+             cells=[objects.InstanceNUMACell()])
+-        fake_host_numa_topology = mock.Mock()
++        # need iterable host numa topology
++        fake_host_numa_topology = fakes.NUMA_TOPOLOGY
+         fake_instance = objects.Instance(numa_topology=fake_numa_topology)
+         host_topo_mock.return_value = (fake_host_numa_topology, True)
+         numa_usage_mock.return_value = fake_host_numa_topology
+@@ -1219,9 +1220,12 @@ class HostStateTestCase(test.NoDBTestCase):
+                                   vcpus=0,
+                                   # - numa affinity
+                                   extra_specs={}),
++            image=objects.ImageMeta(properties=objects.ImageMetaProps()),
+             numa_topology=fake_numa_topology,
+             pci_requests=objects.InstancePCIRequests(requests=[]))
+         host = host_manager.HostState("fakehost", "fakenode", uuids.cell)
++        # cpu_allocation_ratio is now needed
++        host.cpu_allocation_ratio = 16
+ 
+         self.assertIsNone(host.updated)
+         host.consume_from_request(spec_obj)
+@@ -1246,6 +1250,7 @@ class HostStateTestCase(test.NoDBTestCase):
+                                   vcpus=0,
+                                   # - numa affinity
+                                   extra_specs={}),
++            image=objects.ImageMeta(properties=objects.ImageMetaProps()),
+             numa_topology=second_numa_topology,
+             pci_requests=objects.InstancePCIRequests(requests=[]))
+         second_host_numa_topology = mock.Mock()
+@@ -1283,7 +1288,8 @@ class HostStateTestCase(test.NoDBTestCase):
+                                   memory_mb=512,
+                                   vcpus=1,
+                                   # - numa affinity
+-                                  extra_specs={}))
++                                  extra_specs={}),
++            image=objects.ImageMeta(properties=objects.ImageMetaProps()))
+         host = host_manager.HostState("fakehost", "fakenode", uuids.cell)
+         self.assertIsNone(host.updated)
+         host.pci_stats = pci_stats.PciDeviceStats(
+@@ -1292,12 +1298,15 @@ class HostStateTestCase(test.NoDBTestCase):
+                                                              numa_node=1,
+                                                              count=1)])
+         host.numa_topology = fakes.NUMA_TOPOLOGY
++        # cpu_allocation_ratio is now needed
++        host.cpu_allocation_ratio = 16.0
+         host.consume_from_request(req_spec)
+         self.assertIsInstance(req_spec.numa_topology,
+                               objects.InstanceNUMATopology)
+ 
+         self.assertEqual(512, host.numa_topology.cells[1].memory_usage)
+-        self.assertEqual(1, host.numa_topology.cells[1].cpu_usage)
++        self.assertEqual(1 / host.cpu_allocation_ratio,
++                         host.numa_topology.cells[1].cpu_usage)
+         self.assertEqual(0, len(host.pci_stats.pools))
+         self.assertIsNotNone(host.updated)
+ 
+@@ -1318,7 +1327,8 @@ class HostStateTestCase(test.NoDBTestCase):
+                                   memory_mb=1024,
+                                   vcpus=1,
+                                   # - numa affinity
+-                                  extra_specs={}))
++                                  extra_specs={}),
++            image=objects.ImageMeta(properties=objects.ImageMetaProps()))
+         host = host_manager.HostState("fakehost", "fakenode", uuids.cell)
+         self.assertIsNone(host.updated)
+         fake_updated = mock.sentinel.fake_updated
+diff --git a/nova/tests/unit/virt/test_hardware.py b/nova/tests/unit/virt/test_hardware.py
+index 1b31081..b1a0d92 100644
+--- a/nova/tests/unit/virt/test_hardware.py
++++ b/nova/tests/unit/virt/test_hardware.py
+@@ -1604,7 +1604,8 @@ class NUMATopologyTest(test.NoDBTestCase):
+                          hostusage.cells[0].cpuset)
+         self.assertEqual(hosttopo.cells[0].memory,
+                          hostusage.cells[0].memory)
+-        self.assertEqual(hostusage.cells[0].cpu_usage, 5)
++        self.assertEqual(hostusage.cells[0].cpu_usage,
++                         5 / hw.CONF.cpu_allocation_ratio)
+         self.assertEqual(hostusage.cells[0].memory_usage, 512)
+         self.assertEqual(hostusage.cells[0].mempages, [
+             hpages0_4K, hpages0_2M])
+@@ -1614,7 +1615,8 @@ class NUMATopologyTest(test.NoDBTestCase):
+                          hostusage.cells[1].cpuset)
+         self.assertEqual(hosttopo.cells[1].memory,
+                          hostusage.cells[1].memory)
+-        self.assertEqual(hostusage.cells[1].cpu_usage, 3)
++        self.assertEqual(hostusage.cells[1].cpu_usage,
++                         3 / hw.CONF.cpu_allocation_ratio)
+         self.assertEqual(hostusage.cells[1].memory_usage, 512)
+         self.assertEqual(hostusage.cells[1].mempages, [
+             hpages1_4K, hpages1_2M])
+@@ -1671,7 +1673,8 @@ class NUMATopologyTest(test.NoDBTestCase):
+                          hostusage.cells[0].cpuset)
+         self.assertEqual(hosttopo.cells[0].memory,
+                          hostusage.cells[0].memory)
+-        self.assertEqual(hostusage.cells[0].cpu_usage, 5)
++        self.assertEqual(hostusage.cells[0].cpu_usage,
++                         5 / hw.CONF.cpu_allocation_ratio)
+         self.assertEqual(hostusage.cells[0].memory_usage, 512)
+ 
+         self.assertIsInstance(hostusage.cells[1], objects.NUMACell)
+@@ -1681,7 +1684,8 @@ class NUMATopologyTest(test.NoDBTestCase):
+                          hostusage.cells[1].cpuset)
+         self.assertEqual(hosttopo.cells[1].memory,
+                          hostusage.cells[1].memory)
+-        self.assertEqual(hostusage.cells[1].cpu_usage, 2)
++        self.assertEqual(hostusage.cells[1].cpu_usage,
++                         2 / hw.CONF.cpu_allocation_ratio)
+         self.assertEqual(hostusage.cells[1].memory_usage, 256)
+ 
+         self.assertIsInstance(hostusage.cells[2], objects.NUMACell)
+@@ -1689,16 +1693,19 @@ class NUMATopologyTest(test.NoDBTestCase):
+                          hostusage.cells[2].cpuset)
+         self.assertEqual(hosttopo.cells[2].memory,
+                          hostusage.cells[2].memory)
+-        self.assertEqual(hostusage.cells[2].cpu_usage, 1)
++        self.assertEqual(hostusage.cells[2].cpu_usage,
++                         1 / hw.CONF.cpu_allocation_ratio)
+         self.assertEqual(hostusage.cells[2].memory_usage, 256)
+ 
+     def test_host_usage_culmulative_with_free(self):
+         hosttopo = objects.NUMATopology(cells=[
+             objects.NUMACell(id=0, cpuset=set([0, 1, 2, 3]), memory=1024,
+-                             cpu_usage=2, memory_usage=512, mempages=[],
++                             cpu_usage=2 / hw.CONF.cpu_allocation_ratio,
++                             memory_usage=512, mempages=[],
+                              siblings=[], pinned_cpus=set([])),
+             objects.NUMACell(id=1, cpuset=set([4, 6]), memory=512,
+-                             cpu_usage=1, memory_usage=512, mempages=[],
++                             cpu_usage=1 / hw.CONF.cpu_allocation_ratio,
++                             memory_usage=512, mempages=[],
+                              siblings=[], pinned_cpus=set([])),
+             objects.NUMACell(id=2, cpuset=set([5, 7]), memory=256,
+                              cpu_usage=0, memory_usage=0, mempages=[],
+@@ -1712,24 +1719,29 @@ class NUMATopologyTest(test.NoDBTestCase):
+         hostusage = hw.numa_usage_from_instances(
+                 hosttopo, [instance1])
+         self.assertIsInstance(hostusage.cells[0], objects.NUMACell)
+-        self.assertEqual(hostusage.cells[0].cpu_usage, 5)
++        self.assertEqual(hostusage.cells[0].cpu_usage,
++                         5 / hw.CONF.cpu_allocation_ratio)
+         self.assertEqual(hostusage.cells[0].memory_usage, 1024)
+ 
+         self.assertIsInstance(hostusage.cells[1], objects.NUMACell)
+-        self.assertEqual(hostusage.cells[1].cpu_usage, 2)
++        self.assertEqual(hostusage.cells[1].cpu_usage,
++                         2 / hw.CONF.cpu_allocation_ratio)
+         self.assertEqual(hostusage.cells[1].memory_usage, 768)
+ 
+         self.assertIsInstance(hostusage.cells[2], objects.NUMACell)
+-        self.assertEqual(hostusage.cells[2].cpu_usage, 1)
++        self.assertEqual(hostusage.cells[2].cpu_usage,
++                         1 / hw.CONF.cpu_allocation_ratio)
+         self.assertEqual(hostusage.cells[2].memory_usage, 256)
+ 
+         # Test freeing of resources
+         hostusage = hw.numa_usage_from_instances(
+                 hostusage, [instance1], free=True)
+-        self.assertEqual(hostusage.cells[0].cpu_usage, 2)
++        self.assertEqual(hostusage.cells[0].cpu_usage,
++                         2 / hw.CONF.cpu_allocation_ratio)
+         self.assertEqual(hostusage.cells[0].memory_usage, 512)
+ 
+-        self.assertEqual(hostusage.cells[1].cpu_usage, 1)
++        self.assertEqual(hostusage.cells[1].cpu_usage,
++                         1 / hw.CONF.cpu_allocation_ratio)
+         self.assertEqual(hostusage.cells[1].memory_usage, 512)
+ 
+         self.assertEqual(hostusage.cells[2].cpu_usage, 0)
+@@ -1828,14 +1840,16 @@ class NUMATopologyTest(test.NoDBTestCase):
+ 
+         hostusage = hw.numa_usage_from_instances(
+                 hosttopo, [])
+-        self.assertEqual(hostusage.cells[0].cpu_usage, 0)
++        self.assertEqual(hostusage.cells[0].cpu_usage,
++                         0 / hw.CONF.cpu_allocation_ratio)
+         self.assertEqual(hostusage.cells[0].memory_usage, 0)
+         self.assertEqual(hostusage.cells[1].cpu_usage, 0)
+         self.assertEqual(hostusage.cells[1].memory_usage, 0)
+ 
+         hostusage = hw.numa_usage_from_instances(
+                 hosttopo, None)
+-        self.assertEqual(hostusage.cells[0].cpu_usage, 0)
++        self.assertEqual(hostusage.cells[0].cpu_usage,
++                         0 / hw.CONF.cpu_allocation_ratio)
+         self.assertEqual(hostusage.cells[0].memory_usage, 0)
+         self.assertEqual(hostusage.cells[1].cpu_usage, 0)
+         self.assertEqual(hostusage.cells[1].memory_usage, 0)
+@@ -1858,16 +1872,20 @@ class NUMATopologyTest(test.NoDBTestCase):
+         instance2_topo = None
+ 
+         hostusage = hw.numa_usage_from_instances(hosttopo, [instance1_topo])
+-        self.assertEqual(hostusage.cells[0].cpu_usage, 2)
++        self.assertEqual(hostusage.cells[0].cpu_usage,
++                         2 / hw.CONF.cpu_allocation_ratio)
+         self.assertEqual(hostusage.cells[0].memory_usage, 256)
+-        self.assertEqual(hostusage.cells[1].cpu_usage, 1)
++        self.assertEqual(hostusage.cells[1].cpu_usage,
++                         1 / hw.CONF.cpu_allocation_ratio)
+         self.assertEqual(hostusage.cells[1].memory_usage, 128)
+ 
+         # This is like processing an instance with no numa_topology
+         hostusage = hw.numa_usage_from_instances(hostusage, instance2_topo)
+-        self.assertEqual(hostusage.cells[0].cpu_usage, 2)
++        self.assertEqual(hostusage.cells[0].cpu_usage,
++                         2 / hw.CONF.cpu_allocation_ratio)
+         self.assertEqual(hostusage.cells[0].memory_usage, 256)
+-        self.assertEqual(hostusage.cells[1].cpu_usage, 1)
++        self.assertEqual(hostusage.cells[1].cpu_usage,
++                         1 / hw.CONF.cpu_allocation_ratio)
+         self.assertEqual(hostusage.cells[1].memory_usage, 128)
+ 
+     def assertNUMACellMatches(self, expected_cell, got_cell):
+@@ -1908,7 +1926,7 @@ class VirtNUMATopologyCellUsageTestCase(test.NoDBTestCase):
+ 
+     def test_fit_instance_cell_success_w_limit(self):
+         host_cell = objects.NUMACell(id=4, cpuset=set([1, 2]), memory=1024,
+-                                     cpu_usage=2,
++                                     cpu_usage=1,
+                                      memory_usage=1024,
+                                      mempages=[], siblings=[],
+                                      pinned_cpus=set([]))
+@@ -1961,11 +1979,11 @@ class VirtNUMAHostTopologyTestCase(test.NoDBTestCase):
+         self.host = objects.NUMATopology(
+                 cells=[
+                     objects.NUMACell(id=1, cpuset=set([1, 2]), memory=2048,
+-                                     cpu_usage=2, memory_usage=2048,
++                                     cpu_usage=1, memory_usage=2048,
+                                      mempages=[], siblings=[],
+                                      pinned_cpus=set([])),
+                     objects.NUMACell(id=2, cpuset=set([3, 4]), memory=2048,
+-                                     cpu_usage=2, memory_usage=2048,
++                                     cpu_usage=1, memory_usage=2048,
+                                      mempages=[], siblings=[],
+                                      pinned_cpus=set([]))])
+ 
+@@ -2298,15 +2316,25 @@ class HelperMethodsTestCase(test.NoDBTestCase):
+                 objects.InstanceNUMACell(
+                     id=0, cpuset=set([0, 1]), memory=256, pagesize=2048,
+                     cpu_pinning={0: 0, 1: 1},
++                    cpu_policy=fields.CPUAllocationPolicy.DEDICATED,
+                     cpu_topology=None),
+                 objects.InstanceNUMACell(
+                     id=1, cpuset=set([2]), memory=256, pagesize=2048,
+                     cpu_pinning={2: 3},
++                    cpu_policy=fields.CPUAllocationPolicy.DEDICATED,
+                     cpu_topology=None),
+         ])
+         self.context = context.RequestContext('fake-user',
+                                               'fake-project')
+ 
++    def _check_usage_float(self, host_usage):
++        self.assertEqual(2 / hw.CONF.cpu_allocation_ratio,
++                         host_usage.cells[0].cpu_usage)
++        self.assertEqual(256, host_usage.cells[0].memory_usage)
++        self.assertEqual(1 / hw.CONF.cpu_allocation_ratio,
++                         host_usage.cells[1].cpu_usage)
++        self.assertEqual(256, host_usage.cells[1].memory_usage)
++
+     def _check_usage(self, host_usage):
+         self.assertEqual(2, host_usage.cells[0].cpu_usage)
+         self.assertEqual(256, host_usage.cells[0].memory_usage)
+@@ -2336,7 +2364,7 @@ class HelperMethodsTestCase(test.NoDBTestCase):
+ 
+         res = hw.get_host_numa_usage_from_instance(host, instance)
+         self.assertIsInstance(res, objects.NUMATopology)
+-        self._check_usage(res)
++        self._check_usage_float(res)
+ 
+     def test_dicts_host_json(self):
+         host = {'numa_topology': self.hosttopo._to_json()}
+@@ -2667,7 +2695,8 @@ class _CPUPinningTestCaseBase(object):
+ class CPUPinningCellTestCase(test.NoDBTestCase, _CPUPinningTestCaseBase):
+     def test_get_pinning_inst_too_large_cpu(self):
+         host_pin = objects.NUMACell(id=0, cpuset=set([0, 1, 2]),
+-                                    memory=2048, memory_usage=0, siblings=[],
++                                    memory=2048, memory_usage=0,
++                                    cpu_usage=0, siblings=[],
+                                     mempages=[], pinned_cpus=set([]))
+         inst_pin = objects.InstanceNUMACell(cpuset=set([0, 1, 2, 3]),
+                                             memory=2048)
+@@ -2678,7 +2707,7 @@ class CPUPinningCellTestCase(test.NoDBTestCase, _CPUPinningTestCaseBase):
+     def test_get_pinning_inst_too_large_mem(self):
+         host_pin = objects.NUMACell(id=0, cpuset=set([0, 1, 2]),
+                                     memory=2048, memory_usage=1024,
+-                                    siblings=[], mempages=[],
++                                    cpu_usage=0, siblings=[], mempages=[],
+                                     pinned_cpus=set([]))
+         inst_pin = objects.InstanceNUMACell(cpuset=set([0, 1, 2]),
+                                             memory=2048)
+@@ -2689,7 +2718,7 @@ class CPUPinningCellTestCase(test.NoDBTestCase, _CPUPinningTestCaseBase):
+     def test_get_pinning_inst_not_avail(self):
+         host_pin = objects.NUMACell(id=0, cpuset=set([0, 1, 2, 3]),
+                                     memory=2048, memory_usage=0,
+-                                    pinned_cpus=set([0]),
++                                    cpu_usage=1, pinned_cpus=set([0]),
+                                     siblings=[], mempages=[])
+         inst_pin = objects.InstanceNUMACell(cpuset=set([0, 1, 2, 3]),
+                                             memory=2048)
+@@ -2699,7 +2728,8 @@ class CPUPinningCellTestCase(test.NoDBTestCase, _CPUPinningTestCaseBase):
+ 
+     def test_get_pinning_no_sibling_fits_empty(self):
+         host_pin = objects.NUMACell(id=0, cpuset=set([0, 1, 2]),
+-                                    memory=2048, memory_usage=0, siblings=[],
++                                    memory=2048, memory_usage=0,
++                                    cpu_usage=0, siblings=[],
+                                     mempages=[], pinned_cpus=set([]))
+         inst_pin = objects.InstanceNUMACell(cpuset=set([0, 1, 2]), memory=2048)
+ 
+@@ -2712,7 +2742,7 @@ class CPUPinningCellTestCase(test.NoDBTestCase, _CPUPinningTestCaseBase):
+ 
+     def test_get_pinning_no_sibling_fits_w_usage(self):
+         host_pin = objects.NUMACell(id=0, cpuset=set([0, 1, 2, 3]),
+-                                    memory=2048, memory_usage=0,
++                                    memory=2048, memory_usage=0, cpu_usage=1,
+                                     pinned_cpus=set([1]), mempages=[],
+                                     siblings=[])
+         inst_pin = objects.InstanceNUMACell(cpuset=set([0, 1, 2]), memory=1024)
+@@ -2724,7 +2754,8 @@ class CPUPinningCellTestCase(test.NoDBTestCase, _CPUPinningTestCaseBase):
+ 
+     def test_get_pinning_instance_siblings_fits(self):
+         host_pin = objects.NUMACell(id=0, cpuset=set([0, 1, 2, 3]),
+-                                    memory=2048, memory_usage=0, siblings=[],
++                                    memory=2048, memory_usage=0,
++                                    cpu_usage=0, siblings=[],
+                                     mempages=[], pinned_cpus=set([]))
+         inst_pin = objects.InstanceNUMACell(
+                 cpuset=set([0, 1, 2, 3]), memory=2048)
+@@ -2738,7 +2769,7 @@ class CPUPinningCellTestCase(test.NoDBTestCase, _CPUPinningTestCaseBase):
+ 
+     def test_get_pinning_instance_siblings_host_siblings_fits_empty(self):
+         host_pin = objects.NUMACell(id=0, cpuset=set([0, 1, 2, 3]),
+-                                    memory=2048, memory_usage=0,
++                                    memory=2048, memory_usage=0, cpu_usage=0,
+                                     siblings=[set([0, 1]), set([2, 3])],
+                                     mempages=[], pinned_cpus=set([]))
+         inst_pin = objects.InstanceNUMACell(
+@@ -2754,7 +2785,7 @@ class CPUPinningCellTestCase(test.NoDBTestCase, _CPUPinningTestCaseBase):
+     def test_get_pinning_instance_siblings_host_siblings_fits_empty_2(self):
+         host_pin = objects.NUMACell(
+                 id=0, cpuset=set([0, 1, 2, 3, 4, 5, 6, 7]),
+-                memory=4096, memory_usage=0,
++                memory=4096, memory_usage=0, cpu_usage=0,
+                 siblings=[set([0, 1]), set([2, 3]), set([4, 5]), set([6, 7])],
+                 mempages=[], pinned_cpus=set([]))
+         inst_pin = objects.InstanceNUMACell(
+@@ -2771,7 +2802,7 @@ class CPUPinningCellTestCase(test.NoDBTestCase, _CPUPinningTestCaseBase):
+         host_pin = objects.NUMACell(
+                 id=0,
+                 cpuset=set([0, 1, 2, 3, 4, 5, 6, 7]),
+-                memory=4096, memory_usage=0,
++                memory=4096, memory_usage=0, cpu_usage=4,
+                 pinned_cpus=set([1, 2, 5, 6]),
+                 siblings=[set([0, 1, 2, 3]), set([4, 5, 6, 7])],
+                 mempages=[])
+@@ -2788,7 +2819,7 @@ class CPUPinningCellTestCase(test.NoDBTestCase, _CPUPinningTestCaseBase):
+     def test_get_pinning_host_siblings_fit_single_core(self):
+         host_pin = objects.NUMACell(
+                 id=0, cpuset=set([0, 1, 2, 3, 4, 5, 6, 7]),
+-                memory=4096, memory_usage=0,
++                memory=4096, memory_usage=0, cpu_usage=0,
+                 siblings=[set([0, 1, 2, 3]), set([4, 5, 6, 7])],
+                 mempages=[], pinned_cpus=set([]))
+         inst_pin = objects.InstanceNUMACell(cpuset=set([0, 1, 2, 3]),
+@@ -2803,7 +2834,7 @@ class CPUPinningCellTestCase(test.NoDBTestCase, _CPUPinningTestCaseBase):
+ 
+     def test_get_pinning_host_siblings_fit(self):
+         host_pin = objects.NUMACell(id=0, cpuset=set([0, 1, 2, 3]),
+-                                    memory=4096, memory_usage=0,
++                                    memory=4096, memory_usage=0, cpu_usage=0,
+                                     siblings=[set([0, 1]), set([2, 3])],
+                                     mempages=[], pinned_cpus=set([]))
+         inst_pin = objects.InstanceNUMACell(cpuset=set([0, 1, 2, 3]),
+@@ -2819,7 +2850,7 @@ class CPUPinningCellTestCase(test.NoDBTestCase, _CPUPinningTestCaseBase):
+         host_pin = objects.NUMACell(
+                 id=0,
+                 cpuset=set([0, 1, 2, 3, 4, 5, 6, 7]),
+-                memory=4096, memory_usage=0,
++                memory=4096, memory_usage=0, cpu_usage=0,
+                 pinned_cpus=set([]),
+                 siblings=[],
+                 mempages=[])
+@@ -2835,7 +2866,7 @@ class CPUPinningCellTestCase(test.NoDBTestCase, _CPUPinningTestCaseBase):
+         host_pin = objects.NUMACell(
+                 id=0,
+                 cpuset=set([0, 1, 2, 3, 4, 5, 6, 7]),
+-                memory=4096, memory_usage=0,
++                memory=4096, memory_usage=0, cpu_usage=3,
+                 pinned_cpus=set([0, 1, 2]),
+                 siblings=[set([0, 4]), set([1, 5]), set([2, 6]), set([3, 7])],
+                 mempages=[])
+@@ -2849,7 +2880,7 @@ class CPUPinningCellTestCase(test.NoDBTestCase, _CPUPinningTestCaseBase):
+ 
+     def test_get_pinning_require_policy_fits(self):
+         host_pin = objects.NUMACell(id=0, cpuset=set([0, 1, 2, 3]),
+-                                    memory=4096, memory_usage=0,
++                                    memory=4096, memory_usage=0, cpu_usage=0,
+                                     siblings=[set([0, 1]), set([2, 3])],
+                                     mempages=[], pinned_cpus=set([]))
+         inst_pin = objects.InstanceNUMACell(
+@@ -2868,7 +2899,7 @@ class CPUPinningCellTestCase(test.NoDBTestCase, _CPUPinningTestCaseBase):
+         host_pin = objects.NUMACell(
+                 id=0,
+                 cpuset=set([0, 1, 2, 3, 4, 5, 6, 7]),
+-                memory=4096, memory_usage=0,
++                memory=4096, memory_usage=0, cpu_usage=2,
+                 pinned_cpus=set([0, 1]),
+                 siblings=[set([0, 4]), set([1, 5]), set([2, 6]), set([3, 7])],
+                 mempages=[])
+@@ -2886,7 +2917,7 @@ class CPUPinningCellTestCase(test.NoDBTestCase, _CPUPinningTestCaseBase):
+ 
+     def test_get_pinning_host_siblings_instance_odd_fit(self):
+         host_pin = objects.NUMACell(id=0, cpuset=set([0, 1, 2, 3, 4, 5, 6, 7]),
+-                                    memory=4096, memory_usage=0,
++                                    memory=4096, memory_usage=0, cpu_usage=0,
+                                     siblings=[set([0, 1]), set([2, 3]),
+                                               set([4, 5]), set([6, 7])],
+                                     mempages=[], pinned_cpus=set([]))
+@@ -2901,7 +2932,7 @@ class CPUPinningCellTestCase(test.NoDBTestCase, _CPUPinningTestCaseBase):
+ 
+     def test_get_pinning_host_siblings_instance_fit_optimize_threads(self):
+         host_pin = objects.NUMACell(id=0, cpuset=set([0, 1, 2, 3, 4, 5, 6, 7]),
+-                                    memory=4096, memory_usage=0,
++                                    memory=4096, memory_usage=0, cpu_usage=0,
+                                     siblings=[set([0, 1, 2, 3]),
+                                               set([4, 5, 6, 7])],
+                                     mempages=[], pinned_cpus=set([]))
+@@ -2916,7 +2947,7 @@ class CPUPinningCellTestCase(test.NoDBTestCase, _CPUPinningTestCaseBase):
+ 
+     def test_get_pinning_host_siblings_instance_odd_fit_w_usage(self):
+         host_pin = objects.NUMACell(id=0, cpuset=set([0, 1, 2, 3, 4, 5, 6, 7]),
+-                                    memory=4096, memory_usage=0,
++                                    memory=4096, memory_usage=0, cpu_usage=3,
+                                     siblings=[set([0, 1]), set([2, 3]),
+                                               set([4, 5]), set([6, 7])],
+                                     mempages=[], pinned_cpus=set([0, 2, 5]))
+@@ -2931,7 +2962,7 @@ class CPUPinningCellTestCase(test.NoDBTestCase, _CPUPinningTestCaseBase):
+ 
+     def test_get_pinning_host_siblings_instance_mixed_siblings(self):
+         host_pin = objects.NUMACell(id=0, cpuset=set([0, 1, 2, 3, 4, 5, 6, 7]),
+-                                    memory=4096, memory_usage=0,
++                                    memory=4096, memory_usage=0, cpu_usage=4,
+                                     siblings=[set([0, 1]), set([2, 3]),
+                                               set([4, 5]), set([6, 7])],
+                                     mempages=[], pinned_cpus=set([0, 1, 2, 5]))
+@@ -2946,7 +2977,7 @@ class CPUPinningCellTestCase(test.NoDBTestCase, _CPUPinningTestCaseBase):
+ 
+     def test_get_pinning_host_siblings_instance_odd_fit_orphan_only(self):
+         host_pin = objects.NUMACell(id=0, cpuset=set([0, 1, 2, 3, 4, 5, 6, 7]),
+-                                    memory=4096, memory_usage=0,
++                                    memory=4096, memory_usage=0, cpu_usage=4,
+                                     siblings=[set([0, 1]), set([2, 3]),
+                                               set([4, 5]), set([6, 7])],
+                                     mempages=[], pinned_cpus=set([0, 2, 5, 6]))
+@@ -2963,7 +2994,7 @@ class CPUPinningCellTestCase(test.NoDBTestCase, _CPUPinningTestCaseBase):
+         host_pin = objects.NUMACell(id=0, cpuset=set([0, 1, 2, 3, 4, 5, 6, 7,
+                                                       8, 9, 10, 11, 12, 13, 14,
+                                                       15]),
+-                                    memory=4096, memory_usage=0,
++                                    memory=4096, memory_usage=0, cpu_usage=0,
+                                     siblings=[set([0, 8]), set([1, 9]),
+                                               set([2, 10]), set([3, 11]),
+                                               set([4, 12]), set([5, 13]),
+@@ -2981,7 +3012,7 @@ class CPUPinningCellTestCase(test.NoDBTestCase, _CPUPinningTestCaseBase):
+ 
+     def test_get_pinning_isolate_policy_too_few_fully_free_cores(self):
+         host_pin = objects.NUMACell(id=0, cpuset=set([0, 1, 2, 3]),
+-                                    memory=4096, memory_usage=0,
++                                    memory=4096, memory_usage=0, cpu_usage=0,
+                                     siblings=[set([0, 1]), set([2, 3])],
+                                     mempages=[], pinned_cpus=set([1]))
+         inst_pin = objects.InstanceNUMACell(
+@@ -2994,7 +3025,7 @@ class CPUPinningCellTestCase(test.NoDBTestCase, _CPUPinningTestCaseBase):
+ 
+     def test_get_pinning_isolate_policy_no_fully_free_cores(self):
+         host_pin = objects.NUMACell(id=0, cpuset=set([0, 1, 2, 3]),
+-                                    memory=4096, memory_usage=0,
++                                    memory=4096, memory_usage=0, cpu_usage=2,
+                                     siblings=[set([0, 1]), set([2, 3])],
+                                     mempages=[], pinned_cpus=set([1, 2]))
+         inst_pin = objects.InstanceNUMACell(
+@@ -3007,7 +3038,7 @@ class CPUPinningCellTestCase(test.NoDBTestCase, _CPUPinningTestCaseBase):
+ 
+     def test_get_pinning_isolate_policy_fits(self):
+         host_pin = objects.NUMACell(id=0, cpuset=set([0, 1, 2, 3]),
+-                                    memory=4096, memory_usage=0,
++                                    memory=4096, memory_usage=0, cpu_usage=0,
+                                     siblings=[],
+                                     mempages=[], pinned_cpus=set([]))
+         inst_pin = objects.InstanceNUMACell(
+@@ -3024,7 +3055,7 @@ class CPUPinningCellTestCase(test.NoDBTestCase, _CPUPinningTestCaseBase):
+ 
+     def test_get_pinning_isolate_policy_fits_ht_host(self):
+         host_pin = objects.NUMACell(id=0, cpuset=set([0, 1, 2, 3]),
+-                                    memory=4096, memory_usage=0,
++                                    memory=4096, memory_usage=0, cpu_usage=0,
+                                     siblings=[set([0, 1]), set([2, 3])],
+                                     mempages=[], pinned_cpus=set([]))
+         inst_pin = objects.InstanceNUMACell(
+@@ -3043,7 +3074,7 @@ class CPUPinningCellTestCase(test.NoDBTestCase, _CPUPinningTestCaseBase):
+         host_pin = objects.NUMACell(
+                 id=0,
+                 cpuset=set([0, 1, 2, 3, 4, 5, 6, 7]),
+-                memory=4096, memory_usage=0,
++                memory=4096, memory_usage=0, cpu_usage=2,
+                 pinned_cpus=set([0, 1]),
+                 siblings=[set([0, 4]), set([1, 5]), set([2, 6]), set([3, 7])],
+                 mempages=[])
+@@ -3141,7 +3172,7 @@ class CPUPinningCellTestCase(test.NoDBTestCase, _CPUPinningTestCaseBase):
+         host_pin = objects.NUMACell(
+                 id=0,
+                 cpuset=set([0, 2, 3, 4, 5, 6, 7]),
+-                memory=4096, memory_usage=0, cpu_usage=0,
++                memory=4096, memory_usage=0, cpu_usage=2,
+                 pinned_cpus=set([0, 2]),
+                 siblings=[set([0, 4]), set([1, 5]), set([2, 6]), set([3, 7])],
+                 mempages=[],
+@@ -3165,7 +3196,8 @@ class CPUPinningTestCase(test.NoDBTestCase, _CPUPinningTestCaseBase):
+     def test_host_numa_fit_instance_to_host_single_cell(self):
+         host_topo = objects.NUMATopology(
+                 cells=[objects.NUMACell(id=0, cpuset=set([0, 1]), memory=2048,
+-                                        memory_usage=0, siblings=[],
++                                        memory_usage=0, cpu_usage=0,
++                                        siblings=[],
+                                         mempages=[], pinned_cpus=set([])),
+                        objects.NUMACell(id=1, cpuset=set([2, 3]), memory=2048,
+                                         memory_usage=0, siblings=[],
+@@ -3185,10 +3217,11 @@ class CPUPinningTestCase(test.NoDBTestCase, _CPUPinningTestCaseBase):
+         host_topo = objects.NUMATopology(
+                 cells=[objects.NUMACell(id=0, cpuset=set([0, 1]),
+                                         pinned_cpus=set([0]), memory=2048,
+-                                        memory_usage=0, siblings=[],
+-                                        mempages=[]),
++                                        memory_usage=0, cpu_usage=1,
++                                        siblings=[], mempages=[]),
+                        objects.NUMACell(id=1, cpuset=set([2, 3]), memory=2048,
+-                                        memory_usage=0, siblings=[],
++                                        memory_usage=0, cpu_usage=0,
++                                        siblings=[],
+                                         mempages=[], pinned_cpus=set([]))])
+         inst_topo = objects.InstanceNUMATopology(
+                 cells=[objects.InstanceNUMACell(
+@@ -3204,9 +3237,11 @@ class CPUPinningTestCase(test.NoDBTestCase, _CPUPinningTestCaseBase):
+         host_topo = objects.NUMATopology(
+                 cells=[objects.NUMACell(id=0, cpuset=set([0, 1]), memory=2048,
+                                         pinned_cpus=set([0]), memory_usage=0,
++                                        cpu_usage=1,
+                                         siblings=[], mempages=[]),
+                        objects.NUMACell(id=1, cpuset=set([2, 3]), memory=2048,
+                                         pinned_cpus=set([2]), memory_usage=0,
++                                        cpu_usage=1,
+                                         siblings=[], mempages=[])])
+         inst_topo = objects.InstanceNUMATopology(
+                 cells=[objects.InstanceNUMACell(
+@@ -3220,10 +3255,12 @@ class CPUPinningTestCase(test.NoDBTestCase, _CPUPinningTestCaseBase):
+         host_topo = objects.NUMATopology(
+                 cells=[objects.NUMACell(id=0, cpuset=set([0, 1, 2, 3]),
+                                         memory=2048, memory_usage=0,
++                                        cpu_usage=0,
+                                         siblings=[], mempages=[],
+                                         pinned_cpus=set([])),
+                        objects.NUMACell(id=1, cpuset=set([4, 5, 6, 7]),
+                                         memory=2048, memory_usage=0,
++                                        cpu_usage=0,
+                                         siblings=[], mempages=[],
+                                         pinned_cpus=set([]))])
+         inst_topo = objects.InstanceNUMATopology(
+@@ -3243,13 +3280,15 @@ class CPUPinningTestCase(test.NoDBTestCase, _CPUPinningTestCaseBase):
+                 cells=[objects.NUMACell(id=0, cpuset=set([0, 1, 2, 3]),
+                                         memory=2048, pinned_cpus=set([0]),
+                                         siblings=[], mempages=[],
+-                                        memory_usage=0),
++                                        memory_usage=0, cpu_usage=1),
+                        objects.NUMACell(id=1, cpuset=set([4, 5, 6, 7]),
+                                         memory=2048, memory_usage=0,
++                                        cpu_usage=3,
+                                         siblings=[], mempages=[],
+                                         pinned_cpus=set([4, 5, 6])),
+                        objects.NUMACell(id=2, cpuset=set([8, 9, 10, 11]),
+                                         memory=2048, memory_usage=0,
++                                        cpu_usage=2,
+                                         siblings=[], mempages=[],
+                                         pinned_cpus=set([10, 11]))])
+         inst_topo = objects.InstanceNUMATopology(
+@@ -3268,10 +3307,12 @@ class CPUPinningTestCase(test.NoDBTestCase, _CPUPinningTestCaseBase):
+         host_topo = objects.NUMATopology(
+                 cells=[objects.NUMACell(id=0, cpuset=set([0, 1, 2, 3]),
+                                         memory=4096, memory_usage=0,
++                                        cpu_usage=1,
+                                         mempages=[], siblings=[],
+                                         pinned_cpus=set([0])),
+                        objects.NUMACell(id=1, cpuset=set([4, 5, 6, 7]),
+                                         memory=4096, memory_usage=0,
++                                        cpu_usage=3,
+                                         siblings=[], mempages=[],
+                                         pinned_cpus=set([4, 5, 6]))])
+         inst_topo = objects.InstanceNUMATopology(
+@@ -3288,10 +3329,12 @@ class CPUPinningTestCase(test.NoDBTestCase, _CPUPinningTestCaseBase):
+         host_topo = objects.NUMATopology(
+                 cells=[objects.NUMACell(id=0, cpuset=set([0, 1, 2, 3]),
+                                         memory=4096, memory_usage=0,
++                                        cpu_usage=0,
+                                         siblings=[], mempages=[],
+                                         pinned_cpus=set([])),
+                        objects.NUMACell(id=1, cpuset=set([4, 5, 6, 7]),
+                                         memory=4096, memory_usage=0,
++                                        cpu_usage=0,
+                                         siblings=[], mempages=[],
+                                         pinned_cpus=set([]))])
+         inst_topo = objects.InstanceNUMATopology(
+@@ -3553,7 +3596,7 @@ class CPUSReservedCellTestCase(test.NoDBTestCase):
+     def test_cpu_pinning_usage_from_instances_free_with_offline_cpus(self):
+         host_pin = objects.NUMATopology(
+             cells=[objects.NUMACell(id=0, cpuset=set([0, 1, 2, 3]),
+-                                    memory=4096, cpu_usage=0, memory_usage=0,
++                                    memory=4096, cpu_usage=3, memory_usage=0,
+                                     siblings=[], mempages=[],
+                                     pinned_cpus=set([0, 1, 3]))])
+         inst_pin_1 = objects.InstanceNUMATopology(
+diff --git a/nova/virt/hardware.py b/nova/virt/hardware.py
+index f8b11dc..57b1b02 100644
+--- a/nova/virt/hardware.py
++++ b/nova/virt/hardware.py
+@@ -21,6 +21,7 @@
+ import collections
+ import fractions
+ import itertools
++import sys
+ 
+ from oslo_log import log as logging
+ from oslo_serialization import jsonutils
+@@ -45,6 +46,159 @@ MEMPAGES_LARGE = -2
+ MEMPAGES_ANY = -3
+ 
+ 
++# extra_specs, image_props helper functions
++# NOTE: This must be consistent with _add_pinning_constraint().
++def is_cpu_policy_dedicated(extra_specs, image_props):
++    flavor_policy = extra_specs.get('hw:cpu_policy')
++    image_policy = image_props.get('hw_cpu_policy')
++    if (flavor_policy == fields.CPUAllocationPolicy.DEDICATED or
++        image_policy == fields.CPUAllocationPolicy.DEDICATED):
++        return True
++    return False
++
++
++# NOTE: This must be consistent with _add_pinning_constraint().
++def is_cpu_thread_policy_isolate(extra_specs, image_props):
++    flavor_thread_policy = extra_specs.get('hw:cpu_thread_policy')
++    image_thread_policy = image_props.get('hw_cpu_thread_policy')
++    if (flavor_thread_policy == fields.CPUThreadAllocationPolicy.ISOLATE or
++        image_thread_policy == fields.CPUThreadAllocationPolicy.ISOLATE):
++        return True
++    return False
++
++
++def _get_threads_per_core(host_numa_topology):
++    """Get number of hyperthreading threads per core based on host numa
++       topology siblings.
++    """
++    threads_per_core = 1
++    if (host_numa_topology is None or
++            not hasattr(host_numa_topology, 'cells')):
++        return threads_per_core
++
++    host_cell = host_numa_topology.cells[0]
++    if host_cell.siblings:
++        threads_per_core = max(map(len, host_cell.siblings))
++    return threads_per_core
++
++
++# extension - normalized vcpu accounting
++# NOTE: We do not need to also check cpu_policy since flavors are validated.
++def unshared_vcpus(vcpus, extra_specs):
++    """Count of unshared vCPUs"""
++    shared_vcpu = extra_specs.get('hw:wrs:shared_vcpu', None)
++    if shared_vcpu is not None:
++        vcpus -= 1
++    return vcpus
++
++
++def normalized_vcpus(vcpus=None, reserved=None, extra_specs=None,
++                     image_props=None, ratio=None, threads_per_core=1):
++    """Normalize vcpu used count based on cpu_policy, cpu_thread_policy,
++       reserved_vcpus, and shared_vcpu.
++
++       Accounting of vcpus_used is adjusted to be out of vcpus_total
++       (i.e. pcpus) using fractional units. When vcpus_used reaches pcpus,
++       the compute node is full.  This routine provides consistency across
++       scheduler (i.e. core_filter, host_manager), and resource tracker..
++
++       Pinned instances effectively have ratio = 1.0.
++       Pinned instances with shared_vcpu require exclusion of 1 vcpu.
++       Non-pinned instances (floaters) are divided by ratio.
++    """
++    if vcpus is None or ratio is None:
++        return 0
++    norm_vcpus = float(vcpus)
++    if extra_specs is None:
++        extra_specs = {}
++    if image_props is None:
++        image_props = {}
++    is_dedicated = is_cpu_policy_dedicated(extra_specs, image_props)
++    is_isolate = is_cpu_thread_policy_isolate(extra_specs, image_props)
++    shared_vcpu = extra_specs.get('hw:wrs:shared_vcpu', None)
++    if is_dedicated:
++        if is_isolate and reserved is not None:
++            n_reserved = len(reserved)
++            if n_reserved > 0:
++                norm_vcpus += len(reserved)
++            else:
++                norm_vcpus *= threads_per_core
++        if shared_vcpu is not None:
++            # NOTE(jgauld): should extend this to handle thread siblings
++            norm_vcpus -= 1
++    else:
++        norm_vcpus = norm_vcpus / ratio
++
++    # Get parent calling functions
++    parent_fname1 = sys._getframe(1).f_code.co_name
++    parent_fname2 = sys._getframe(2).f_code.co_name
++    LOG.debug('{}.{}.normalized_vcpus(), '
++              'vcpus={}, reserved={}, extra_specs={}, image_props={}, '
++              'is_dedicated={}, is_isolate={}, shared_vcpu={}, '
++              'threads_per_core={}, norm_vcpus={}'.
++              format(parent_fname2, parent_fname1,
++                     vcpus, reserved, extra_specs, image_props,
++                     is_dedicated, is_isolate, shared_vcpu, threads_per_core,
++                     norm_vcpus))
++    return norm_vcpus
++
++
++def get_reserved_thread_sibling_pcpus(instance_numa_topology=None,
++                                      host_numa_topology=None):
++    """Get set of reserved thread sibling pcpus.
++
++    When using cpu_thread_policy = isolate, there are thread-siblings
++    corresponding to cpu_pinned that cannot be used, so in effect they are
++    reserved.  These are currently not stored in numa topology object.
++
++    Returns a set of reserved thread sibling pcpus excluding self.
++    """
++    reserved = set()
++
++    # Get parent calling functions
++    parent_fname1 = sys._getframe(1).f_code.co_name
++    parent_fname2 = sys._getframe(2).f_code.co_name
++
++    if (instance_numa_topology is None or
++            not hasattr(instance_numa_topology, 'cells')):
++        LOG.warning(
++            "%(name2)s.%(name1)s.get_reserved_thread_sibling_pcpus(), "
++            "instance_numa_topology not present.",
++            {'name1': parent_fname1, 'name2': parent_fname2})
++        return reserved
++    if (host_numa_topology is None or
++            not hasattr(host_numa_topology, 'cells')):
++        LOG.warning(
++            "%(name2)s.%(name1)s.get_reserved_thread_sibling_pcpus(), "
++            "host_numa_topology not present.",
++            {'name1': parent_fname1, 'name2': parent_fname2})
++        return reserved
++
++    # Deduce the set of thread siblings for each sibling (excluding self),
++    # based on host numa topology.
++    siblings = {}
++    for cell in host_numa_topology.cells:
++        for sibs in cell.siblings:
++            for e in sibs:
++                siblings[e] = sibs.copy() - set([e])
++
++    # Deduce set of pinned pcpus and reserved thread sibling pcpus from
++    # instance numa topology.  Only need to do this for ISOLATE policy.
++    cpu_thread_policy = instance_numa_topology.cells[0]['cpu_thread_policy']
++    if cpu_thread_policy != fields.CPUThreadAllocationPolicy.ISOLATE:
++        return reserved
++    pinned = set()
++    for cell in instance_numa_topology.cells:
++        cpu_pinning = cell['cpu_pinning']
++        if cpu_pinning is not None:
++            for e in cpu_pinning.values():
++                pinned.add(e)
++                if e in siblings:
++                    reserved.update(siblings[e])
++    reserved.difference_update(pinned)
++    return reserved
++
++
+ # shared pcpu extension
+ def get_shared_pcpu_map():
+     """Parsing shared_pcpu_map config.
+@@ -933,8 +1087,12 @@ def _pack_instance_onto_cores(available_siblings,
+         if (instance_cell.cpu_thread_policy !=
+                 fields.CPUThreadAllocationPolicy.REQUIRE and
+                 not pinning):
+-            pinning = list(zip(sorted(instance_cell.cpuset),
+-                               itertools.chain(*sibling_set)))
++            # add check to ensure there are enough available cpus
++            if (len(instance_cell.cpuset) <=
++                         len(list(itertools.chain(*sibling_set)))):
++                pinning = list(zip(sorted(instance_cell.cpuset),
++                              itertools.chain(*sibling_set)))
++
+             # add details on failure to pin
+             if not pinning:
+                 msg = ("NUMA %(N)d: CPUs requested %(R)d > avail %(A)d" %
+@@ -1135,8 +1293,9 @@ def _numa_fit_instance_cell(host_cell, instance_cell, limit_cell=None,
+         LOG.debug('No pinning requested, considering limitations on usable cpu'
+                   ' and memory')
+         memory_usage = host_cell.memory_usage + instance_cell.memory
+-        cpu_usage = host_cell.cpu_usage + len(instance_cell.cpuset)
+-        cpu_limit = len(host_cell.cpuset) * limit_cell.cpu_allocation_ratio
++        cpu_usage = (host_cell.cpu_usage + len(instance_cell.cpuset) /
++                     limit_cell.cpu_allocation_ratio)
++        cpu_limit = len(host_cell.cpuset)
+         ram_limit = host_cell.memory * limit_cell.ram_allocation_ratio
+         if memory_usage > ram_limit or cpu_usage > cpu_limit:
+             if memory_usage > ram_limit:
+@@ -2017,6 +2176,8 @@ def numa_usage_from_instances(host, instances, free=False):
+                             len(set(instancecell.cpu_pinning.values()))
+                     else:
+                         cpu_usage_diff = len(instancecell.cpuset)
++                    if not instance.cpu_pinning_requested:
++                        cpu_usage_diff /= float(CONF.cpu_allocation_ratio)
+                     if (instancecell.cpu_thread_policy ==
+                             fields.CPUThreadAllocationPolicy.ISOLATE and
+                             hostcell.siblings):
+-- 
+2.7.4
+

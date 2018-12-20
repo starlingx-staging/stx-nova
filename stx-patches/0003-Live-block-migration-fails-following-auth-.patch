@@ -1,0 +1,172 @@
+From 3099f6f7a02bd462017756541ac88d13bcd5fe37 Mon Sep 17 00:00:00 2001
+From: Francois Palin <francois.palin@windriver.com>
+Date: Tue, 28 Mar 2017 13:19:09 -0400
+Subject: [PATCH 003/143] Live block migration fails following auth token expiration
+
+    These changes fix issues with live block migration following
+    previous cherry-picking. Auth token is renewed as admin for
+    post live migration operations at destination.
+
+    Upstream NNNN was opened for this change.
+
+__TYPE_upstreamable
+__R4_commit_00346f2
+---
+ nova/network/neutronv2/api.py             | 18 +++++++++++-------
+ nova/tests/unit/network/test_neutronv2.py | 25 +++++++++++++++----------
+ 2 files changed, 26 insertions(+), 17 deletions(-)
+
+diff --git a/nova/network/neutronv2/api.py b/nova/network/neutronv2/api.py
+index 4e035a4..c148bc6 100644
+--- a/nova/network/neutronv2/api.py
++++ b/nova/network/neutronv2/api.py
+@@ -304,7 +304,8 @@ class API(base_api.NetworkAPI):
+     def setup_networks_on_host(self, context, instance, host=None,
+                                teardown=False):
+         """Setup or teardown the network structures."""
+-        if not self._has_port_binding_extension(context, refresh_cache=True):
++        if not self._has_port_binding_extension(context, refresh_cache=True,
++                                                admin=True):
+             return
+         # Check if the instance is migrating to a new host.
+         port_migrating = host and (instance.host != host)
+@@ -316,9 +317,9 @@ class API(base_api.NetworkAPI):
+                            BINDING_HOST_ID: instance.host}
+             # Now get the port details to process the ports
+             # binding profile info.
+-            data = self.list_ports(context, **search_opts)
+-            ports = data['ports']
+             admin_client = get_client(context, admin=True)
++            data = admin_client.list_ports(**search_opts)
++            ports = data['ports']
+             if teardown:
+                 # Reset the port profile
+                 self._clear_migration_port_profile(
+@@ -1016,22 +1017,25 @@ class API(base_api.NetworkAPI):
+         return (nets_in_requested_order, ports_in_requested_order,
+             preexisting_port_ids, created_port_ids)
+ 
+-    def _refresh_neutron_extensions_cache(self, context, neutron=None):
++    def _refresh_neutron_extensions_cache(self, context, neutron=None,
++                                          admin=False):
++
+         """Refresh the neutron extensions cache when necessary."""
+         if (not self.last_neutron_extension_sync or
+             ((time.time() - self.last_neutron_extension_sync)
+              >= CONF.neutron.extension_sync_interval)):
+             if neutron is None:
+-                neutron = get_client(context)
++                neutron = get_client(context, admin=admin)
+             extensions_list = neutron.list_extensions()['extensions']
+             self.last_neutron_extension_sync = time.time()
+             self.extensions.clear()
+             self.extensions = {ext['name']: ext for ext in extensions_list}
+ 
+     def _has_port_binding_extension(self, context, refresh_cache=False,
+-                                    neutron=None):
++                                    neutron=None, admin=False):
+         if refresh_cache:
+-            self._refresh_neutron_extensions_cache(context, neutron=neutron)
++            self._refresh_neutron_extensions_cache(context, neutron=neutron,
++                                                   admin=admin)
+         return constants.PORTBINDING_EXT in self.extensions
+ 
+     def _has_auto_allocate_extension(self, context, refresh_cache=False,
+diff --git a/nova/tests/unit/network/test_neutronv2.py b/nova/tests/unit/network/test_neutronv2.py
+index edab43e..8acf716 100644
+--- a/nova/tests/unit/network/test_neutronv2.py
++++ b/nova/tests/unit/network/test_neutronv2.py
+@@ -627,11 +627,11 @@ class TestNeutronv2Base(test.TestCase):
+         elif has_dns_extension:
+             self.mox.StubOutWithMock(api, '_refresh_neutron_extensions_cache')
+             api._refresh_neutron_extensions_cache(mox.IgnoreArg(),
+-                neutron=self.moxed_client)
++                neutron=self.moxed_client, admin=False)
+         else:
+             self.mox.StubOutWithMock(api, '_refresh_neutron_extensions_cache')
+             api._refresh_neutron_extensions_cache(mox.IgnoreArg(),
+-                neutron=self.moxed_client)
++                neutron=self.moxed_client, admin=False)
+             self.mox.StubOutWithMock(api, '_populate_neutron_extension_values')
+         return has_portbinding
+ 
+@@ -1083,7 +1083,7 @@ class TestNeutronv2(TestNeutronv2Base):
+ 
+         # Note: Don't want the default get_client from setUp()
+         self.mox.ResetAll()
+-        neutronapi.get_client(mox.IgnoreArg()).AndReturn(
++        neutronapi.get_client(mox.IgnoreArg(), admin=False).AndReturn(
+             self.moxed_client)
+         self.moxed_client.list_extensions().AndReturn(
+             {'extensions': [{'name': constants.QOS_QUEUE}]})
+@@ -1098,7 +1098,7 @@ class TestNeutronv2(TestNeutronv2Base):
+ 
+         # Note: Don't want the default get_client from setUp()
+         self.mox.ResetAll()
+-        neutronapi.get_client(mox.IgnoreArg()).AndReturn(
++        neutronapi.get_client(mox.IgnoreArg(), admin=False).AndReturn(
+             self.moxed_client)
+         self.moxed_client.list_extensions().AndReturn(
+             {'extensions': [{'name': constants.QOS_QUEUE}]})
+@@ -4194,7 +4194,8 @@ class TestNeutronv2WithMock(test.TestCase):
+         get_ports = {'ports': [
+                         {'id': uuids.port_id,
+                          neutronapi.BINDING_HOST_ID: instance.host}]}
+-        self.api.list_ports = mock.Mock(return_value=get_ports)
++        mocked_port_list = mock.Mock(return_value=get_ports)
++        get_client_mock.return_value.list_ports = mocked_port_list
+         update_port_mock = mock.Mock()
+         get_client_mock.return_value.update_port = update_port_mock
+         migrate_profile = {neutronapi.MIGRATING_ATTR: 'my-new-host'}
+@@ -4226,7 +4227,8 @@ class TestNeutronv2WithMock(test.TestCase):
+                  neutronapi.BINDING_PROFILE: None}
+             ]
+         }
+-        self.api.list_ports = mock.Mock(return_value=get_ports)
++        mocked_port_list = mock.Mock(return_value=get_ports)
++        get_client_mock.return_value.list_ports = mocked_port_list
+         update_port_mock = mock.Mock()
+         get_client_mock.return_value.update_port = update_port_mock
+         migrate_profile = {neutronapi.MIGRATING_ATTR: 'my-new-host'}
+@@ -4251,7 +4253,8 @@ class TestNeutronv2WithMock(test.TestCase):
+         get_ports = {'ports': [
+                         {'id': port_id,
+                          neutronapi.BINDING_HOST_ID: instance.host}]}
+-        self.api.list_ports = mock.Mock(return_value=get_ports)
++        mocked_port_list = mock.Mock(return_value=get_ports)
++        get_client_mock.return_value.list_ports = mocked_port_list
+         self.api._setup_migration_port_profile = mock.Mock()
+         self.api.setup_networks_on_host(self.context,
+                                         instance,
+@@ -4293,7 +4296,8 @@ class TestNeutronv2WithMock(test.TestCase):
+                         {'id': port_id,
+                          neutronapi.BINDING_PROFILE: migrate_profile,
+                          neutronapi.BINDING_HOST_ID: instance.host}]}
+-        self.api.list_ports = mock.Mock(return_value=get_ports)
++        mocked_port_list = mock.Mock(return_value=get_ports)
++        get_client_mock.return_value.list_ports = mocked_port_list
+         update_port_mock = mock.Mock()
+         get_client_mock.return_value.update_port = update_port_mock
+         self.api.setup_networks_on_host(self.context,
+@@ -4313,7 +4317,8 @@ class TestNeutronv2WithMock(test.TestCase):
+         get_ports = {'ports': [
+                         {'id': uuids.port_id,
+                          neutronapi.BINDING_HOST_ID: instance.host}]}
+-        self.api.list_ports = mock.Mock(return_value=get_ports)
++        mocked_port_list = mock.Mock(return_value=get_ports)
++        get_client_mock.return_value.list_ports = mocked_port_list
+         update_port_mock = mock.Mock()
+         get_client_mock.return_value.update_port = update_port_mock
+         self.api.setup_networks_on_host(self.context,
+@@ -4989,7 +4994,7 @@ class TestNeutronv2Portbinding(TestNeutronv2Base):
+ 
+     def test_populate_neutron_extension_values_binding(self):
+         api = neutronapi.API()
+-        neutronapi.get_client(mox.IgnoreArg()).AndReturn(
++        neutronapi.get_client(mox.IgnoreArg(), admin=False).AndReturn(
+                 self.moxed_client)
+         self.moxed_client.list_extensions().AndReturn(
+             {'extensions': [{'name': constants.PORTBINDING_EXT}]})
+-- 
+2.7.4
+

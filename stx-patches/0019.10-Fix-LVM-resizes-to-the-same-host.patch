@@ -1,0 +1,57 @@
+From 836702005d063496befacc72bbb606b89505c3af Mon Sep 17 00:00:00 2001
+From: Robert Church <robert.church@windriver.com>
+Date: Fri, 30 Sep 2016 18:22:51 -0500
+Subject: [PATCH] Fix LVM resizes to the same host
+
+For LVM backed instances, if the resize is to the same host we attempt
+to preserve the contents of the existing LVM root disk by duplicating
+the original disk and resize up as necessary. At the point where we
+attempt to duplicate the volume (via a thin snapshot), we already have
+disks for the new instance created. This causes an error that the disk
+already exists.
+
+This will remove the new volume that was created as part of setting up
+the instance related to the new flavor so that the volume duplication
+operation can work as expected.
+
+This also fixes the snapshot that is created during duplication so that
+it ignores the activation skip flag on the volume. We need the snapshot
+activated in order for the resized instance to use it.
+---
+ nova/virt/libvirt/driver.py      | 6 ++++++
+ nova/virt/libvirt/storage/lvm.py | 2 +-
+ 2 files changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/nova/virt/libvirt/driver.py b/nova/virt/libvirt/driver.py
+index 3cf99ba..971ee4d 100644
+--- a/nova/virt/libvirt/driver.py
++++ b/nova/virt/libvirt/driver.py
+@@ -7883,6 +7883,12 @@ class LibvirtDriver(driver.ComputeDriver):
+             # extensions). They currently get regenerated regardless
+             # of resizing.
+             if not ext:
++                # An instance has already been spun up at this point but since
++                # we are resizing to the same host we would like to preserve
++                # the contents of the original LVM disk. So nuke the new disk
++                # and copy the original volume
++                lvm.remove_volumes([info['path']])
++
+                 # Make a duplicate volume of the same size which we
+                 # will use for resizing. This preserves the original
+                 # for reverting if resize fails
+diff --git a/nova/virt/libvirt/storage/lvm.py b/nova/virt/libvirt/storage/lvm.py
+index 82bdd9b..d88d1bd 100644
+--- a/nova/virt/libvirt/storage/lvm.py
++++ b/nova/virt/libvirt/storage/lvm.py
+@@ -99,7 +99,7 @@ def thin_copy_volume(lv_src, lv_dest, vg, size):
+                             'free_space': free_space,
+                             'size': size,
+                             'lv': lv_dest})
+-    cmd = ('lvcreate', '-s', '-n', lv_dest, '%s/%s' % (vg, lv_src))
++    cmd = ('lvcreate', '-s', '-kn', '-n', lv_dest, '%s/%s' % (vg, lv_src))
+     utils.execute(*cmd, run_as_root=True, attempts=3)
+ 
+ 
+-- 
+2.7.4
+

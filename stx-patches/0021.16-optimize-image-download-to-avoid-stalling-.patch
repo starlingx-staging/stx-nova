@@ -1,0 +1,83 @@
+From a27f07677b4ef819592b2c92b0d1930959a5aec6 Mon Sep 17 00:00:00 2001
+From: Jim Gauld <james.gauld@windriver.com>
+Date: Wed, 5 Apr 2017 14:10:55 -0400
+Subject: [PATCH] optimize image download to avoid stalling other tasks
+
+This adds the same IO offload mechanism to the new download method
+GlanceImageServiceV2 in nova/image/glance.py as V1. Note we now
+default to glance V2.
+
+For next rebase, this should be merged with commit
+66685ae813e3f2ccb89673788a23bc087dbaf6d1 (optimize image
+download to avoid stalling other tasks).
+
+Can see the offload working by collecting 'schedtop' on the compute,
+we now see significant occupancy and disk writes for in nova-compute
+task with a TID unequal to main PID.
+---
+ nova/image/glance.py | 48 ++++++++++++++++++++++++++++--------------------
+ 1 file changed, 28 insertions(+), 20 deletions(-)
+
+diff --git a/nova/image/glance.py b/nova/image/glance.py
+index 647a4ba..b554c8e 100644
+--- a/nova/image/glance.py
++++ b/nova/image/glance.py
+@@ -607,27 +607,35 @@ class GlanceImageServiceV2(object):
+                                       'for image: %s'), image_id)
+             return image_chunks
+         else:
+-            try:
+-                for chunk in image_chunks:
++            # offload image download to another thread to reduce chances
++            #      of nova-compute getting stuck on disk IO
++            def write_image(data, image_chunks, close_file, verifier):
++                try:
++                    for chunk in image_chunks:
++                        if verifier:
++                            verifier.update(chunk)
++                        data.write(chunk)
++                        # Without this periodic tasks get delayed
++                        time.sleep(0)
+                     if verifier:
+-                        verifier.update(chunk)
+-                    data.write(chunk)
+-                if verifier:
+-                    verifier.verify()
+-                    LOG.info(_LI('Image signature verification succeeded '
+-                                 'for image %s'), image_id)
+-            except cryptography.exceptions.InvalidSignature:
+-                data.truncate(0)
+-                with excutils.save_and_reraise_exception():
+-                    LOG.error(_LE('Image signature verification failed '
+-                                  'for image: %s'), image_id)
+-            except Exception as ex:
+-                with excutils.save_and_reraise_exception():
+-                    LOG.error(_LE("Error writing to %(path)s: %(exception)s"),
+-                              {'path': dst_path, 'exception': ex})
+-            finally:
+-                if close_file:
+-                    data.close()
++                        verifier.verify()
++                        LOG.info(_LI('Image signature verification succeeded '
++                                     'for image %s'), image_id)
++                except cryptography.exceptions.InvalidSignature:
++                    data.truncate(0)
++                    with excutils.save_and_reraise_exception():
++                        LOG.error(_LE('Image signature verification failed '
++                                      'for image: %s'), image_id)
++                except Exception as ex:
++                    with excutils.save_and_reraise_exception():
++                        LOG.error(_LE("Error writing to %(path)s: "
++                                      "%(exception)s"),
++                                  {'path': dst_path, 'exception': ex})
++                finally:
++                    if close_file:
++                        data.close()
++            tpool.execute(write_image, data, image_chunks, close_file,
++                          verifier)
+ 
+     def create(self, context, image_meta, data=None):
+         """Store the image data and return the new image object."""
+-- 
+2.7.4
+

@@ -1,0 +1,135 @@
+From 5343f5902ccbef905a2c4e4a394b2dcc504d8903 Mon Sep 17 00:00:00 2001
+From: Jack Ding <Jack.Ding@windriver.com>
+Date: Mon, 13 Feb 2017 10:02:19 -0500
+Subject: [PATCH] Decorate dispatch functions for resize and
+ live_migration
+
+Jira title: Unexpected API Error returned on nova flavor-key set and nova
+flavor-delete on existing flavor after running negative resize vm testcases
+
+- Change dispatch_resize_instance() to be a decoraded class member
+  function.
+  In case of migration failure, the decorated function is able to
+  set the state of this migration to error in the DB.
+
+- Change dispatch_live_migration() to be a decoraded class member
+  function.
+
+- Add check in resize() api for flavor ephemeral size
+
+Newton rebase note:
+This commit includes the following commits:
+23de1d7, b196396, 733c317, 4153fb2, a529715
+The changes related to flavor are removed since we are now allowing
+in-use flavor deletion.
+---
+ nova/compute/api.py                     |  6 ++++++
+ nova/compute/manager.py                 | 34 +++++++++++++++++++++++----------
+ nova/tests/unit/compute/test_compute.py |  2 +-
+ 3 files changed, 31 insertions(+), 11 deletions(-)
+
+diff --git a/nova/compute/api.py b/nova/compute/api.py
+index a84692c..0e5ba09 100644
+--- a/nova/compute/api.py
++++ b/nova/compute/api.py
+@@ -3147,6 +3147,12 @@ class API(base.Base):
+                 reason = _('Resize to zero disk flavor is not allowed.')
+                 raise exception.CannotResizeDisk(reason=reason)
+ 
++            if (new_instance_type.get('ephemeral_gb') <
++                    current_instance_type.get('ephemeral_gb')):
++                reason = _('Resize to smaller ephemeral flavor'
++                           ' is not allowed.')
++                raise exception.CannotResizeDisk(reason=reason)
++
+         if not new_instance_type:
+             raise exception.FlavorNotFound(flavor_id=flavor_id)
+ 
+diff --git a/nova/compute/manager.py b/nova/compute/manager.py
+index 2da31e5..8be89ab 100644
+--- a/nova/compute/manager.py
++++ b/nova/compute/manager.py
+@@ -4121,6 +4121,19 @@ class ComputeManager(manager.Manager):
+     @wrap_instance_event(prefix='compute')
+     @errors_out_migration
+     @wrap_instance_fault
++    def dispatch_resize_instance(self, context, instance, image,
++                                 reservations, migration, instance_type,
++                                 clean_shutdown):
++
++        with self._migration_semaphore:
++            self._do_resize_instance(context, instance, image,
++                      reservations, migration, instance_type,
++                      clean_shutdown)
++
++    @wrap_exception()
++    @reverts_task_state
++    @errors_out_migration
++    @wrap_instance_fault
+     def resize_instance(self, context, instance, image,
+                         reservations, migration, instance_type,
+                         clean_shutdown):
+@@ -4130,14 +4143,10 @@ class ComputeManager(manager.Manager):
+         with migration.obj_as_admin():
+             migration.save()
+ 
+-        def dispatch_resize_instance(*args, **kwargs):
+-            with self._migration_semaphore:
+-                self._do_resize_instance(*args, **kwargs)
+-
+         # NOTE(jgauld): We spawn here to return the RPC worker thread back to
+         # the pool. Since what follows could take a really long time, we don't
+         # want to tie up RPC workers.
+-        utils.spawn_n(dispatch_resize_instance,
++        utils.spawn_n(self.dispatch_resize_instance,
+                       context, instance, image,
+                       reservations, migration, instance_type,
+                       clean_shutdown)
+@@ -5645,6 +5654,15 @@ class ComputeManager(manager.Manager):
+     @wrap_exception()
+     @wrap_instance_event(prefix='compute')
+     @wrap_instance_fault
++    def dispatch_live_migration(self, context, dest, instance,
++                                block_migration, migration, migrate_data):
++            with self._live_migration_semaphore:
++                self._do_live_migration(context, dest,
++                                        instance, block_migration,
++                                        migration, migrate_data)
++
++    @wrap_exception()
++    @wrap_instance_fault
+     def live_migration(self, context, dest, instance, block_migration,
+                        migration, migrate_data):
+         """Executing live migration.
+@@ -5659,14 +5677,10 @@ class ComputeManager(manager.Manager):
+         """
+         self._set_migration_status(migration, 'queued')
+ 
+-        def dispatch_live_migration(*args, **kwargs):
+-            with self._live_migration_semaphore:
+-                self._do_live_migration(*args, **kwargs)
+-
+         # NOTE(danms): We spawn here to return the RPC worker thread back to
+         # the pool. Since what follows could take a really long time, we don't
+         # want to tie up RPC workers.
+-        utils.spawn_n(dispatch_live_migration,
++        utils.spawn_n(self.dispatch_live_migration,
+                       context, dest, instance,
+                       block_migration, migration,
+                       migrate_data)
+diff --git a/nova/tests/unit/compute/test_compute.py b/nova/tests/unit/compute/test_compute.py
+index 0ad7110..8d49dad 100644
+--- a/nova/tests/unit/compute/test_compute.py
++++ b/nova/tests/unit/compute/test_compute.py
+@@ -5901,7 +5901,7 @@ class ComputeTestCase(BaseTestCase):
+ 
+         self.assertIsNone(ret)
+         mock_event.assert_called_with(
+-                c, 'compute_live_migration', instance.uuid)
++                c, 'compute_dispatch_live_migration', instance.uuid)
+         # cleanup
+         instance.destroy()
+ 
+-- 
+2.7.4
+

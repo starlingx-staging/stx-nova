@@ -1,0 +1,493 @@
+From 2a32386a58795d4732a06ded041b3c8c9611d57e Mon Sep 17 00:00:00 2001
+From: Jim Gauld <james.gauld@windriver.com>
+Date: Sat, 11 Jun 2016 23:32:34 -0400
+Subject: [PATCH 030/143] Memory accounting of vswitch and reserved overheads,
+ set default mempage size
+
+This commit merges the R3 commits:
+
+commit d4fbd75:
+This updates memory accounting of 4K, 2M, and 1G memory so that nova accounts
+only the engineered amount of VM memory that was configured by compute-huge.
+This removes vswitch overheads and reserved overhead 4K memory.
+
+compute-huge exports the 4K, 2M, and 1G values via:
+/etc/nova/compute_extend.conf; nova reads these in when nova is launched.
+
+The nova/virt/libvirt/host.py:get_capabilities() routine obtains memory info
+from libvirt. The per-cell and per-pagesize memory are modified based on the
+exported values so this exactly corresponds to allocatable VM memory.
+
+The nova/virt/libvirt/host.py:get_memory_mb_total() now reflects the
+engineered VM total memory.  get_memory_mb_used() is refactored to read
+hugepages and account for overheads.
+
+Default mempage size is now configured via CONF.default_mempages_size;
+this is configured to 2048 by packstack (i.e., 2M page size).
+
+The following are ported from R2 (kilo):
+commit f1e3492ff5d9ac05e05dbdb52c2dd67e1d71fdf9 :
+  Set default memory pagesize, vswitch memory accounting
+commit 09fe4233c26dffff5cc3693c05018e79f29d8a70 :
+  Updated vswitch total mem calc and aggregate util
+  (excludes vswitch_monitor, wrs_server_resources)
+commit 6b41a8ff161b62443b18ee29e13a5a3cb84362bf :
+  VMs not using hugepages backed memory
+commit 1b74f90b2431cb96cbd80350cb994ee575744e7c :
+  Enable VMs backed by 4K pages
+commit 74157e9fdd9e2fd9fe12057e4983929aa489fca8 :
+  Fix tox py27 libvirt test_driver testcases
+
+497a78b Launch image fails if set page size in image metadata HTTP 400 error
+
+   This enables launching instances with identical memory page size settings
+   given both flavor and image-meta extra-specs.
+   Upstream design intent is that if flavor specifies an exact numeric
+   value then the image cannot specify a pagesize (even if it's the same as
+   the flavor). We are modifying this criteria so that we will allow
+   identical page size settings.
+   Previously, when both hw:mem_page_size and hw_mem_page_size specified,
+   and flavor extra-spec is set to values ('small' , '2048', or '1048576'),
+   but not 'any' or 'large', the logic prevents VMs to launch.
+   ASIDE:
+   We have considered simplifying mem_page_size criteria, but that diverges
+   from openstack behaviour. eg., would be much simpler as:
+   pgsize = flavor_pgsize or image_pgsize
+
+__TYPE_primary
+__TAG_memory,overhead,resource,hugepage
+__R4_commit_4073bc6
+__R3_commit_a36e994
+__TC2982,TC6550
+---
+ nova/conf/compute.py                      |  71 ++++++++++++++++
+ nova/tests/unit/conf_fixture.py           |   3 +
+ nova/tests/unit/virt/libvirt/test_host.py |  75 ++++++++++++++--
+ nova/virt/hardware.py                     |  25 ++++--
+ nova/virt/libvirt/host.py                 | 136 +++++++++++++++++++++++++++++-
+ 5 files changed, 294 insertions(+), 16 deletions(-)
+
+diff --git a/nova/conf/compute.py b/nova/conf/compute.py
+index 25be246..c215bdb 100644
+--- a/nova/conf/compute.py
++++ b/nova/conf/compute.py
+@@ -28,9 +28,65 @@ import sys
+ 
+ from oslo_config import cfg
+ from oslo_config import types
++import re
+ 
+ from nova.conf import paths
+ 
++
++# - get host extended configuration options
++def host_extend_options(config_opts_file='/etc/nova/compute_extend.conf'):
++    """Provide nova configuration options from auxiliary file.
++
++    Extend nova.conf options to have defaults initialized from a separate file.
++    This was done since there is no obvious way to have an 'include' file
++    with configuration parameters.
++
++    If no configuration file is provided, default values are provided.
++
++    param:   config_opts_file - supplemental configuration file
++    returns: parsed config data as key,value dictionary
++    """
++    # extended options defaults
++    dict_ext = {
++        'compute_vswitch_2M_pages': '',
++        'compute_vswitch_1G_pages': '',
++        'compute_vm_4K_pages': '',
++    }
++    re_blank = re.compile(r'^\s*$')
++    re_comment = re.compile(r'^\s*[#!]')
++    re_nonword = re.compile(r'^\s*\W')
++    re_dict = re.compile(r'^\s*(\w+)\s*[=:]\s*(.*)')
++
++    try:
++        with open(config_opts_file, 'r') as infile:
++            for line in infile:
++                # skip lines we don't care about
++                match = re_blank.search(line)
++                if match:
++                    continue
++                match = re_comment.search(line)
++                if match:
++                    continue
++                match = re_nonword.search(line)
++                if match:
++                    continue
++
++                # match key value pairs
++                match = re_dict.search(line)
++                if match:
++                    k = match.group(1)
++                    v = match.group(2)
++                    dict_ext[k] = v
++    except IOError:
++        pass
++
++    return dict_ext
++
++
++# Define extended configuration options
++_extend_opts = host_extend_options()
++
++
+ compute_group = cfg.OptGroup(
+     'compute',
+     title='Compute Manager Options',
+@@ -1149,6 +1205,21 @@ wrs_compute_opts = [
+     cfg.DictOpt('shared_pcpu_map',
+                 default={},
+                 help='Shared pcpu index per numa node'),
++    cfg.StrOpt('default_mempages_size',
++               default='',
++               help="Default mempages size. "
++                    "Valid options: '', 'any', 'small', '2048', 'large'."),
++
++    # Define extended configuration options
++    cfg.StrOpt('compute_vswitch_2M_pages',
++               default=_extend_opts['compute_vswitch_2M_pages'],
++               help='List of per-numa node vswitch 2M reserved memory.'),
++    cfg.StrOpt('compute_vswitch_1G_pages',
++               default=_extend_opts['compute_vswitch_1G_pages'],
++               help='List of per-numa node vswitch 1G reserved memory.'),
++    cfg.StrOpt('compute_vm_4K_pages',
++               default=_extend_opts['compute_vm_4K_pages'],
++               help='List of per-numa node VM 4K memory.'),
+ ]
+ 
+ 
+diff --git a/nova/tests/unit/conf_fixture.py b/nova/tests/unit/conf_fixture.py
+index bfbc212..b1fe7d9 100644
+--- a/nova/tests/unit/conf_fixture.py
++++ b/nova/tests/unit/conf_fixture.py
+@@ -99,3 +99,6 @@ class ConfFixture(config_fixture.Config):
+ 
+         # extension
+         self.conf.set_default('normalize_weigher', True, group='scheduler')
++        self.conf.set_default('compute_vm_4K_pages', '16908243,16348416')
++        self.conf.set_default('compute_vswitch_2M_pages', '0,0')
++        self.conf.set_default('compute_vswitch_1G_pages', '1,1')
+diff --git a/nova/tests/unit/virt/libvirt/test_host.py b/nova/tests/unit/virt/libvirt/test_host.py
+index 0ba5762..6f706fc 100644
+--- a/nova/tests/unit/virt/libvirt/test_host.py
++++ b/nova/tests/unit/virt/libvirt/test_host.py
+@@ -736,13 +736,58 @@ class HostTestCase(test.NoDBTestCase):
+             mock_conn().getInfo.return_value = ['zero', 'one', 'two']
+             self.assertEqual('two', self.host.get_cpu_count())
+ 
++    # - memory accounting
+     def test_get_memory_total(self):
+-        with mock.patch.object(host.Host, "get_connection") as mock_conn:
+-            mock_conn().getInfo.return_value = ['zero', 'one', 'two']
+-            self.assertEqual('one', self.host.get_memory_mb_total())
++        self.assertEqual(4096, self.host.get_memory_mb_total())
+ 
++    # - memory accounting
++    def test_get_capabilities_memtotal_exclude_overheads(self):
++        """Tests that we can calculate memory total with exclusions.
++        """
++        fake_caps_xml = '''
++<capabilities>
++  <host>
++    <uuid>cef19ce0-0ca2-11df-855d-b19fbce37686</uuid>
++    <cpu>
++      <arch>x86_64</arch>
++      <vendor>Intel</vendor>
++      <pages unit='KiB' size='4'/>
++      <pages unit='KiB' size='2048'/>
++      <pages unit='KiB' size='1048576'/>
++    </cpu>
++    <topology>
++      <cells num='2'>
++        <cell id='0'>
++          <memory unit='KiB'>134090572</memory>
++          <pages unit='KiB' size='4'>32273363</pages>
++          <pages unit='KiB' size='2048'>5000</pages>
++          <pages unit='KiB' size='1048576'>51</pages>
++        </cell>
++        <cell id='1'>
++          <memory unit='KiB'>134217728</memory>
++          <pages unit='KiB' size='4'>32305152</pages>
++          <pages unit='KiB' size='2048'>10000</pages>
++          <pages unit='KiB' size='1048576'>41</pages>
++        </cell>
++      </cells>
++    </topology>
++  </host>
++</capabilities>'''
++        with mock.patch.object(fakelibvirt.virConnect, 'getCapabilities',
++                               return_value=fake_caps_xml):
++            MiB = 0
++            MiB += 4 * 16908243 / 1024 + 2 * (5000 - 0) + 1024 * (51 - 1)
++            MiB += 4 * 16348416 / 1024 + 2 * (10000 - 0) + 1024 * (41 - 1)
++            self.assertEqual(MiB, self.host.get_memory_mb_total())
++
++    # - memory accounting
+     def test_get_memory_used(self):
+-        m = mock.mock_open(read_data="""
++        real_open = six.moves.builtins.open
++
++        def fake_open(filename, *args, **kwargs):
++            if filename == "/proc/meminfo":
++                h = mock.MagicMock()
++                h.read.return_value = """
+ MemTotal:       16194180 kB
+ MemFree:          233092 kB
+ MemAvailable:    8892356 kB
+@@ -750,17 +795,33 @@ Buffers:          567708 kB
+ Cached:          8362404 kB
+ SwapCached:            0 kB
+ Active:          8381604 kB
+-""")
++"""
++                h.__enter__.return_value = h
++                return h
++            if "/nr_hugepages" in filename:
++                h = mock.MagicMock()
++                h.read.return_value = "0"
++                h.__enter__.return_value = h
++                return h
++            if "/free_hugepages" in filename:
++                h = mock.MagicMock()
++                h.read.return_value = "0"
++                h.__enter__.return_value = h
++                return h
++            return real_open(filename, *args, **kwargs)
++
+         with test.nested(
+-                mock.patch.object(six.moves.builtins, "open", m, create=True),
++                mock.patch.object(six.moves.builtins, "open", create=True),
+                 mock.patch.object(host.Host,
+                                   "get_connection"),
+                 mock.patch('sys.platform', 'linux2'),
+                 ) as (mock_file, mock_conn, mock_platform):
++            mock_file.side_effect = fake_open
+             mock_conn().getInfo.return_value = [
+                 obj_fields.Architecture.X86_64, 15814, 8, 1208, 1, 1, 4, 2]
+ 
+-            self.assertEqual(6866, self.host.get_memory_mb_used())
++            MiB = 6866 - 2 * 1024
++            self.assertEqual(MiB, self.host.get_memory_mb_used())
+ 
+     def test_get_memory_used_xen(self):
+         self.flags(virt_type='xen', group='libvirt')
+diff --git a/nova/virt/hardware.py b/nova/virt/hardware.py
+index 6f551ce..21c4ed4 100644
+--- a/nova/virt/hardware.py
++++ b/nova/virt/hardware.py
+@@ -1166,15 +1166,26 @@ def _numa_get_pagesize_constraints(flavor, image_meta):
+     if not flavor_request:
+         # Nothing was specified for hugepages,
+         # let's the default process running.
+-        return None
++
++        # - Set default memory pagesize.
++        # This has side-effect of forcing VMs to a numa node.
++        if CONF.default_mempages_size:
++            flavor_request = CONF.default_mempages_size
++            LOG.info("defaulting pagesize to: %s", flavor_request)
++        else:
++            return None
+ 
+     pagesize = check_and_return_pages_size(flavor_request)
+-    if image_request and (pagesize in (MEMPAGES_ANY, MEMPAGES_LARGE)):
+-        return check_and_return_pages_size(image_request)
+-    elif image_request:
+-        raise exception.MemoryPageSizeForbidden(
+-            pagesize=image_request,
+-            against=flavor_request)
++    if image_request:
++        img_pagesize = check_and_return_pages_size(image_request)
++        if (pagesize in (MEMPAGES_ANY, MEMPAGES_LARGE)
++                or pagesize == img_pagesize):
++
++            return img_pagesize
++        else:
++            raise exception.MemoryPageSizeForbidden(
++                pagesize=image_request,
++                against=flavor_request)
+ 
+     return pagesize
+ 
+diff --git a/nova/virt/libvirt/host.py b/nova/virt/libvirt/host.py
+index 41573cd..ce34398 100644
+--- a/nova/virt/libvirt/host.py
++++ b/nova/virt/libvirt/host.py
+@@ -71,6 +71,10 @@ native_Queue = patcher.original("Queue" if six.PY2 else "queue")
+ 
+ CONF = nova.conf.CONF
+ 
++# - memory accounting - constants (KiB)
++MEMPAGE_SZ_4K = 4
++MEMPAGE_SZ_2M = 2048
++MEMPAGE_SZ_1G = 1048576
+ 
+ # This list is for libvirt hypervisor drivers that need special handling.
+ # This is *not* the complete list of supported hypervisor drivers.
+@@ -656,6 +660,25 @@ class Host(object):
+ 
+         return online_cpus
+ 
++    # - memory accounting
++    def _get_configured_pages(self, csv=None):
++        """Get number of configured hugepages per numa node.
++
++        :param: comma-separated-list of configured values
++
++        :returns: list of number of configured hugepages per numa node
++
++        """
++        if csv is None:
++            return []
++        values = csv.strip()
++        if not values:
++            return []
++        pages = []
++        for value in values.split(','):
++            pages.append(int(value))
++        return pages
++
+     def get_capabilities(self):
+         """Returns the host capabilities information
+ 
+@@ -694,6 +717,52 @@ class Host(object):
+                                      {'uri': self._uri, 'error': ex})
+                     else:
+                         raise
++
++            # Simplify memory accounting by engineering out of maximum
++            # VM available memory instead of total physical memory.
++            # After this adjustment, cell.mempages[] only represents VM memory
++            # and corresponds exactly match compute-huge.
++            # The following adjustment also removes vswitch hugepages overheads
++            # and 4K pages overheads from accounting.
++            # Important: cell.memory obtained from getCapabilities() is KiB.
++            # The NumaCell.memory field is in MiB as converted by routine
++            # virt/libvirt/driver.py: _get_host_numa_topology().  This is
++            # confusing since both use same variable name.
++            topology = self._caps.host.topology
++            if topology is None or not topology.cells:
++                return self._caps
++            vm_4K_nodes = self._get_configured_pages(
++                csv=CONF.compute_vm_4K_pages)
++            vs_2M_nodes = self._get_configured_pages(
++                csv=CONF.compute_vswitch_2M_pages)
++            vs_1G_nodes = self._get_configured_pages(
++                csv=CONF.compute_vswitch_1G_pages)
++            for cell in topology.cells:
++                msg = []
++                cell.memory = 0
++                for k, pages in enumerate(cell.mempages):
++                    pg = cell.mempages[k]
++                    if pages.size == MEMPAGE_SZ_4K and vm_4K_nodes:
++                        vm_4K = vm_4K_nodes[cell.id]
++                        oh_4K = pg.total - vm_4K
++                        pg.total -= oh_4K
++                        cell.memory += (pg.total * pg.size)
++                        MiB = oh_4K * MEMPAGE_SZ_4K // units.Ki
++                        msg.append('%d MiB 4K overhead' % (MiB))
++                    if pages.size == MEMPAGE_SZ_2M and vs_2M_nodes:
++                        vs_2M = vs_2M_nodes[cell.id]
++                        pg.total -= vs_2M
++                        cell.memory += (pg.total * pg.size)
++                        MiB = vs_2M * MEMPAGE_SZ_2M // units.Ki
++                        msg.append('%d MiB 2M vswitch' % (MiB))
++                    if pages.size == MEMPAGE_SZ_1G and vs_1G_nodes:
++                        vs_1G = vs_1G_nodes[cell.id]
++                        pg.total -= vs_1G
++                        cell.memory += (pg.total * pg.size)
++                        MiB = vs_1G * MEMPAGE_SZ_1G // units.Ki
++                        msg.append('%d MiB 1G vswitch' % (MiB))
++                LOG.info("cell:%(id)s exclude: %(msg)s",
++                         {'id': cell.id, 'msg': '; '.join(msg)})
+         return self._caps
+ 
+     def get_driver_type(self):
+@@ -808,7 +877,17 @@ class Host(object):
+ 
+         :returns: the total amount of memory(MB).
+         """
+-        return self._get_hardware_info()[1]
++        # Get the total reserved memory.  Note that cell.memory values
++        # have already excluded Linux and vswitch overheads.
++        # Important: cell.memory obtained from getCapabilities() is KiB.
++        caps = self.get_capabilities()
++        topology = caps.host.topology
++        if topology is None or not topology.cells:
++            return self._get_hardware_info()[1]
++        memory = 0
++        for cell in topology.cells:
++            memory += int(cell.memory)
++        return memory // units.Ki
+ 
+     def get_memory_mb_used(self):
+         """Get the used memory size(MB) of physical computer.
+@@ -848,8 +927,61 @@ class Host(object):
+             return used // units.Ki
+         else:
+             avail = (int(m[idx1 + 1]) + int(m[idx2 + 1]) + int(m[idx3 + 1]))
++            # memory accounting
+             # Convert it to MB
+-            return self.get_memory_mb_total() - avail // units.Ki
++            # return self.get_memory_mb_total() - avail // units.Ki
++
++            # Used amount of 2M hugepages
++            vs_2M_nodes = self._get_configured_pages(
++                csv=CONF.compute_vswitch_2M_pages)
++            vs_2M = 0
++            for pages in vs_2M_nodes:
++                vs_2M += pages
++            f_2M = '/sys/kernel/mm/hugepages/hugepages-%dkB' % (MEMPAGE_SZ_2M)
++            f_nr = f_2M + '/nr_hugepages'
++            f_nf = f_2M + '/free_hugepages'
++            try:
++                with open(f_nr) as f:
++                    h_Total = int(f.read().strip())
++                with open(f_nf) as f:
++                    h_Free = int(f.read().strip())
++            except IOError:
++                h_Total = 0
++                h_Free = 0
++                vs_2M = 0
++            Used_2M_MiB = int((h_Total - vs_2M - h_Free) *
++                              MEMPAGE_SZ_2M / units.Ki)
++            HTot_2M_MiB = int(h_Total) * MEMPAGE_SZ_2M // units.Ki
++
++            # Used amount of 1G hugepages
++            vs_1G_nodes = self._get_configured_pages(
++                csv=CONF.compute_vswitch_1G_pages)
++            vs_1G = 0
++            for pages in vs_1G_nodes:
++                vs_1G += pages
++            f_1G = '/sys/kernel/mm/hugepages/hugepages-%dkB' % (MEMPAGE_SZ_1G)
++            f_nr = f_1G + '/nr_hugepages'
++            f_nf = f_1G + '/free_hugepages'
++            try:
++                with open(f_nr) as f:
++                    h_Total = int(f.read().strip())
++                with open(f_nf) as f:
++                    h_Free = int(f.read().strip())
++            except IOError:
++                h_Total = 0
++                h_Free = 0
++                vs_1G = 0
++            Used_1G_MiB = int((h_Total - vs_1G - h_Free) *
++                              MEMPAGE_SZ_1G / units.Ki)
++            HTot_1G_MiB = int(h_Total) * MEMPAGE_SZ_1G // units.Ki
++
++            # Used amount of 4K pages: including linux base + VMs
++            Total_MiB = self._get_hardware_info()[1]
++            Total_4K_MiB = Total_MiB - HTot_2M_MiB - HTot_1G_MiB
++            Used_4K_MiB = Total_4K_MiB - avail // units.Ki
++
++            Used_MiB = Used_4K_MiB + Used_2M_MiB + Used_1G_MiB
++            return Used_MiB
+ 
+     def get_cpu_stats(self):
+         """Returns the current CPU state of the host with frequency."""
+-- 
+2.7.4
+

@@ -1,0 +1,39 @@
+From 65002492775af38cd80c3f4458e9b8253d0d07d9 Mon Sep 17 00:00:00 2001
+From: Gerry Kopec <Gerry.Kopec@windriver.com>
+Date: Thu, 6 Apr 2017 19:12:27 -0400
+Subject: [PATCH] Fix Circular reference error on resize/cold migrate retry
+
+This commit adds NovaObjectDictCompat to VirtCPUTopology object to
+avoid Circular reference detected error when compute attempts reschedule
+after failure during prep_resize.  This is required due to upstream
+commit 76dfb4b in Newton which added json serialize/unserialize of
+legacy_spec prior to rpc call to prep_resize().  On first pass through,
+cpu_topology field of numa_topology cell is not defined so there isn't
+an issue but on reschedule it exists and triggers the error.
+
+This same fix had also been done in Mitaka by commit 2fb28a0, but that
+was to support upgrade from Kilo so it was not ported forward to
+R4/Newton.
+
+This change is a candidate for upstreaming.
+---
+ nova/objects/virt_cpu_topology.py | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/nova/objects/virt_cpu_topology.py b/nova/objects/virt_cpu_topology.py
+index bb74c0d..015a270 100644
+--- a/nova/objects/virt_cpu_topology.py
++++ b/nova/objects/virt_cpu_topology.py
+@@ -15,7 +15,8 @@ from nova.objects import fields
+ 
+ 
+ @base.NovaObjectRegistry.register
+-class VirtCPUTopology(base.NovaObject):
++class VirtCPUTopology(base.NovaObject,
++                      base.NovaObjectDictCompat):
+     # Version 1.0: Initial version
+     VERSION = '1.0'
+ 
+-- 
+2.7.4
+

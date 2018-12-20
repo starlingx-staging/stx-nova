@@ -1,0 +1,223 @@
+From c88a791428028cdc15f468a1cdda4c4a372ba68c Mon Sep 17 00:00:00 2001
+From: Al Bailey <al.bailey@windriver.com>
+Date: Mon, 23 Jan 2017 09:02:07 -0500
+Subject: [PATCH 040/143] US91052  Support changing userdata as part of rebuild
+
+2.19 microversion support for rebuild with new userdata
+
+__TYPE_single
+__TAG_userdata
+__R4_commit_05e66cf
+__R3_commit_6647fc5
+---
+ nova/api/openstack/compute/schemas/servers.py      |  4 ++
+ nova/api/openstack/compute/servers.py              |  2 +
+ nova/api/validation/parameter_types.py             | 13 +++++
+ nova/compute/api.py                                |  4 ++
+ .../unit/api/openstack/compute/test_serversV21.py  | 20 +++++++-
+ nova/tests/unit/compute/test_compute_api.py        | 57 ++++++++++++++++++++++
+ 6 files changed, 98 insertions(+), 2 deletions(-)
+
+diff --git a/nova/api/openstack/compute/schemas/servers.py b/nova/api/openstack/compute/schemas/servers.py
+index efb031b..44170e5 100644
+--- a/nova/api/openstack/compute/schemas/servers.py
++++ b/nova/api/openstack/compute/schemas/servers.py
+@@ -212,6 +212,10 @@ base_rebuild_v219 = copy.deepcopy(base_rebuild)
+ base_rebuild_v219['properties']['rebuild'][
+     'properties']['description'] = parameter_types.description
+ 
++# adding userdata to rebuild for 2.19
++base_rebuild_v219['properties']['rebuild'][
++    'properties']['userdata'] = parameter_types.userdata
++
+ resize = {
+     'type': 'object',
+     'properties': {
+diff --git a/nova/api/openstack/compute/servers.py b/nova/api/openstack/compute/servers.py
+index cabdc6a..526da6c 100644
+--- a/nova/api/openstack/compute/servers.py
++++ b/nova/api/openstack/compute/servers.py
+@@ -934,6 +934,8 @@ class ServersController(wsgi.Controller):
+             'name': 'display_name',
+             'description': 'display_description',
+             'metadata': 'metadata',
++            # adding userdata to rebuild args
++            'userdata': 'userdata',
+         }
+ 
+         kwargs = {}
+diff --git a/nova/api/validation/parameter_types.py b/nova/api/validation/parameter_types.py
+index 138d2de..5055409 100644
+--- a/nova/api/validation/parameter_types.py
++++ b/nova/api/validation/parameter_types.py
+@@ -11,6 +11,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++#  Copyright (c) 2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ """
+ Common parameter types for validating request Body.
+ 
+@@ -299,6 +306,12 @@ description = {
+ }
+ 
+ 
++userdata = {
++    'type': 'string',
++    'format': 'base64'
++}
++
++
+ tcp_udp_port = {
+     'type': ['integer', 'string'], 'pattern': '^[0-9]*$',
+     'minimum': 0, 'maximum': 65535,
+diff --git a/nova/compute/api.py b/nova/compute/api.py
+index 52377bc..0d99f42 100644
+--- a/nova/compute/api.py
++++ b/nova/compute/api.py
+@@ -3064,6 +3064,7 @@ class API(base.Base):
+         """Rebuild the given instance with the provided attributes."""
+         files_to_inject = files_to_inject or []
+         metadata = kwargs.get('metadata', {})
++        userdata = kwargs.get('userdata', None)
+         preserve_ephemeral = kwargs.get('preserve_ephemeral', False)
+         auto_disk_config = kwargs.get('auto_disk_config')
+ 
+@@ -3141,6 +3142,9 @@ class API(base.Base):
+         instance.ramdisk_id = ramdisk_id or ""
+         instance.progress = 0
+         instance.update(kwargs)
++        if userdata is not None:
++            LOG.info("Updating the userdata")
++            instance.user_data = userdata
+         instance.save(expected_task_state=[None])
+ 
+         # On a rebuild, since we're potentially changing images, we need to
+diff --git a/nova/tests/unit/api/openstack/compute/test_serversV21.py b/nova/tests/unit/api/openstack/compute/test_serversV21.py
+index c36c977..a46f015 100644
+--- a/nova/tests/unit/api/openstack/compute/test_serversV21.py
++++ b/nova/tests/unit/api/openstack/compute/test_serversV21.py
+@@ -21,6 +21,7 @@
+ # of an applicable Wind River license agreement.
+ #
+ 
++from base64 import b64encode
+ import collections
+ import datetime
+ import ddt
+@@ -2197,21 +2198,36 @@ class ServersControllerRebuildTestV219(ServersControllerRebuildInstanceTest):
+         self.req.api_version_request = \
+             api_version_request.APIVersionRequest('2.19')
+ 
+-    def _rebuild_server(self, set_desc, desc):
++    def _rebuild_server(self, set_desc, desc, set_ud=False, ud_enc=None):
+         fake_get = fakes.fake_compute_get(vm_state=vm_states.ACTIVE,
+                                           display_description=desc,
+                                           project_id=self.req_project_id,
+-                                          user_id=self.req_user_id)
++                                          user_id=self.req_user_id,
++                                          user_data = ud_enc)
+         self.stubs.Set(compute_api.API, 'get',
+                        lambda api, *a, **k: fake_get(*a, **k))
+ 
+         if set_desc:
+             self.body['rebuild']['description'] = desc
++
++        if set_ud:
++            self.body['rebuild']['userdata'] = ud_enc
++
+         self.req.body = jsonutils.dump_as_bytes(self.body)
+         server = self.controller._action_rebuild(self.req, FAKE_UUID,
+                                                  body=self.body).obj['server']
+         self.assertEqual(server['id'], FAKE_UUID)
+         self.assertEqual(server['description'], desc)
++        # userdata is an extended attribute.
++
++    # enhancement to support rebuild with new userdata
++    def test_rebuild_server_with_userdata(self):
++        ud_enc = b64encode("some userdata").decode('utf-8')
++        self._rebuild_server(False, '', True, ud_enc)
++
++    def test_rebuild_server_with_empty_userdata(self):
++        ud_enc = b64encode("").decode('utf-8')
++        self._rebuild_server(False, '', True, ud_enc)
+ 
+     def test_rebuild_server_with_description(self):
+         self._rebuild_server(True, 'server desc')
+diff --git a/nova/tests/unit/compute/test_compute_api.py b/nova/tests/unit/compute/test_compute_api.py
+index a72180e..609e4d2 100644
+--- a/nova/tests/unit/compute/test_compute_api.py
++++ b/nova/tests/unit/compute/test_compute_api.py
+@@ -3198,6 +3198,63 @@ class _ComputeAPIUnitTestMixIn(object):
+         bdm_get_by_instance_uuid.assert_called_once_with(
+             self.context, instance.uuid)
+ 
++    # New tox test
++    @mock.patch.object(objects.RequestSpec, 'get_by_instance_uuid')
++    @mock.patch.object(objects.Instance, 'save')
++    @mock.patch.object(objects.Instance, 'get_flavor')
++    @mock.patch.object(objects.BlockDeviceMappingList, 'get_by_instance_uuid')
++    @mock.patch.object(compute_api.API, '_get_image')
++    @mock.patch.object(compute_api.API, '_check_auto_disk_config')
++    @mock.patch.object(compute_api.API, '_checks_for_create_and_rebuild')
++    @mock.patch.object(compute_api.API, '_record_action_start')
++    def test_rebuild_change_userdata(self, _record_action_start,
++            _checks_for_create_and_rebuild, _check_auto_disk_config,
++            _get_image, bdm_get_by_instance_uuid, get_flavor, instance_save,
++            req_spec_get_by_inst_uuid):
++        orig_system_metadata = {}
++        instance = fake_instance.fake_instance_obj(self.context,
++                vm_state=vm_states.ACTIVE, cell_name='fake-cell',
++                launched_at=timeutils.utcnow(),
++                system_metadata=orig_system_metadata,
++                image_ref='foo',
++                expected_attrs=['system_metadata'])
++        get_flavor.return_value = test_flavor.fake_flavor
++        flavor = instance.get_flavor()
++        image_href = 'foo'
++        image = {"min_ram": 10, "min_disk": 1,
++                 "properties": {'architecture':
++                                    fields_obj.Architecture.X86_64}}
++        admin_pass = ''
++        files_to_inject = []
++        bdms = objects.BlockDeviceMappingList()
++
++        _get_image.return_value = (None, image)
++        bdm_get_by_instance_uuid.return_value = bdms
++
++        fake_spec = objects.RequestSpec()
++        req_spec_get_by_inst_uuid.return_value = fake_spec
++
++        with mock.patch.object(self.compute_api.compute_task_api,
++                'rebuild_instance') as rebuild_instance:
++            self.compute_api.rebuild(self.context, instance, image_href,
++                    admin_pass, files_to_inject, userdata="foo")
++
++            rebuild_instance.assert_called_once_with(self.context,
++                    instance=instance, new_pass=admin_pass,
++                    injected_files=files_to_inject, image_ref=image_href,
++                    orig_image_ref=image_href,
++                    orig_sys_metadata=orig_system_metadata, bdms=bdms,
++                    preserve_ephemeral=False, host=instance.host,
++                    request_spec=fake_spec,
++                    kwargs={"userdata": "foo"})
++
++        # note:  kwargs are passed into _check_auto_disk_config
++        _check_auto_disk_config.assert_called_once_with(image=image,
++                                                        userdata="foo")
++        _checks_for_create_and_rebuild.assert_called_once_with(self.context,
++                None, image, flavor, {}, [], None)
++        self.assertNotEqual(orig_system_metadata, instance.system_metadata)
++
+     @mock.patch.object(objects.RequestSpec, 'save')
+     @mock.patch.object(objects.RequestSpec, 'get_by_instance_uuid')
+     @mock.patch.object(objects.Instance, 'save')
+-- 
+2.7.4
+

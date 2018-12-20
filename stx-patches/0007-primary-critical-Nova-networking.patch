@@ -1,0 +1,1204 @@
+From a81d357c4da47c51d4fc84de82429f224431748e Mon Sep 17 00:00:00 2001
+From: Gerry Kopec <Gerry.Kopec@windriver.com>
+Date: Thu, 12 Jan 2017 18:56:37 -0500
+Subject: [PATCH 007/143] primary: critical Nova networking
+
+This commit contains changes to:
+- add vif_model, mtu and mac_filtering to VIF metadata
+- add vif_model to NetworkRequest object
+- disable security groups
+- add support for vif_model on server create for api v2.19
+- limit vNICs per VM to 16
+- add wrs-if api extension for api v2.1 for server nic details
+- limit supported vif models to virtio, net2K_pci, rtl8139, e1000,
+  e1000e, sriov
+
+This includes the following R3 commits:
+abbc4dd Port critical Nova networking patches to Mitaka
+6ed7a67 Greater than 8  vNICs cause a crash
+c4b046d Add supported vif_model to servers schema v2.19
+854fa29 No error message given when bootng VM with >8 avp NICs
+
+Also includes R4 commits:
+20002fb Restrict VM to 8 NICs
+1b18596 Increase maximum number of vnics from 8 to 16
+b270993 Fix for nova 'tox -e pep8' failure
+
+For port to Newton, modified wrs-if api extension to conform to upstream
+refactoring of policy rules.
+
+For port to Pike,
+426731f add vif_model to networks properties for v2.37
+
+__TYPE_primary
+__TAG_critical,networking,vif_model
+__R4_commit_a8c0c0e
+__R3_commit_7551638
+__TC2977,TC5079
+---
+ nova/api/openstack/common.py                       |  36 +++++
+ nova/api/openstack/compute/extension_info.py       |   8 ++
+ nova/api/openstack/compute/routes.py               |   2 +
+ nova/api/openstack/compute/schemas/servers.py      |  13 ++
+ nova/api/openstack/compute/security_groups.py      |  21 ++-
+ nova/api/openstack/compute/servers.py              |  19 +++
+ nova/api/openstack/compute/wrs_server_if.py        |  70 ++++++++++
+ nova/compute/api.py                                |   4 +-
+ nova/network/model.py                              |  22 ++-
+ nova/network/neutronv2/api.py                      |  24 +++-
+ nova/objects/network_request.py                    |  19 ++-
+ nova/policies/__init__.py                          |  11 +-
+ nova/policies/wrs_server_if.py                     |  42 ++++++
+ .../compute/test_neutron_security_groups.py        |  17 ++-
+ .../unit/api/openstack/compute/test_serversV21.py  |  52 +++++--
+ .../api/openstack/compute/test_wrs_server_if.py    | 151 +++++++++++++++++++++
+ nova/tests/unit/fake_policy.py                     |  10 +-
+ nova/tests/unit/network/test_neutronv2.py          |  41 +++---
+ nova/tests/unit/objects/test_network_request.py    |  13 +-
+ nova/tests/unit/objects/test_objects.py            |  11 +-
+ nova/tests/unit/test_policy.py                     |   9 ++
+ nova/tests/unit/virt/libvirt/test_vif.py           |  16 ++-
+ nova/virt/wrs/libvirt/vif.py                       |   4 +-
+ 23 files changed, 554 insertions(+), 61 deletions(-)
+ create mode 100644 nova/api/openstack/compute/wrs_server_if.py
+ create mode 100644 nova/policies/wrs_server_if.py
+ create mode 100644 nova/tests/unit/api/openstack/compute/test_wrs_server_if.py
+
+diff --git a/nova/api/openstack/common.py b/nova/api/openstack/common.py
+index 9274fe2..582f1fd 100644
+--- a/nova/api/openstack/common.py
++++ b/nova/api/openstack/common.py
+@@ -12,6 +12,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2013-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ import collections
+ import functools
+@@ -288,6 +295,35 @@ def check_img_metadata_properties_quota(context, metadata):
+         raise webob.exc.HTTPForbidden(explanation=expl)
+ 
+ 
++# extension
++def get_nics_for_instance_from_nw_info(nw_info):
++    nics = []
++    for index, vif in enumerate(nw_info):
++        name = "nic" + str(index + 1)
++        nics.append({name: {'port_id': vif['id'],
++                            'mac_address': vif['address'],
++                            'vif_model': vif['vif_model'],
++                            'mtu': vif['mtu'],
++                            'network': vif['network']['label']}})
++    return nics
++
++
++# extension
++def get_nics_for_instance(context, instance):
++    """Returns a prepared nic/vif list for passing into the view builders
++
++    We end up with a data structure like::
++
++        {'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa':
++            {'vif_model': 'virtio',
++             'mtu': 1500,
++             'index'}}
++         ...}
++    """
++    nw_info = instance.get_network_info()
++    return get_nics_for_instance_from_nw_info(nw_info)
++
++
+ def get_networks_for_instance_from_nw_info(nw_info):
+     networks = collections.OrderedDict()
+     for vif in nw_info:
+diff --git a/nova/api/openstack/compute/extension_info.py b/nova/api/openstack/compute/extension_info.py
+index d3eb9be..683ee06 100644
+--- a/nova/api/openstack/compute/extension_info.py
++++ b/nova/api/openstack/compute/extension_info.py
+@@ -839,6 +839,14 @@ EXTENSION_LIST = [
+         "name": "Volumes",
+         "namespace": "http://docs.openstack.org/compute/ext/fake_xml",
+         "updated": "2014-12-03T00:00:00Z"
++    },
++    {
++        "alias": "wrs-if",
++        "description": "Adds wrs-if:nics on Servers.",
++        "links": [],
++        "name": "WrsServerIf",
++        "namespace": "http://docs.openstack.org/compute/ext/fake_xml",
++        "updated": "2014-12-03T00:00:00Z"
+     }
+ ]
+ 
+diff --git a/nova/api/openstack/compute/routes.py b/nova/api/openstack/compute/routes.py
+index 7b7d75c..88b3e0d 100644
+--- a/nova/api/openstack/compute/routes.py
++++ b/nova/api/openstack/compute/routes.py
+@@ -93,6 +93,7 @@ from nova.api.openstack.compute import used_limits
+ from nova.api.openstack.compute import versionsV21
+ from nova.api.openstack.compute import virtual_interfaces
+ from nova.api.openstack.compute import volumes
++from nova.api.openstack.compute import wrs_server_if
+ from nova.api.openstack import wsgi
+ import nova.conf
+ from nova import wsgi as base_wsgi
+@@ -286,6 +287,7 @@ server_controller = functools.partial(_create_controller,
+         keypairs.Controller,
+         security_groups.SecurityGroupsOutputController,
+         server_usage.ServerUsageController,
++        wrs_server_if.WrsServerIfController
+     ],
+     [
+         admin_actions.AdminActionsController,
+diff --git a/nova/api/openstack/compute/schemas/servers.py b/nova/api/openstack/compute/schemas/servers.py
+index b6a2c54..efb031b 100644
+--- a/nova/api/openstack/compute/schemas/servers.py
++++ b/nova/api/openstack/compute/schemas/servers.py
+@@ -11,11 +11,19 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2016-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ import copy
+ 
+ from nova.api.validation import parameter_types
+ from nova.api.validation.parameter_types import multi_params
++from nova.network import model
+ from nova.objects import instance
+ 
+ base_create = {
+@@ -71,6 +79,9 @@ base_create_v20['properties']['server'][
+ base_create_v219 = copy.deepcopy(base_create)
+ base_create_v219['properties']['server'][
+     'properties']['description'] = parameter_types.description
++# add vif_model to networks properties for v2.19
++base_create_v219['properties']['server']['properties']['networks'][
++    'items']['properties']['wrs-if:vif_model'] = {'enum': model.VIF_MODEL_ALL}
+ 
+ 
+ base_create_v232 = copy.deepcopy(base_create_v219)
+@@ -97,6 +108,8 @@ base_create_v237['properties']['server']['properties']['networks'] = {
+                                {'type': 'null'}]
+                  },
+                  'uuid': {'type': 'string', 'format': 'uuid'},
++                 # add vif_model to networks properties for v2.37
++                 'wrs-if:vif_model': {'enum': model.VIF_MODEL_ALL},
+              },
+              'additionalProperties': False,
+          },
+diff --git a/nova/api/openstack/compute/security_groups.py b/nova/api/openstack/compute/security_groups.py
+index e8d0717..22027f0 100644
+--- a/nova/api/openstack/compute/security_groups.py
++++ b/nova/api/openstack/compute/security_groups.py
+@@ -13,6 +13,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2013-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ """The security groups extension."""
+ from oslo_log import log as logging
+@@ -464,10 +471,16 @@ class SecurityGroupsOutputController(wsgi.Controller):
+                     self.security_group_api
+                     .get_instances_security_groups_bindings(context,
+                                                                 servers))
+-                for server in servers:
+-                    groups = sg_instance_bindings.get(server['id'])
+-                    if groups:
+-                        server[ATTRIBUTE_NAME] = groups
++                # only get the security groups if doing a detailed show of a
++                # specific instance, otherwise the retrieval of the port list
++                # from neutron causes a neutron CPU usage to spike when there
++                # are a large number of ports
++                if len(servers) == 1:
++                    for server in servers:
++                        groups = sg_instance_bindings.get(server['id'])
++                        if groups:
++                            server[ATTRIBUTE_NAME] = groups
+ 
+             # In this section of code len(servers) == 1 as you can only POST
+             # one server in an API request.
+diff --git a/nova/api/openstack/compute/servers.py b/nova/api/openstack/compute/servers.py
+index 48f0d64..ef643b4 100644
+--- a/nova/api/openstack/compute/servers.py
++++ b/nova/api/openstack/compute/servers.py
+@@ -13,6 +13,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2013-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ import copy
+ 
+@@ -423,6 +438,10 @@ class ServersController(wsgi.Controller):
+                         request.network_id, network_uuids)
+                     network_uuids.append(request.network_id)
+ 
++                # vif_model is optional
++                if utils.is_neutron():
++                    request.vif_model = network.get('wrs-if:vif_model', None)
++
+                 networks.append(request)
+             except KeyError as key:
+                 expl = _('Bad network format: missing %s') % key
+diff --git a/nova/api/openstack/compute/wrs_server_if.py b/nova/api/openstack/compute/wrs_server_if.py
+new file mode 100644
+index 0000000..6414400
+--- /dev/null
++++ b/nova/api/openstack/compute/wrs_server_if.py
+@@ -0,0 +1,70 @@
++#   Licensed under the Apache License, Version 2.0 (the "License"); you may
++#   not use this file except in compliance with the License. You may obtain
++#   a copy of the License at
++#
++#       http://www.apache.org/licenses/LICENSE-2.0
++#
++#   Unless required by applicable law or agreed to in writing, software
++#   distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#   WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#   License for the specific language governing permissions and limitations
++#   under the License.
++#
++# Copyright (c) 2014-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
++
++"""The Server Groups Extension."""
++
++from nova.api.openstack import common
++from nova.api.openstack import wsgi
++from nova import exception
++from nova.policies import wrs_server_if as wrs_if_policies
++
++
++class WrsServerIfController(wsgi.Controller):
++    def __init__(self, *args, **kwargs):
++        super(WrsServerIfController, self).__init__(*args, **kwargs)
++
++    def _extend_server(self, context, server, instance):
++        server["wrs-if:nics"] = common.get_nics_for_instance(context, instance)
++
++    @wsgi.extends
++    def show(self, req, resp_obj, id):
++        context = req.environ['nova.context']
++        if context.can(wrs_if_policies.BASE_POLICY_NAME, fatal=False):
++            server = resp_obj.obj['server']
++            db_instance = req.get_db_instance(server['id'])
++            # server['id'] is guaranteed to be in the cache due to
++            # the core API adding it in its 'show' method.
++            self._extend_server(context, server, db_instance)
++
++    @wsgi.extends
++    def detail(self, req, resp_obj):
++        context = req.environ['nova.context']
++        if context.can(wrs_if_policies.BASE_POLICY_NAME, fatal=False):
++            servers = list(resp_obj.obj['servers'])
++            for server in servers:
++                instance = req.get_db_instance(server['id'])
++                # server['id'] is guaranteed to be in the cache due to
++                # the core API adding it in its 'detail' method.
++                self._extend_server(context, server, instance)
+diff --git a/nova/compute/api.py b/nova/compute/api.py
+index 27ddbf6..584c0b9 100644
+--- a/nova/compute/api.py
++++ b/nova/compute/api.py
+@@ -1073,7 +1073,9 @@ class API(base.Base):
+         # Normalize and setup some parameters
+         if reservation_id is None:
+             reservation_id = utils.generate_uid('r')
+-        security_groups = security_groups or ['default']
++        # DO NOT SET A DEFAULT SECURITY GROUP
++        # security_groups = security_groups or ['default']
++        security_groups = security_groups or []
+         min_count = min_count or 1
+         max_count = max_count or min_count
+         block_device_mapping = block_device_mapping or []
+diff --git a/nova/network/model.py b/nova/network/model.py
+index 763e56d..0760e9f 100644
+--- a/nova/network/model.py
++++ b/nova/network/model.py
+@@ -12,6 +12,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2013-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ import functools
+ 
+@@ -128,6 +135,12 @@ VIF_MODEL_SRIOV = 'sriov'
+ VIF_MODEL_VMXNET = 'vmxnet'
+ VIF_MODEL_VMXNET3 = 'vmxnet3'
+ 
++# change supported vif_models from upstream
++#   removed: VIF_MODEL_NETFRONT, VIF_MODEL_SPAPR_VLAN, VIF_MODEL_VMXNET,
++#            VIF_MODEL_VMXNET3
+ VIF_MODEL_ALL = (
+     VIF_MODEL_VIRTIO,
+     VIF_MODEL_NE2K_PCI,
+@@ -135,12 +148,9 @@ VIF_MODEL_ALL = (
+     VIF_MODEL_RTL8139,
+     VIF_MODEL_E1000,
+     VIF_MODEL_E1000E,
+-    VIF_MODEL_NETFRONT,
+-    VIF_MODEL_SPAPR_VLAN,
+     VIF_MODEL_LAN9118,
+     VIF_MODEL_SRIOV,
+-    VIF_MODEL_VMXNET,
+-    VIF_MODEL_VMXNET3,
+ )
+ 
+ # these types have been leaked to guests in network_data.json
+@@ -378,6 +388,7 @@ class VIF(Model):
+                  details=None, devname=None, ovs_interfaceid=None,
+                  qbh_params=None, qbg_params=None, active=False,
+                  vnic_type=VNIC_TYPE_NORMAL, profile=None,
++                 mtu=None, vif_model=None,
+                  preserve_on_delete=False, **kwargs):
+         super(VIF, self).__init__()
+ 
+@@ -395,6 +406,9 @@ class VIF(Model):
+         self['vnic_type'] = vnic_type
+         self['profile'] = profile
+         self['preserve_on_delete'] = preserve_on_delete
++        # extension: add mtu & vif_model
++        self['mtu'] = mtu
++        self['vif_model'] = vif_model
+ 
+         self._set_meta(kwargs)
+ 
+diff --git a/nova/network/neutronv2/api.py b/nova/network/neutronv2/api.py
+index c148bc6..7238e6f 100644
+--- a/nova/network/neutronv2/api.py
++++ b/nova/network/neutronv2/api.py
+@@ -14,6 +14,12 @@
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
+ #
++# Copyright (c) 2013-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ import time
+ 
+@@ -1193,7 +1199,9 @@ class API(base_api.NetworkAPI):
+         # NOTE(danms): Temporary and transitional
+         if isinstance(requested_networks, objects.NetworkRequestList):
+             requested_networks = requested_networks.as_tuples()
+-        ports_to_skip = set([port_id for nets, fips, port_id, pci_request_id
++        # extension: add vif_model
++        ports_to_skip = set([port_id for nets, fips, port_id,
++                             pci_request_id, vif_model
+                              in requested_networks])
+         # NOTE(boden): requested_networks only passed in when deallocating
+         # from a failed build / spawn call. Therefore we need to include
+@@ -1218,16 +1226,19 @@ class API(base_api.NetworkAPI):
+         base_api.update_instance_cache_with_nw_info(self, context, instance,
+                                             network_model.NetworkInfo([]))
+ 
++    # extension: add vif_model
+     def allocate_port_for_instance(self, context, instance, port_id,
+                                    network_id=None, requested_ip=None,
+-                                   bind_host_id=None, tag=None):
++                                   bind_host_id=None, tag=None,
++                                   vif_model=None):
+         """Allocate a port for the instance."""
+         requested_networks = objects.NetworkRequestList(
+             objects=[objects.NetworkRequest(network_id=network_id,
+                                             address=requested_ip,
+                                             port_id=port_id,
+                                             pci_request_id=None,
+-                                            tag=tag)])
++                                            tag=tag,
++                                            vif_model=vif_model)])
+         return self.allocate_for_instance(context, instance, vpn=False,
+                 requested_networks=requested_networks,
+                 bind_host_id=bind_host_id)
+@@ -2321,9 +2332,14 @@ class API(base_api.NetworkAPI):
+                         network_model.VNIC_TYPE_NORMAL),
+                     type=current_neutron_port.get('binding:vif_type'),
+                     profile=_get_binding_profile(current_neutron_port),
+-                    details=current_neutron_port.get('binding:vif_details'),
++                    # extension: add mtu, vif_model, mac_filter
++                    mtu=current_neutron_port.get('binding:mtu'),
++                    vif_model=current_neutron_port.get('binding:vif_model'),
+                     ovs_interfaceid=ovs_interfaceid,
+                     devname=devname,
++                    mac_filter=current_neutron_port.get(
++                        'binding:mac_filtering', False),
++                    details=current_neutron_port.get('binding:vif_details'),
+                     active=vif_active,
+                     preserve_on_delete=preserve_on_delete))
+ 
+diff --git a/nova/objects/network_request.py b/nova/objects/network_request.py
+index 4eade4e..eacb3c5 100644
+--- a/nova/objects/network_request.py
++++ b/nova/objects/network_request.py
+@@ -11,6 +11,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2013-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ from oslo_utils import versionutils
+ 
+@@ -33,12 +40,14 @@ class NetworkRequest(obj_base.NovaObject):
+     # Version 1.1: Added pci_request_id
+     # Version 1.2: Added tag field
+     VERSION = '1.2'
++    #              Added vif_model
+     fields = {
+         'network_id': fields.StringField(nullable=True),
+         'address': fields.IPAddressField(nullable=True),
+         'port_id': fields.UUIDField(nullable=True),
+         'pci_request_id': fields.UUIDField(nullable=True),
+         'tag': fields.StringField(nullable=True),
++        'vif_model': fields.StringField(nullable=True),
+     }
+ 
+     def obj_make_compatible(self, primitive, target_version):
+@@ -52,16 +61,18 @@ class NetworkRequest(obj_base.NovaObject):
+     def to_tuple(self):
+         address = str(self.address) if self.address is not None else None
+         if utils.is_neutron():
+-            return self.network_id, address, self.port_id, self.pci_request_id
++            return (self.network_id, address, self.port_id,
++                    self.pci_request_id, self.vif_model)
+         else:
+             return self.network_id, address
+ 
+     @classmethod
+     def from_tuple(cls, net_tuple):
+-        if len(net_tuple) == 4:
+-            network_id, address, port_id, pci_request_id = net_tuple
++        if len(net_tuple) == 5:
++            network_id, address, port_id, pci_request_id, vif_model = net_tuple
+             return cls(network_id=network_id, address=address,
+-                       port_id=port_id, pci_request_id=pci_request_id)
++                       port_id=port_id, pci_request_id=pci_request_id,
++                       vif_model=vif_model)
+         else:
+             network_id, address = net_tuple
+             return cls(network_id=network_id, address=address)
+diff --git a/nova/policies/__init__.py b/nova/policies/__init__.py
+index 627b082..4af7335 100644
+--- a/nova/policies/__init__.py
++++ b/nova/policies/__init__.py
+@@ -9,6 +9,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ 
+ import itertools
+@@ -87,6 +94,7 @@ from nova.policies import used_limits
+ from nova.policies import virtual_interfaces
+ from nova.policies import volumes
+ from nova.policies import volumes_attachments
++from nova.policies import wrs_server_if
+ 
+ 
+ def list_rules():
+@@ -164,5 +172,6 @@ def list_rules():
+         used_limits.list_rules(),
+         virtual_interfaces.list_rules(),
+         volumes.list_rules(),
+-        volumes_attachments.list_rules()
++        volumes_attachments.list_rules(),
++        wrs_server_if.list_rules()
+     )
+diff --git a/nova/policies/wrs_server_if.py b/nova/policies/wrs_server_if.py
+new file mode 100644
+index 0000000..91b4c6b
+--- /dev/null
++++ b/nova/policies/wrs_server_if.py
+@@ -0,0 +1,42 @@
++#
++# Copyright (c) 2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
++
++from oslo_policy import policy
++
++from nova.policies import base
++
++
++BASE_POLICY_NAME = 'os_compute_api:wrs-if'
++
++
++wrs_if_policies = [
++     policy.DocumentedRuleDefault(
++         BASE_POLICY_NAME,
++         base.RULE_ADMIN_OR_OWNER,
++         """Add wrs-if:nics attribute in the server response.
++
++This check is performed only after the check
++'os_compute_api:servers:show' for GET /servers/{id} and
++'os_compute_api:servers:detail' for GET /servers/detail passes""",
++
++
++         [
++             {
++                 'method': 'GET',
++                 'path': '/servers/{id}'
++             },
++             {
++                 'method': 'GET',
++                 'path': '/servers/detail'
++             }
++         ]),
++]
++
++
++def list_rules():
++    return wrs_if_policies
+diff --git a/nova/tests/unit/api/openstack/compute/test_neutron_security_groups.py b/nova/tests/unit/api/openstack/compute/test_neutron_security_groups.py
+index bca44f6..39db3df 100644
+--- a/nova/tests/unit/api/openstack/compute/test_neutron_security_groups.py
++++ b/nova/tests/unit/api/openstack/compute/test_neutron_security_groups.py
+@@ -12,6 +12,14 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2013-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
++
+ import six
+ 
+ import mock
+@@ -621,10 +629,11 @@ class TestNeutronSecurityGroupsOutputTest(TestNeutronSecurityGroupsTestCase):
+         res = self._make_request(url)
+ 
+         self.assertEqual(res.status_int, 200)
+-        for i, server in enumerate(self._get_servers(res.body)):
+-            for j, group in enumerate(self._get_groups(server)):
+-                name = 'fake-%s-%s' % (i, j)
+-                self.assertEqual(group.get('name'), name)
++        # Security groups are not returned when there are multiple servers
++        # for i, server in enumerate(self._get_servers(res.body)):
++        #     for j, group in enumerate(self._get_groups(server)):
++        #         name = 'fake-%s-%s' % (i, j)
++        #         self.assertEqual(group.get('name'), name)
+ 
+     def test_no_instance_passthrough_404(self):
+ 
+diff --git a/nova/tests/unit/api/openstack/compute/test_serversV21.py b/nova/tests/unit/api/openstack/compute/test_serversV21.py
+index a1d2e1a..8d995e4 100644
+--- a/nova/tests/unit/api/openstack/compute/test_serversV21.py
++++ b/nova/tests/unit/api/openstack/compute/test_serversV21.py
+@@ -13,6 +13,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2013-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ import collections
+ import datetime
+@@ -214,21 +221,32 @@ class ServersControllerTest(ControllerTest):
+         uuid = 'br-00000000-0000-0000-0000-000000000000'
+         requested_networks = [{'uuid': uuid}]
+         res = self.controller._get_requested_networks(requested_networks)
+-        self.assertIn((uuid, None, None, None), res.as_tuples())
++        self.assertIn((uuid, None, None, None, None), res.as_tuples())
+ 
+     def test_requested_networks_neutronv2_enabled_with_port(self):
+         self.flags(use_neutron=True)
+         port = 'eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee'
+         requested_networks = [{'port': port}]
+         res = self.controller._get_requested_networks(requested_networks)
+-        self.assertEqual([(None, None, port, None)], res.as_tuples())
++        self.assertEqual([(None, None, port, None, None)],
++                         res.as_tuples())
+ 
+     def test_requested_networks_neutronv2_enabled_with_network(self):
+         self.flags(use_neutron=True)
+         network = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
+         requested_networks = [{'uuid': network}]
+         res = self.controller._get_requested_networks(requested_networks)
+-        self.assertEqual([(network, None, None, None)], res.as_tuples())
++        self.assertEqual([(network, None, None, None, None)],
++                         res.as_tuples())
+ 
+     def test_requested_networks_neutronv2_enabled_with_network_and_port(self):
+         self.flags(use_neutron=True)
+@@ -236,7 +254,8 @@ class ServersControllerTest(ControllerTest):
+         port = 'eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee'
+         requested_networks = [{'uuid': network, 'port': port}]
+         res = self.controller._get_requested_networks(requested_networks)
+-        self.assertEqual([(None, None, port, None)], res.as_tuples())
++        self.assertEqual([(None, None, port, None, None)],
++                         res.as_tuples())
+ 
+     def test_requested_networks_with_duplicate_networks_nova_net(self):
+         # duplicate networks are allowed only for nova neutron v2.0
+@@ -254,8 +273,9 @@ class ServersControllerTest(ControllerTest):
+         network = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
+         requested_networks = [{'uuid': network}, {'uuid': network}]
+         res = self.controller._get_requested_networks(requested_networks)
+-        self.assertEqual([(network, None, None, None),
+-                          (network, None, None, None)], res.as_tuples())
++        self.assertEqual([(network, None, None, None, None),
++                          (network, None, None, None, None)],
++                         res.as_tuples())
+ 
+     def test_requested_networks_neutronv2_enabled_conflict_on_fixed_ip(self):
+         self.flags(use_neutron=True)
+@@ -285,7 +305,8 @@ class ServersControllerTest(ControllerTest):
+         port = 'eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee'
+         requested_networks = [{'uuid': network, 'port': port}]
+         res = self.controller._get_requested_networks(requested_networks)
+-        self.assertEqual([(None, None, port, None)], res.as_tuples())
++        self.assertEqual([(None, None, port, None, None)],
++                         res.as_tuples())
+ 
+     def test_get_server_by_uuid(self):
+         req = self.req('/fake/servers/%s' % FAKE_UUID)
+@@ -365,7 +386,8 @@ class ServersControllerTest(ControllerTest):
+                         {'version': 4, 'addr': '192.168.1.100',
+                          'OS-EXT-IPS:type': 'fixed',
+                          'OS-EXT-IPS-MAC:mac_addr': 'aa:aa:aa:aa:aa:aa'},
+-                        {'version': 6, 'addr': '2001:db8:0:1::1',
++                        {'version': 6,
++                         'addr': '2001:db8:0:1::1',
+                          'OS-EXT-IPS:type': 'fixed',
+                          'OS-EXT-IPS-MAC:mac_addr': 'aa:aa:aa:aa:aa:aa'}
+                     ]
+@@ -2957,7 +2979,7 @@ class ServersControllerCreateTest(test.TestCase):
+ 
+         def create(*args, **kwargs):
+             result = [('76fa36fc-c930-4bf3-8c8a-ea2a2420deb6', None,
+-                       None, None)]
++                       None, None, None)]
+             self.assertEqual(result, kwargs['requested_networks'].as_tuples())
+             return old_create(*args, **kwargs)
+ 
+diff --git a/nova/tests/unit/api/openstack/compute/test_wrs_server_if.py b/nova/tests/unit/api/openstack/compute/test_wrs_server_if.py
+new file mode 100644
+index 0000000..2e67bea
+--- /dev/null
++++ b/nova/tests/unit/api/openstack/compute/test_wrs_server_if.py
+@@ -0,0 +1,151 @@
++#   Licensed under the Apache License, Version 2.0 (the "License"); you may
++#   not use this file except in compliance with the License. You may obtain
++#   a copy of the License at
++#
++#       http://www.apache.org/licenses/LICENSE-2.0
++#
++#   Unless required by applicable law or agreed to in writing, software
++#   distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#   WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#   License for the specific language governing permissions and limitations
++#   under the License.
++#
++# Copyright (c) 2015-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
++
++from oslo_serialization import jsonutils
++
++from nova.api.openstack import wsgi as os_wsgi
++from nova import objects
++from nova import test
++from nova.tests.unit.api.openstack import fakes
++
++UUID1 = '00000000-0000-0000-0000-000000000001'
++UUID2 = '00000000-0000-0000-0000-000000000002'
++UUID3 = '00000000-0000-0000-0000-000000000003'
++NW_CACHE = [
++    {
++        'address': 'aa:aa:aa:aa:aa:aa',
++        'id': 1,
++        'vif_model': 'virtio',
++        'network': {
++            'bridge': 'br0',
++            'id': 1,
++            'label': 'private',
++            'subnets': [
++                {
++                    'cidr': '192.168.1.0/24',
++                    'ips': [
++                        {
++                            'address': '192.168.1.100',
++                            'type': 'fixed',
++                            'floating_ips': [
++                                {'address': '5.0.0.1', 'type': 'floating'},
++                            ],
++                        },
++                    ],
++                },
++            ]
++        }
++    },
++    {
++        'address': 'bb:bb:bb:bb:bb:bb',
++        'id': 2,
++        'vif_model': None,
++        'network': {
++            'bridge': 'br1',
++            'id': 2,
++            'label': 'public',
++            'subnets': [
++                {
++                    'cidr': '10.0.0.0/24',
++                    'ips': [
++                        {
++                            'address': '10.0.0.100',
++                            'type': 'fixed',
++                            'floating_ips': [
++                                {'address': '5.0.0.2', 'type': 'floating'},
++                            ],
++                        }
++                    ],
++                },
++            ]
++        }
++    }
++]
++ALL_NICS = []
++for index, cache in enumerate(NW_CACHE):
++    name = 'nic' + str(index + 1)
++    nic = {name: {'port_id': cache['id'],
++                  'mac_address': cache['address'],
++                  'vif_model': cache['vif_model'],
++                  'mtu': None,  # only available from neutron in real env
++                  'network': cache['network']['label']}}
++    ALL_NICS.append(nic)
++
++
++def fake_compute_get(*args, **kwargs):
++    inst = fakes.stub_instance_obj(None, 1, uuid=UUID3, nw_cache=NW_CACHE)
++    return inst
++
++
++def fake_compute_get_all(*args, **kwargs):
++    inst_list = [
++        fakes.stub_instance_obj(None, 1, uuid=UUID1, nw_cache=NW_CACHE),
++        fakes.stub_instance_obj(None, 2, uuid=UUID2, nw_cache=NW_CACHE),
++    ]
++    return objects.InstanceList(objects=inst_list)
++
++
++class WrsServerIfTestV21(test.TestCase):
++    content_type = 'application/json'
++    prefix = 'wrs-if'
++    _prefix = "/v2/fake"
++    wsgi_api_version = os_wsgi.DEFAULT_API_VERSION
++
++    def setUp(self):
++        super(WrsServerIfTestV21, self).setUp()
++        self.flags(use_neutron=False)
++        fakes.stub_out_nw_api(self)
++        self.stub_out('nova.compute.api.API.get', fake_compute_get)
++        self.stub_out('nova.compute.api.API.get_all', fake_compute_get_all)
++        return_server = fakes.fake_instance_get()
++        self.stub_out('nova.db.instance_get_by_uuid', return_server)
++
++    def _make_request(self, url):
++        req = fakes.HTTPRequest.blank(url)
++        req.accept = self.content_type
++        res = req.get_response(self._get_app())
++        return res
++
++    def _get_app(self):
++        return fakes.wsgi_app_v21()
++
++    def _get_server(self, body):
++        return jsonutils.loads(body).get('server')
++
++    def _get_servers(self, body):
++        return jsonutils.loads(body).get('servers')
++
++    def _get_nics(self, server):
++        return server['wrs-if:nics']
++
++    def assertServerNics(self, server):
++        self.assertEqual(ALL_NICS, self._get_nics(server))
++
++    def test_show(self):
++        url = self._prefix + '/servers/%s' % UUID3
++        res = self._make_request(url)
++        self.assertEqual(res.status_int, 200)
++        self.assertServerNics(self._get_server(res.body))
++
++    def test_detail(self):
++        url = self._prefix + '/servers/detail'
++        res = self._make_request(url)
++        self.assertEqual(res.status_int, 200)
++        for i, server in enumerate(self._get_servers(res.body)):
++            self.assertServerNics(server)
+diff --git a/nova/tests/unit/fake_policy.py b/nova/tests/unit/fake_policy.py
+index 920ed06..c80cf2b 100644
+--- a/nova/tests/unit/fake_policy.py
++++ b/nova/tests/unit/fake_policy.py
+@@ -11,6 +11,13 @@
+ # WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ # License for the specific language governing permissions and limitations
+ # under the License.
++#
++# Copyright (c) 2016-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ 
+ policy_data = """
+@@ -126,6 +133,7 @@ policy_data = """
+     "os_compute_api:server-metadata:update_all": "",
+     "os_compute_api:server-metadata:delete": "",
+     "os_compute_api:server-metadata:show": "",
+-    "os_compute_api:server-metadata:index": ""
++    "os_compute_api:server-metadata:index": "",
++    "os_compute_api:wrs-if": ""
+ }
+ """
+diff --git a/nova/tests/unit/network/test_neutronv2.py b/nova/tests/unit/network/test_neutronv2.py
+index 8acf716..c6617e0 100644
+--- a/nova/tests/unit/network/test_neutronv2.py
++++ b/nova/tests/unit/network/test_neutronv2.py
+@@ -13,6 +13,12 @@
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
+ #
++# Copyright (c) 2013-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ import collections
+ import copy
+@@ -490,7 +496,8 @@ class TestNeutronv2Base(test.TestCase):
+             return api
+ 
+         if (('requested_networks' not in kwargs or
+-             kwargs['requested_networks'].as_tuples() == [(None, None, None)])
++             kwargs['requested_networks'].as_tuples() == [(None, None, None,
++                                                          None)])
+             and len(nets) > 1):
+                 self.mox.ReplayAll()
+                 return api
+@@ -1567,7 +1574,7 @@ class TestNeutronv2(TestNeutronv2Base):
+                 # NOTE(danms): Temporary and transitional
+                 with mock.patch('nova.utils.is_neutron', return_value=True):
+                     requested_networks = requested_networks.as_tuples()
+-            for net, fip, port, request_id in requested_networks:
++            for net, fip, port, request_id, vif_model in requested_networks:
+                 ret_data.append({'network_id': net,
+                                  'device_id': self.instance.uuid,
+                                  'device_owner': 'compute:nova',
+@@ -1582,7 +1589,7 @@ class TestNeutronv2(TestNeutronv2Base):
+                 {'ports': ret_data})
+         self.moxed_client.list_extensions().AndReturn({'extensions': []})
+         if requested_networks:
+-            for net, fip, port, request_id in requested_networks:
++            for net, fip, port, request_id, vif_model in requested_networks:
+                 self.moxed_client.update_port(port)
+         for port in ports:
+             self.moxed_client.delete_port(port).InAnyOrder("delete_port_group")
+@@ -1724,8 +1731,8 @@ class TestNeutronv2(TestNeutronv2Base):
+         neutronapi.API().show_port(self.context, 'foo')
+ 
+     def test_validate_networks(self):
+-        requested_networks = [(uuids.my_netid1, None, None, None),
+-                              (uuids.my_netid2, None, None, None)]
++        requested_networks = [(uuids.my_netid1, None, None, None, None),
++                              (uuids.my_netid2, None, None, None, None)]
+         ids = [uuids.my_netid1, uuids.my_netid2]
+         neutronapi.get_client(mox.IgnoreArg()).AndReturn(self.moxed_client)
+         self.moxed_client.list_networks(
+@@ -1742,8 +1749,8 @@ class TestNeutronv2(TestNeutronv2Base):
+         api.validate_networks(self.context, requested_networks, 1)
+ 
+     def test_validate_networks_without_port_quota_on_network_side(self):
+-        requested_networks = [(uuids.my_netid1, None, None, None),
+-                              (uuids.my_netid2, None, None, None)]
++        requested_networks = [(uuids.my_netid1, None, None, None, None),
++                              (uuids.my_netid2, None, None, None, None)]
+         ids = [uuids.my_netid1, uuids.my_netid2]
+         neutronapi.get_client(mox.IgnoreArg()).AndReturn(self.moxed_client)
+         self.moxed_client.list_networks(
+@@ -1757,7 +1764,7 @@ class TestNeutronv2(TestNeutronv2Base):
+         api.validate_networks(self.context, requested_networks, 1)
+ 
+     def test_validate_networks_ex_1(self):
+-        requested_networks = [(uuids.my_netid1, None, None, None)]
++        requested_networks = [(uuids.my_netid1, None, None, None, None)]
+         neutronapi.get_client(mox.IgnoreArg()).AndReturn(self.moxed_client)
+         self.moxed_client.list_networks(
+             id=mox.SameElementsAs([uuids.my_netid1])).AndReturn(
+@@ -1776,9 +1783,9 @@ class TestNeutronv2(TestNeutronv2Base):
+             self.assertIn("my_netid2", six.text_type(ex))
+ 
+     def test_validate_networks_ex_2(self):
+-        requested_networks = [(uuids.my_netid1, None, None, None),
+-                              (uuids.my_netid2, None, None, None),
+-                              (uuids.my_netid3, None, None, None)]
++        requested_networks = [(uuids.my_netid1, None, None, None, None),
++                              (uuids.my_netid2, None, None, None, None),
++                              (uuids.my_netid3, None, None, None, None)]
+         ids = [uuids.my_netid1, uuids.my_netid2, uuids.my_netid3]
+         neutronapi.get_client(mox.IgnoreArg()).AndReturn(self.moxed_client)
+         self.moxed_client.list_networks(
+@@ -3452,8 +3459,8 @@ class TestNeutronv2WithMock(test.TestCase):
+         """Test validates that a relevant exception is being raised when
+            there are more ports defined, than there is a quota for it.
+         """
+-        requested_networks = [(uuids.my_netid1, '10.0.1.2', None, None),
+-                              (uuids.my_netid2, '10.0.1.3', None, None)]
++        requested_networks = [(uuids.my_netid1, '10.0.1.2', None, None, None),
++                              (uuids.my_netid2, '10.0.1.3', None, None, None)]
+ 
+         list_port_values = [({'network_id': uuids.my_netid1,
+                               'fixed_ips': 'ip_address=10.0.1.2',
+@@ -3501,7 +3508,7 @@ class TestNeutronv2WithMock(test.TestCase):
+                   'subnets': ['mysubnid1'],
+                   'tenant_id': 'fake-project'}]
+ 
+-        requested_networks = [(uuids.my_netid1, '10.0.1.2', None, None)]
++        requested_networks = [(uuids.my_netid1, '10.0.1.2', None, None, None)]
+         ids = [uuids.my_netid1]
+         list_port_values = [({'network_id': uuids.my_netid1,
+                               'fixed_ips': 'ip_address=10.0.1.2',
+@@ -3525,8 +3532,8 @@ class TestNeutronv2WithMock(test.TestCase):
+                   'subnets': ['mysubnid2'],
+                   'tenant_id': 'fake-project'}]
+ 
+-        requested_networks = [(uuids.my_netid1, '10.0.1.2', None, None),
+-                              (uuids.my_netid2, '10.0.1.3', None, None)]
++        requested_networks = [(uuids.my_netid1, '10.0.1.2', None, None, None),
++                              (uuids.my_netid2, '10.0.1.3', None, None, None)]
+         ids = [uuids.my_netid1, uuids.my_netid2]
+         list_port_values = [({'network_id': uuids.my_netid1,
+                               'fixed_ips': 'ip_address=10.0.1.2',
+@@ -3547,7 +3554,7 @@ class TestNeutronv2WithMock(test.TestCase):
+         # Test validation for a request for a network with a
+         # fixed ip that is already in use
+ 
+-        requested_networks = [(uuids.my_netid1, '10.0.1.2', None, None)]
++        requested_networks = [(uuids.my_netid1, '10.0.1.2', None, None, None)]
+         list_port_mock_params = {'network_id': uuids.my_netid1,
+                                  'fixed_ips': 'ip_address=10.0.1.2',
+                                  'fields': 'device_id'}
+diff --git a/nova/tests/unit/objects/test_network_request.py b/nova/tests/unit/objects/test_network_request.py
+index 80c63c8..1dd4f61 100644
+--- a/nova/tests/unit/objects/test_network_request.py
++++ b/nova/tests/unit/objects/test_network_request.py
+@@ -11,6 +11,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2013-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ import mock
+ 
+@@ -43,7 +50,7 @@ class _TestNetworkRequestObject(object):
+                                          port_id=FAKE_UUID,
+                                      )
+         with mock.patch('nova.utils.is_neutron', return_value=True):
+-            self.assertEqual(('123', '1.2.3.4', FAKE_UUID, None),
++            self.assertEqual(('123', '1.2.3.4', FAKE_UUID, None, None),
+                              request.to_tuple())
+ 
+     def test_to_tuple_nova(self):
+@@ -56,7 +63,7 @@ class _TestNetworkRequestObject(object):
+ 
+     def test_from_tuples_neutron(self):
+         requests = objects.NetworkRequestList.from_tuples(
+-            [('123', '1.2.3.4', FAKE_UUID, None)])
++            [('123', '1.2.3.4', FAKE_UUID, None, None)])
+         self.assertEqual(1, len(requests))
+         self.assertEqual('123', requests[0].network_id)
+         self.assertEqual('1.2.3.4', str(requests[0].address))
+@@ -77,7 +84,7 @@ class _TestNetworkRequestObject(object):
+             objects=[objects.NetworkRequest(network_id='123'),
+                      objects.NetworkRequest(network_id='456')])
+         self.assertEqual(
+-            [('123', None, None, None), ('456', None, None, None)],
++            [('123', None, None, None, None), ('456', None, None, None, None)],
+              requests.as_tuples())
+ 
+     def test_is_single_unspecified(self):
+diff --git a/nova/tests/unit/objects/test_objects.py b/nova/tests/unit/objects/test_objects.py
+index 6b6bcca..e3e9fc2 100644
+--- a/nova/tests/unit/objects/test_objects.py
++++ b/nova/tests/unit/objects/test_objects.py
+@@ -11,6 +11,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2013-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ import contextlib
+ import copy
+@@ -1099,7 +1106,7 @@ object_data = {
+     'HVSpec': '1.2-de06bcec472a2f04966b855a49c46b41',
+     'IDEDeviceBus': '1.0-29d4c9f27ac44197f01b6ac1b7e16502',
+     'ImageMeta': '1.8-642d1b2eb3e880a367f37d72dd76162d',
+-    'ImageMetaProps': '1.19-dc9581ff2b80d8c33462889916b82df0',
++    'ImageMetaProps': '1.19-a64c0dccbe29dcc6ac9c5f6b3615aa5f',
+     'Instance': '2.3-4f98ab23f4b0a25fabb1040c8f5edecc',
+     'InstanceAction': '1.1-f9f293e526b66fca0d05c3b3a2d13914',
+     'InstanceActionEvent': '1.1-e56a64fa4710e43ef7af2ad9d6028b33',
+@@ -1139,7 +1146,7 @@ object_data = {
+     'Network': '1.2-a977ab383aa462a479b2fae8211a5dde',
+     'NetworkInterfaceMetadata': '1.1-3269ce11b30531eb1febfa5173b78b81',
+     'NetworkList': '1.2-69eca910d8fa035dfecd8ba10877ee59',
+-    'NetworkRequest': '1.2-af1ff2d986999fbb79377712794d82aa',
++    'NetworkRequest': '1.2-3eeb5369745665f03fe792cf5d25eda4',
+     'NetworkRequestList': '1.1-15ecf022a68ddbb8c2a6739cfc9f8f5e',
+     'PciDevice': '1.6-2a2612baaa1786679e52084e82ca7e66',
+     'PCIDeviceBus': '1.0-2b891cb77e42961044689f3dc2718995',
+diff --git a/nova/tests/unit/test_policy.py b/nova/tests/unit/test_policy.py
+index 0d2914f..a14bdfb 100644
+--- a/nova/tests/unit/test_policy.py
++++ b/nova/tests/unit/test_policy.py
+@@ -12,6 +12,14 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2016-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
++
+ 
+ """Test of Policy Engine For Nova."""
+ 
+@@ -444,6 +452,7 @@ class RealRolePolicyTestCase(test.NoDBTestCase):
+ "os_compute_api:os-volumes-attachments:create",
+ "os_compute_api:os-volumes-attachments:delete",
+ "os_compute_api:os-availability-zone:list",
++"os_compute_api:wrs-if",
+ )
+ 
+         self.non_admin_only_rules = (
+diff --git a/nova/tests/unit/virt/libvirt/test_vif.py b/nova/tests/unit/virt/libvirt/test_vif.py
+index 9a4d8c8..35a3804 100644
+--- a/nova/tests/unit/virt/libvirt/test_vif.py
++++ b/nova/tests/unit/virt/libvirt/test_vif.py
+@@ -11,6 +11,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2016-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ import os
+ 
+@@ -763,18 +770,19 @@ class LibvirtVifTestCase(test.NoDBTestCase):
+                 supported = (network_model.VIF_MODEL_RTL8139,
+                              network_model.VIF_MODEL_E1000)
+             elif virt == 'qemu':
++                # removed unspported model: VIF_MODEL_SPAPR_VLAN
+                 supported = (network_model.VIF_MODEL_LAN9118,
+                              network_model.VIF_MODEL_NE2K_PCI,
+                              network_model.VIF_MODEL_PCNET,
+                              network_model.VIF_MODEL_RTL8139,
+-                             network_model.VIF_MODEL_E1000,
+-                             network_model.VIF_MODEL_SPAPR_VLAN)
++                             network_model.VIF_MODEL_E1000)
+             else:
++                # removed unspported model: VIF_MODEL_SPAPR_VLAN
+                 supported = (network_model.VIF_MODEL_NE2K_PCI,
+                              network_model.VIF_MODEL_PCNET,
+                              network_model.VIF_MODEL_RTL8139,
+-                             network_model.VIF_MODEL_E1000,
+-                             network_model.VIF_MODEL_SPAPR_VLAN)
++                             network_model.VIF_MODEL_E1000)
++
+             for model in supported:
+                 image_meta = objects.ImageMeta.from_dict(
+                     {'properties': {'hw_vif_model': model}})
+-- 
+2.7.4
+

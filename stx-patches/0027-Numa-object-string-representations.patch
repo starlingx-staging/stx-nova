@@ -1,0 +1,203 @@
+From 0793a7ca9caf855f30e25bb3fa8b00f6a8a49edb Mon Sep 17 00:00:00 2001
+From: Jack Ding <jack.ding@windriver.com>
+Date: Tue, 29 Aug 2017 21:29:07 -0400
+Subject: [PATCH 027/143] Numa object string representations
+
+This commit adds __str__ and __repr__ methods to objects
+InstanceNUMACell
+and NUMACell.  These will generate more readable representations of the
+objects for use in logs.
+
+The __str__ method has lots of newlines (i.e., per field).
+The __repr__ specifically does not print newlines per field, so we
+may print one line of output per numa cell. This was deliberate for
+resource tracking debug log enhancments (CONF.compute_resource_debug).
+
+__TYPE_single
+__TAG_logging
+__R4_commit_4283d2b
+__R3_commit_6ee9234
+__TC2898,TC2994,TC5081
+---
+ nova/objects/instance_numa_topology.py | 67 ++++++++++++++++++++++++++++++++++
+ nova/objects/numa.py                   | 65 +++++++++++++++++++++++++++++++++
+ 2 files changed, 132 insertions(+)
+
+diff --git a/nova/objects/instance_numa_topology.py b/nova/objects/instance_numa_topology.py
+index 18c3cc9..f33d77c 100644
+--- a/nova/objects/instance_numa_topology.py
++++ b/nova/objects/instance_numa_topology.py
+@@ -154,6 +154,62 @@ class InstanceNUMACell(base.NovaObject,
+     def numa_pinning_requested(self):
+         return self.physnode is not None
+ 
++    # add a readable string representation
++    def __str__(self):
++        return '  {obj_name} (id: {id})\n' \
++               '    cpuset: {cpuset}\n' \
++               '    memory: {memory}\n' \
++               '    physnode: {physnode}\n' \
++               '    pagesize: {pagesize}\n' \
++               '    cpu_topology: {cpu_topology}\n' \
++               '    cpu_pinning_raw: {cpu_pinning_raw}\n' \
++               '    cpu_pinning: {cpu_pinning}\n' \
++               '    siblings: {siblings}\n' \
++               '    cpu_policy: {cpu_policy}\n' \
++               '    cpu_thread_policy: {cpu_thread_policy}\n'.format(
++            obj_name=self.obj_name(),
++            id=self.id if ('id' in self) else None,
++            cpuset=self.cpuset,
++            memory=self.memory,
++            physnode=self.physnode,
++            pagesize=self.pagesize,
++            cpu_topology=self.cpu_topology if (
++                'cpu_topology' in self) else None,
++            cpu_pinning_raw=self.cpu_pinning_raw,
++            cpu_pinning=self.cpu_pinning,
++            siblings=self.siblings,
++            cpu_policy=self.cpu_policy,
++            cpu_thread_policy=self.cpu_thread_policy,
++        )
++
++    # add a readable representation, without newlines
++    def __repr__(self):
++        return '{obj_name} (id: {id}) ' \
++               'cpuset: {cpuset} ' \
++               'memory: {memory} ' \
++               'physnode: {physnode} ' \
++               'pagesize: {pagesize} ' \
++               'cpu_topology: {cpu_topology} ' \
++               'cpu_pinning_raw: {cpu_pinning_raw} ' \
++               'cpu_pinning: {cpu_pinning} ' \
++               'siblings: {siblings} ' \
++               'cpu_policy: {cpu_policy} ' \
++               'cpu_thread_policy: {cpu_thread_policy}'.format(
++            obj_name=self.obj_name(),
++            id=self.id if ('id' in self) else None,
++            cpuset=self.cpuset,
++            memory=self.memory,
++            physnode=self.physnode,
++            pagesize=self.pagesize,
++            cpu_topology=self.cpu_topology if (
++                'cpu_topology' in self) else None,
++            cpu_pinning_raw=self.cpu_pinning_raw,
++            cpu_pinning=self.cpu_pinning,
++            siblings=self.siblings,
++            cpu_policy=self.cpu_policy,
++            cpu_thread_policy=self.cpu_thread_policy,
++        )
++
+ 
+ # TODO(berrange): Remove NovaObjectDictCompat
+ @base.NovaObjectRegistry.register
+@@ -260,6 +316,17 @@ class InstanceNUMATopology(base.NovaObject,
+             cell.clear_host_pinning()
+         return self
+ 
++    def __str__(self):
++        topology_str = '{obj_name}:'.format(obj_name=self.obj_name())
++        for cell in self.cells:
++            topology_str += '\n' + str(cell)
++        return topology_str
++
++    def __repr__(self):
++        topology_str = '{obj_name}: '.format(obj_name=self.obj_name())
++        topology_str += ', '.join(repr(cell) for cell in self.cells)
++        return topology_str
++
+     @property
+     def emulator_threads_isolated(self):
+         """Determines whether emulator threads should be isolated"""
+diff --git a/nova/objects/numa.py b/nova/objects/numa.py
+index 94892d1..41b5961 100644
+--- a/nova/objects/numa.py
++++ b/nova/objects/numa.py
+@@ -11,6 +11,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2015-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ from oslo_serialization import jsonutils
+ from oslo_utils import versionutils
+@@ -158,6 +165,52 @@ class NUMACell(base.NovaObject):
+                         (memory % pages.size_kb) == 0)
+         raise exception.MemoryPageSizeNotSupported(pagesize=pagesize)
+ 
++    # add a readable string representation
++    def __str__(self):
++        return '  {obj_name} (id: {id})\n' \
++               '    cpus: {cpus}\n' \
++               '    mem:\n' \
++               '      total: {total}\n' \
++               '      used: {used}\n' \
++               '    cpu_usage: {cpu_usage}\n' \
++               '    siblings: {siblings}\n' \
++               '    pinned_cpus: {pinned_cpus}\n' \
++               '    mempages: {mempages}'.format(
++            obj_name=self.obj_name(),
++            id=self.id,
++            cpus=hardware.format_cpu_spec(
++                self.cpuset, allow_ranges=False),
++            total=self.memory,
++            used=self.memory_usage,
++            cpu_usage=self.cpu_usage if ('cpu_usage' in self) else None,
++            siblings=self.siblings,
++            pinned_cpus=hardware.format_cpu_spec(
++                self.pinned_cpus, allow_ranges=False),
++            mempages=self.mempages,
++        )
++
++    # add a readable representation, without newlines
++    def __repr__(self):
++        return '{obj_name} (id: {id}) ' \
++               'cpus: {cpus} ' \
++               'mem: total: {total} used: {used} ' \
++               'cpu_usage: {cpu_usage} ' \
++               'siblings: {siblings} ' \
++               'pinned_cpus: {pinned_cpus} ' \
++               'mempages: {mempages}'.format(
++            obj_name=self.obj_name(),
++            id=self.id,
++            cpus=hardware.format_cpu_spec(
++                self.cpuset, allow_ranges=False),
++            total=self.memory,
++            used=self.memory_usage,
++            cpu_usage=self.cpu_usage if ('cpu_usage' in self) else None,
++            siblings=self.siblings,
++            pinned_cpus=hardware.format_cpu_spec(
++                self.pinned_cpus, allow_ranges=False),
++            mempages=self.mempages,
++        )
++
+ 
+ @base.NovaObjectRegistry.register
+ class NUMAPagesTopology(base.NovaObject):
+@@ -245,6 +298,18 @@ class NUMATopology(base.NovaObject):
+             NUMACell._from_dict(cell_dict)
+             for cell_dict in data_dict.get('cells', [])])
+ 
++    def __str__(self):
++        topology_str = '{obj_name}:'.format(obj_name=self.obj_name())
++        for cell in self.cells:
++            topology_str += '\n' + str(cell)
++        return topology_str
++
++    def __repr__(self):
++        topology_str = '{obj_name}:'.format(obj_name=self.obj_name())
++        for cell in self.cells:
++            topology_str += '\n' + repr(cell)
++        return topology_str
++
+ 
+ @base.NovaObjectRegistry.register
+ class NUMATopologyLimits(base.NovaObject):
+-- 
+2.7.4
+

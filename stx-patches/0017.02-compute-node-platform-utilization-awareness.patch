@@ -1,0 +1,295 @@
+From 1c3bdd8a17db1b8a86dd8d09c175dac4730f88ab Mon Sep 17 00:00:00 2001
+From: Daniel Chavolla <daniel.chavolla@windriver.com>
+Date: Sun, 29 May 2016 15:37:53 -0400
+Subject: [PATCH] compute node platform utilization awareness
+
+This commit consists of the compute platform monitor
+and the nova scheduler platform filter
+This feature allows the nova-scheduler a way to filter out
+compute nodes where its memory or cpu usage is above a
+defined threshold.
+This threshold is defined in nova.conf
+
+Change-Id: Ide030dbe2c9b30e9897e5bbd2ca1b684f6759bca
+---
+ nova/compute/monitors/platform_monitor.py | 178 ++++++++++++++++++++++++++++++
+ nova/scheduler/filters/platform_filter.py |  82 ++++++++++++++
+ 2 files changed, 260 insertions(+)
+ create mode 100644 nova/compute/monitors/platform_monitor.py
+ create mode 100644 nova/scheduler/filters/platform_filter.py
+
+diff --git a/nova/compute/monitors/platform_monitor.py b/nova/compute/monitors/platform_monitor.py
+new file mode 100644
+index 0000000..e801d9c
+--- /dev/null
++++ b/nova/compute/monitors/platform_monitor.py
+@@ -0,0 +1,178 @@
++# Copyright 2016 Intel Corporation.
++# All Rights Reserved.
++#
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++"""
++Platform monitor to retrieve platform CPU and MEM information
++"""
++
++import os
++import re
++import time
++
++from nova.compute import monitors
++import nova.utils as utils
++from oslo_log import log as logging
++
++LOG = logging.getLogger(__name__)
++
++ONE_MILLION = 1000000
++ONE_THOUSAND = 1000
++ONE_HUNDRED = 100
++
++
++class PlatformMonitor(monitors.ResourceMonitorBase):
++    """CPU monitor base."""
++
++    def __init__(self, parent):
++        super(PlatformMonitor, self).__init__(parent)
++        self.source = 'platform-monitor-stats'
++        self._cpu_stats = {}
++        self._cpu_usage_percent = 0
++        self._mem_usage_percent = 0
++        self._cpu_list = []
++
++        with open('/etc/nova/compute_reserved.conf') as f:
++            lines = f.readlines()
++            for line in lines:
++                if "PLATFORM_CPU_LIST" in line:
++                    sp = line.split('=')
++                    self._cpu_list = utils.range_to_list(
++                            re.findall('"(.*)"', sp[1])[0])
++
++    @monitors.ResourceMonitorBase.add_timestamp
++    def _get_platform_cpu_usage_percent(self, **kwargs):
++        return self._cpu_usage_percent
++
++    @monitors.ResourceMonitorBase.add_timestamp
++    def _get_platform_mem_usage_percent(self, **kwargs):
++        return self._mem_usage_percent
++
++    def _update_data(self, **kwargs):
++        self._update_data_mem()
++        self._update_data_cpu()
++
++    # Calculate relative percent used platform 4K memory
++    def _update_data_mem(self, **kwargs):
++        avail = 0
++        with open('/proc/meminfo') as fp:
++            m = fp.read().split()
++
++        MemFree = int(m[m.index('MemFree:') + 1])
++        Buffers = int(m[m.index('Buffers:') + 1])
++        Cached = int(m[m.index('Cached:') + 1])
++        SReclaimable = int(m[m.index('SReclaimable:') + 1])
++        path = "/sys/devices/system/node/"
++
++        dir = os.listdir(path)
++        for file_name in dir:
++            # look for /sys/devices/system/node/node() dirs
++            if 'node' in file_name:
++                # look into /sys/devices/system/node/node()/meminfo
++                # to compute available 4K memory from MemFree, FilePages,
++                # and SReclaimable
++                f_minfo = "%s/%s/meminfo" % (path, file_name)
++                try:
++                    with open(f_minfo) as fm:
++                        lines = fm.readlines()
++                        for line in lines:
++                            match_list = ["MemFree:", "FilePages:",
++                                          "SReclaimable:"]
++                            if any(x in line for x in match_list):
++                                sp = line.split()
++                                avail += int(sp[3])
++                except IOError:
++                    avail = 0
++
++        # now calculate PSS from /proc/*/smaps
++        path = '/proc'
++        dirs = [os.path.join(path, d) for d in os.listdir(path) if
++                os.path.isdir(os.path.join(path, d))]
++        pss_sum = 0
++        for dir in dirs:
++            file = dir + '/smaps'
++            if os.path.exists(file):
++                try:
++                    with open(file) as fd:
++                        for line in fd.readlines():
++                            if line.startswith("Pss"):
++                                sp = line.split()
++                                pss_sum += int(sp[1])
++                except IOError:
++                    pass
++
++        # mem_total is the total mem available to the platform.
++        # since we excluded huge pages, it is avail + pss
++        mem_total = avail + pss_sum
++
++        mem_usage = 100.0 * float(mem_total - MemFree - Buffers - Cached -
++                                  SReclaimable) / float(mem_total)
++        self._mem_usage_percent = mem_usage
++        LOG.debug("Average Platform Memory Usage: %.2f%%" % mem_usage)
++
++    # Calculate relative occupancy of platform cpus.
++    def _update_data_cpu(self, **kwargs):
++        # Don't allow to call this function so frequently (<= 1 sec)
++        now = time.time()
++        if self._cpu_stats.get("timestamp") is not None:
++            delta = now - self._cpu_stats.get("timestamp")
++            if delta <= 1:
++                return
++
++        cpus = []
++        cpu_times = {}
++        for cpu in self._cpu_list:
++            cpus.append("cpu%s" % cpu)
++
++        # Obtain cumulative cpu time from /proc/schedstat, row cpuX, 7th field.
++        # 7th field is the sum of all time spent running by tasks on this
++        # processor (in ms)
++        with open('/proc/schedstat') as f:
++            lines = f.readlines()
++            # first check version
++            for line in lines:
++                if "version" in line:
++                    sp = line.split()
++                    if sp[1] != "15":
++                        # only version 15 supported
++                        return
++                l = [cp for cp in cpus if cp in line]
++                if l:
++                    sp = line.split()
++                    cpu_times[l[0]] = sp[7]
++
++        if not self._cpu_stats:
++            self._cpu_stats = cpu_times.copy()
++            self._cpu_stats['timestamp'] = now
++            return
++
++        n_cpus = 0
++        cputime_ms = 0
++        elapsed_s = now - self._cpu_stats['timestamp']
++        for cpu in cpu_times:
++            n_cpus += 1
++            cputime_ms += (int(cpu_times[cpu]) - int(self._cpu_stats[cpu])) \
++                           / ONE_MILLION
++        if n_cpus > 0:
++            occupancy_p = (ONE_HUNDRED * float(cputime_ms)) \
++                          / ONE_THOUSAND / float(elapsed_s) / n_cpus
++        else:
++            occupancy_p = 0.0
++
++        self._cpu_usage_percent = occupancy_p
++        LOG.debug("Average Platform Cpu Usage: %.2f%%" %
++                  self._cpu_usage_percent)
++
++        self._cpu_stats = cpu_times.copy()
++        self._cpu_stats['timestamp'] = now
+diff --git a/nova/scheduler/filters/platform_filter.py b/nova/scheduler/filters/platform_filter.py
+new file mode 100644
+index 0000000..bc27ff4
+--- /dev/null
++++ b/nova/scheduler/filters/platform_filter.py
+@@ -0,0 +1,82 @@
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++#
++# Copyright (c) 2016 Wind River Systems, Inc.
++#
++#
++#
++#
++#
++from oslo_config import cfg
++from oslo_log import log as logging
++
++from nova.scheduler import filters
++
++LOG = logging.getLogger(__name__)
++
++platform_usage_tresholds = [
++        cfg.IntOpt('platform_cpu_threshold',
++                     default=80,
++                     help='Threshold for platform CPU usage. '
++                          'Hosts where platform CPU usage is above '
++                          'this threshold will be set as unsuited '
++                          'to launch a new VM. Expressed as percentage.'),
++        cfg.IntOpt('platform_mem_threshold',
++                     default=80,
++                     help='Threshold for platform memory usage. '
++                          'Hosts where platform memory usage is above '
++                          'this threshold will be set as unsuited '
++                          'to launch a new VM. Expressed as percentage.'),
++]
++
++CONF = cfg.CONF
++CONF.register_opts(platform_usage_tresholds, group='metrics')
++
++
++class PlatformFilter(filters.BaseHostFilter):
++    """Disk Filter with over subscription flag."""
++    def __init__(self):
++        self._cpu_threshold = CONF.metrics.platform_cpu_threshold
++        self._mem_threshold = CONF.metrics.platform_mem_threshold
++
++    def host_passes(self, host_state, filter_properties):
++        """Filter based on platform cpu and mem usage."""
++
++        # -1 for threshold means the feature is disabled
++        if self._cpu_threshold == -1 or self._mem_threshold == -1:
++            return True
++
++        try:
++            host_plat_cpu_usage = host_state.metrics.get(
++                'platform.cpu.usage.percent').value
++            host_plat_mem_usage = host_state.metrics.get(
++                'platform.mem.usage.percent').value
++        except AttributeError:
++            # If host does not support these metrics we fall into legacy mode
++            return True
++
++        if host_plat_cpu_usage < self._cpu_threshold and \
++            host_plat_mem_usage < self._mem_threshold:
++            return True
++        else:
++            msg = '%s: ' % host_state.host
++            if host_plat_cpu_usage >= self._cpu_threshold:
++                msg += ("Platform CPU usage (%.1f%%) is above nova platform "
++                       "threshold (%.1f%%) " %
++                       (host_plat_cpu_usage, self._cpu_threshold))
++
++            if host_plat_mem_usage >= self._mem_threshold:
++                msg += ("Platform mem usage (%.1f%%) is above nova platform "
++                       "threshold (%.1f%%) " %
++                        (host_plat_mem_usage, self._mem_threshold))
++            self.filter_reject(host_state, filter_properties, msg)
++            return False
+-- 
+2.7.4
+

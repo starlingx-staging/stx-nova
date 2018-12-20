@@ -1,0 +1,80 @@
+From d59eb000270c980390a7f8eeba95d2c8dd7b38e5 Mon Sep 17 00:00:00 2001
+From: Joseph Richard <joseph.richard@windriver.com>
+Date: Fri, 17 Apr 2015 15:30:35 -0400
+Subject: [PATCH] Fix namespace on calls to binding:vif_model
+
+This commit replaces all calls to binding:vif_model
+with wrs-binding:vif_model.
+---
+ nova/network/neutronv2/api.py             | 6 ++++--
+ nova/network/neutronv2/constants.py       | 1 +
+ nova/tests/unit/network/test_neutronv2.py | 6 +++---
+ 3 files changed, 8 insertions(+), 5 deletions(-)
+
+diff --git a/nova/network/neutronv2/api.py b/nova/network/neutronv2/api.py
+index 020f0f9..54863f7 100644
+--- a/nova/network/neutronv2/api.py
++++ b/nova/network/neutronv2/api.py
+@@ -560,7 +560,8 @@ class API(base_api.NetworkAPI):
+             zone = 'compute:%s' % instance.availability_zone
+             port_req_body = {'port': {'device_id': instance.uuid,
+                                       'device_owner': zone,
+-                                      'binding:vif_model': request.vif_model}}
++                                      constants.PORT_VIF_MODEL:
++                                          request.vif_model}}
+             if request.vif_model == 'pci-sriov':
+                 port_req_body['port'].update({'binding:vnic_type': 'direct'})
+             try:
+@@ -1590,7 +1591,8 @@ class API(base_api.NetworkAPI):
+                     type=current_neutron_port.get('binding:vif_type'),
+                     profile=current_neutron_port.get('binding:profile'),
+                     mtu=current_neutron_port.get('binding:mtu'),
+-                    vif_model=current_neutron_port.get('binding:vif_model'),
++                    vif_model=
++                        current_neutron_port.get(constants.PORT_VIF_MODEL),
+                     details=current_neutron_port.get('binding:vif_details'),
+                     ovs_interfaceid=ovs_interfaceid,
+                     devname=devname,
+diff --git a/nova/network/neutronv2/constants.py b/nova/network/neutronv2/constants.py
+index ca81b17..57251c6 100644
+--- a/nova/network/neutronv2/constants.py
++++ b/nova/network/neutronv2/constants.py
+@@ -16,3 +16,4 @@
+ QOS_QUEUE = 'QoS Queue'
+ NET_EXTERNAL = 'router:external'
+ PORTBINDING_EXT = 'Port Binding'
++PORT_VIF_MODEL = 'wrs-binding:vif_model'
+diff --git a/nova/tests/unit/network/test_neutronv2.py b/nova/tests/unit/network/test_neutronv2.py
+index efd7fc5..1ffe2ab 100644
+--- a/nova/tests/unit/network/test_neutronv2.py
++++ b/nova/tests/unit/network/test_neutronv2.py
+@@ -486,7 +486,7 @@ class TestNeutronv2Base(test.TestCase):
+                 'port': {
+                     'device_id': self.instance.uuid,
+                     'device_owner': 'compute:nova',
+-                    'binding:vif_model': None,
++                    constants.PORT_VIF_MODEL: None,
+                 },
+             }
+             # Network lookup for available network_id
+@@ -1071,7 +1071,7 @@ class TestNeutronv2(TestNeutronv2Base):
+                 'port': {
+                     'device_id': self.instance.uuid,
+                     'device_owner': 'compute:nova',
+-                    'binding:vif_model': None,
++                    constants.PORT_VIF_MODEL: None,
+                 },
+             }
+             port_req_body = {
+@@ -1128,7 +1128,7 @@ class TestNeutronv2(TestNeutronv2Base):
+             'port': {
+                 'device_id': self.instance.uuid,
+                 'device_owner': 'compute:nova',
+-                'binding:vif_model': None,
++                constants.PORT_VIF_MODEL: None,
+             },
+         }
+         port_req_body = {
+-- 
+2.7.4
+

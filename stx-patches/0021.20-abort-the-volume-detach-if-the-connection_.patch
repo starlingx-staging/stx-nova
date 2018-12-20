@@ -1,0 +1,125 @@
+From 2cea356da6297313aaf4033388dd82faf663e47d Mon Sep 17 00:00:00 2001
+From: Jack Ding <jack.ding@windriver.com>
+Date: Fri, 5 May 2017 15:26:07 -0400
+Subject: [PATCH] abort the volume detach if the connection_info is
+ None.
+
+Root Cause:
+The issue is a rare race condition where compute-0 was rebooted right
+after the instance tenant2-image_vol-26 live-migrated to compute-0
+and had not completed attaching its volumes.
+When volume ba5438bb-aac5-48ef-8982-28330e18d159 was being attached
+to the instance tenant2-image_vol-26, nova started the attaching
+process, but the cinder backend had not finished the attaching before
+compute-0 went down. As a result, bdm.connection_info is not saved.
+At volume detach during evacuation, bdm.connection_info was empty and
+caused exception.
+
+Fix:
+Nova should abort the detach process if the connection_info is None.
+
+This commit should squash with 653c985 in the next rebase.
+---
+ nova/compute/manager.py                     | 10 ++++------
+ nova/tests/unit/compute/test_compute.py     | 11 ++---------
+ nova/tests/unit/compute/test_compute_mgr.py |  1 -
+ 3 files changed, 6 insertions(+), 16 deletions(-)
+
+diff --git a/nova/compute/manager.py b/nova/compute/manager.py
+index e9f41e7..a0bcfae 100644
+--- a/nova/compute/manager.py
++++ b/nova/compute/manager.py
+@@ -5142,12 +5142,11 @@ class ComputeManager(manager.Manager):
+                 self.notifier.info(context, 'volume.usage',
+                                    compute_utils.usage_volume_info(vol_usage))
+ 
++        connection_info = None
+         if bdm.connection_info is not None:
+             connection_info = jsonutils.loads(bdm.connection_info)
+-        else:
+-            connection_info = {}
+         connector = self.driver.get_volume_connector(instance)
+-        if CONF.host == instance.host:
++        if CONF.host == instance.host and connection_info:
+             # Only attempt to detach and disconnect from the volume if the
+             # instance is currently associated with the local compute host.
+             self._driver_detach_volume(context, instance, bdm, connection_info)
+@@ -5366,9 +5365,8 @@ class ComputeManager(manager.Manager):
+                     context, volume_id, instance.uuid)
+             if bdm.connection_info is not None:
+                 connection_info = jsonutils.loads(bdm.connection_info)
+-            else:
+-                connection_info = {}
+-            self._driver_detach_volume(context, instance, bdm, connection_info)
++                self._driver_detach_volume(
++                    context, instance, bdm, connection_info)
+             connector = self.driver.get_volume_connector(instance)
+             self.volume_api.terminate_connection(context, volume_id, connector)
+         except exception.NotFound:
+diff --git a/nova/tests/unit/compute/test_compute.py b/nova/tests/unit/compute/test_compute.py
+index 236c8b7..b185ba9 100644
+--- a/nova/tests/unit/compute/test_compute.py
++++ b/nova/tests/unit/compute/test_compute.py
+@@ -434,20 +434,16 @@ class ComputeVolumeTestCase(BaseTestCase):
+         instance = self._create_fake_instance_obj()
+ 
+         with test.nested(
+-            mock.patch.object(self.compute, '_driver_detach_volume'),
+             mock.patch.object(self.compute.volume_api, 'detach'),
+             mock.patch.object(objects.BlockDeviceMapping,
+                               'get_by_volume_and_instance'),
+             mock.patch.object(fake_bdm, 'destroy')
+-        ) as (mock_internal_detach, mock_detach, mock_get, mock_destroy):
++        ) as (mock_detach, mock_get, mock_destroy):
+             mock_detach.side_effect = test.TestingException
+             mock_get.return_value = fake_bdm
+             self.assertRaises(
+                     test.TestingException, self.compute.detach_volume,
+                     self.context, 'fake', instance, 'fake_id')
+-            mock_internal_detach.assert_called_once_with(self.context,
+-                                                         instance,
+-                                                         fake_bdm, {})
+             self.assertTrue(mock_destroy.called)
+ 
+     def test_await_block_device_created_too_slow(self):
+@@ -822,8 +818,7 @@ class ComputeVolumeTestCase(BaseTestCase):
+     @mock.patch.object(fake.FakeDriver, 'block_stats')
+     @mock.patch.object(compute_manager.ComputeManager, '_get_host_volume_bdms')
+     @mock.patch.object(fake.FakeDriver, 'get_all_volume_usage')
+-    @mock.patch.object(fake.FakeDriver, 'instance_exists')
+-    def test_detach_volume_usage(self, mock_exists, mock_get_all,
++    def test_detach_volume_usage(self, mock_get_all,
+                                  mock_get_bdms, mock_stats, mock_get):
+         # Test that detach volume update the volume usage cache table correctly
+         instance = self._create_fake_instance_obj()
+@@ -850,7 +845,6 @@ class ComputeVolumeTestCase(BaseTestCase):
+                                       'wr_req': 1,
+                                       'wr_bytes': 5,
+                                       'instance': instance}]
+-        mock_exists.return_value = True
+ 
+         def fake_get_volume_encryption_metadata(self, context, volume_id):
+             return {}
+@@ -905,7 +899,6 @@ class ComputeVolumeTestCase(BaseTestCase):
+         mock_stats.assert_called_once_with(instance, 'vdb')
+         mock_get_bdms.assert_called_once_with(self.context, use_slave=True)
+         mock_get_all(self.context, host_volume_bdms)
+-        mock_exists.assert_called_once_with(mock.ANY)
+ 
+     def test_prepare_image_mapping(self):
+         swap_size = 1
+diff --git a/nova/tests/unit/compute/test_compute_mgr.py b/nova/tests/unit/compute/test_compute_mgr.py
+index ba87167..fa3103c5 100755
+--- a/nova/tests/unit/compute/test_compute_mgr.py
++++ b/nova/tests/unit/compute/test_compute_mgr.py
+@@ -2477,7 +2477,6 @@ class ComputeManagerUnitTestCase(test.NoDBTestCase):
+                                             destroy_bdm=destroy_bdm,
+                                             attachment_id=attachment_id)
+ 
+-                detach.assert_called_once_with(self.context, inst_obj, bdm, {})
+                 driver.get_volume_connector.assert_called_once_with(inst_obj)
+                 volume_api.terminate_connection.assert_called_once_with(
+                     self.context, volume_id, connector_sentinel)
+-- 
+2.7.4
+

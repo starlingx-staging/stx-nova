@@ -1,0 +1,57 @@
+From 6adc0db62b3ba087205fe25ea9963c1b1716b60a Mon Sep 17 00:00:00 2001
+From: Gerry Kopec <Gerry.Kopec@windriver.com>
+Date: Mon, 20 Mar 2017 19:13:18 -0400
+Subject: [PATCH] Add robustness to instance save after create retry mechanism
+
+Update commit a7df1fb (retry instance save after VM creation)
+to add flexibility when instance.save() times out:
+- check instance state before attempting retry as instance state change
+  may have already succeeded
+- on retry, allow for expected state to already be active.  This
+  prevents exception on expected state mismatch when earlier attempt
+  succeeds after messaging timeout.
+
+This change should be merged with commit a7df1fb on next rebase.
+---
+ nova/compute/manager.py | 18 +++++++++++++++++-
+ 1 file changed, 17 insertions(+), 1 deletion(-)
+
+diff --git a/nova/compute/manager.py b/nova/compute/manager.py
+index 9da1c63..d1930c4 100644
+--- a/nova/compute/manager.py
++++ b/nova/compute/manager.py
+@@ -2125,7 +2125,14 @@ class ComputeManager(manager.Manager):
+         retries = 2
+         while True:
+             try:
+-                instance.save(expected_task_state=task_states.SPAWNING)
++                if attempt == 0:
++                    instance.save(expected_task_state=task_states.SPAWNING)
++                else:
++                    # On retries, allow for state to already be active
++                    instance.save(
++                             expected_task_state=[task_states.SPAWNING, None],
++                             expected_vm_state=[vm_states.BUILDING,
++                                                vm_states.ACTIVE])
+                 break
+             except (exception.InstanceNotFound,
+                     exception.UnexpectedDeletingTaskStateError) as e:
+@@ -2134,6 +2141,15 @@ class ComputeManager(manager.Manager):
+                         'create.error', fault=e,
+                         filter_properties=filter_properties)
+             except messaging.MessagingTimeout:
++                # if timeout lets check if instance got created before
++                # attempting retry of instance.save()
++                try:
++                    instance_new = objects.Instance.get_by_uuid(context,
++                                                                instance.uuid)
++                    if instance_new.launched_at:
++                        break
++                except Exception:
++                    pass
+                 attempt += 1
+                 if attempt <= retries:
+                     LOG.warning(_LW(
+-- 
+2.7.4
+

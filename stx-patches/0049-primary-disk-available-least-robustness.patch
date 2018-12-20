@@ -1,0 +1,919 @@
+From 34a2d71d87089c35ec3fa3ad0d4df56805b1446f Mon Sep 17 00:00:00 2001
+From: Steven Webster <steven.webster@windriver.com>
+Date: Tue, 27 Sep 2016 21:53:59 -0400
+Subject: [PATCH 049/143] primary: disk available least robustness
+
+These changes correspond to item b) listed below for the fix:
+
+a. Move disk_available_least into a separate function, which will be
+called by the resource audit while holding the COMPUTE_RESOURCE_SEMAPHORE.
+b. Fix instance deletion
+c. Fix instance creation
+
+disk_available_least is now updated and reported to the DataBase as part
+of the instance delete process. This computation is also guarded by
+COMPUTE_RESOURCE_SEMAPHORE to avoid a race condition with the resource audit
+
+Note on port to Pike:
+Upstream patch 1c96759 creates a single ResourceTracker object instance.
+manager.py calls to self._get_resource_tracker() now takes no argument,
+and the porting of this commit required some cleanup for this.
+
+e57fd18 Port fix for disk_available_least at instance creation
+   Port R3 commit 54f460 to Newton:
+   Fix disk_available_least at instance creation
+
+   1) disk_available_least is updated and reported to the database when the
+   new instance's resources are claimed.
+   2) resource audit to account for this claimed disk space up to when the
+   instance is actually created
+   3) the disk claim is atomically removed when the instance is created to
+   avoid the resource audit to account the disk space twice.
+
+   These changes correspond to item c) listed below for the fix :
+
+   a. Move disk_available_least into a separate function, which will be
+   called by the resource audit while holding the COMPUTE_RESOURCE_SEMAPHORE.
+   b. Fix instance deletion
+   c. Fix instance creation
+
+   Notes on port to Newton:
+
+   1) _get_usage_dict uses selected fields directly, rather than the entire
+      Instance object.  We need to add the instance uuid as a selected field.
+   2) The test_tracker.py unit test file does not exist anymore.  Certain
+      tests were moved to the test_resource_tracker.py file. These tests have
+      been updated with the relevant changes from 54f46a0
+
+c8b5864 This is the 3rd commit message:
+   disk_available_least to be moved into a separate function
+   These changes correspond to item a) listed below for the fix:
+
+   a. Move disk_available_least into a separate function, which will be
+   called by the resource audit while holding the COMPUTE_RESOURCE_SEMAPHORE.
+   b. Fix instance deletion
+   c. Fix instance creation
+
+   Note that with this change, the resource audit's reading of
+   disk_available_least is guarded by the COMPUTE_RESOURCE_SEMAPHORE. This
+   prevents this value from changing underneath, up to when it is sent to the
+   DataBase.
+
+   (cherry picked from R3 commit 37e9ed0)
+
+51d18f2 fix: instance spawn to not hold the resource semaphore.
+   For atomicity purposes, the original solution 
+   included a change to hold COMPUTE_RESOURCE_SEMAPHORE during both
+   driver spawn() and the update to the resource tracker
+   disk_available_least account. This was because the driver reading
+   of this value can change at any moment during the spawning.
+   This solution turned out  to be problematic when the downloading of
+   the instance image during spawn() takes a long time.
+   This is  because holding that semaphore prevents many other
+   instance actions on the compute from running.
+
+   Instead of holding that semaphore, the solution is to keep a
+   cached reading of the drivers disk_available_least
+   (which is taken directly from looking at the disk) whenever
+   an instance is being spawned, migrated or deleted, so that the tracker
+   can re-calculate its value  without actually looking at the disk.
+
+   Upstream bug: https://bugs.launchpad.net/nova/+bug/1517442
+
+9d27c5f fix race condition when mass deleting instances
+
+   The issue is caused by the mass deletion plus the changes ,
+   specifically not holding the resource tracker semaphore anymore when
+   deleting instances. Instance deletion is no longer serialized because of
+   this change.
+
+   To  solve this issue we now catch exceptions caused by an instance file
+   no longer present when driver._get_disk_over_commited_size_total() runs.
+
+b367a2a fix for exception in disk available least calculation
+   When a compute host reboots, its compute_node object in the resource
+   tracker is not recreated until the resource tracker' audit runs and
+   updates its resource accounting. Meanwhile, if the host has a pending
+   instance deletion or an instance that was not evacuated,  the compute
+   manager will eventually call  tracker_dal_update(). This last routine
+   needs to handle the case where there is no compute_node, gracefully.
+
+   In R4, this condition is handled by looking whether self.compute_node
+   exists. In R5, self.compute_nodes is a dictionary indexed by the node
+   name. This commit adds a try block when referencing self.compute_nodes
+   in this routine.
+
+__TYPE_primary
+__TAG_computemanager,resource
+__R4_commit_bccd2f6
+__R3_commit_c8a8161
+__TC6498
+---
+ nova/compute/claims.py                           |   6 +
+ nova/compute/manager.py                          |  50 +++++--
+ nova/compute/resource_tracker.py                 | 170 ++++++++++++++++++++---
+ nova/tests/unit/compute/test_compute_mgr.py      |  27 +++-
+ nova/tests/unit/compute/test_resource_tracker.py |  46 ++++--
+ nova/tests/unit/virt/libvirt/test_driver.py      |   1 -
+ nova/tests/unit/virt/test_images.py              |   2 +-
+ nova/tests/unit/virt/test_virt_drivers.py        |   2 +-
+ nova/virt/driver.py                              |   5 +
+ nova/virt/images.py                              |   3 +
+ nova/virt/libvirt/driver.py                      |  17 ++-
+ 11 files changed, 273 insertions(+), 56 deletions(-)
+
+diff --git a/nova/compute/claims.py b/nova/compute/claims.py
+index 2ed737a..d86c483 100644
+--- a/nova/compute/claims.py
++++ b/nova/compute/claims.py
+@@ -104,6 +104,12 @@ class Claim(NopClaim):
+         # Raise exception ComputeResourcesUnavailable if claim failed
+         self._claim_test(resources, limits)
+ 
++    def __exit__(self, exc_type, exc_val, exc_tb):
++        if exc_type is not None:
++            self.abort()
++        else:
++            self.tracker.remove_instance_claim(self.context, self.instance)
++
+     @property
+     def disk_gb(self):
+         return (self.instance.flavor.root_gb +
+diff --git a/nova/compute/manager.py b/nova/compute/manager.py
+index ccf5036..9ec487b 100644
+--- a/nova/compute/manager.py
++++ b/nova/compute/manager.py
+@@ -2123,7 +2123,8 @@ class ComputeManager(manager.Manager):
+                     LOG.debug('Start spawning the instance on the hypervisor.',
+                               instance=instance)
+                     with timeutils.StopWatch() as timer:
+-                        self.driver.spawn(context, instance, image_meta,
++                        rt.spawn_instance_and_update_tracker(context, instance,
++                                          image_meta,
+                                           injected_files, admin_password,
+                                           network_info=network_info,
+                                           block_device_info=block_device_info)
+@@ -2499,12 +2500,21 @@ class ComputeManager(manager.Manager):
+         # NOTE(melwitt): attempt driver destroy before releasing ip, may
+         #                want to keep ip allocated for certain failures
+         timer = timeutils.StopWatch()
++        if instance.node is None:
++            node = self.driver.get_available_nodes(refresh=True)[0]
++            LOG.debug('No instance node set, defaulting to %s', node,
++                      instance=instance)
++        else:
++            node = instance.node
++
++        rt = self._get_resource_tracker()
+         try:
+             LOG.debug('Start destroying the instance on the hypervisor.',
+                       instance=instance)
+             timer.start()
+-            self.driver.destroy(context, instance, network_info,
+-                    block_device_info)
++            rt.destroy_instance_and_update_tracker(context, instance,
++                    network_info, block_device_info)
++
+             LOG.info('Took %0.2f seconds to destroy the instance on the '
+                      'hypervisor.', timer.elapsed(), instance=instance)
+         except exception.InstancePowerOffFailure:
+@@ -3027,6 +3037,7 @@ class ComputeManager(manager.Manager):
+             rt = self._get_resource_tracker()
+             rebuild_claim = rt.rebuild_claim
+         else:
++            rt = None
+             rebuild_claim = claims.NopClaim
+ 
+         image_meta = {}
+@@ -3093,6 +3104,13 @@ class ComputeManager(manager.Manager):
+                 # NOTE (ndipanov): Mark the migration as done only after we
+                 # mark the instance as belonging to this host.
+                 self._set_migration_status(migration, 'done')
++            finally:
++                if rt:
++                    @utils.synchronized(
++                        resource_tracker.COMPUTE_RESOURCE_SEMAPHORE)
++                    def _update_rebuild_tracking():
++                        rt.tracker_dal_update(context, instance)
++                    _update_rebuild_tracking()
+ 
+     def _do_rebuild_instance_with_claim(self, claim_context, *args, **kwargs):
+         """Helper to avoid deep nesting in the top-level method."""
+@@ -4374,6 +4392,14 @@ class ComputeManager(manager.Manager):
+                     self._set_instance_info(instance,
+                                             old_instance_type)
+ 
++        finally:
++            @utils.synchronized(
++                resource_tracker.COMPUTE_RESOURCE_SEMAPHORE)
++            def _update_migration_tracking():
++                rt = self._get_resource_tracker()
++                rt.tracker_dal_update(context, instance)
++            _update_migration_tracking()
++
+         migration.status = 'finished'
+         with migration.obj_as_admin():
+             migration.save()
+@@ -6135,8 +6161,7 @@ class ComputeManager(manager.Manager):
+ 
+         # Drop live-migration instance tracking at source.
+         try:
+-            rt = self._get_resource_tracker(
+-                migrate_data.migration.source_node)
++            rt = self._get_resource_tracker()
+             rt.drop_move_claim(ctxt, instance,
+                                migrate_data.migration.source_node,
+                                instance['flavor'], prefix='old_')
+@@ -6257,6 +6282,9 @@ class ComputeManager(manager.Manager):
+                     instance.progress = 0
+                     instance.save(expected_task_state=task_states.MIGRATING)
+                     self._set_migration_status(migration, migration_status)
++                    if node_name:
++                        rt = self._get_resource_tracker()
++                        rt.tracker_dal_update(context, instance)
+                     return instance
+                 instance = _update_instance_migration_state(instance,
+                                                             migration,
+@@ -6408,25 +6436,17 @@ class ComputeManager(manager.Manager):
+                      'revert numa_topology=%(numa)r.',
+                      {'numa': instance.numa_topology}, instance=instance)
+ 
+-            # Drop live-migration claim and migration at destination.
+-            # NOTE(jgauld): migrate_data not always defined if there is an
+-            #               exception in pre_live_migration. Using self.host
+-            #               as a fallback. Should find better solution.
+-            try:
+-                dest_node = migrate_data.migration.dest_node
+-            except Exception:
+-                dest_node = self.host
+             try:
+                 # Depending on where we are in the live migration,
+                 # migrate_data may not have the migration object. If it does,
+                 # we can direct the resource tracker to drop the claim on the
+                 # appropriate node.  Otherwise force a full resource audit.
+                 if hasattr(migrate_data, 'migration'):
+-                    rt = self._get_resource_tracker(dest_node)
++                    rt = self._get_resource_tracker()
+                     rt.drop_move_claim(context, instance,
+                                        migrate_data.migration.dest_node,
+                                        instance.flavor,
+-                                       prefix='new_')
++                                       prefix='new_', live_mig_rollback=True)
+                 else:
+                     self.update_available_resource(context)
+             except Exception as e:
+diff --git a/nova/compute/resource_tracker.py b/nova/compute/resource_tracker.py
+index af563a3..94986a6 100644
+--- a/nova/compute/resource_tracker.py
++++ b/nova/compute/resource_tracker.py
+@@ -27,6 +27,7 @@ model.
+ """
+ import collections
+ import copy
++import math
+ import sys
+ 
+ from oslo_log import log as logging
+@@ -161,6 +162,9 @@ class ResourceTracker(object):
+         self.ram_allocation_ratio = CONF.ram_allocation_ratio
+         self.cpu_allocation_ratio = CONF.cpu_allocation_ratio
+         self.disk_allocation_ratio = CONF.disk_allocation_ratio
++        self.tracked_in_progress = []
++        self.cached_dal = (self.driver.get_disk_available_least()
++                           if driver else 0)
+ 
+     def _get_compat_cpu(self, instance, resources):
+         """Helper function to reserve a pcpu from the host
+@@ -367,6 +371,17 @@ class ResourceTracker(object):
+             self.pci_tracker.claim_instance(context, pci_requests,
+                                             instance_numa_topology)
+ 
++        # add claim to tracker's list
++        # tracked_in_progress is a list of instances that are not yet
++        # created but whose resources have been already claimed.
++        # The resource audit needs to know of ongoing claims so that
++        # disk_available_least is adjusted. Note that this is different
++        # from other disk stats like local_gb_used because once the
++        #  instance is created, its disk space, along with its qcow
++        # backup files, is accounted by the driver (get_disk_available_least())
++        # and therefore should no longer be accounted for in _update_usage()
++        self.tracked_in_progress.append(instance.uuid)
++
+         # Mark resources in-use and update stats
+         self._update_usage_from_instance(context, instance, nodename,
+                                          strict=True)
+@@ -592,12 +607,61 @@ class ResourceTracker(object):
+         instance.node = None
+         instance.save()
+ 
++    def tracker_dal_update(self, context, instance, going_out=False,
++                           live_mig_rollback=False):
++        # COMPUTE_RESOURCE_SEMAPHORE should already be taken
++        if not instance.node:
++            return
++        nodename = instance.node
++        try:
++            cn = self.compute_nodes[nodename]
++        except KeyError:
++            # Likely we are comming from a host reboot
++            return
++
++        if not self.tracked_in_progress:
++            migrations = objects.MigrationList.\
++                get_in_progress_by_host_and_node(context,
++                                                 self.host, nodename)
++            if not migrations:
++                # we are no longer in cached mode
++                cn.disk_available_least = \
++                    self.get_disk_available_least(migrations)
++                return
++
++        # we are in cached mode
++        if live_mig_rollback:
++            # we are rolling back from a live-migration. We should leave
++            # cached_dal untouched because it was never decremented
++            return
++        disk_space = instance.get('root_gb', 0) + \
++                     instance.get('ephemeral_gb', 0)
++        swap = instance.flavor.get('swap', 0)
++        disk_space += int(math.ceil((swap * units.Mi) / float(units.Gi)))
++        if going_out:
++            self.cached_dal += disk_space
++        else:
++            self.cached_dal -= disk_space
++        cn.disk_available_least = self.cached_dal
++
++    @utils.synchronized(COMPUTE_RESOURCE_SEMAPHORE)
++    def remove_instance_claim(self, context, instance):
++        uuid = instance.get('uuid')
++        if uuid and uuid in self.tracked_in_progress:
++            self.tracked_in_progress.remove(uuid)
++            self.tracker_dal_update(context, instance)
++
+     @utils.synchronized(COMPUTE_RESOURCE_SEMAPHORE)
+     def abort_instance_claim(self, context, instance, nodename):
+         """Remove usage from the given instance."""
+         # non-strict pinning accounting when freeing
+         self._update_usage_from_instance(context, instance, nodename,
+                                          is_removed=True, strict=False)
++
++        uuid = instance.get('uuid')
++        if uuid and uuid in self.tracked_in_progress:
++            self.tracked_in_progress.remove(uuid)
++
+         instance.clear_numa_topology()
+         self._unset_instance_host_and_node(instance)
+ 
+@@ -619,7 +683,8 @@ class ResourceTracker(object):
+     # tracked_instances.
+     @utils.synchronized(COMPUTE_RESOURCE_SEMAPHORE)
+     def drop_move_claim(self, context, instance, nodename,
+-                        instance_type=None, prefix='new_'):
++                        instance_type=None, prefix='new_',
++                        live_mig_rollback=False):
+         # get numa_topology based on prefix
+         numa_topology = self._get_migration_context_resource('numa_topology',
+                                   instance, prefix=prefix)
+@@ -637,7 +702,9 @@ class ResourceTracker(object):
+                 usage = self._get_usage_dict(
+                         instance_type, numa_topology=numa_topology)
+                 self._drop_pci_devices(instance, nodename, prefix)
+-                self._update_usage(usage, nodename, sign=-1)
++                # non-strict pinning accounting when freeing
++                self._update_usage(usage, nodename, sign=-1, strict=False,
++                                   from_migration=True)
+ 
+                 ctxt = context.elevated()
+                 self._update(ctxt, self.compute_nodes[nodename])
+@@ -711,6 +778,28 @@ class ResourceTracker(object):
+         return (nodename not in self.compute_nodes or
+                 not self.driver.node_is_available(nodename))
+ 
++    def destroy_instance_and_update_tracker(self, context,
++        instance, network_info, block_device_info):
++
++        self.driver.destroy(context, instance, network_info,
++                    block_device_info)
++
++        @utils.synchronized(COMPUTE_RESOURCE_SEMAPHORE)
++        def _update_dal():
++            self.tracker_dal_update(context, instance, going_out=True)
++        _update_dal()
++
++    def spawn_instance_and_update_tracker(self, context, instance, image_meta,
++                                          injected_files, admin_password,
++                                          network_info,
++                                          block_device_info):
++
++        self.driver.spawn(context, instance, image_meta,
++                                          injected_files, admin_password,
++                                          network_info=network_info,
++                                          block_device_info=block_device_info)
++        self.remove_instance_claim(context, instance)
++
+     def _init_compute_node(self, context, resources):
+         """Initialize the compute node if it does not already exist.
+ 
+@@ -848,7 +937,6 @@ class ResourceTracker(object):
+         self._verify_resources(resources)
+ 
+         self._report_hypervisor_resource_view(resources)
+-
+         self._update_available_resource(context, resources)
+ 
+     def _pair_instances_to_migrations(self, migrations, instances):
+@@ -868,20 +956,33 @@ class ResourceTracker(object):
+                               'another host\'s instance!',
+                           {'uuid': migration.instance_uuid})
+ 
++    def get_disk_available_least(self, migrations):
++        # if tracked_in_progress is not empty, there is an ongoing instance
++        # launch. We avoid reading disk_available_least from the driver here
++        # because it could be stale. It is better to use the last good
++        # reading and adjust its value in _update_usage()
++
++        # We purge migrations in the "done" status here because that is the
++        # state they become after an evacuation, and remain in that state
++        # until the source host recovers and re-initializes. If the source
++        # host never recovers we would be never coming out of the cached state.
++        migrations_in_progress = []
++        for migration in migrations:
++            if _instance_in_migration_or_resize_state(migration.instance):
++                mig_info = {'instance_uuid': migration.instance_uuid}
++                mig_info['status'] = migration.status
++                migrations_in_progress.append(mig_info)
++        if not (self.tracked_in_progress or migrations_in_progress):
++            self.cached_dal = self.driver.get_disk_available_least()
++        else:
++            LOG.info("disk_available_least in cached mode. "
++                     "In progress instances:%s migrations:%s",
++                     self.tracked_in_progress, migrations_in_progress)
++        return self.cached_dal
++
+     @utils.synchronized(COMPUTE_RESOURCE_SEMAPHORE)
+     def _update_available_resource(self, context, resources):
+-
+-        # initialize the compute node object, creating it
+-        # if it does not already exist.
+-        self._init_compute_node(context, resources)
+-
+         nodename = resources['hypervisor_hostname']
+-
+-        # if we could not init the compute node the tracker will be
+-        # disabled and we should quit now
+-        if self.disabled(nodename):
+-            return
+-
+         # Grab all instances assigned to this node:
+         instances = objects.InstanceList.get_by_host_and_node(
+             context, self.host, nodename,
+@@ -898,11 +999,24 @@ class ResourceTracker(object):
+         # the resource audit.
+         migrations = objects.MigrationList.get_in_progress_by_host_and_node(
+                 context, self.host, nodename)
++        self._pair_instances_to_migrations(migrations, instances)
++
++        # needs to be set before init_compute_node in order to be included
++        # in compute_node's _changed_fields
++        resources['disk_available_least'] = \
++            self.get_disk_available_least(migrations)
++
++        # initialize the compute node object, creating it
++        # if it does not already exist.
++        self._init_compute_node(context, resources)
++
++        # if we could not init the compute node the tracker will be
++        # disabled and we should quit now
++        if self.disabled(nodename):
++            return
+ 
+         # Now calculate usage based on instance utilization:
+         self._update_usage_from_instances(context, instances, nodename)
+-
+-        self._pair_instances_to_migrations(migrations, instances)
+         self._update_usage_from_migrations(context, migrations, nodename)
+ 
+         # Detect and account for orphaned instances that may exist on the
+@@ -1254,7 +1368,7 @@ class ResourceTracker(object):
+ 
+     # add update_affinity
+     def _update_usage(self, usage, nodename, sign=1, update_affinity=True,
+-                      strict=True):
++                      strict=True, from_migration=False):
+         # tracker debug logging
+         if CONF.compute_resource_debug:
+             # Get parent calling functions
+@@ -1319,6 +1433,15 @@ class ResourceTracker(object):
+         cn.local_gb_used += sign * usage.get('ephemeral_gb', 0)
+         cn.vcpus_used += sign * vcpus_usage
+ 
++        if usage.get('uuid') in self.tracked_in_progress or from_migration:
++            cn.disk_available_least -= \
++                sign * usage.get('root_gb', 0)
++            cn.disk_available_least -= \
++                sign * usage.get('ephemeral_gb', 0)
++            swap = usage.get('swap', 0)
++            cn.disk_available_least -= \
++                sign * int(math.ceil((swap * units.Mi) / float(units.Gi)))
++
+         # free ram and disk may be negative, depending on policy:
+         cn.free_ram_mb = cn.memory_mb - cn.memory_mb_used
+         cn.free_disk_gb = cn.local_gb - cn.local_gb_used
+@@ -1483,6 +1606,7 @@ class ResourceTracker(object):
+         itype = None
+         numa_topology = None
+         sign = 0
++        same_node_old = False
+         if same_node:
+             # Same node resize. Record usage for the 'new_' resources.  This
+             # is executed on resize_claim().
+@@ -1509,6 +1633,7 @@ class ResourceTracker(object):
+                         migration)
+                 numa_topology = self._get_migration_context_resource(
+                     'numa_topology', instance, prefix='old_')
++                same_node_old = True
+ 
+         elif incoming and not record:
+             # instance has not yet migrated here:
+@@ -1533,8 +1658,8 @@ class ResourceTracker(object):
+             if self.pci_tracker and sign:
+                 self.pci_tracker.update_pci_for_instance(
+                     context, instance, sign=sign)
+-            self._update_usage(usage, nodename, strict=strict)
+-
++            self._update_usage(usage, nodename, strict=strict,
++                               from_migration=(incoming and not same_node_old))
+             if self.pci_tracker:
+                 obj = self.pci_tracker.stats.to_device_pools_obj()
+                 cn.pci_device_pools = obj
+@@ -1669,6 +1794,7 @@ class ResourceTracker(object):
+             sign = -1
+ 
+         cn = self.compute_nodes[nodename]
++
+         self.stats.update_stats_for_instance(instance, is_removed_instance)
+ 
+         # if it's a new or deleted instance:
+@@ -2027,7 +2153,7 @@ class ResourceTracker(object):
+         Accepts a dict or an Instance or Flavor object, and a set of updates.
+         Converts the object to a dict and applies the updates.
+ 
+-        :param object_or_dict: instance or flavor as an object or just a dict
++        param object_or_dict: instance or flavor as an object or just a dict
+         :param updates: key-value pairs to update the passed object.
+                         Currently only considers 'numa_topology', all other
+                         keys are ignored.
+@@ -2043,8 +2169,8 @@ class ResourceTracker(object):
+                      'vcpus': object_or_dict.vcpus,
+                      'root_gb': object_or_dict.root_gb,
+                      'ephemeral_gb': object_or_dict.flavor.ephemeral_gb,
+-                     'numa_topology': object_or_dict.numa_topology}
+-
++                     'numa_topology': object_or_dict.numa_topology,
++                     'uuid': object_or_dict.uuid}
+             # need to add in flavor and system_metadata so we
+             # can properly normalize vcpu usage
+             usage['flavor'] = object_or_dict.flavor
+diff --git a/nova/tests/unit/compute/test_compute_mgr.py b/nova/tests/unit/compute/test_compute_mgr.py
+index e72c2e7..940a3eb 100644
+--- a/nova/tests/unit/compute/test_compute_mgr.py
++++ b/nova/tests/unit/compute/test_compute_mgr.py
+@@ -2418,6 +2418,7 @@ class ComputeManagerUnitTestCase(test.NoDBTestCase):
+         compute_node.get = mock.Mock()
+         compute_node.get.return_value = None
+         compute_node.hypervisor_hostname = hypervisor_hostname
++        compute_node.disk_available_least = 0
+         fake_rt.compute_nodes[hypervisor_hostname] = compute_node
+ 
+         if fail_claim:
+@@ -6356,6 +6357,9 @@ class ComputeManagerMigrationTestCase(test.NoDBTestCase):
+ 
+     def test_post_live_migration_at_destination_success(self):
+ 
++        @mock.patch.object(resource_tracker.ResourceTracker,
++                           'tracker_dal_update')
++        @mock.patch.object(manager.ComputeManager, '_get_resource_tracker')
+         @mock.patch.object(self.instance, 'refresh')
+         @mock.patch.object(self.instance, 'save')
+         @mock.patch.object(self.instance, 'mutated_migration_context')
+@@ -6378,7 +6382,8 @@ class ComputeManagerMigrationTestCase(test.NoDBTestCase):
+                      _notify_about_instance_usage, migrate_instance_finish,
+                      setup_networks_on_host, get_instance_nw_info,
+                      apply_migration_context, drop_migration_context,
+-                     mutated_migration_context, save, refresh):
++                     mutated_migration_context, save, refresh, mock_get_rt,
++                     tracker_dal_update):
+             cn = mock.Mock(spec_set=['hypervisor_hostname'])
+             migration = mock.Mock(spec=objects.Migration)
+             cn.hypervisor_hostname = 'test_host'
+@@ -6386,6 +6391,21 @@ class ComputeManagerMigrationTestCase(test.NoDBTestCase):
+             cn_old = self.instance.host
+             instance_old = self.instance
+             get_by_instance_and_status.return_value = migration
++            fake_rt = fake_resource_tracker.FakeResourceTracker(
++                self.compute.host,
++                self.compute.driver)
++            compute_node = mock.Mock(spec=objects.ComputeNode)
++            compute_node.memory_mb = 512
++            compute_node.memory_mb_used = 0
++            compute_node.local_gb = 259
++            compute_node.local_gb_used = 0
++            compute_node.vcpus = 2
++            compute_node.vcpus_used = 0
++            compute_node.get = mock.Mock()
++            compute_node.get.return_value = None
++            compute_node.hypervisor_hostname = cn.hypervisor_hostname
++            compute_node.disk_available_least = 0
++            mock_get_rt.return_value = fake_rt
+ 
+             self.compute.post_live_migration_at_destination(
+                 self.context, self.instance, False)
+@@ -6474,6 +6494,8 @@ class ComputeManagerMigrationTestCase(test.NoDBTestCase):
+ 
+     def test_post_live_migration_at_destination_unexpected_exception(self):
+ 
++        @mock.patch.object(resource_tracker.ResourceTracker,
++                           'tracker_dal_update')
+         @mock.patch.object(compute_utils, 'add_instance_fault_from_exc')
+         @mock.patch.object(self.instance, 'refresh')
+         @mock.patch.object(self.instance, 'save')
+@@ -6496,7 +6518,8 @@ class ComputeManagerMigrationTestCase(test.NoDBTestCase):
+                      _notify_about_instance_usage, network_api,
+                      apply_migration_context, drop_migration_context,
+                      mutated_migration_context,
+-                     save, refresh, add_instance_fault_from_exc):
++                     save, refresh, add_instance_fault_from_exc,
++                     tracker_dal_update):
+             cn = mock.Mock(spec_set=['hypervisor_hostname'])
+             migration = mock.Mock(spec=objects.Migration)
+             cn.hypervisor_hostname = 'test_host'
+diff --git a/nova/tests/unit/compute/test_resource_tracker.py b/nova/tests/unit/compute/test_resource_tracker.py
+index 5290a1f..a408d3e 100644
+--- a/nova/tests/unit/compute/test_resource_tracker.py
++++ b/nova/tests/unit/compute/test_resource_tracker.py
+@@ -85,7 +85,8 @@ _COMPUTE_NODE_FIXTURES = [
+         current_workload=0,
+         running_vms=0,
+         cpu_info='{}',
+-        disk_available_least=0,
++        disk_available_least=(_VIRT_DRIVER_AVAIL_RESOURCES['local_gb'] -
++                              _VIRT_DRIVER_AVAIL_RESOURCES['local_gb_used']),
+         host_ip='1.1.1.1',
+         supported_hv_specs=[
+             objects.HVSpec.from_list([
+@@ -447,6 +448,8 @@ def setup_rt(hostname, virt_resources=_VIRT_DRIVER_AVAIL_RESOURCES,
+     vd.estimate_instance_overhead.side_effect = estimate_overhead
+     # mock a return value of empty dict to give default behaviour.
+     vd.get_local_gb_info.return_value = {}
++    vd.get_disk_available_least.return_value = virt_resources['local_gb'] - \
++                                               virt_resources['local_gb_used']
+ 
+     with test.nested(
+             mock.patch('nova.scheduler.client.SchedulerClient',
+@@ -500,6 +503,8 @@ class TestUpdateAvailableResources(BaseTestCase):
+             self.rt.update_available_resource(mock.MagicMock(), _NODENAME)
+         return update_mock
+ 
++    @mock.patch('nova.compute.resource_tracker.ResourceTracker.'
++                '_update_usage_from_instances')
+     @mock.patch('nova.objects.InstancePCIRequests.get_by_instance',
+                 return_value=objects.InstancePCIRequests(requests=[]))
+     @mock.patch('nova.objects.PciDeviceList.get_by_compute_node',
+@@ -508,30 +513,27 @@ class TestUpdateAvailableResources(BaseTestCase):
+     @mock.patch('nova.objects.MigrationList.get_in_progress_by_host_and_node')
+     @mock.patch('nova.objects.InstanceList.get_by_host_and_node')
+     def test_disabled(self, get_mock, migr_mock, get_cn_mock, pci_mock,
+-            instance_pci_mock):
++            instance_pci_mock, update_usage_mock):
+         self._setup_rt()
+ 
+         # Set up resource tracker in an enabled state and verify that all is
+         # good before simulating a disabled node.
+-        get_mock.return_value = []
+         migr_mock.return_value = []
+         get_cn_mock.return_value = _COMPUTE_NODE_FIXTURES[0]
++        update_usage_mock.return_value = []
+ 
+         # This will call _init_compute_node() and create a ComputeNode object
+         # and will also call through to InstanceList.get_by_host_and_node()
+         # because the node is available.
+         self._update_available_resources()
+-
+-        self.assertTrue(get_mock.called)
+-
+-        get_mock.reset_mock()
++        self.assertTrue(update_usage_mock.called)
++        update_usage_mock.reset_mock()
+ 
+         # OK, now simulate a node being disabled by the Ironic virt driver.
+         vd = self.driver_mock
+         vd.node_is_available.return_value = False
+         self._update_available_resources()
+-
+-        self.assertFalse(get_mock.called)
++        self.assertFalse(update_usage_mock.called)
+ 
+     @mock.patch('nova.objects.InstancePCIRequests.get_by_instance',
+                 return_value=objects.InstancePCIRequests(requests=[]))
+@@ -1423,6 +1425,8 @@ class TestInstanceClaim(BaseTestCase):
+             'local_gb_used': disk_used,
+             'memory_mb_used': self.instance.memory_mb,
+             'free_disk_gb': expected.local_gb - disk_used,
++            'disk_available_least': expected.disk_available_least -
++                                    disk_used,
+             "free_ram_mb": expected.memory_mb - self.instance.memory_mb,
+             'running_vms': 1,
+             'vcpus_used': 1 / self.rt.cpu_allocation_ratio,
+@@ -1450,6 +1454,8 @@ class TestInstanceClaim(BaseTestCase):
+             'local_gb_used': disk_used,
+             'memory_mb_used': self.instance.memory_mb,
+             'free_disk_gb': expected.local_gb - disk_used,
++            'disk_available_least': expected.disk_available_least -
++                                    disk_used,
+             "free_ram_mb": expected.memory_mb - self.instance.memory_mb,
+             'running_vms': 1,
+             'vcpus_used': 1 / self.rt.cpu_allocation_ratio,
+@@ -1487,6 +1493,8 @@ class TestInstanceClaim(BaseTestCase):
+             'local_gb_used': disk_used,
+             'memory_mb_used': self.instance.memory_mb,
+             'free_disk_gb': expected.local_gb - disk_used,
++            'disk_available_least': expected.disk_available_least -
++                                    disk_used,
+             "free_ram_mb": expected.memory_mb - self.instance.memory_mb,
+             'running_vms': 1,
+             'vcpus_used': 1 / self.rt.cpu_allocation_ratio,
+@@ -1536,6 +1544,8 @@ class TestInstanceClaim(BaseTestCase):
+             'local_gb_used': disk_used,
+             'memory_mb_used': self.instance.memory_mb,
+             'free_disk_gb': expected.local_gb - disk_used,
++            'disk_available_least': expected.disk_available_least -
++                                    disk_used,
+             "free_ram_mb": expected.memory_mb - self.instance.memory_mb,
+             'running_vms': 1,
+             'vcpus_used': 1 / self.rt.cpu_allocation_ratio,
+@@ -1750,6 +1760,9 @@ class TestResize(BaseTestCase):
+         expected.free_disk_gb = (expected.free_disk_gb -
+                                 (new_flavor.root_gb +
+                                     new_flavor.ephemeral_gb))
++        expected.disk_available_least = (expected.disk_available_least -
++                                         (new_flavor.root_gb +
++                                          new_flavor.ephemeral_gb))
+ 
+         with test.nested(
+             mock.patch('nova.compute.resource_tracker.ResourceTracker'
+@@ -1833,6 +1846,9 @@ class TestResize(BaseTestCase):
+ 
+         expected = compute_update_usage(expected, old_flavor, sign=1)
+         expected.running_vms = 1
++        expected.disk_available_least = (expected.disk_available_least -
++                                        (old_flavor.root_gb +
++                                         old_flavor.ephemeral_gb))
+         self.assertTrue(obj_base.obj_equal_prims(
+             expected,
+             self.rt.compute_nodes[_NODENAME],
+@@ -1870,6 +1886,10 @@ class TestResize(BaseTestCase):
+             self.rt.resize_claim(ctx, instance, new_flavor, _NODENAME)
+ 
+         expected = compute_update_usage(expected, new_flavor, sign=1)
++        expected.disk_available_least = (expected.disk_available_least -
++                                        (new_flavor.root_gb +
++                                         new_flavor.ephemeral_gb))
++
+         self.assertTrue(obj_base.obj_equal_prims(
+             expected,
+             self.rt.compute_nodes[_NODENAME],
+@@ -1887,6 +1907,9 @@ class TestResize(BaseTestCase):
+                                 prefix=prefix)
+ 
+         expected = compute_update_usage(expected, flavor, sign=-1)
++        expected.disk_available_least = (expected.disk_available_least +
++                                        (flavor.root_gb +
++                                         flavor.ephemeral_gb))
+         self.assertTrue(obj_base.obj_equal_prims(
+             expected,
+             self.rt.compute_nodes[_NODENAME],
+@@ -2157,6 +2180,11 @@ class TestResize(BaseTestCase):
+                                  flavor1.ephemeral_gb +
+                                  flavor2.root_gb +
+                                  flavor2.ephemeral_gb))
++        expected.disk_available_least = (expected.disk_available_least -
++                                 (flavor1.root_gb +
++                                  flavor1.ephemeral_gb +
++                                  flavor2.root_gb +
++                                  flavor2.ephemeral_gb))
+ 
+         # not using mock.sentinel.ctx because resize_claim calls #elevated
+         ctx = mock.MagicMock()
+diff --git a/nova/tests/unit/virt/libvirt/test_driver.py b/nova/tests/unit/virt/libvirt/test_driver.py
+index 1c9ddf2..ccfce5f 100755
+--- a/nova/tests/unit/virt/libvirt/test_driver.py
++++ b/nova/tests/unit/virt/libvirt/test_driver.py
+@@ -16486,7 +16486,6 @@ class HostStateTestCase(test.NoDBTestCase):
+                               "mca", "pge", "mtrr", "sep", "apic"],
+                  "topology": {"cores": "1", "threads": "1", "sockets": "1"}
+                 })
+-        self.assertEqual(stats["disk_available_least"], 80)
+         self.assertEqual(jsonutils.loads(stats["pci_passthrough_devices"]),
+                          HostStateTestCase.pci_devices)
+         self.assertThat(objects.NUMATopology.obj_from_db_obj(
+diff --git a/nova/tests/unit/virt/test_images.py b/nova/tests/unit/virt/test_images.py
+index b6d3920..7d11e34 100644
+--- a/nova/tests/unit/virt/test_images.py
++++ b/nova/tests/unit/virt/test_images.py
+@@ -40,7 +40,7 @@ class QemuTestCase(test.NoDBTestCase):
+ 
+     @mock.patch.object(os.path, 'exists', return_value=True)
+     def test_qemu_info_with_errors(self, path_exists):
+-        self.assertRaises(exception.InvalidDiskInfo,
++        self.assertRaises(exception.DiskNotFound,
+                           images.qemu_img_info,
+                           '/fake/path')
+ 
+diff --git a/nova/tests/unit/virt/test_virt_drivers.py b/nova/tests/unit/virt/test_virt_drivers.py
+index a78e8c9..02b949d 100644
+--- a/nova/tests/unit/virt/test_virt_drivers.py
++++ b/nova/tests/unit/virt/test_virt_drivers.py
+@@ -711,7 +711,7 @@ class _VirtDriverTestCase(_FakeDriverBackendTestCase):
+     def _check_available_resource_fields(self, host_status):
+         keys = ['vcpus', 'memory_mb', 'local_gb', 'vcpus_used',
+                 'memory_mb_used', 'hypervisor_type', 'hypervisor_version',
+-                'hypervisor_hostname', 'cpu_info', 'disk_available_least',
++                'hypervisor_hostname', 'cpu_info',
+                 'supported_instances']
+         for key in keys:
+             self.assertIn(key, host_status)
+diff --git a/nova/virt/driver.py b/nova/virt/driver.py
+index 64556b7..0546998 100644
+--- a/nova/virt/driver.py
++++ b/nova/virt/driver.py
+@@ -1648,6 +1648,11 @@ class ComputeDriver(object):
+     def get_local_gb_info(self):
+         return {}
+ 
++    # This is used in resource tracker.
++    # Default to return zero for simplified unit testing.
++    def get_disk_available_least(self):
++        return 0
++
+ 
+ def load_compute_driver(virtapi, compute_driver=None):
+     """Load a compute driver module.
+diff --git a/nova/virt/images.py b/nova/virt/images.py
+index 2e431b6..7c075f9 100644
+--- a/nova/virt/images.py
++++ b/nova/virt/images.py
+@@ -79,6 +79,9 @@ def qemu_img_info(path, format=None):
+             cmd = cmd + ('--force-share',)
+         out, err = utils.execute(*cmd, prlimit=QEMU_IMG_LIMITS)
+     except processutils.ProcessExecutionError as exp:
++        if exp.stderr and "No such file or directory" in exp.stderr:
++            raise exception.DiskNotFound(location=path)
++
+         # this means we hit prlimits, make the exception more specific
+         if exp.exit_code == -9:
+             msg = (_("qemu-img aborted by prlimits when inspecting "
+diff --git a/nova/virt/libvirt/driver.py b/nova/virt/libvirt/driver.py
+index 8b4b71c..4aaaca9 100644
+--- a/nova/virt/libvirt/driver.py
++++ b/nova/virt/libvirt/driver.py
+@@ -6121,11 +6121,6 @@ class LibvirtDriver(driver.ComputeDriver):
+         # data format needs to be standardized across drivers
+         data["cpu_info"] = jsonutils.dumps(self._get_cpu_info())
+ 
+-        disk_free_gb = disk_info_dict['free']
+-        disk_over_committed = self._get_disk_over_committed_size_total()
+-        available_least = disk_free_gb * units.Gi - disk_over_committed
+-        data['disk_available_least'] = available_least / units.Gi
+-
+         data['pci_passthrough_devices'] = \
+             self._get_pci_passthrough_devices()
+ 
+@@ -6137,6 +6132,13 @@ class LibvirtDriver(driver.ComputeDriver):
+ 
+         return data
+ 
++    # extension
++    def get_disk_available_least(self):
++        # called by the resource tracker with lock taken.
++        d = self._get_local_gb_info()
++        return (d['free'] * units.Gi -
++            self._get_disk_over_committed_size_total()) / units.Gi
++
+     def check_instance_shared_storage_local(self, context, instance):
+         """Check if instance files located on shared storage.
+ 
+@@ -7960,6 +7962,11 @@ class LibvirtDriver(driver.ComputeDriver):
+                             'by concurrent operations such as resize. '
+                             'Error: %(error)s',
+                             {'i_name': guest.name, 'error': e})
++            except exception.DiskNotFound as e:
++                LOG.warning(
++                    'Instance file not found. Possibly was removed by a '
++                    'concurrent instance deletion operation. %(ex)s',
++                    {'ex': e})
+             # NOTE(gtt116): give other tasks a chance.
+             greenthread.sleep(0)
+         return disk_over_committed_size
+-- 
+2.7.4
+

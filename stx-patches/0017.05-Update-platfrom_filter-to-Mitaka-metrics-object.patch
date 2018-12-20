@@ -1,0 +1,56 @@
+From c45ea5cc088c25e2031311c26dc1d2acebe2d45a Mon Sep 17 00:00:00 2001
+From: Daniel Chavolla <daniel.chavolla@windriver.com>
+Date: Fri, 2 Sep 2016 10:51:22 -0400
+Subject: [PATCH] Update platfrom_filter to Mitaka metrics object.
+
+This commit fixes platform_filter AttributeError exception when
+retrieving the host's memory and cpu metrics.
+This problem is caused by the Mitaka change to monitor's metrics
+so that they are no longer a simple  list.
+
+Previous code failed with the following message:
+
+AttributeError: "'MonitorMetricList' object has no attribute 'get'"
+---
+ nova/scheduler/filters/platform_filter.py | 15 ++++++++++-----
+ 1 file changed, 10 insertions(+), 5 deletions(-)
+
+diff --git a/nova/scheduler/filters/platform_filter.py b/nova/scheduler/filters/platform_filter.py
+index bb684bd..d9ca414 100644
+--- a/nova/scheduler/filters/platform_filter.py
++++ b/nova/scheduler/filters/platform_filter.py
+@@ -19,6 +19,7 @@
+ from oslo_config import cfg
+ from oslo_log import log as logging
+ 
++from nova.i18n import _LW
+ from nova.objects import fields
+ from nova.scheduler import filters
+ 
+@@ -55,14 +56,18 @@ class PlatformFilter(filters.BaseHostFilter):
+         # -1 for threshold means the feature is disabled
+         if self._cpu_threshold == -1 or self._mem_threshold == -1:
+             return True
++        metrics_ = {}
++        if host_state.metrics:
++            metrics_ = {m.name: m.value for m in host_state.metrics.objects}
+ 
+         try:
+-            host_plat_cpu_usage = host_state.metrics.get(
+-                fields.MonitorMetricType.PLATFORM_CPU_PERCENT).value
+-            host_plat_mem_usage = host_state.metrics.get(
+-                fields.MonitorMetricType.PLATFORM_MEM_PERCENT).value
+-        except AttributeError:
++            host_plat_cpu_usage = \
++                metrics_[fields.MonitorMetricType.PLATFORM_CPU_PERCENT]
++            host_plat_mem_usage = \
++                metrics_[fields.MonitorMetricType.PLATFORM_MEM_PERCENT]
++        except AttributeError as ex:
+             # If host does not support these metrics we fall into legacy mode
++            LOG.warning(_LW('Unable to get metric: %s.'), ex.message)
+             return True
+ 
+         if host_plat_cpu_usage < self._cpu_threshold and \
+-- 
+2.7.4
+

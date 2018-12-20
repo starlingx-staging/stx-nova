@@ -1,0 +1,920 @@
+From 963dc06b6b482c2f93abd32ab1669a034a36f5ac Mon Sep 17 00:00:00 2001
+From: Jack Ding <jack.ding@windriver.com>
+Date: Tue, 23 Jan 2018 10:03:20 -0500
+Subject: [PATCH 036/143] primary: live migration driver fixes
+
+7f39026 Support live migration with different host cpu topology
+An issue was found where a live migration was executed from a host with
+non-HT to a host with HT.  The guest cpu topology was being recalculated
+and the topology can't change during live migration (see
+_live_migration_operation() in the libvirt driver).
+
+This commit fixes the issue by not changing the <cpu><topology> during
+live migration and keeps the one from the running instance.  Note that
+the <cputune> part will still be modified based on the
+InstanceNUMATopology that has been claimed on the destination.
+
+Executing a reboot on the instance will result in the guest cpu topology
+to be modified based on the current host where it resides (the best cpu
+topology will be picked based on the physical cpu capabilities).
+
+e53efcc live migration stuck calling abort_job
+   When live migration timeouts guest.abort_job() is called to cancel
+   the current libvirt background job. If the jobinfo type were not
+   updated after aborting then the libvirt stucks in
+   VIR_DOMAIN_JOB_UNBOUNDED state and keep calling guest.abort_job()
+   every 0.5 seconds forever.
+
+   Fix is to let nova reset the job type to VIR_DOMAIN_JOB_NONE after
+   calling guest.abort_job() so it can transition to either
+   VIR_DOMAIN_JOB_FAILED or VIR_DOMAIN_JOB_COMPLETED to get out of the
+   while loop.
+
+   There is likely a bug in libvirt that sets the jobinfo to wrong type.
+   libvirt should ideally set jobinfo type to VIR_DOMAIN_JOB_CANCELLED
+   when aborting.
+
+397109f live-migration to compute-nodes with heterogeneous cpu topology
+   This enables live-migration to compute nodes with heterogeneous cpu
+   topology.
+
+   This passes the destination vcpu_pin_set through along with numa
+   topology when evaluating guest numa config. The guest XML is then
+   updated with correct destination NUMA / cpu topology.
+
+   Upstreaming note:
+   There is additional work to do for object versioning and adding unit
+   tests to actually cover the heterogeneous compute node case.
+
+   This commit merges a number of R3 commits: 2d0b8da, 0d319e4, 6dffc9e
+   (unit tests) and 023235e (log changes for vcpu_pin_set).
+
+   For port to Newton, since this commit now changes _update_numa_xml()
+   to look at instance migration_context, needed to bring in some unit test
+   fakes in test_driver from R3 commit fcd1bb8 (which will not be ported
+   due to upstream fix).
+
+0a9ff8f Enhance live-migration progress log for memory and
+   block data.
+   This enhances live-migration progress log to show the breakdown of
+   memory vs block data, in terms of processed, remaining, and total
+   MiB. Units are displayed in MiB since that is easier to read.
+
+   The overall instance.progress metric is changed to be a function of
+   info.data_remaining, since that actually includes both memory + data.
+
+   This is cherry-picked from commit d2dd17b on Mitaka.  For port to
+   Newton, upstream moved save of instance and migration object to a new
+   function save_stats() in migration.py so that also required a change.
+
+1f12c2d live migration auto-converge and libvirt tunnelling
+   In order to make live-migrations more likely to complete under load
+   we plan to default to enabling auto-converge and disabling libvirt
+   tunnelling.
+
+   In some cases this behaviour will not be appropriate, so we will
+   allow the behaviour to be customized via flavor extra-spec and
+   instance metadata.
+
+   Specifically, the libvirt tunnelling can now be controlled by the
+   "hw:wrs:live_migration_tunnel" flavor extra-spec or instance
+   metadata.
+   Both of these take a value that can be converted to a boolean.
+
+   Similarly, the auto-converge functionality can now be controlled by
+   the "hw:wrs:live_migration_auto_converge" flavor extra-spec  or
+   instance metadata.  Both of these take a value that can be converted
+   to a boolean.
+
+   In both cases, if values are specified for both the flavor extra-spec
+   and the instance metadata, the latter will take priority.
+
+2f11245 Do not use mutated migration context during live
+   migration.
+   This fixes issues with upstream backported fix:
+   8ef14cf live-mig: Add claims and proper resource tracking
+
+   In the version of proposed upstream change that we backported to
+   Newton (https://review.openstack.org/#/c/244489/58),
+   mutated_migration_context()
+   was used when calling driver.live_migration() to do the main part of
+   the live migration.  This applies the destination host numa_topology,
+   pci_devices and pci_requests to the working instance object.  This
+   has a couple issues:
+   - Within driver.live_migration() there is an instance.save() (to save
+     the progress stats) which isn't allowed under mutated context.
+     This means the destination host numa_topology gets saved in db
+     prior to instance host changing.
+   - A rollback is done under the mutated context and the instance ends
+     up with the destination numa_topology back on the source host.
+     This has already been flagged in the upstream review.
+
+   Fix for R4/Newton is to not use the mutated migration context in this
+   case.  This is the same as it was in R3/Mitaka.  This does mean we
+   have to port R3 commit fcd1bb8 (Correction for upstream patch for
+   numa xml on live migration) to make sure the numa xml is correct on
+   the destination host as the instance object will have the source
+   topology.
+
+5ac8998 improve live migration monitor logging
+   Add information about migration bandwidth and current estimated
+   downtime to the periodic live migration monitor log.  This is
+   useful for debugging.
+
+__TYPE_primary
+__TAG_livemigration,hyperthreading
+__R4_commit_7f39026
+__R3_commit_8d82efa
+__TC6491,TC6499,TC6521,TC6552
+---
+ nova/api/openstack/common.py                     |  14 ++
+ nova/api/openstack/compute/flavors_extraspecs.py |   1 +
+ nova/compute/manager.py                          |   9 +-
+ nova/compute/resource_tracker.py                 |   9 +-
+ nova/objects/migration_context.py                |   5 +
+ nova/tests/unit/compute/test_compute.py          |   3 +
+ nova/tests/unit/compute/test_compute_mgr.py      |   6 +-
+ nova/tests/unit/compute/test_resource_tracker.py |   2 +
+ nova/tests/unit/objects/test_objects.py          |   2 +-
+ nova/tests/unit/virt/libvirt/test_driver.py      | 156 +++++++++++++++++++++-
+ nova/tests/unit/virt/libvirt/test_migration.py   |   2 +-
+ nova/tests/unit/virt/test_virt_drivers.py        |   8 ++
+ nova/virt/libvirt/driver.py                      | 162 +++++++++++++++++++----
+ nova/virt/libvirt/migration.py                   |  29 +++-
+ 14 files changed, 357 insertions(+), 51 deletions(-)
+
+diff --git a/nova/api/openstack/common.py b/nova/api/openstack/common.py
+index 89fefa9..4993fd6 100644
+--- a/nova/api/openstack/common.py
++++ b/nova/api/openstack/common.py
+@@ -337,6 +337,20 @@ def validate_live_migration_timeout(metadata):
+ def validate_metadata(metadata):
+     validate_live_migration_timeout(metadata)
+     validate_live_migration_max_downtime(metadata)
++    validate_boolean_options(metadata)
++
++
++def validate_boolean_options(metadata):
++    keys = ['hw:wrs:live_migration_auto_converge',
++            'hw:wrs:live_migration_tunnel']
++    for key in keys:
++        if key in metadata:
++            try:
++                strutils.bool_from_string(metadata[key], strict=True)
++            except ValueError as error:
++                msg = _('Error setting key %(k)s: %(m)s') % \
++                        {'k': key, 'm': error.message}
++                raise webob.exc.HTTPBadRequest(explanation=msg)
+ 
+ 
+ # extension
+diff --git a/nova/api/openstack/compute/flavors_extraspecs.py b/nova/api/openstack/compute/flavors_extraspecs.py
+index b1ed9a3..2013dc5 100644
+--- a/nova/api/openstack/compute/flavors_extraspecs.py
++++ b/nova/api/openstack/compute/flavors_extraspecs.py
+@@ -368,6 +368,7 @@ class FlavorExtraSpecsController(wsgi.Controller):
+         common.validate_live_migration_max_downtime(flavor.extra_specs)
+         self._validate_sw_keys(flavor)
+         self._validate_nested_vmx(flavor)
++        common.validate_boolean_options(flavor.extra_specs)
+         self._validate_cpu_realtime_mask(flavor)
+         self._validate_wrs_deprecated_keys(flavor)
+ 
+diff --git a/nova/compute/manager.py b/nova/compute/manager.py
+index 9ca704a..39ddfc4 100644
+--- a/nova/compute/manager.py
++++ b/nova/compute/manager.py
+@@ -5834,11 +5834,10 @@ class ComputeManager(manager.Manager):
+             migrate_data.migration = migration
+         LOG.debug('live_migration data is %s', migrate_data)
+         try:
+-            with instance.mutated_migration_context():
+-                self.driver.live_migration(context, instance, dest,
+-                                           self._post_live_migration,
+-                                           self._rollback_live_migration,
+-                                           block_migration, migrate_data)
++            self.driver.live_migration(context, instance, dest,
++                                       self._post_live_migration,
++                                       self._rollback_live_migration,
++                                       block_migration, migrate_data)
+         except Exception:
+             LOG.exception('Live migration failed.', instance=instance)
+             with excutils.save_and_reraise_exception():
+diff --git a/nova/compute/resource_tracker.py b/nova/compute/resource_tracker.py
+index f32ddc9..f6ee7aa 100644
+--- a/nova/compute/resource_tracker.py
++++ b/nova/compute/resource_tracker.py
+@@ -472,7 +472,8 @@ class ResourceTracker(object):
+             old_pci_devices=instance.pci_devices,
+             new_pci_devices=claimed_pci_devices,
+             old_pci_requests=instance.pci_requests,
+-            new_pci_requests=new_pci_requests)
++            new_pci_requests=new_pci_requests,
++            new_allowed_cpus=hardware.get_vcpu_pin_set())
+ 
+         def getter(obj, attr, default=None):
+             """Method to get object attributes without exception."""
+@@ -485,12 +486,14 @@ class ResourceTracker(object):
+         LOG.info(
+             "Migration type:%(ty)s, "
+             "source_compute:%(sc)s source_node:%(sn)s, "
+-            "dest_compute:%(dc)s dest_node:%(dn)s",
++            "dest_compute:%(dc)s dest_node:%(dn)s, "
++            "new_allowed_cpus=%(allowed)s",
+             {'ty': getter(migration, 'migration_type'),
+              'sc': getter(migration, 'source_compute'),
+              'sn': getter(migration, 'source_node'),
+              'dc': getter(migration, 'dest_compute'),
+-             'dn': getter(migration, 'dest_node')},
++             'dn': getter(migration, 'dest_node'),
++             'allowed': getter(mig_context, 'new_allowed_cpus')},
+             instance=instance)
+ 
+         instance.migration_context = mig_context
+diff --git a/nova/objects/migration_context.py b/nova/objects/migration_context.py
+index 9774eea..01cf0fe 100644
+--- a/nova/objects/migration_context.py
++++ b/nova/objects/migration_context.py
+@@ -35,6 +35,7 @@ class MigrationContext(base.NovaPersistentObject, base.NovaObject):
+ 
+     # Version 1.0: Initial version
+     # Version 1.1: Add old/new pci_devices and pci_requests
++    #              add new_allowed_cpus
+     VERSION = '1.1'
+ 
+     fields = {
+@@ -52,6 +53,10 @@ class MigrationContext(base.NovaPersistentObject, base.NovaObject):
+                                                nullable=True),
+         'old_pci_requests': fields.ObjectField('InstancePCIRequests',
+                                                 nullable=True),
++        # handle migration to hosts of different cpu topology.
++        # This is also added in R3/Mitaka (v1.0) so don't need to make
++        # compatible.
++        'new_allowed_cpus': fields.SetOfIntegersField(),
+     }
+ 
+     @classmethod
+diff --git a/nova/tests/unit/compute/test_compute.py b/nova/tests/unit/compute/test_compute.py
+index d3dd82e..f7fb1b5 100644
+--- a/nova/tests/unit/compute/test_compute.py
++++ b/nova/tests/unit/compute/test_compute.py
+@@ -160,6 +160,9 @@ class BaseTestCase(test.TestCase):
+         self.flags(network_manager='nova.network.manager.FlatManager')
+         fake.set_nodes([NODENAME, NODENAME2])
+ 
++        # Required since adding new_allowed_cpus to migration_context.
++        self.flags(vcpu_pin_set="0-15")
++
+         fake_notifier.stub_notifier(self)
+         self.addCleanup(fake_notifier.reset)
+ 
+diff --git a/nova/tests/unit/compute/test_compute_mgr.py b/nova/tests/unit/compute/test_compute_mgr.py
+index b7634b3..8fd57ff 100644
+--- a/nova/tests/unit/compute/test_compute_mgr.py
++++ b/nova/tests/unit/compute/test_compute_mgr.py
+@@ -96,6 +96,8 @@ class ComputeManagerUnitTestCase(test.NoDBTestCase):
+         # stub out server group messaging
+         self.stubs.Set(nova.compute.cgcs_messaging.CGCSMessaging,
+                       '_do_setup', lambda *a, **kw: None)
++        # Required since adding new_allowed_cpus to migration_context.
++        self.flags(vcpu_pin_set="1-4")
+ 
+     @mock.patch.object(manager.ComputeManager, '_get_power_state')
+     @mock.patch.object(manager.ComputeManager, '_sync_instance_power_state')
+@@ -6265,10 +6267,9 @@ class ComputeManagerMigrationTestCase(test.NoDBTestCase):
+     def test_live_migration_handles_dict(self):
+         compute = manager.ComputeManager()
+ 
+-        @mock.patch.object(self.instance, 'mutated_migration_context')
+         @mock.patch.object(compute, 'compute_rpcapi')
+         @mock.patch.object(compute, 'driver')
+-        def _test(mock_driver, mock_rpc, mock_mc):
++        def _test(mock_driver, mock_rpc):
+             migrate_data = migrate_data_obj.LiveMigrateData()
+             migration = objects.Migration()
+             migration.status = 'queued'
+@@ -6279,7 +6280,6 @@ class ComputeManagerMigrationTestCase(test.NoDBTestCase):
+             self.assertIsInstance(
+                 mock_rpc.pre_live_migration.call_args_list[0][0][5],
+                 migrate_data_obj.LiveMigrateData)
+-            mock_mc.assert_called_once_with()
+ 
+         _test()
+ 
+diff --git a/nova/tests/unit/compute/test_resource_tracker.py b/nova/tests/unit/compute/test_resource_tracker.py
+index bb4842a..a9bfb79 100644
+--- a/nova/tests/unit/compute/test_resource_tracker.py
++++ b/nova/tests/unit/compute/test_resource_tracker.py
+@@ -2190,6 +2190,8 @@ class TestRebuild(BaseTestCase):
+         # manager.
+         self.flags(reserved_host_disk_mb=0,
+                    reserved_host_memory_mb=0)
++        # Required since adding new_allowed_cpus to migration_context.
++        self.flags(vcpu_pin_set="1-4")
+ 
+         # Starting state for the destination node of the rebuild claim is the
+         # normal compute node fixture containing a single active running VM
+diff --git a/nova/tests/unit/objects/test_objects.py b/nova/tests/unit/objects/test_objects.py
+index 0aa8a02..0705c32 100644
+--- a/nova/tests/unit/objects/test_objects.py
++++ b/nova/tests/unit/objects/test_objects.py
+@@ -1134,7 +1134,7 @@ object_data = {
+     'KeyPairList': '1.3-94aad3ac5c938eef4b5e83da0212f506',
+     'MemoryDiagnostics': '1.0-2c995ae0f2223bb0f8e523c5cc0b83da',
+     'Migration': '1.4-17979b9f2ae7f28d97043a220b2a8350',
+-    'MigrationContext': '1.1-9fb17b0b521370957a884636499df52d',
++    'MigrationContext': '1.1-47eb1cfad14598827c81eca1cabb2f18',
+     'MigrationList': '1.3-55595bfc1a299a5962614d0821a3567e',
+     'MonitorMetric': '1.1-0fc771d8b3f29946f43a72547ceb07f9',
+     'MonitorMetricList': '1.1-15ecf022a68ddbb8c2a6739cfc9f8f5e',
+diff --git a/nova/tests/unit/virt/libvirt/test_driver.py b/nova/tests/unit/virt/libvirt/test_driver.py
+index 0418290..697cbce 100755
+--- a/nova/tests/unit/virt/libvirt/test_driver.py
++++ b/nova/tests/unit/virt/libvirt/test_driver.py
+@@ -8126,6 +8126,13 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+     @mock.patch.object(libvirt_driver.LibvirtDriver, '_get_guest_cpu_config',
+                        return_value=None)
+     def test_live_migration_update_graphics_xml(self, mock_cpu_config):
++        # Need to fake as _update_numa_xml now accesses migration_context
++        def fake_update_numa_xml(xml_doc, driver_interface, instance):
++            return xml_doc
++
++        self.stubs.Set(libvirt_migrate, '_update_numa_xml',
++                       fake_update_numa_xml)
++
+         self.compute = manager.ComputeManager()
+         instance_dict = dict(self.test_instance)
+         instance_dict.update({'host': 'fake',
+@@ -8345,6 +8352,13 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+ 
+     @mock.patch.object(objects.ImageMeta, "from_instance")
+     def test_update_volume_xml(self, mock_image_meta):
++        # Need to fake as _update_numa_xml now accesses migration_context
++        def fake_update_numa_xml(xml_doc, driver_interface, instance):
++            return xml_doc
++
++        self.stubs.Set(libvirt_migrate, '_update_numa_xml',
++                       fake_update_numa_xml)
++
+         drvr = libvirt_driver.LibvirtDriver(fake.FakeVirtAPI(), False)
+ 
+         initial_xml = self.device_xml_tmpl.format(
+@@ -8488,6 +8502,13 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+ 
+     @mock.patch.object(objects.ImageMeta, "from_instance")
+     def test_update_volume_xml_no_serial(self, mock_image_meta):
++        # Need to fake as _update_numa_xml now accesses migration_context
++        def fake_update_numa_xml(xml_doc, driver_interface, instance):
++            return xml_doc
++
++        self.stubs.Set(libvirt_migrate, '_update_numa_xml',
++                       fake_update_numa_xml)
++
+         drvr = libvirt_driver.LibvirtDriver(fake.FakeVirtAPI(), False)
+ 
+         xml_tmpl = """
+@@ -8561,6 +8582,13 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+ 
+     @mock.patch.object(objects.ImageMeta, "from_instance")
+     def test_update_volume_xml_no_connection_info(self, mock_image_meta):
++        # Need to fake as _update_numa_xml now accesses migration_context
++        def fake_update_numa_xml(xml_doc, driver_interface, instance):
++            return xml_doc
++
++        self.stubs.Set(libvirt_migrate, '_update_numa_xml',
++                       fake_update_numa_xml)
++
+         drvr = libvirt_driver.LibvirtDriver(fake.FakeVirtAPI(), False)
+         initial_xml = self.device_xml_tmpl.format(
+             device_path='/dev/disk/by-path/'
+@@ -8610,10 +8638,17 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+                                                       mock_get_serial_ports,
+                                                       mock_image_meta,
+                                                       mock_cpu_config):
++        # Need to fake as _update_numa_xml now accesses migration_context
++        def fake_update_numa_xml(xml_doc, driver_interface, instance):
++            return xml_doc
++
++        self.stubs.Set(libvirt_migrate, '_update_numa_xml',
++                       fake_update_numa_xml)
+         self.compute = manager.ComputeManager()
+         inst_dict = self.test_instance
+         instance_ref = fake_instance.fake_instance_obj(self.context,
+-                                                       **inst_dict)
++                                                    expected_attrs="metadata",
++                                                    **inst_dict)
+         instance_ref.numa_topology = None
+         image_meta = objects.ImageMeta()
+         image_meta_props = objects.ImageMetaProps()
+@@ -8734,7 +8769,7 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+                 objects.InstanceNUMACell(
+                     id=1, cpuset=set([0, 1, 2, 3]), memory=4096,
+                     cpu_policy=fields.CPUAllocationPolicy.DEDICATED,
+-                    cpu_pinning={0: 4, 1: 5, 2: 6, 3: 7},
++                    cpu_pinning={0: 0, 1: 1, 2: 2, 3: 3},
+                     pagesize=2048)])
+ 
+         host_topology = objects.NUMATopology(
+@@ -8749,6 +8784,11 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+                     objects.NUMAPagesTopology(size_kb=2048, total=512, used=0)
+                 ], siblings=[], pinned_cpus=set([]))])
+ 
++        new_instance_topology = copy.deepcopy(instance_topology)
++        new_instance_topology.cells[0].cpu_pinning_raw = {'0': 4, '1': 5,
++                                                          '2': 6, '3': 7}
++        new_allowed_cpus = set([0, 1, 2, 3, 4, 5, 6, 7])
++
+         xml_new = """<domain type="kvm">
+   <memory unit="KiB">4194304</memory>
+   <vcpu>4</vcpu>
+@@ -8772,7 +8812,7 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+     </hugepages>
+   </memoryBacking>
+   <cpu mode="host-model" match="exact">
+-    <topology sockets="4" cores="1" threads="1"/>
++    <topology sockets="1" cores="1" threads="1"/>
+     <numa>
+       <cell id="0" cpus="0-3" memory="4194304" memAccess="shared"/>
+     </numa>
+@@ -8787,12 +8827,22 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+             block_migration=False,
+             bdms=[])
+ 
+-        instance = fake_instance.fake_instance_obj(self.context)
++        instance = fake_instance.fake_instance_obj(self.context,
++                                                   expected_attrs="metadata")
+         image_meta = objects.ImageMeta()
+         image_meta_props = objects.ImageMetaProps()
+         image_meta.properties = image_meta_props
+         instance.numa_topology = instance_topology
+         instance.flavor.vcpus = 4
++        # _update_numa_xml modified to access new_allowed_cpus and
++        # new_numa_topology so create migration_context and add to instance
++        mig_context = objects.MigrationContext(instance_uuid=instance.uuid,
++            migration_id=1,
++            old_numa_topology=instance_topology,
++            new_numa_topology=new_instance_topology,
++            new_allowed_cpus=new_allowed_cpus)
++        instance.migration_context = mig_context
++
+         dom = fakelibvirt.virDomain
+ 
+         mock_xml.return_value = xml_old
+@@ -8871,6 +8921,24 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+         drvr._parse_migration_flags()
+ 
+         instance = objects.Instance(**self.test_instance)
++
++        # _update_numa_xml modified to access new_allowed_cpus and
++        # new_numa_topology so create migration_context and add to instance
++        instance_topology = objects.InstanceNUMATopology(
++            cells=[
++                objects.InstanceNUMACell(
++                    id=1, cpuset=set([]), memory=4096,
++                    cpu_policy=fields.CPUAllocationPolicy.DEDICATED,
++                    cpu_pinning={},
++                    pagesize=2048)])
++        mig_context = objects.MigrationContext(
++            instance_uuid=instance.uuid,
++            migration_id=1,
++            old_numa_topology=instance_topology,
++            new_numa_topology=instance_topology,
++            new_allowed_cpus=set([]))
++        instance.migration_context = mig_context
++
+         drvr._live_migration_operation(self.context, instance, 'dest',
+                                        True, migrate_data, guest,
+                                        device_names)
+@@ -9057,11 +9125,13 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+         self.assertFalse(mock_exist.called)
+         self.assertFalse(mock_shutil.called)
+ 
++    @mock.patch.object(libvirt_driver.LibvirtDriver, "_handle_libvirt_tunnel",
++                       return_value=0)
+     @mock.patch.object(host.Host, "get_connection")
+     @mock.patch.object(host.Host, "has_min_version", return_value=False)
+     @mock.patch.object(fakelibvirt.Domain, "XMLDesc")
+     def test_live_migration_copy_disk_paths(self, mock_xml, mock_version,
+-                                            mock_conn):
++                                            mock_conn, mock_handle):
+         xml = """
+         <domain>
+           <name>dummy</name>
+@@ -9098,7 +9168,8 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+         dom = fakelibvirt.Domain(drvr._get_connection(), xml, False)
+         guest = libvirt_guest.Guest(dom)
+ 
+-        paths = drvr._live_migration_copy_disk_paths(None, None, guest)
++        paths = drvr._live_migration_copy_disk_paths(None, mock.MagicMock(),
++                                                     guest)
+         self.assertEqual((["/var/lib/nova/instance/123/disk.root",
+                           "/dev/mapper/somevol"], ['vda', 'vdd']), paths)
+ 
+@@ -9142,7 +9213,8 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+         dom = fakelibvirt.Domain(drvr._get_connection(), xml, False)
+         guest = libvirt_guest.Guest(dom)
+ 
+-        paths = drvr._live_migration_copy_disk_paths(None, None, guest)
++        paths = drvr._live_migration_copy_disk_paths(None, mock.MagicMock(),
++                                                     guest)
+         self.assertEqual((["/var/lib/nova/instance/123/disk.root",
+                           "/dev/mapper/somevol"], ['vda', 'vdd']), paths)
+ 
+@@ -10078,6 +10150,76 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+                                              self.EXPECT_SUCCESS,
+                                              expected_switch=True)
+ 
++    def test_live_migration_tunnel_override(self):
++        drvr = libvirt_driver.LibvirtDriver(fake.FakeVirtAPI(), False)
++
++        flavor = objects.Flavor(extra_specs={})
++        instance_meta = {}
++        flags = drvr._handle_libvirt_tunnel(flavor, instance_meta, 0)
++        self.assertEqual(0, flags)
++
++        flags = drvr._handle_libvirt_tunnel(flavor, instance_meta,
++            libvirt_driver.libvirt.VIR_MIGRATE_TUNNELLED)
++        self.assertEqual(flags, libvirt_driver.libvirt.VIR_MIGRATE_TUNNELLED)
++
++        flavor.extra_specs = {"hw:wrs:live_migration_tunnel": 1}
++        flags = drvr._handle_libvirt_tunnel(flavor, instance_meta, 0)
++        self.assertEqual(flags, libvirt_driver.libvirt.VIR_MIGRATE_TUNNELLED)
++
++        instance_meta = {"hw:wrs:live_migration_tunnel": 0}
++        flags = drvr._handle_libvirt_tunnel(flavor, instance_meta, 0)
++        self.assertEqual(flags, 0)
++
++        instance_meta = {"hw:wrs:live_migration_tunnel": True}
++        flags = drvr._handle_libvirt_tunnel(flavor, instance_meta, 0)
++        self.assertEqual(flags, libvirt_driver.libvirt.VIR_MIGRATE_TUNNELLED)
++
++        flavor.extra_specs = {"hw:wrs:live_migration_tunnel": "n"}
++        flags = drvr._handle_libvirt_tunnel(flavor, instance_meta, 0)
++        self.assertEqual(flags, libvirt_driver.libvirt.VIR_MIGRATE_TUNNELLED)
++
++        instance_meta = {"hw:wrs:live_migration_tunnel": False}
++        flags = drvr._handle_libvirt_tunnel(flavor, instance_meta,
++            libvirt_driver.libvirt.VIR_MIGRATE_TUNNELLED)
++        self.assertEqual(flags, 0)
++
++    def test_live_migration_auto_converge_override(self):
++        drvr = libvirt_driver.LibvirtDriver(fake.FakeVirtAPI(), False)
++
++        flavor = objects.Flavor(extra_specs={})
++        instance_meta = {}
++        flags = drvr._handle_auto_converge(flavor, instance_meta, 0)
++        self.assertEqual(0, flags)
++
++        flags = drvr._handle_auto_converge(flavor, instance_meta,
++            libvirt_driver.libvirt.VIR_MIGRATE_AUTO_CONVERGE)
++        self.assertEqual(flags,
++                         libvirt_driver.libvirt.VIR_MIGRATE_AUTO_CONVERGE)
++
++        flavor.extra_specs = {"hw:wrs:live_migration_auto_converge": 1}
++        flags = drvr._handle_auto_converge(flavor, instance_meta, 0)
++        self.assertEqual(flags,
++                         libvirt_driver.libvirt.VIR_MIGRATE_AUTO_CONVERGE)
++
++        instance_meta = {"hw:wrs:live_migration_auto_converge": 0}
++        flags = drvr._handle_auto_converge(flavor, instance_meta, 0)
++        self.assertEqual(flags, 0)
++
++        instance_meta = {"hw:wrs:live_migration_auto_converge": True}
++        flags = drvr._handle_auto_converge(flavor, instance_meta, 0)
++        self.assertEqual(flags,
++                         libvirt_driver.libvirt.VIR_MIGRATE_AUTO_CONVERGE)
++
++        flavor.extra_specs = {"hw:wrs:live_migration_auto_converge": "n"}
++        flags = drvr._handle_auto_converge(flavor, instance_meta, 0)
++        self.assertEqual(flags,
++                         libvirt_driver.libvirt.VIR_MIGRATE_AUTO_CONVERGE)
++
++        instance_meta = {"hw:wrs:live_migration_auto_converge": False}
++        flags = drvr._handle_auto_converge(flavor, instance_meta,
++            libvirt_driver.libvirt.VIR_MIGRATE_AUTO_CONVERGE)
++        self.assertEqual(flags, 0)
++
+     def test_live_migration_completion_timeout(self):
+         self.flags(live_migration_completion_timeout=800, group='libvirt')
+ 
+diff --git a/nova/tests/unit/virt/libvirt/test_migration.py b/nova/tests/unit/virt/libvirt/test_migration.py
+index 33576ee..25dac40 100644
+--- a/nova/tests/unit/virt/libvirt/test_migration.py
++++ b/nova/tests/unit/virt/libvirt/test_migration.py
+@@ -589,7 +589,7 @@ class MigrationMonitorTestCase(test.NoDBTestCase):
+         self.assertEqual(mig.disk_processed, 10 * units.Gi)
+         self.assertEqual(mig.disk_remaining, 14 * units.Gi)
+ 
+-        self.assertEqual(self.instance.progress, 25)
++        self.assertEqual(self.instance.progress, 75)
+ 
+         mock_msave.assert_called_once_with()
+         mock_isave.assert_called_once_with()
+diff --git a/nova/tests/unit/virt/test_virt_drivers.py b/nova/tests/unit/virt/test_virt_drivers.py
+index 6b969d5..a78e8c9 100644
+--- a/nova/tests/unit/virt/test_virt_drivers.py
++++ b/nova/tests/unit/virt/test_virt_drivers.py
+@@ -683,6 +683,14 @@ class _VirtDriverTestCase(_FakeDriverBackendTestCase):
+         migrate_data = objects.LibvirtLiveMigrateData(
+             migration=migration, bdms=[], block_migration=False,
+             serial_listen_addr='127.0.0.1')
++
++        # Need to fake as _update_numa_xml now accesses migration_context
++        def fake_update_numa_xml(xml_doc, driver_interface, instance):
++            return xml_doc
++
++        self.stubs.Set(libvirt.migration, '_update_numa_xml',
++                       fake_update_numa_xml)
++
+         self.connection.live_migration(self.ctxt, instance_ref, 'otherhost',
+                                        lambda *a: None,
+                                        lambda *a, **kwargs: None,
+diff --git a/nova/virt/libvirt/driver.py b/nova/virt/libvirt/driver.py
+index 315d496..cbd38f2 100644
+--- a/nova/virt/libvirt/driver.py
++++ b/nova/virt/libvirt/driver.py
+@@ -6308,8 +6308,11 @@ class LibvirtDriver(driver.ComputeDriver):
+                     raise exception.MigrationPreCheckError(reason=msg)
+                 # NOTE(eliqiao): Selective disk migrations are not supported
+                 # with tunnelled block migrations so we can block them early.
++                block_migration_flags = self._handle_libvirt_tunnel(
++                    instance.flavor, instance.metadata,
++                    self._block_migration_flags)
+                 if (bdm and
+-                    (self._block_migration_flags &
++                    (block_migration_flags &
+                      libvirt.VIR_MIGRATE_TUNNELLED != 0)):
+                     msg = (_('Cannot block migrate instance %(uuid)s with'
+                              ' mapped volumes. Selective block device'
+@@ -6601,6 +6604,76 @@ class LibvirtDriver(driver.ComputeDriver):
+                     ' must disable serial console.')
+             raise exception.MigrationError(reason=msg)
+ 
++    def _handle_auto_converge(self, flavor, instance_meta, migration_flags):
++        auto_converge = None
++
++        # Check flavor extra-spec
++        flavor_auto_converge = flavor.extra_specs.get(
++                "hw:wrs:live_migration_auto_converge")
++        if flavor_auto_converge is not None:
++            try:
++                auto_converge = strutils.bool_from_string(
++                    flavor_auto_converge, strict=True)
++            except ValueError:
++                LOG.info("Ignoring invalid flavor extra spec "
++                         "'hw:wrs:live_migration_auto_converge', "
++                         "value must be boolean")
++
++        # Now check instance metadata
++        instance_auto_converge = instance_meta.get(
++            "hw:wrs:live_migration_auto_converge")
++        if instance_auto_converge is not None:
++            try:
++                auto_converge = strutils.bool_from_string(
++                    instance_auto_converge, strict=True)
++            except ValueError:
++                LOG.info("Ignoring invalid instance metadata "
++                         "'hw:wrs:live_migration_auto_converge', "
++                         "value must be boolean")
++        if auto_converge is not None:
++            if auto_converge:
++                migration_flags |= libvirt.VIR_MIGRATE_AUTO_CONVERGE
++            else:
++                migration_flags &= ~libvirt.VIR_MIGRATE_AUTO_CONVERGE
++                LOG.info("auto_converge disabled for this migration")
++
++        return migration_flags
++
++    def _handle_libvirt_tunnel(self, flavor, instance_meta, migration_flags):
++        libvirt_tunnel = None
++
++        # Check flavor extra-spec
++        flavor_libvirt_tunnel = flavor.extra_specs.get(
++                "hw:wrs:live_migration_tunnel")
++        if flavor_libvirt_tunnel is not None:
++            try:
++                libvirt_tunnel = strutils.bool_from_string(
++                    flavor_libvirt_tunnel, strict=True)
++            except ValueError:
++                LOG.info("Ignoring invalid flavor extra spec"
++                         "'hw:wrs:live_migration_libvirt_tunnel', "
++                         "value must be boolean")
++
++        # Now check instance metadata
++        instance_libvirt_tunnel = instance_meta.get(
++            "hw:wrs:live_migration_tunnel")
++        if instance_libvirt_tunnel is not None:
++            try:
++                libvirt_tunnel = strutils.bool_from_string(
++                    instance_libvirt_tunnel, strict=True)
++            except ValueError:
++                LOG.info("Ignoring invalid instance metadata"
++                         "'hw:wrs:live_migration_libvirt_tunnel', "
++                         "value must be boolean")
++        if libvirt_tunnel is not None:
++            if libvirt_tunnel:
++                migration_flags |= libvirt.VIR_MIGRATE_TUNNELLED
++                LOG.info("libvirt_tunnel enabled for this migration")
++            else:
++                migration_flags &= ~libvirt.VIR_MIGRATE_TUNNELLED
++
++        return migration_flags
++
+     def _live_migration_operation(self, context, instance, dest,
+                                   block_migration, migrate_data, guest,
+                                   device_names):
+@@ -6628,6 +6701,13 @@ class LibvirtDriver(driver.ComputeDriver):
+ 
+             serial_listen_addr = libvirt_migrate.serial_listen_addr(
+                 migrate_data)
++
++            migration_flags = self._handle_auto_converge(instance.flavor,
++                                                         instance.metadata,
++                                                         migration_flags)
++            migration_flags = self._handle_libvirt_tunnel(instance.flavor,
++                                                          instance.metadata,
++                                                          migration_flags)
+             if not serial_listen_addr:
+                 # In this context we want to ensure that serial console is
+                 # disabled on source node. This is because nova couldn't
+@@ -6784,10 +6864,12 @@ class LibvirtDriver(driver.ComputeDriver):
+         disk_paths = []
+         device_names = []
+         block_devices = []
+-
+         # TODO(pkoniszewski): Remove version check when we bump min libvirt
+         # version to >= 1.2.17.
+-        if (self._block_migration_flags &
++        block_migration_flags = self._handle_libvirt_tunnel(instance.flavor,
++                                                instance.metadata,
++                                                self._block_migration_flags)
++        if (block_migration_flags &
+                 libvirt.VIR_MIGRATE_TUNNELLED == 0 and
+                 self._host.has_min_version(
+                     MIN_LIBVIRT_BLOCK_LM_WITH_VOLUMES_VERSION)):
+@@ -6979,9 +7061,24 @@ class LibvirtDriver(driver.ComputeDriver):
+         is_post_copy_enabled = self._is_post_copy_enabled(migration_flags)
+         should_abort = False
+         fault = None
++        abort = False
+         while True:
+             info = guest.get_job_info()
+ 
++            # after guest.abort_job() is called, query of
++            # libvirt job type could return VIR_DOMAIN_JOB_NONE or in case
++            # of this Jira it stucks with VIR_DOMAIN_JOB_UNBOUNDED state.
++            # Reset the job type to VIR_DOMAIN_JOB_NONE here so it can
++            # transition to either VIR_DOMAIN_JOB_FAILED or
++            # VIR_DOMAIN_JOB_COMPLETED to get out of the while loop.
++            # TODO(wrs): There is likely a bug in libvirt that sets the jobinfo
++            # to wrong type. libvirt should ideally set jobinfo type to
++            # VIR_DOMAIN_JOB_CANCELLED when aborting.
++            if info.type == libvirt.VIR_DOMAIN_JOB_UNBOUNDED and abort:
++                info.type = libvirt.VIR_DOMAIN_JOB_NONE
++                LOG.warning("Reset job type to be %d after abort",
++                            info.type, instance=instance)
++
+             if info.type == libvirt.VIR_DOMAIN_JOB_NONE:
+                 # Either still running, or failed or completed,
+                 # lets untangle the mess
+@@ -7069,34 +7166,51 @@ class LibvirtDriver(driver.ComputeDriver):
+                     # transfer stats in the progress too, but it
+                     # might make memory info more obscure as large
+                     # disk sizes might dwarf memory size
+-                    remaining = 100
++                    mprogress = 0
+                     if info.memory_total != 0:
+-                        remaining = round(info.memory_remaining *
+-                                          100 / info.memory_total)
+-
++                        mprogress = 100 - round(info.memory_remaining *
++                                                100 / info.memory_total)
++                    dprogress = 0
++                    if info.data_total != 0:
++                        dprogress = 100 - round(info.data_remaining *
++                                                100 / info.data_total)
++
++                    # data_remaining includes memory + data, so it is a
++                    # better overall progress metric.
+                     libvirt_migrate.save_stats(instance, migration,
+-                                               info, remaining)
++                                               info, dprogress)
+ 
+                     lg = LOG.debug
+                     if (n % 60) == 0:
+                         lg = LOG.info
+ 
+-                    lg("Migration running for %(secs)d secs, "
+-                       "memory %(remaining)d%% remaining; "
+-                       "(bytes processed=%(processed_memory)d, "
+-                       "remaining=%(remaining_memory)d, "
+-                       "total=%(total_memory)d)",
+-                       {"secs": n / 2, "remaining": remaining,
+-                        "processed_memory": info.memory_processed,
+-                        "remaining_memory": info.memory_remaining,
+-                        "total_memory": info.memory_total}, instance=instance)
+-                    if info.data_remaining > progress_watermark:
+-                        lg("Data remaining %(remaining)d bytes, "
+-                           "low watermark %(watermark)d bytes "
+-                           "%(last)d seconds ago",
+-                           {"remaining": info.data_remaining,
+-                            "watermark": progress_watermark,
+-                            "last": (now - progress_time)}, instance=instance)
++                    # - enhance migration logs to show progress stats from
++                    # both memory and data.
++                    lg("Migration running for %(secs).1f secs; "
++                       "memory progress %(mprog)d%% ("
++                       "%(mproc)d MiB processed, "
++                       "%(mrem)d MiB remaining, "
++                       "%(mtot)d MiB total); "
++                       "data progress %(dprog)d%% ("
++                       "%(dproc)d MiB processed, "
++                       "%(drem)d MiB remaining, "
++                       "%(dtot)d MiB total); "
++                       "memory bandwidth %(mbps)d MB/s;"
++                       "expected downtime %(downtime)d ms;"
++                       "since %(last).1f seconds ago",
++                       {"secs": float(now - start),
++                        "mprog": mprogress,
++                        "mproc": info.memory_processed / units.Mi,
++                        "mrem": info.memory_remaining / units.Mi,
++                        "mtot": info.memory_total / units.Mi,
++                        "dprog": dprogress,
++                        "dproc": info.data_processed / units.Mi,
++                        "drem": info.data_remaining / units.Mi,
++                        "dtot": info.data_total / units.Mi,
++                        "mbps": info.memory_bps / units.Mi,
++                        "downtime": info.downtime,
++                        "last": float(now - progress_time)
++                        }, instance=instance)
+ 
+                 n = n + 1
+             elif info.type == libvirt.VIR_DOMAIN_JOB_COMPLETED:
+diff --git a/nova/virt/libvirt/migration.py b/nova/virt/libvirt/migration.py
+index 8d9c012..7fd7161 100644
+--- a/nova/virt/libvirt/migration.py
++++ b/nova/virt/libvirt/migration.py
+@@ -25,6 +25,7 @@ import six
+ 
+ from nova import objects
+ from nova.virt import hardware
++from nova.virt.libvirt import config as vconfig
+ 
+ from nova.compute import power_state
+ import nova.conf
+@@ -407,8 +408,8 @@ def save_stats(instance, migration, info, remaining):
+     migration.disk_remaining = info.disk_remaining
+     migration.save()
+ 
+-    # The coarse % completion stats
+-    instance.progress = 100 - remaining
++    # we pass in a stat based on data_remaining so just store in progress
++    instance.progress = remaining
+     instance.save()
+ 
+ 
+@@ -553,15 +554,14 @@ def downtime_steps(completion_timeout, downtime):
+ 
+ def _update_numa_xml(xml_doc, driver_interface, instance):
+     image_meta = objects.ImageMeta.from_instance(instance)
+-    # FIXME(ndipanov): This is not correct - we need to get the
+-    # vcpu_pin_set from the destination host, however in the (presumably
+-    # common) case when these are the same on both - this should be fine
+-    allowed_cpus = hardware.get_vcpu_pin_set()
++    # Use numa topology and allowed cpus from destination host.
++    allowed_cpus = instance.migration_context.new_allowed_cpus
+     # TODO(sahid/cfriesen): If the destination has more numa nodes than the
+     # source then this could cause problems due to the loop over topology.cells
+     # where "topology" is for the source host.
+     numa_config = driver_interface.get_guest_numa_config(
+-        instance.numa_topology, instance.flavor, allowed_cpus, image_meta)
++        instance.migration_context.new_numa_topology,
++        instance.flavor, allowed_cpus, image_meta)
+     if numa_config[1] is None:
+         # Quit early if the instance does not provide numa topology.
+         return xml_doc
+@@ -583,6 +583,21 @@ def _update_numa_xml(xml_doc, driver_interface, instance):
+         xml_doc.remove(vcpu)
+     xml_doc.append(new_vcpu)
+ 
++    # It's possible that a guest cpu changes while migrating to a host
++    # that has a different physical host cpu topology (for e.g. HT to non-HT).
++    # Guest cpu topology can't change during live migration.  For this reason,
++    # we always keep the guest cpu topology that is currently used in the
++    # running instance.  The topology stays the same but the cpu_tune still
++    # gets recalculated based on the InstanceNUMATopology that was
++    # claimed on the destination.
++    old_cpu_xml = xml_doc.find('./cpu')
++    old_cpu = vconfig.LibvirtConfigCPU()
++    old_cpu.parse_dom(old_cpu_xml)
++
++    cpu.sockets = old_cpu.sockets
++    cpu.cores = old_cpu.cores
++    cpu.threads = old_cpu.threads
++
+     def replace_from_config(tag, config):
+         """Replace a top level node with xml generated by config """
+         elem = xml_doc.find('./' + tag)
+-- 
+2.7.4
+

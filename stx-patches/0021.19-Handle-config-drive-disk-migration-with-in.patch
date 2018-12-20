@@ -1,0 +1,174 @@
+From 1df718a60d90b12ff58dfc8b37f947e4581b9483 Mon Sep 17 00:00:00 2001
+From: Robert Church <robert.church@windriver.com>
+Date: Thu, 20 Apr 2017 18:34:00 -0500
+Subject: [PATCH] Handle config drive disk migration with infra interfaces
+
+When we have an infrastructure interface configured, the nova ssh
+migration keys will be setup to use that interface for instance
+migrations.
+
+When the config drive disk is copied, nova's remotefs SshDriver is
+copying files via scp using the hostname which aligns to the mgmt
+interface (compute-n vs. compute-n-infra)
+
+Since the compute-n-infra name is aliased on hosts that don't have a
+provisioned infra interface, the infra related hostname is always
+present.
+
+Update the safe_ip_format() utility routine to always use the infra
+hostname when a hostname is detected and call safe_ip_format() when
+forming the src path for the config drive disk copy.
+
+This is related to https://bugs.launchpad.net/nova/+bug/1246201.
+---
+ nova/tests/unit/test_utils.py                        |  4 ++--
+ nova/tests/unit/virt/libvirt/test_driver.py          |  2 +-
+ nova/tests/unit/virt/libvirt/test_utils.py           |  4 ++--
+ nova/tests/unit/virt/libvirt/volume/test_remotefs.py | 10 +++++-----
+ nova/utils.py                                        | 11 +++++++++++
+ nova/virt/libvirt/driver.py                          |  4 +++-
+ 6 files changed, 24 insertions(+), 11 deletions(-)
+
+diff --git a/nova/tests/unit/test_utils.py b/nova/tests/unit/test_utils.py
+index 93464f0..d65f651 100644
+--- a/nova/tests/unit/test_utils.py
++++ b/nova/tests/unit/test_utils.py
+@@ -219,7 +219,7 @@ class GenericUtilsTestCase(test.NoDBTestCase):
+         self.assertEqual("127.0.0.1", utils.safe_ip_format("127.0.0.1"))
+         self.assertEqual("[::ffff:127.0.0.1]", utils.safe_ip_format(
+                          "::ffff:127.0.0.1"))
+-        self.assertEqual("localhost", utils.safe_ip_format("localhost"))
++        self.assertEqual("localhost-infra", utils.safe_ip_format("localhost"))
+ 
+     def test_format_remote_path(self):
+         self.assertEqual("[::1]:/foo/bar",
+@@ -229,7 +229,7 @@ class GenericUtilsTestCase(test.NoDBTestCase):
+         self.assertEqual("[::ffff:127.0.0.1]:/foo/bar",
+                          utils.format_remote_path("::ffff:127.0.0.1",
+                                                   "/foo/bar"))
+-        self.assertEqual("localhost:/foo/bar",
++        self.assertEqual("localhost-infra:/foo/bar",
+                          utils.format_remote_path("localhost", "/foo/bar"))
+         self.assertEqual("/foo/bar", utils.format_remote_path(None,
+                                                               "/foo/bar"))
+diff --git a/nova/tests/unit/virt/libvirt/test_driver.py b/nova/tests/unit/virt/libvirt/test_driver.py
+index 13e9515..47f8f05 100644
+--- a/nova/tests/unit/virt/libvirt/test_driver.py
++++ b/nova/tests/unit/virt/libvirt/test_driver.py
+@@ -730,7 +730,7 @@ def _create_test_instance():
+         'user_id': '838a72b0-0d54-4827-8fd6-fb1227633ceb',
+         'ephemeral_key_uuid': None,
+         'vcpu_model': None,
+-        'host': 'fake-host',
++        'host': 'fake-host-infra',
+         'task_state': None,
+         'node': None
+     }
+diff --git a/nova/tests/unit/virt/libvirt/test_utils.py b/nova/tests/unit/virt/libvirt/test_utils.py
+index 0caa01a..8945c8d 100644
+--- a/nova/tests/unit/virt/libvirt/test_utils.py
++++ b/nova/tests/unit/virt/libvirt/test_utils.py
+@@ -58,14 +58,14 @@ class LibvirtUtilsTestCase(test.NoDBTestCase):
+     def test_copy_image_remote_ssh(self, mock_rem_fs_remove):
+         self.flags(remote_filesystem_transport='ssh', group='libvirt')
+         libvirt_utils.copy_image('src', 'dest', host='host')
+-        mock_rem_fs_remove.assert_called_once_with('src', 'host:dest',
++        mock_rem_fs_remove.assert_called_once_with('src', 'host-infra:dest',
+             on_completion=None, on_execute=None, compression=True)
+ 
+     @mock.patch('nova.virt.libvirt.volume.remotefs.RsyncDriver.copy_file')
+     def test_copy_image_remote_rsync(self, mock_rem_fs_remove):
+         self.flags(remote_filesystem_transport='rsync', group='libvirt')
+         libvirt_utils.copy_image('src', 'dest', host='host')
+-        mock_rem_fs_remove.assert_called_once_with('src', 'host:dest',
++        mock_rem_fs_remove.assert_called_once_with('src', 'host-infra:dest',
+             on_completion=None, on_execute=None, compression=True)
+ 
+     @mock.patch('os.path.exists', return_value=True)
+diff --git a/nova/tests/unit/virt/libvirt/volume/test_remotefs.py b/nova/tests/unit/virt/libvirt/volume/test_remotefs.py
+index 1c4be00..1cc72a2 100644
+--- a/nova/tests/unit/virt/libvirt/volume/test_remotefs.py
++++ b/nova/tests/unit/virt/libvirt/volume/test_remotefs.py
+@@ -66,7 +66,7 @@ class RemoteFSTestCase(test.NoDBTestCase):
+         rsync_call_args = mock.call('rsync', '--archive',
+                                     '--delete', '--include',
+                                     'dest', '--exclude', '*',
+-                                    '/tmp/Mercury/', 'host:',
++                                    '/tmp/Mercury/', 'host-infra:',
+                                     on_completion=None, on_execute=None)
+         self.assertEqual(mock_execute.mock_calls[0], rsync_call_args)
+         rm_call_args = mock.call('rm', '-rf', '/tmp/Mercury')
+@@ -87,13 +87,13 @@ class RemoteFSTestCase(test.NoDBTestCase):
+         remotefs.RsyncDriver().remove_dir('host', 'dest', None, None)
+         rsync_call_args = mock.call('rsync', '--archive',
+                                     '--delete-excluded', '/tmp/Venus/',
+-                                    'host:dest',
++                                    'host-infra:dest',
+                                     on_completion=None, on_execute=None)
+         self.assertEqual(mock_execute.mock_calls[0], rsync_call_args)
+         rsync_call_args = mock.call('rsync', '--archive',
+                                     '--delete', '--include',
+                                     'dest', '--exclude', '*',
+-                                    '/tmp/Venus/', 'host:',
++                                    '/tmp/Venus/', 'host-infra:',
+                                     on_completion=None, on_execute=None)
+         self.assertEqual(mock_execute.mock_calls[1], rsync_call_args)
+         rm_call_args = mock.call('rm', '-rf', '/tmp/Venus')
+@@ -120,7 +120,7 @@ class RemoteFSTestCase(test.NoDBTestCase):
+         self.assertEqual(mock_execute.mock_calls[1], touch_call_args)
+         rsync_call_args = mock.call('rsync', '--archive', '--relative',
+                                     '--no-implied-dirs',
+-                                    '/tmp/Mars/./dest_dir', 'host:/',
++                                    '/tmp/Mars/./dest_dir', 'host-infra:/',
+                                     on_completion=None, on_execute=None)
+         self.assertEqual(mock_execute.mock_calls[2], rsync_call_args)
+         rm_call_args = mock.call('rm', '-rf', '/tmp/Mars')
+@@ -145,7 +145,7 @@ class RemoteFSTestCase(test.NoDBTestCase):
+         self.assertEqual(mock_execute.mock_calls[0], mkdir_call_args)
+         rsync_call_args = mock.call('rsync', '--archive', '--relative',
+                                     '--no-implied-dirs',
+-                                    '/tmp/Jupiter/./dest_dir', 'host:/',
++                                    '/tmp/Jupiter/./dest_dir', 'host-infra:/',
+                                     on_completion=None, on_execute=None)
+         self.assertEqual(mock_execute.mock_calls[1], rsync_call_args)
+         rm_call_args = mock.call('rm', '-rf', '/tmp/Jupiter')
+diff --git a/nova/utils.py b/nova/utils.py
+index 5d36a24..3278872 100644
+--- a/nova/utils.py
++++ b/nova/utils.py
+@@ -743,6 +743,17 @@ def safe_ip_format(ip):
+         if netaddr.IPAddress(ip).version == 6:
+             return '[%s]' % ip
+     except (TypeError, netaddr.AddrFormatError):  # hostname
++        # we set up ssh keys for passwordless ssh between
++        # computes. If we have an infra interface present, the keys
++        # will be associated with that interface rather than the
++        # mgmt interface. We also always provide hostname
++        # resolution for the mgmt interface (compute-n) and the
++        # infra interface (compute-n-infra) irrespective of the
++        # infra interface actually being provisioned. By ensuring
++        # that we use the infra interface hostname we guarantee we
++        # will align with the ssh keys.
++        if '-infra' not in ip:
++            return '%s-infra' % ip
+         pass
+     # it's IPv4 or hostname
+     return ip
+diff --git a/nova/virt/libvirt/driver.py b/nova/virt/libvirt/driver.py
+index ef8d5b5..de57299 100644
+--- a/nova/virt/libvirt/driver.py
++++ b/nova/virt/libvirt/driver.py
+@@ -7326,7 +7326,9 @@ class LibvirtDriver(driver.ComputeDriver):
+                     # live migration will fail on copying iso config drive to
+                     # destination and writing to read-only device.
+                     # Please see bug/1246201 for more details.
+-                    src = "%s:%s/disk.config" % (instance.host, instance_dir)
++                    src = "%s:%s/disk.config" % (
++                        utils.safe_ip_format(instance.host),
++                        instance_dir)
+                     self._remotefs.copy_file(src, instance_dir)
+ 
+             if not is_block_migration:
+-- 
+2.7.4
+

@@ -1,0 +1,35 @@
+From 7c7e36e43c6bbc5400272dacd5ef2547b4b59d28 Mon Sep 17 00:00:00 2001
+From: Gerry Kopec <Gerry.Kopec@windriver.com>
+Date: Thu, 16 Jun 2016 15:11:07 -0400
+Subject: [PATCH] Fix tox unit test after rebase to stable/mitaka
+
+This commit fixes tox unit test failure seen after rebase to latest
+upstream stable/mitaka and rebase of all R3 commits from mitaka-port
+branch.  Failed testcase was added upstream since last rebase and is
+fixed in the same way as other one in commit e5d3345:
+Enable instance resizing for LVM backed instancesh
+---
+ nova/tests/unit/virt/libvirt/test_driver.py | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/nova/tests/unit/virt/libvirt/test_driver.py b/nova/tests/unit/virt/libvirt/test_driver.py
+index 2124b36..a02b838 100644
+--- a/nova/tests/unit/virt/libvirt/test_driver.py
++++ b/nova/tests/unit/virt/libvirt/test_driver.py
+@@ -14962,6 +14962,13 @@ class LibvirtDriverTestCase(test.NoDBTestCase):
+         drvr.image_backend.image.return_value = drvr.image_backend
+         drvr.image_backend.check_image_exists.return_value = False
+ 
++        def fake_cleanup_lvm(instance, block_device_info=None,
++                             preserve_disk_filter="Non-Resize"):
++            pass
++
++        self.stubs.Set(drvr, '_cleanup_lvm',
++                       fake_cleanup_lvm)
++
+         with test.nested(
+                 mock.patch.object(os.path, 'exists'),
+                 mock.patch.object(libvirt_utils, 'get_instance_path'),
+-- 
+2.7.4
+

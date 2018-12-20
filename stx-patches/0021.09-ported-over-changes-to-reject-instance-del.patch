@@ -1,0 +1,114 @@
+From 1e491acb357dd896b5e14a39cd0da6d6ffda8478 Mon Sep 17 00:00:00 2001
+From: Francois Palin <francois.palin@windriver.com>
+Date: Mon, 8 Aug 2016 09:38:24 -0400
+Subject: [PATCH] ported over changes to reject instance deletion
+ during resize/migrate
+
+(cherry picked from commits 3ad6477 and 2cbff05)
+---
+ nova/compute/api.py                                    | 17 +++++++++++++++++
+ .../unit/api/openstack/compute/test_serversV21.py      |  8 +++++++-
+ nova/tests/unit/api/openstack/fakes.py                 | 10 ++++++++++
+ nova/tests/unit/compute/test_compute_api.py            | 18 ++++++++++++++----
+ 4 files changed, 48 insertions(+), 5 deletions(-)
+
+diff --git a/nova/compute/api.py b/nova/compute/api.py
+index 621e7de..c75444f 100644
+--- a/nova/compute/api.py
++++ b/nova/compute/api.py
+@@ -1856,6 +1856,23 @@ class API(base.Base):
+                 # Instance is already deleted.
+                 return
+ 
++        # if this instance is in the middle of a resize/migrate, we can't
++        # safely delete it.  (Theoretically we could fix the
++        # _confirm_resize_on_deleting() code to handle this case but it'd
++        # be more risky and more work to validate.
++        if instance.task_state in (task_states.RESIZE_PREP,
++                                   task_states.RESIZE_MIGRATING,
++                                   task_states.RESIZE_MIGRATED,
++                                   task_states.RESIZE_FINISH):
++            LOG.warning(_LW("Unable to delete instance since a "
++                            "resize/migration  is in progress"),
++                        instance=instance)
++            raise exception.InstanceInvalidState(
++                    instance_uuid = instance.uuid,
++                    attr = 'task_state',
++                    state = instance.task_state,
++                    method = 'delete')
++
+         bdms = objects.BlockDeviceMappingList.get_by_instance_uuid(
+                 context, instance.uuid)
+ 
+diff --git a/nova/tests/unit/api/openstack/compute/test_serversV21.py b/nova/tests/unit/api/openstack/compute/test_serversV21.py
+index c4c05a0..bc15d5d 100644
+--- a/nova/tests/unit/api/openstack/compute/test_serversV21.py
++++ b/nova/tests/unit/api/openstack/compute/test_serversV21.py
+@@ -1602,7 +1602,13 @@ class ServersControllerDeleteTest(ControllerTest):
+         self.stubs.Set(compute_api.API, 'get',
+                        lambda api, *a, **k: fake_get(*a, **k))
+ 
+-        self.controller.delete(req, FAKE_UUID)
++        self.stubs.Set(compute_api.API, 'delete',
++                       fakes.fake_actions_to_server_instance_while_resize)
++
++        # self.controller.delete(req, FAKE_UUID)
++        # prevent delete while resizing, it leads to a race.
++        self.assertRaises(webob.exc.HTTPConflict, self.controller.delete,
++                          req, FAKE_UUID)
+ 
+     def test_delete_server_instance_if_not_launched(self):
+         self.flags(reclaim_instance_interval=3600)
+diff --git a/nova/tests/unit/api/openstack/fakes.py b/nova/tests/unit/api/openstack/fakes.py
+index 09dbae2..e4b59fb 100644
+--- a/nova/tests/unit/api/openstack/fakes.py
++++ b/nova/tests/unit/api/openstack/fakes.py
+@@ -331,6 +331,16 @@ def fake_actions_to_locked_server(self, context, instance, *args, **kwargs):
+     raise exc.InstanceIsLocked(instance_uuid=instance['uuid'])
+ 
+ 
++def fake_actions_to_server_instance_while_resize(self, context, instance,
++                                                 *args, **kwargs):
++
++    raise exc.InstanceInvalidState(
++                    instance_uuid = instance['uuid'],
++                    attr = 'task_state',
++                    state = instance.task_state,
++                    method = 'delete')
++
++
+ def fake_instance_get_all_by_filters(num_servers=5, **kwargs):
+     def _return_servers(context, *args, **kwargs):
+         servers_list = []
+diff --git a/nova/tests/unit/compute/test_compute_api.py b/nova/tests/unit/compute/test_compute_api.py
+index c9b004a..a1ca438 100644
+--- a/nova/tests/unit/compute/test_compute_api.py
++++ b/nova/tests/unit/compute/test_compute_api.py
+@@ -1115,10 +1115,20 @@ class _ComputeAPIUnitTestMixIn(object):
+         self._test_delete('delete', launched_at=None)
+ 
+     def test_delete_in_resizing(self):
+-        old_flavor = objects.Flavor(vcpus=1, memory_mb=512, extra_specs={})
+-        self._test_delete('delete',
+-                          task_state=task_states.RESIZE_FINISH,
+-                          old_flavor=old_flavor)
++        # the delete code has been changed to raise an exception if a
++        # resize is in progress due to a race condition that can potentially
++        # lead to leaked vswitch ports on the source host.
++        inst = self._create_instance_obj()
++        attrs = {'task_state': task_states.RESIZE_FINISH}
++        inst.update(attrs)
++        inst._context = self.context
++        self.mox.ReplayAll()
++
++        self.assertRaises(exception.InstanceInvalidState,
++                          getattr(self.compute_api, 'delete'),
++                          self.context, inst)
++
++        self.mox.UnsetStubs()
+ 
+     def test_delete_in_resized(self):
+         self._test_delete('delete', vm_state=vm_states.RESIZED)
+-- 
+2.7.4
+

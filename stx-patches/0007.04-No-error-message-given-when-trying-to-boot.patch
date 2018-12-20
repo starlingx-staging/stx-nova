@@ -1,0 +1,32 @@
+From 854fa29bb1e85bf1b50b7b04bd0aa46820476968 Mon Sep 17 00:00:00 2001
+From: Francois Palin <francois.palin@windriver.com>
+Date: Mon, 3 Oct 2016 10:18:30 -0400
+Subject: [PATCH] No error message given when trying to boot VM with >8 avp NICs
+
+---
+ nova/api/openstack/compute/servers.py | 9 +++++++--
+ 1 file changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/nova/api/openstack/compute/servers.py b/nova/api/openstack/compute/servers.py
+index f494f95..d653a09 100644
+--- a/nova/api/openstack/compute/servers.py
++++ b/nova/api/openstack/compute/servers.py
+@@ -493,8 +493,13 @@ class ServersController(wsgi.Controller):
+         networks = []
+         network_uuids = []
+         vif_pci_addresses = []
+-        if utils.is_neutron():
+-            WrsController.validate_networks(requested_networks)
++
++        try:
++            if utils.is_neutron():
++                WrsController.validate_networks(requested_networks)
++        except exception.InvalidInput as error:
++            raise exc.HTTPBadRequest(explanation=error.format_message())
++
+         for network in requested_networks:
+             request = objects.NetworkRequest()
+             try:
+-- 
+2.7.4
+

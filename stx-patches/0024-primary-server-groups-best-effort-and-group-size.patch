@@ -1,0 +1,2692 @@
+From d9f6f1ca8d686b1361b137e68955148c4bc811d4 Mon Sep 17 00:00:00 2001
+From: Gerry Kopec <Gerry.Kopec@windriver.com>
+Date: Thu, 19 Jan 2017 19:29:24 -0500
+Subject: [PATCH 024/143] primary: server-groups best-effort and group size
+
+This extends current server-group functionality to provide for best-effort and
+group size.  To simplify upgrades the previous API and DB model was preserved
+even though it's overkill to have a whole metadata table just for these two
+things.
+
+- group affinity "best-effort" metadata flag (eg., --metadata best_effort=1)
+  will first try to schedule with affinity policy criteria, but upon finding no
+  suitable hosts will remove the policy restriction and re-tries to find a destination.
+- group affinity "group_size" metadata flag (eg., --metadata group_size=2)
+  semantic check is applied whenever new members are added to server group. Intent
+  is to limit the size of the server group. Note that ERROR state members
+  that are never launched are excluded from the count. Scheduling is prevented
+  if we hit the group size limit.
+- During instance group validation an instance is compared only against older
+  (as determined by instance.id) instances in the group to determine if server
+  group policy has been violated.  This avoids the problem where multiple
+  instances created simultaneously all detect a policy violation and attempt
+  to rescheule.
+- The mininum instance count is used to determine if launch of multiple
+  instances was successful.  Unscheduled instances in excess of mininum count
+  are silently deleted and quotas rolled back.
+- we prevent deletion of server groups that still have members
+- servers/detail view was extended to show server_group field: name (groupId),
+  this will show up in "nova show", or "nova list --fields=server_group"
+- server-group code was restructured in Kilo; made sure that exceptions
+  raised in scheduling always result in ERROR state VM. Specifically had
+  to make sure that setup_server_group() API called within try block
+  with select_destinations().
+- Server group metadata was revived (was deprecated upstream).
+
+Corresponding novaclient changes allow specifying  metadata option:
+nova server-group-create --metadata key1=value1,key2=value2 <name> <policy>
+
+Change-Id: I0f46bd860265cd332f0a334f9ac9145832e86f77
+
+This commit merges the following R3 commits:
+80c85fc Port server-groups best-effort and group-size
+4df6680 Port server group robustness/multiboot fixes to Mitaka
+e6f732d Fix bug in server group size checking
+e03afa0 add code 400 "Bad Request" to delete expected errors.
+
+Also includes R4 commits:
+cccf880 This change removes warning message that states "Instance
+    has had its server_group deleted while it was still a member", located in
+    nova/api/openstack/compute/wrs
+
+    This part of the code gets invoked either by a periodic Nova query of all
+    instances, or by executing a CLI "nova show" instance query.
+    An exception that prints this warning gets generated whenever an instance
+    exists that is not part of a Server Group.
+
+    Note that the warning message does not get printed if there are no VM
+    instances present.
+
+    Also, code already exists to prevent deleting a Server Group that still
+    has an instance attached to it, so the warning message becomes somewhat
+    redundant.
+
+adb82f1 Fix migration of instances in server groups during upgrade
+    This fixes exception seen when migrate of instance within a server group
+    is attempted during 15.12 to 16.10 upgrade.  During upgrade, 16.10
+    conductor will convert request_spec objects to backwards compatible
+    request_spec and filter_properties dictionaries.  During this translation,
+    server group fields members (upstream) and metadetails (WRS) were not
+    included causing the exception in scheduler in _populate_group_info.
+    Fix is to add in additional fields to filter_properties.
+
+ae273cc availability-zone violation when anti-affinity server-group policy set to best-effort
+    Setting index to 0 in "retry" call to self.host_manager.get_filtered_hosts()
+    will make sure that all filters are used, as decided by logic in base class
+    BaseFilter, method run_filter_for_index().
+
+In upstream Newton, server groups have moved to nova_api database with
+extensive change to instance_group object.  Added handling for metadata
+in new create, save and upgrade functions along with more unit testcases.
+
+34dd1e9 Unable to create Server Groups in Horizon dashboard
+   Add project_id key in the nova server groups schema.
+   This commit is a merge of R3 commits 8551d02 and 9ca2a90
+
+ab4c10d Fix wrs_server_groups extension loading error
+   Nova API was failing to load server groups extension as it was
+   accessing extensions.os_compute_soft_authorizer which was removed
+   upstream in Newton.  This meant server group information was missing
+   from nova show and vm-topology would throw an exception.
+
+e865e45 Extra instance delete build request before deleting instance
+   When instance has no host assigned and is left in the BUILD state,
+   associated build request needs first to be deleted before instance
+   can be deleted.
+
+069a9d9 Add migrating hosts to server group host list
+   This fix allows to get a more up to date Server group host list when
+   cold migrating or resizing.
+   The hosts for Server group instances that are cold migrating in
+   progress are derived from reading database Migration tables.
+   These hosts are then added to the set that was already provided by
+   setup_instance_group().
+
+10760f0 Fix server group policy enforcement over live migration
+   This fixes issue where server group policies were not always enforced
+   on live migrations.  Root cause was RequestSpec for instance had stale
+   server group information (from time of instance creation) which did
+   not always have up to date server group members and metadetails.  Fix
+   is to update request spec with latest instance group info from db
+   before calling scheduler select_destinations.
+   This is a similar issue to the one fixed by commit d878fae.
+   This fix is a candidate for upstreaming as problem was introduced by
+   upstream changes to RequestSpec handling in Mitaka.
+
+8bf1d02 provide ordered scheduling for live-migrating instances
+   This fix allows allows to get a more up to date Server group host list
+   when live-migrating.
+   If a live-migrating instance is part of a server group with strict anti-affinity,
+   the code will execute the scheduling part in a mutually exclusive manner,
+   using a semaphore. This will ensure that the scheduling is done in an orderly
+   fashion and that db migrations table is up to date for the next instance scheduling.
+
+38a4d5f make live-migration lockutils semaphore external
+   Make lockutils semaphore external so it can work across
+   the multiple conductor processes for live-migration.
+
+Notes for Pike rebase:
+ - add wrs-sg:group_exceed to instance_group metadetails
+
+3174b21 use strict retrieval for reading best_effort
+   Need to use strict retrieval for Server group metadetails
+   parameter best_effort.
+
+0eb24a1 Pike rebase Bug 281 server group size is not respected
+   Instance creation now takes a different path with Nova Cell v2 in Pike.
+   Move changes from build_instances() to schedule_and_build_instances()
+   and take into consideration that instances are not created in db before
+   scheduling is done. Some instance properties are no longer valid so use
+   info from request_spec instead.
+   Algorithm of checking group_size limit is simplified.
+
+3dec64e Fix nova actions when a servergroup is full
+   When a server group is full and a resize, cold-migrate, live-migrate
+   or evacuate are attempted, the code would have rejected the action
+   because it was calculating as if there was an addition to the server
+   group. The task_state in the scheduler_hints of the request_spec is
+   populated during those actions, whereas it is blank when a new VM
+   is launched.
+
+__TYPE_primary
+__TAG_servergroup
+__R4_commit_c732f8c
+__R3_commit_7104302
+__TC2908,TC2909,TC2910,TC2911,TC2912,TC2913,TC2914,TC2915,TC2917,TC2918,TC5109,TC6555,TC6566
+---
+ nova/api/openstack/compute/extension_info.py       |   8 ++
+ nova/api/openstack/compute/routes.py               |   7 +-
+ .../api/openstack/compute/schemas/server_groups.py |  68 ++++++++++
+ nova/api/openstack/compute/server_groups.py        |  93 +++++++++++++-
+ nova/api/openstack/compute/wrs_server_groups.py    |  64 ++++++++++
+ nova/compute/api.py                                |   1 +
+ nova/compute/manager.py                            |  24 +++-
+ nova/conductor/manager.py                          |  38 ++++++
+ nova/conductor/tasks/live_migrate.py               | 122 ++++++++++++++----
+ nova/conductor/tasks/migrate.py                    |  29 +++++
+ nova/db/api.py                                     |   7 +-
+ nova/db/sqlalchemy/api.py                          |  75 ++++++++++-
+ .../migrate_repo/versions/018_instance_groups.py   |  15 +++
+ nova/db/sqlalchemy/api_models.py                   |  29 +++++
+ .../250_remove_instance_groups_metadata.py         |  10 ++
+ nova/db/sqlalchemy/models.py                       |  35 +++++
+ nova/exception.py                                  |  17 +++
+ nova/objects/instance_group.py                     | 141 ++++++++++++++++++++-
+ nova/objects/request_spec.py                       |  25 +++-
+ nova/policies/__init__.py                          |   4 +-
+ nova/policies/server_groups.py                     |  11 ++
+ nova/policies/wrs_server_groups.py                 |  41 ++++++
+ nova/scheduler/filter_scheduler.py                 |  41 ++++++
+ nova/scheduler/filters/affinity_filter.py          |   2 +-
+ nova/scheduler/utils.py                            |  58 ++++++++-
+ .../api/openstack/compute/test_server_groups.py    |  89 ++++++++++++-
+ .../unit/conductor/tasks/test_live_migrate.py      |  73 +++++++++++
+ nova/tests/unit/conductor/tasks/test_migrate.py    |  75 +++++++++++
+ nova/tests/unit/db/test_migrations.py              |  13 +-
+ nova/tests/unit/db/test_models.py                  |   8 ++
+ nova/tests/unit/fake_policy.py                     |   3 +-
+ nova/tests/unit/fake_request_spec.py               |   9 ++
+ nova/tests/unit/objects/test_instance_group.py     |  51 ++++++++
+ nova/tests/unit/objects/test_objects.py            |   4 +-
+ nova/tests/unit/objects/test_request_spec.py       |   4 +-
+ .../scheduler/filters/test_affinity_filters.py     |  11 +-
+ nova/tests/unit/scheduler/test_scheduler_utils.py  |  54 ++++++--
+ nova/tests/unit/test_policy.py                     |   2 +
+ 38 files changed, 1290 insertions(+), 71 deletions(-)
+ create mode 100644 nova/api/openstack/compute/wrs_server_groups.py
+ create mode 100644 nova/policies/wrs_server_groups.py
+
+diff --git a/nova/api/openstack/compute/extension_info.py b/nova/api/openstack/compute/extension_info.py
+index 683ee06..28b1d6f 100644
+--- a/nova/api/openstack/compute/extension_info.py
++++ b/nova/api/openstack/compute/extension_info.py
+@@ -847,6 +847,14 @@ EXTENSION_LIST = [
+         "name": "WrsServerIf",
+         "namespace": "http://docs.openstack.org/compute/ext/fake_xml",
+         "updated": "2014-12-03T00:00:00Z"
++    },
++    {
++        "alias": "wrs-sg",
++        "description": "Adds wrs-sg:server_group on Servers.",
++        "links": [],
++        "name": "WrsServerGroup",
++        "namespace": "http://docs.openstack.org/compute/ext/fake_xml",
++        "updated": "2014-12-03T00:00:00Z"
+     }
+ ]
+ 
+diff --git a/nova/api/openstack/compute/routes.py b/nova/api/openstack/compute/routes.py
+index 88b3e0d..36b8e1e 100644
+--- a/nova/api/openstack/compute/routes.py
++++ b/nova/api/openstack/compute/routes.py
+@@ -93,6 +93,7 @@ from nova.api.openstack.compute import used_limits
+ from nova.api.openstack.compute import versionsV21
+ from nova.api.openstack.compute import virtual_interfaces
+ from nova.api.openstack.compute import volumes
++from nova.api.openstack.compute import wrs_server_groups
+ from nova.api.openstack.compute import wrs_server_if
+ from nova.api.openstack import wsgi
+ import nova.conf
+@@ -287,7 +288,8 @@ server_controller = functools.partial(_create_controller,
+         keypairs.Controller,
+         security_groups.SecurityGroupsOutputController,
+         server_usage.ServerUsageController,
+-        wrs_server_if.WrsServerIfController
++        wrs_server_if.WrsServerIfController,
++        wrs_server_groups.WrsServerGroupController
+     ],
+     [
+         admin_actions.AdminActionsController,
+@@ -714,6 +716,9 @@ ROUTE_LIST = (
+         'GET': [server_groups_controller, 'show'],
+         'DELETE': [server_groups_controller, 'delete']
+     }),
++    ('/os-server-groups/{id}/action', {
++        'POST': [server_groups_controller, 'action']
++    }),
+     ('/os-services', {
+         'GET': [services_controller, 'index']
+     }),
+diff --git a/nova/api/openstack/compute/schemas/server_groups.py b/nova/api/openstack/compute/schemas/server_groups.py
+index 0882009..dbb031c 100644
+--- a/nova/api/openstack/compute/schemas/server_groups.py
++++ b/nova/api/openstack/compute/schemas/server_groups.py
+@@ -11,6 +11,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2016-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ import copy
+ 
+ from nova.api.validation import parameter_types
+@@ -50,3 +57,64 @@ create = {
+ create_v215 = copy.deepcopy(create)
+ policies = create_v215['properties']['server_group']['properties']['policies']
+ policies['items'][0]['enum'].extend(['soft-anti-affinity', 'soft-affinity'])
++
++
++# group metadata
++positive_integer_not_empty = {
++    'type': ['integer', 'string'],
++    'pattern': '^[0-9]+$', 'minimum': 1
++}
++
++boolean_with_nullstring = copy.deepcopy(parameter_types.boolean)
++boolean_with_nullstring['type'].append('null')
++boolean_with_nullstring['enum'].extend(['', None])
++
++
++server_group_metadata_create = {
++    'type': 'object',
++    'properties': {
++        'wrs-sg:group_size': positive_integer_not_empty,
++        'wrs-sg:best_effort': parameter_types.boolean,
++    },
++    'additionalProperties': False,
++}
++
++server_group_metadata = {
++    'type': 'object',
++    'properties': {
++        'wrs-sg:group_size': {
++            'oneOf': [
++                positive_integer_not_empty,
++                {
++                    'type': ['null', 'string'],
++                    'enum': [None, ''],
++                },
++            ]
++        },
++        'wrs-sg:best_effort': boolean_with_nullstring,
++    },
++    'additionalProperties': False,
++}
++
++# extend group creation to include optional metadata
++properties = create_v215['properties']['server_group']['properties']
++properties['metadata'] = server_group_metadata_create
++
++properties['project_id'] = parameter_types.project_id
++
++# schema for setting metadata on existing group
++set_meta = {
++    'type': 'object',
++    'properties': {
++        'set_metadata': {
++            'type': 'object',
++            'properties': {
++                'metadata': server_group_metadata
++            },
++            'required': ['metadata'],
++            'additionalProperties': False,
++        }
++    },
++    'required': ['set_metadata'],
++    'additionalProperties': False,
++}
+diff --git a/nova/api/openstack/compute/server_groups.py b/nova/api/openstack/compute/server_groups.py
+index afe3de9..7d408e4 100644
+--- a/nova/api/openstack/compute/server_groups.py
++++ b/nova/api/openstack/compute/server_groups.py
+@@ -12,6 +12,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2016-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ """The Server Group API Extension."""
+ 
+@@ -94,6 +101,15 @@ class ServerGroupController(wsgi.Controller):
+         # NOTE(danms): This has been exposed to the user, but never used.
+         # Since we can't remove it, just make sure it's always empty.
+         server_group['metadata'] = {}
++
++        # metadata
++        if group.metadetails is not None:
++            metadata = {}
++            for k, v in group.metadetails.items():
++                if k in ['wrs-sg:group_size', 'wrs-sg:best_effort']:
++                    metadata[k] = v
++            server_group['metadata'] = metadata
++
+         members = []
+         if group.members:
+             # Display the instances that are not deleted.
+@@ -117,7 +133,7 @@ class ServerGroupController(wsgi.Controller):
+         return {'server_group': self._format_server_group(context, sg, req)}
+ 
+     @wsgi.response(204)
+-    @extensions.expected_errors(404)
++    @extensions.expected_errors((400, 404))
+     def delete(self, req, id):
+         """Delete a server group."""
+         context = _authorize_context(req, 'delete')
+@@ -125,6 +141,12 @@ class ServerGroupController(wsgi.Controller):
+             sg = objects.InstanceGroup.get_by_uuid(context, id)
+         except nova.exception.InstanceGroupNotFound as e:
+             raise webob.exc.HTTPNotFound(explanation=e.format_message())
++
++        # don't allow deleting group with instances
++        if sg.count_members():
++            e = nova.exception.InstanceGroupNotEmpty(group_uuid=sg.uuid)
++            raise webob.exc.HTTPBadRequest(explanation=e.format_message())
++
+         try:
+             sg.destroy()
+         except nova.exception.InstanceGroupNotFound as e:
+@@ -153,20 +175,28 @@ class ServerGroupController(wsgi.Controller):
+         """Creates a new server group."""
+         context = _authorize_context(req, 'create')
+ 
++        # admin can create server-groups for other tenants,
++        # so make sure we charge quota using project_id as specified in body
++        vals = body['server_group']
++        project_id = vals.get('project_id', context.project_id)
++
+         try:
+             objects.Quotas.check_deltas(context, {'server_groups': 1},
+-                                        context.project_id, context.user_id)
++                                        project_id, context.user_id)
+         except nova.exception.OverQuota:
+             msg = _("Quota exceeded, too many server groups.")
+             raise exc.HTTPForbidden(explanation=msg)
+ 
+-        vals = body['server_group']
++        # possibly set project_id from body
+         sg = objects.InstanceGroup(context)
+-        sg.project_id = context.project_id
++        sg.project_id = project_id
+         sg.user_id = context.user_id
+         try:
+             sg.name = vals.get('name')
+             sg.policies = vals.get('policies')
++
++            # metadetails
++            sg.metadetails = vals.get('metadata', {})
+             sg.create()
+         except ValueError as e:
+             raise exc.HTTPBadRequest(explanation=e)
+@@ -178,7 +208,7 @@ class ServerGroupController(wsgi.Controller):
+         if CONF.quota.recheck_quota:
+             try:
+                 objects.Quotas.check_deltas(context, {'server_groups': 0},
+-                                            context.project_id,
++                                            project_id,
+                                             context.user_id)
+             except nova.exception.OverQuota:
+                 sg.destroy()
+@@ -186,3 +216,56 @@ class ServerGroupController(wsgi.Controller):
+                 raise exc.HTTPForbidden(explanation=msg)
+ 
+         return {'server_group': self._format_server_group(context, sg, req)}
++
++    # 
++    @wsgi.Controller.api_version("2.25")
++    @extensions.expected_errors((400, 404))
++    @wsgi.action("set_metadata")
++    @validation.schema(schema.set_meta, "2.25")
++    def _set_metadata(self, req, id, body):
++        """Update metadata for the specified server group."""
++        context = _authorize_context(req, 'set_metadata')
++        try:
++            sg = objects.InstanceGroup.get_by_uuid(context, id)
++        except nova.exception.InstanceGroupNotFound as e:
++            raise webob.exc.HTTPNotFound(explanation=e.format_message())
++
++        metadata = body['set_metadata']['metadata']
++
++        # Check group_size limits
++        key = 'wrs-sg:group_size'
++        if key in metadata.keys():
++            if metadata[key] not in ['', None]:
++                group_size = int(metadata[key])
++                num_members = sg.count_members()
++                if group_size < num_members:
++                    msg = _(
++                        'Action would result in server group %(uuid)s '
++                        'number of members %(num)d exceeding '
++                        ' group size %(size)d.'
++                    ), {'uuid': sg.uuid, 'num': num_members,
++                        'size': group_size}
++                    raise exc.HTTPBadRequest(explanation=msg)
++                sg.metadetails[key] = metadata[key]
++            else:
++                sg.metadetails.pop(key, None)
++
++        key = 'wrs-sg:best_effort'
++        if key in metadata.keys():
++            if metadata[key] not in ['', None]:
++                sg.metadetails[key] = metadata[key]
++            else:
++                sg.metadetails.pop(key, None)
++
++        # Assume we changed something and want to write to the DB.
++        # Updating the metadetails in-place doesn't trigger the what-changed
++        # detection in the object.
++        sg._changed_fields.add('metadetails')
++        sg.save()
++
++        # Get updated server group
++        try:
++            sg = objects.InstanceGroup.get_by_uuid(context, id)
++        except nova.exception.InstanceGroupNotFound as e:
++            raise webob.exc.HTTPNotFound(explanation=e.format_message())
++        return {'server_group': self._format_server_group(context, sg, req)}
+diff --git a/nova/api/openstack/compute/wrs_server_groups.py b/nova/api/openstack/compute/wrs_server_groups.py
+new file mode 100644
+index 0000000..64899b3
+--- /dev/null
++++ b/nova/api/openstack/compute/wrs_server_groups.py
+@@ -0,0 +1,64 @@
++#   Licensed under the Apache License, Version 2.0 (the "License"); you may
++#   not use this file except in compliance with the License. You may obtain
++#   a copy of the License at
++#
++#       http://www.apache.org/licenses/LICENSE-2.0
++#
++#   Unless required by applicable law or agreed to in writing, software
++#   distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#   WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#   License for the specific language governing permissions and limitations
++#   under the License.
++#
++# Copyright (c) 2014-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
++
++"""The Server Groups Extension."""
++
++
++from nova.api.openstack import wsgi
++from nova import exception
++from nova import objects
++from nova.policies import wrs_server_groups as wrs_sg_policies
++
++
++class WrsServerGroupController(wsgi.Controller):
++    def _get_server_group(self, context, instance):
++        try:
++            sg = objects.InstanceGroup.get_by_instance_uuid(context,
++                                                            instance.uuid)
++        except exception.InstanceGroupNotFound:
++            sg = None
++        if not sg:
++            return ''
++
++        return "%s (%s)" % (sg.name, sg.uuid)
++
++    @wsgi.extends
++    def show(self, req, resp_obj, id):
++        context = req.environ['nova.context']
++        if context.can(wrs_sg_policies.BASE_POLICY_NAME, fatal=False):
++            server = resp_obj.obj['server']
++            instance = req.get_db_instance(server['id'])
++            # server['id'] is guaranteed to be in the cache due to
++            # the core API adding it in its 'show' method.
++            server["wrs-sg:server_group"] = self._get_server_group(
++                                                            context,
++                                                            instance)
++
++    @wsgi.extends
++    def detail(self, req, resp_obj):
++        context = req.environ['nova.context']
++        if context.can(wrs_sg_policies.BASE_POLICY_NAME, fatal=False):
++            servers = list(resp_obj.obj['servers'])
++            for server in servers:
++                instance = req.get_db_instance(server['id'])
++                # server['id'] is guaranteed to be in the cache due to
++                # the core API adding it in its 'detail' method.
++                server["wrs-sg:server_group"] = self._get_server_group(
++                                                                context,
++                                                                instance)
+diff --git a/nova/compute/api.py b/nova/compute/api.py
+index e6c95c4..570e287 100644
+--- a/nova/compute/api.py
++++ b/nova/compute/api.py
+@@ -913,6 +913,7 @@ class API(base.Base):
+                 # spec as this is how the conductor knows how many were in this
+                 # batch.
+                 req_spec.num_instances = num_instances
++                req_spec.min_num_instances = min_count
+                 req_spec.create()
+ 
+                 # Create an instance object, but do not store in db yet.
+diff --git a/nova/compute/manager.py b/nova/compute/manager.py
+index c9b6b1e..c57c5d8 100644
+--- a/nova/compute/manager.py
++++ b/nova/compute/manager.py
+@@ -1354,7 +1354,8 @@ class ComputeManager(manager.Manager):
+         # anti-affinity policy may end up here.  It's also possible that
+         # multiple instances with an affinity policy could end up on different
+         # hosts.  This is a validation step to make sure that starting the
+-        # instance here doesn't violate the policy.
++        # instance here doesn't violate the policy.  Note that we only check
++        # against instances created before us.
+ 
+         scheduler_hints = filter_properties.get('scheduler_hints') or {}
+         group_hint = scheduler_hints.get('group')
+@@ -1365,17 +1366,28 @@ class ComputeManager(manager.Manager):
+         def _do_validation(context, instance, group_hint):
+             group = objects.InstanceGroup.get_by_hint(context, group_hint)
+             if 'anti-affinity' in group.policies:
+-                group_hosts = group.get_hosts(exclude=[instance.uuid])
++                group_hosts = group.get_older_member_hosts(instance.uuid)
+                 if self.host in group_hosts:
+-                    msg = _("Anti-affinity instance group policy "
+-                            "was violated.")
++                    if strutils.bool_from_string(group.metadetails.get(
++                            'wrs-sg:best_effort', 'False')):
++                        LOG.info("Host fails anti-affinity policy for "
++                                 "group %s, allowing due to best-effort "
++                                 "flag", group.uuid, instance=instance)
++                        return
++                    msg = _("Anti-affinity server group policy was violated.")
+                     raise exception.RescheduledException(
+                             instance_uuid=instance.uuid,
+                             reason=msg)
+             elif 'affinity' in group.policies:
+-                group_hosts = group.get_hosts(exclude=[instance.uuid])
++                group_hosts = group.get_older_member_hosts(instance.uuid)
+                 if group_hosts and self.host not in group_hosts:
+-                    msg = _("Affinity instance group policy was violated.")
++                    if strutils.bool_from_string(group.metadetails.get(
++                            'wrs-sg:best_effort', 'False')):
++                        LOG.info("Host fails affinity policy for "
++                                 "group %s, allowing due to best-effort "
++                                 "flag", group.uuid, instance=instance)
++                        return
++                    msg = _("Affinity server group policy was violated.")
+                     raise exception.RescheduledException(
+                             instance_uuid=instance.uuid,
+                             reason=msg)
+diff --git a/nova/conductor/manager.py b/nova/conductor/manager.py
+index 4476301..3dad78f 100644
+--- a/nova/conductor/manager.py
++++ b/nova/conductor/manager.py
+@@ -1092,6 +1092,17 @@ class ComputeTaskManager(base.Base):
+         cell_mapping_cache = {}
+         instances = []
+ 
++        # get number of instances allowed to build, may need to adjust
++        #      for maximum server group size
++        instance_group = request_specs[0].instance_group
++        metadetails = {}
++        if instance_group:
++            metadetails = instance_group.get('metadetails', {})
++        group_exceed = int(metadetails.get('wrs-sg:group_exceed', 0))
++        num_allowed = len(build_requests)
++        num_allowed -= max(group_exceed, 0)
++        num_destroyed = 0
++
+         for (build_request, request_spec, host) in six.moves.zip(
+                 build_requests, request_specs, hosts):
+             instance = build_request.get_new_instance(context)
+@@ -1132,6 +1143,16 @@ class ComputeTaskManager(base.Base):
+                 rc.delete_allocation_for_instance(instance.uuid)
+                 continue
+             else:
++                # destroy instances execeeding number of
++                # allowed instances
++                if num_allowed == 0:
++                    try:
++                        build_request.destroy()
++                    except exception.BuildRequestNotFound:
++                        pass
++                    num_destroyed += 1
++                    continue
++                num_allowed -= 1
+                 instance.availability_zone = (
+                     availability_zones.get_host_availability_zone(
+                         context, host['host']))
+@@ -1224,6 +1245,23 @@ class ComputeTaskManager(base.Base):
+                     host=host['host'], node=host['nodename'],
+                     limits=host['limits'])
+ 
++        # rollback quotas for destroyed instances
++        if num_destroyed > 0:
++            # get data to rollback
++            # this code is copied from _check_num_instances_quota()
++            #       in compute/api.py
++            flavor = request_specs[0].flavor
++            unused_cores = num_destroyed * flavor['vcpus']
++            unused_vram = int(flavor.get('extra_specs', {})
++                              .get('hw_video:ram_max_mb', 0))
++            unused_ram = num_destroyed * (flavor['memory_mb'] + unused_vram)
++            # rollback quotas
++            quotas = objects.Quotas(context)
++            quotas.reserve(instances=-num_destroyed,
++                           cores=-unused_cores,
++                           ram=-unused_ram)
++            quotas.commit()
++
+     def _cleanup_build_artifacts(self, context, exc, instances, build_requests,
+                                  request_specs, cell_mapping_cache):
+         for (instance, build_request, request_spec) in six.moves.zip(
+diff --git a/nova/conductor/tasks/live_migrate.py b/nova/conductor/tasks/live_migrate.py
+index 41dd0bf..56e59c4 100644
+--- a/nova/conductor/tasks/live_migrate.py
++++ b/nova/conductor/tasks/live_migrate.py
+@@ -16,11 +16,15 @@
+ # of this software may be licensed only pursuant to the terms
+ # of an applicable Wind River license agreement.
+ #
++
++from oslo_concurrency import lockutils
+ from oslo_log import log as logging
+ import oslo_messaging as messaging
++from oslo_utils import strutils
+ import six
+ 
+ from nova.compute import power_state
++from nova.compute import utils as compute_utils
+ from nova.conductor.tasks import base
+ import nova.conf
+ from nova import exception
+@@ -55,32 +59,49 @@ class LiveMigrationTask(base.TaskBase):
+         self._check_instance_is_active()
+         self._check_host_is_up(self.source)
+ 
+-        if not self.destination:
+-            # Either no host was specified in the API request and the user
+-            # wants the scheduler to pick a destination host, or a host was
+-            # specified but is not forcing it, so they want the scheduler
+-            # filters to run on the specified host, like a scheduler hint.
+-            self.destination, self.sched_limits = self._find_destination()
++        def _select_destination():
++            if not self.destination:
++                # Either no host was specified in the API request and the user
++                # wants the scheduler to pick a destination host, or a host was
++                # specified but is not forcing it, so they want the scheduler
++                # filters to run on the specified host, like a scheduler hint.
++                self.destination, self.sched_limits = self._find_destination()
++            else:
++                # This is the case that the user specified the 'force' flag
++                # when live migrating with a specific destination host so the
++                # scheduler is bypassed. There are still some minimal checks
++                # performed here though.
++                source_node, dest_node = self._check_requested_destination()
++                # Now that we're semi-confident in the force specified host, we
++                # need to copy the source compute node allocations in Placement
++                # to the destination compute node.
++                # Normally select_destinations()
++                # in the scheduler would do this for us, but when forcing the
++                # target host we don't call the scheduler.
++                # TODO(mriedem): In Queens, call select_destinations() with a
++                # skip_filters=True flag so the scheduler does the work of
++                # claiming resources on the destination in Placement but still
++                # bypass the scheduler filters, which honors the 'force' flag
++                # in the API.
++                # This raises NoValidHost which will be handled in
++                # ComputeTaskManager.
++                scheduler_utils.claim_resources_on_destination(
++                    self.scheduler_client.reportclient, self.instance,
++                    source_node, dest_node)
++
++        if self._is_ordered_scheduling_needed():
++            # ensure scheduling of one live-migration at a time for
++            # instances in a given anti-affinity server group.
++            # This closes a race condition.
++            instance_group_name = self.request_spec.instance_group['name']
++
++            sema = lockutils.lock('instance-group-%s' % instance_group_name,
++                         external=True, fair=True)
+         else:
+-            # This is the case that the user specified the 'force' flag when
+-            # live migrating with a specific destination host so the scheduler
+-            # is bypassed. There are still some minimal checks performed here
+-            # though.
+-            source_node, dest_node = self._check_requested_destination()
+-            # Now that we're semi-confident in the force specified host, we
+-            # need to copy the source compute node allocations in Placement
+-            # to the destination compute node. Normally select_destinations()
+-            # in the scheduler would do this for us, but when forcing the
+-            # target host we don't call the scheduler.
+-            # TODO(mriedem): In Queens, call select_destinations() with a
+-            # skip_filters=True flag so the scheduler does the work of claiming
+-            # resources on the destination in Placement but still bypass the
+-            # scheduler filters, which honors the 'force' flag in the API.
+-            # This raises NoValidHost which will be handled in
+-            # ComputeTaskManager.
+-            scheduler_utils.claim_resources_on_destination(
+-                self.scheduler_client.reportclient, self.instance,
+-                source_node, dest_node)
++            sema = compute_utils.UnlimitedSemaphore()
++
++        with sema:
++            _select_destination()
+ 
+         # Log live migration
+         LOG.info("Live migrating instance %(inst_uuid)s: "
+@@ -107,6 +128,18 @@ class LiveMigrationTask(base.TaskBase):
+         # rollback call right now.
+         pass
+ 
++    def _is_ordered_scheduling_needed(self):
++        if hasattr(self.request_spec, 'instance_group') and \
++                   self.request_spec.instance_group:
++            metadetails = self.request_spec.instance_group['metadetails']
++            is_best_effort = strutils.bool_from_string(
++                                metadetails.get('wrs-sg:best_effort', 'False'))
++
++            if ('anti-affinity' in
++                    self.request_spec.instance_group['policies'] and
++                    not is_best_effort):
++                return True
++
+     def _check_instance_is_active(self):
+         if self.instance.power_state not in (power_state.RUNNING,
+                                              power_state.PAUSED):
+@@ -279,6 +312,45 @@ class LiveMigrationTask(base.TaskBase):
+             # if we want to make sure that the next destination
+             # is not forced to be the original host
+             request_spec.reset_forced_destinations()
++
++            # The request_spec has stale instance_group information.
++            # Update from db to get latest members and metadetails.
++            if hasattr(request_spec, 'instance_group') and \
++                       request_spec.instance_group:
++                request_spec.instance_group = \
++                    objects.InstanceGroup.get_by_instance_uuid(
++                           self.context, self.instance.uuid)
++
++                # add hosts to Server group host list for group members
++                # that are migrating in progress
++                metadetails = request_spec.instance_group['metadetails']
++                is_best_effort = strutils.bool_from_string(
++                    metadetails.get('wrs-sg:best_effort', 'False'))
++
++                if ('anti-affinity' in request_spec.instance_group['policies']
++                    and not is_best_effort):
++                    group_members = request_spec.instance_group['members']
++
++                    for member_uuid in group_members:
++                        filters = {
++                            'instance_uuid': member_uuid,
++                            'status': ['queued', 'accepted', 'pre-migrating',
++                                       'preparing', 'running']
++                        }
++                        migrations = objects.MigrationList. \
++                            get_by_filters(self.context, filters)
++
++                        for migration in migrations:
++                            if migration['source_compute'] not in \
++                                    request_spec.instance_group['hosts']:
++                                request_spec.instance_group['hosts'].\
++                                    append(migration['source_compute'])
++                            if (migration['dest_compute'] and (
++                                migration['dest_compute'] not in
++                                        request_spec.instance_group['hosts'])):
++                                request_spec.instance_group['hosts'].\
++                                    append(migration['dest_compute'])
++
+         scheduler_utils.setup_instance_group(self.context, request_spec)
+ 
+         # We currently only support live migrating to hosts in the same
+diff --git a/nova/conductor/tasks/migrate.py b/nova/conductor/tasks/migrate.py
+index f472fab..11ca101 100644
+--- a/nova/conductor/tasks/migrate.py
++++ b/nova/conductor/tasks/migrate.py
+@@ -12,6 +12,7 @@
+ 
+ from oslo_log import log as logging
+ from oslo_serialization import jsonutils
++from oslo_utils import strutils
+ 
+ from nova import availability_zones
+ from nova.conductor.tasks import base
+@@ -40,6 +41,34 @@ class MigrationTask(base.TaskBase):
+         legacy_spec = self.request_spec.to_legacy_request_spec_dict()
+         legacy_props = self.request_spec.to_legacy_filter_properties_dict()
+         scheduler_utils.setup_instance_group(self.context, self.request_spec)
++
++        # add hosts to Server group host list for group members
++        # that are migrating in progress
++        if 'group_members' in legacy_props:
++            metadetails = legacy_props['group_metadetails']
++            is_best_effort = strutils.bool_from_string(
++                                metadetails.get('wrs-sg:best_effort', 'False'))
++
++            if ('anti-affinity' in legacy_props['group_policies'] and
++                    not is_best_effort):
++                group_members = legacy_props['group_members']
++
++                for instance_uuid in group_members:
++                    filters = {
++                        'instance_uuid': instance_uuid,
++                        'status': ['queued', 'pre-migrating', 'migrating',
++                                   'post-migrating', 'finished']
++                    }
++
++                    migrations = objects.MigrationList.\
++                        get_by_filters(self.context, filters)
++
++                    for migration in migrations:
++                        legacy_props['group_hosts'].\
++                            add(migration['source_compute'])
++                        legacy_props['group_hosts'].\
++                            add(migration['dest_compute'])
++
+         scheduler_utils.populate_retry(legacy_props,
+                                        self.instance.uuid)
+ 
+diff --git a/nova/db/api.py b/nova/db/api.py
+index 275340d..5c9ad1a 100644
+--- a/nova/db/api.py
++++ b/nova/db/api.py
+@@ -875,13 +875,16 @@ def instance_remove_security_group(context, instance_id, security_group_id):
+ ####################
+ 
+ 
+-def instance_group_create(context, values, policies=None, members=None):
++# metadata
++def instance_group_create(context, values, policies=None, members=None,
++                          metadata=None):
+     """Create a new group.
+ 
+     Each group will receive a unique uuid. This will be used for access to the
+     group.
+     """
+-    return IMPL.instance_group_create(context, values, policies, members)
++    return IMPL.instance_group_create(context, values, policies, members,
++                                      metadata)
+ 
+ 
+ def instance_group_get(context, group_uuid):
+diff --git a/nova/db/sqlalchemy/api.py b/nova/db/sqlalchemy/api.py
+index 3d6e9b6..47fe653 100644
+--- a/nova/db/sqlalchemy/api.py
++++ b/nova/db/sqlalchemy/api.py
+@@ -6563,7 +6563,8 @@ def service_uuids_online_data_migration(context, max_count):
+ 
+ def _instance_group_get_query(context, model_class, id_field=None, id=None,
+                               read_deleted=None):
+-    columns_to_join = {models.InstanceGroup: ['_policies', '_members']}
++    columns_to_join = {models.InstanceGroup: ['_policies', '_members',
++                                              '_metadata']}
+     query = model_query(context, model_class, read_deleted=read_deleted,
+                         project_only=True)
+     for c in columns_to_join.get(model_class, []):
+@@ -6575,8 +6576,10 @@ def _instance_group_get_query(context, model_class, id_field=None, id=None,
+     return query
+ 
+ 
++# metadata
+ @pick_context_manager_writer
+-def instance_group_create(context, values, policies=None, members=None):
++def instance_group_create(context, values, policies=None, members=None,
++                          metadata=None):
+     """Create a new group."""
+     uuid = values.get('uuid', None)
+     if uuid is None:
+@@ -6601,6 +6604,10 @@ def instance_group_create(context, values, policies=None, members=None):
+         _instance_group_members_add(context, group.id, members)
+     else:
+         group._members = []
++    if metadata:
++        _instance_group_metadata_add(context, group.id, metadata)
++    else:
++        group._metadata = []
+ 
+     return instance_group_get(context, uuid)
+ 
+@@ -6634,6 +6641,7 @@ def instance_group_get_by_instance(context, instance_uuid):
+     return group
+ 
+ 
++# metadata
+ @pick_context_manager_writer
+ def instance_group_update(context, group_uuid, values):
+     """Update the attributes of a group.
+@@ -6659,6 +6667,12 @@ def instance_group_update(context, group_uuid, values):
+                                     group.id,
+                                     values.pop('members'),
+                                     set_delete=True)
++    metadata = values.get('metadata')
++    if metadata is not None:
++        _instance_group_metadata_add(context,
++                                    group.id,
++                                    values.pop('metadata'),
++                                    set_delete=True)
+ 
+     group.update(values)
+ 
+@@ -6666,8 +6680,11 @@ def instance_group_update(context, group_uuid, values):
+         values['policies'] = policies
+     if members:
+         values['members'] = members
++    if metadata:
++        values['metadata'] = metadata
+ 
+ 
++# metadata
+ @pick_context_manager_writer
+ def instance_group_delete(context, group_uuid):
+     """Delete a group."""
+@@ -6682,6 +6699,7 @@ def instance_group_delete(context, group_uuid):
+ 
+     # Delete policies, metadata and members
+     instance_models = [models.InstanceGroupPolicy,
++                       models.InstanceGroupMetadata,
+                        models.InstanceGroupMember]
+     for model in instance_models:
+         model_query(context, model).filter_by(group_id=group_id).soft_delete()
+@@ -6729,6 +6747,59 @@ def _instance_group_id(context, group_uuid):
+     return result.id
+ 
+ 
++# metadata
++def _instance_group_metadata_add(context, id, metadata, set_delete=False):
++        all_keys = metadata.keys()
++        query = _instance_group_model_get_query(context,
++                                                models.InstanceGroupMetadata,
++                                                id)
++        if set_delete:
++            query.filter(~models.InstanceGroupMetadata.key.in_(all_keys)).\
++                    soft_delete(synchronize_session=False)
++
++        query = query.filter(models.InstanceGroupMetadata.key.in_(all_keys))
++        already_existing_keys = set()
++        for meta_ref in query.all():
++            key = meta_ref.key
++            meta_ref['value'] = metadata[key]
++            already_existing_keys.add(key)
++
++        for key, value in metadata.items():
++            if key in already_existing_keys:
++                continue
++            meta_ref = models.InstanceGroupMetadata()
++            meta_ref.update({'key': key,
++                             'value': value,
++                             'group_id': id})
++            context.session.add(meta_ref)
++
++        return metadata
++
++
++# metadata
++@pick_context_manager_writer
++def instance_group_metadata_add(context, group_uuid, metadata,
++                                set_delete=False):
++    id = _instance_group_id(context, group_uuid)
++    return _instance_group_metadata_add(context, id, metadata,
++                                        set_delete=set_delete)
++
++
++# metadata
++@pick_context_manager_writer
++def instance_group_metadata_delete(context, group_uuid, key):
++    id = _instance_group_id(context, group_uuid)
++    count = _instance_group_model_get_query(context,
++                                      models.InstanceGroupMetadata,
++                                      models.InstanceGroupMetadata.group_id,
++                                      id).\
++                filter_by(key=key).\
++                soft_delete()
++    if count == 0:
++        raise exception.InstanceGroupMetadataNotFound(group_uuid=group_uuid,
++                                                      metadata_key=key)
++
++
+ def _instance_group_members_add(context, id, members, set_delete=False):
+     all_members = set(members)
+     query = _instance_group_model_get_query(context,
+diff --git a/nova/db/sqlalchemy/api_migrations/migrate_repo/versions/018_instance_groups.py b/nova/db/sqlalchemy/api_migrations/migrate_repo/versions/018_instance_groups.py
+index 08d952f..1e10748 100644
+--- a/nova/db/sqlalchemy/api_migrations/migrate_repo/versions/018_instance_groups.py
++++ b/nova/db/sqlalchemy/api_migrations/migrate_repo/versions/018_instance_groups.py
+@@ -69,3 +69,18 @@ def upgrade(migrate_engine):
+     )
+ 
+     group_member.create(checkfirst=True)
++
++    group_metadata = Table('instance_group_metadata', meta,
++        Column('created_at', DateTime),
++        Column('updated_at', DateTime),
++        Column('id', Integer, primary_key=True, nullable=False),
++        Column('key', String(length=255)),
++        Column('value', String(length=255)),
++        Column('group_id', Integer, ForeignKey('instance_groups.id'),
++               nullable=False),
++        Index('instance_group_metadata_key_idx', 'key'),
++        mysql_engine='InnoDB',
++        mysql_charset='utf8',
++    )
++
++    group_metadata.create(checkfirst=True)
+diff --git a/nova/db/sqlalchemy/api_models.py b/nova/db/sqlalchemy/api_models.py
+index 08c29cb..ca95379 100644
+--- a/nova/db/sqlalchemy/api_models.py
++++ b/nova/db/sqlalchemy/api_models.py
+@@ -9,6 +9,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ 
+ from oslo_db.sqlalchemy import models
+@@ -406,6 +413,20 @@ class InstanceGroupPolicy(API_BASE):
+                       nullable=False)
+ 
+ 
++class InstanceGroupMetadata(API_BASE):
++    """Represents a key/value pair for an instance group."""
++    __tablename__ = 'instance_group_metadata'
++    __table_args__ = (
++        Index('instance_group_metadata_key_idx', 'key'),
++    )
++    id = Column(Integer, primary_key=True, nullable=False)
++    key = Column(String(255))
++    value = Column(String(255))
++
++    group_id = Column(Integer, ForeignKey('instance_groups.id'),
++                      nullable=False)
++
++
+ class InstanceGroup(API_BASE):
+     """Represents an instance group.
+ 
+@@ -425,6 +446,9 @@ class InstanceGroup(API_BASE):
+     name = Column(String(255))
+     _policies = orm.relationship(InstanceGroupPolicy,
+             primaryjoin='InstanceGroup.id == InstanceGroupPolicy.group_id')
++    # metadata
++    _metadata = orm.relationship(InstanceGroupMetadata,
++            primaryjoin='InstanceGroup.id == InstanceGroupMetadata.group_id')
+     _members = orm.relationship(InstanceGroupMember,
+             primaryjoin='InstanceGroup.id == InstanceGroupMember.group_id')
+ 
+@@ -432,6 +456,11 @@ class InstanceGroup(API_BASE):
+     def policies(self):
+         return [p.policy for p in self._policies]
+ 
++    # metadetails
++    @property
++    def metadetails(self):
++        return {m.key: m.value for m in self._metadata}
++
+     @property
+     def members(self):
+         return [m.instance_uuid for m in self._members]
+diff --git a/nova/db/sqlalchemy/migrate_repo/versions/250_remove_instance_groups_metadata.py b/nova/db/sqlalchemy/migrate_repo/versions/250_remove_instance_groups_metadata.py
+index 4762fdb..c742134 100644
+--- a/nova/db/sqlalchemy/migrate_repo/versions/250_remove_instance_groups_metadata.py
++++ b/nova/db/sqlalchemy/migrate_repo/versions/250_remove_instance_groups_metadata.py
+@@ -12,12 +12,22 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2016-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ 
+ from sqlalchemy import MetaData, Table
+ 
+ 
+ def upgrade(migrate_engine):
++    # prevent instance_groups_metadata from being removed
++    return
++
+     """Remove the instance_group_metadata table."""
+     meta = MetaData(bind=migrate_engine)
+ 
+diff --git a/nova/db/sqlalchemy/models.py b/nova/db/sqlalchemy/models.py
+index 523ea57..1d62f02 100644
+--- a/nova/db/sqlalchemy/models.py
++++ b/nova/db/sqlalchemy/models.py
+@@ -15,6 +15,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2016-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ """
+ SQLAlchemy models for nova data.
+ """
+@@ -1370,6 +1377,22 @@ class InstanceGroupPolicy(BASE, NovaBase, models.SoftDeleteMixin):
+                       nullable=False)
+ 
+ 
++# add metadata table.  Similar to other instance group tables, per move to
++# nova_api database, this is deprecated but required for upgrade.
++class InstanceGroupMetadata(BASE, NovaBase, models.SoftDeleteMixin):
++    """Represents a key/value pair for an instance group."""
++    __tablename__ = 'instance_group_metadata'
++    __table_args__ = (
++        Index('instance_group_metadata_key_idx', 'key'),
++    )
++    id = Column(Integer, primary_key=True, nullable=False)
++    key = Column(String(255))
++    value = Column(String(255))
++
++    group_id = Column(Integer, ForeignKey('instance_groups.id'),
++                      nullable=False)
++
++
+ # NOTE(alaski): This table exists in the nova_api database and its usage here
+ # is deprecated.
+ class InstanceGroup(BASE, NovaBase, models.SoftDeleteMixin):
+@@ -1394,6 +1417,13 @@ class InstanceGroup(BASE, NovaBase, models.SoftDeleteMixin):
+         'InstanceGroup.id == InstanceGroupPolicy.group_id,'
+         'InstanceGroupPolicy.deleted == 0,'
+         'InstanceGroup.deleted == 0)')
++
++    # metadata
++    _metadata = orm.relationship(InstanceGroupMetadata, primaryjoin='and_('
++        'InstanceGroup.id == InstanceGroupMetadata.group_id,'
++        'InstanceGroupMetadata.deleted == 0,'
++        'InstanceGroup.deleted == 0)')
++
+     _members = orm.relationship(InstanceGroupMember, primaryjoin='and_('
+         'InstanceGroup.id == InstanceGroupMember.group_id,'
+         'InstanceGroupMember.deleted == 0,'
+@@ -1403,6 +1433,11 @@ class InstanceGroup(BASE, NovaBase, models.SoftDeleteMixin):
+     def policies(self):
+         return [p.policy for p in self._policies]
+ 
++    # metadetails
++    @property
++    def metadetails(self):
++        return {m.key: m.value for m in self._metadata}
++
+     @property
+     def members(self):
+         return [m.instance_id for m in self._members]
+diff --git a/nova/exception.py b/nova/exception.py
+index 6a460c7..9eee04d 100644
+--- a/nova/exception.py
++++ b/nova/exception.py
+@@ -1646,6 +1646,18 @@ class AgentNotImplemented(AgentError):
+     msg_fmt = _('Agent does not support the call: %(method)s')
+ 
+ 
++# 
++class InstanceGroupNotEmpty(NovaException):
++    msg_fmt = _("Instance group %(group_uuid)s is not empty. "
++                "Must delete all group members before deleting group.")
++
++
++# 
++class InstanceGroupSizeLimit(NovaException):
++    msg_fmt = _("Action would result in server group %(group_uuid)s "
++                "exceeding the group size of %(group_size)s.")
++
++
+ class InstanceGroupNotFound(NotFound):
+     msg_fmt = _("Instance group %(group_uuid)s could not be found.")
+ 
+@@ -1654,6 +1666,11 @@ class InstanceGroupIdExists(NovaException):
+     msg_fmt = _("Instance group %(group_uuid)s already exists.")
+ 
+ 
++class InstanceGroupMetadataNotFound(NotFound):
++    msg_fmt = _("Instance group %(group_uuid)s has no metadata with "
++                "key %(metadata_key)s.")
++
++
+ class InstanceGroupMemberNotFound(NotFound):
+     msg_fmt = _("Instance group %(group_uuid)s has no member with "
+                 "id %(instance_id)s.")
+diff --git a/nova/objects/instance_group.py b/nova/objects/instance_group.py
+index 4f111f2..a92ecc7 100644
+--- a/nova/objects/instance_group.py
++++ b/nova/objects/instance_group.py
+@@ -11,6 +11,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2013-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ import copy
+ 
+@@ -21,6 +28,7 @@ from sqlalchemy.orm import contains_eager
+ from sqlalchemy.orm import joinedload
+ 
+ from nova.compute import utils as compute_utils
++from nova.compute import vm_states
+ from nova import db
+ from nova.db.sqlalchemy import api as db_api
+ from nova.db.sqlalchemy import api_models
+@@ -35,9 +43,11 @@ LAZY_LOAD_FIELDS = ['hosts']
+ 
+ 
+ def _instance_group_get_query(context, id_field=None, id=None):
++    # metadata
+     query = context.session.query(api_models.InstanceGroup).\
+             options(joinedload('_policies')).\
+-            options(joinedload('_members'))
++            options(joinedload('_members')).\
++            options(joinedload('_metadata'))
+     if not context.is_admin:
+         query = query.filter_by(project_id=context.project_id)
+     if id and id_field:
+@@ -81,6 +91,41 @@ def _instance_group_policies_add(context, group, policies):
+                                      append_to_models=group._policies)
+ 
+ 
++# update metadata.  Based on provided metadata, key/value
++# pairs will be added, updated or deleted.
++def _instance_group_metadata_add(context, group, metadata, update_group=False):
++    query = _instance_group_model_get_query(context,
++                                            api_models.InstanceGroupMetadata,
++                                            group.id)
++    metadata_new = []
++    already_existing_keys = set()
++    group_metadata = group._metadata
++    for meta_ref in query.all():
++        key = meta_ref.key
++        if key in metadata:
++            meta_ref['value'] = metadata[key]
++            already_existing_keys.add(key)
++            metadata_new.append(meta_ref)
++        else:
++            context.session.delete(meta_ref)
++            if update_group:
++                group_metadata.remove(meta_ref)
++
++    for key, value in metadata.items():
++        if key in already_existing_keys:
++            continue
++        meta_ref = api_models.InstanceGroupMetadata()
++        meta_ref.update({'key': key,
++                         'value': value,
++                         'group_id': id})
++        context.session.add(meta_ref)
++        if update_group:
++            group_metadata.append(meta_ref)
++        metadata_new.append(meta_ref)
++
++    return metadata_new
++
++
+ def _instance_group_members_add(context, group, members):
+     query = _instance_group_model_get_query(context,
+                                             api_models.InstanceGroupMember,
+@@ -134,6 +179,10 @@ class InstanceGroup(base.NovaPersistentObject, base.NovaObject,
+         'name': fields.StringField(nullable=True),
+ 
+         'policies': fields.ListOfStringsField(nullable=True),
++
++        # 'metadetails' is deprecated, but we still need it
++        'metadetails': fields.DictOfStringsField(nullable=True),
++
+         'members': fields.ListOfStringsField(nullable=True),
+         'hosts': fields.ListOfStringsField(nullable=True),
+         }
+@@ -221,6 +270,8 @@ class InstanceGroup(base.NovaPersistentObject, base.NovaObject,
+         values_copy = copy.copy(values)
+         policies = values_copy.pop('policies', None)
+         members = values_copy.pop('members', None)
++        # metadata
++        metadata = values_copy.pop('metadata', None)
+ 
+         grp.update(values_copy)
+ 
+@@ -228,12 +279,18 @@ class InstanceGroup(base.NovaPersistentObject, base.NovaObject,
+             _instance_group_policies_add(context, grp, policies)
+         if members is not None:
+             _instance_group_members_add(context, grp, members)
++        # metadata
++        if metadata is not None:
++            _instance_group_metadata_add(context, grp, metadata,
++                                         update_group=True)
+ 
+         return grp
+ 
++    # metadata
+     @staticmethod
+     @db_api.api_context_manager.writer
+-    def _create_in_db(context, values, policies=None, members=None):
++    def _create_in_db(context, values, policies=None, members=None,
++                      metadata=None):
+         try:
+             group = api_models.InstanceGroup()
+             group.update(values)
+@@ -253,6 +310,12 @@ class InstanceGroup(base.NovaPersistentObject, base.NovaObject,
+         else:
+             group._members = []
+ 
++        if metadata:
++            group._metadata = _instance_group_metadata_add(context, group,
++                                                         metadata)
++        else:
++            group._metadata = []
++
+         return group
+ 
+     @staticmethod
+@@ -267,6 +330,8 @@ class InstanceGroup(base.NovaPersistentObject, base.NovaObject,
+         # Delete policies and members
+         group_id = qry.first().id
+         instance_models = [api_models.InstanceGroupPolicy,
++                           # metadata
++                           api_models.InstanceGroupMetadata,
+                            api_models.InstanceGroupMember]
+         for model in instance_models:
+             context.session.query(model).filter_by(group_id=group_id).delete()
+@@ -364,6 +429,11 @@ class InstanceGroup(base.NovaPersistentObject, base.NovaObject,
+         if not updates:
+             return
+ 
++        # 
++        if 'metadetails' in updates:
++            metadata = updates.pop('metadetails')
++            updates.update({'metadata': metadata})
++
+         payload = dict(updates)
+         payload['server_group_id'] = self.uuid
+ 
+@@ -397,6 +467,8 @@ class InstanceGroup(base.NovaPersistentObject, base.NovaObject,
+         updates.pop('id', None)
+         policies = updates.pop('policies', None)
+         members = updates.pop('members', None)
++        # metadetails
++        metadetails = updates.pop('metadetails', None)
+ 
+         if 'uuid' not in updates:
+             self.uuid = uuidutils.generate_uuid()
+@@ -412,7 +484,9 @@ class InstanceGroup(base.NovaPersistentObject, base.NovaObject,
+                 pass
+         db_group = self._create_in_db(self._context, updates,
+                                       policies=policies,
+-                                      members=members)
++                                      members=members,
++                                      # WRS:extension -- metadetails
++                                      metadata=metadetails)
+         self._from_db_object(self._context, self, db_group)
+         payload['server_group_id'] = self.uuid
+         compute_utils.notify_about_server_group_update(self._context,
+@@ -475,6 +549,65 @@ class InstanceGroup(base.NovaPersistentObject, base.NovaObject,
+                                                         filters=filters)
+         return len(instances)
+ 
++    # 
++    @base.remotable
++    def get_older_member_hosts(self, instance_uuid):
++        """Get a list of hosts for older non-deleted instances in the group
++
++        This method allows you to get a list of the hosts where instances in
++        this group are currently running.  Only instances which were created
++        before the specified instance are considered.
++
++        """
++        filter_uuids = self.members
++        filters = {'uuid': filter_uuids, 'deleted': False}
++        instances = objects.InstanceList.get_by_filters(self._context,
++                                                        filters=filters)
++        # Determine the id of "instance_uuid"
++        instance_id = next(i.id for i in instances
++                                if i.uuid == instance_uuid)
++
++        # Unique hosts for instances that were created earlier than
++        # instance_uuid
++        return list(set([i.host for i in instances
++                         if i.host and i.id < instance_id]))
++
++    # 
++    @base.remotable
++    def count_members(self):
++        """Count the number of instances in a group.
++        This includes instances that:
++        - have launched
++        - are building (i.e.. not yet launched)
++        - never launched and are in error state
++        """
++        filter_uuids = self.members
++        filters = {'uuid': filter_uuids, 'deleted': False}
++        instances = objects.InstanceList.get_by_filters(self._context,
++                                                        filters=filters)
++        return len(instances)
++
++    # 
++    @base.remotable
++    def get_members_launched(self, exclude=None):
++        """Get the instances in a group that have launched.
++
++        This includes all instances that:
++        - have launched
++        - are building (i.e.. not yet launched)
++
++        This excludes instances that never launched are are in error state.
++        """
++        filter_uuids = self.members
++        filters = {'uuid': filter_uuids, 'deleted': False}
++        instances = objects.InstanceList.get_by_filters(self._context,
++                                                        filters=filters)
++        members = []
++        {members.append(I.uuid) for I in instances if
++            I['vm_state'] == vm_states.BUILDING or
++            I['launched_at']}
++        return members
++
+ 
+ @base.NovaObjectRegistry.register
+ class InstanceGroupList(base.ObjectListBase, base.NovaObject):
+@@ -556,6 +689,7 @@ class InstanceGroupList(base.ObjectListBase, base.NovaObject):
+ def _get_main_instance_groups(context, limit):
+     return context.session.query(main_models.InstanceGroup).\
+         options(joinedload('_policies')).\
++        options(joinedload('_metadata')).\
+         options(joinedload('_members')).\
+         filter_by(deleted=0).\
+         limit(limit).\
+@@ -572,6 +706,7 @@ def migrate_instance_groups_to_api_db(context, count):
+                                       uuid=db_group.uuid,
+                                       name=db_group.name,
+                                       policies=db_group.policies,
++                                      metadetails=db_group.metadetails,
+                                       members=db_group.members)
+         try:
+             group._create(skipcheck=True)
+diff --git a/nova/objects/request_spec.py b/nova/objects/request_spec.py
+index f2282db..82b8c9e 100644
+--- a/nova/objects/request_spec.py
++++ b/nova/objects/request_spec.py
+@@ -11,6 +11,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2016-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ from oslo_serialization import jsonutils
+ from oslo_utils import versionutils
+@@ -41,6 +48,7 @@ class RequestSpec(base.NovaObject):
+     # Version 1.6: Added requested_destination
+     # Version 1.7: Added destroy()
+     # Version 1.8: Added security_groups
++    #              add min_num_instances
+     VERSION = '1.8'
+ 
+     fields = {
+@@ -77,6 +85,7 @@ class RequestSpec(base.NovaObject):
+         'scheduler_hints': fields.DictOfListOfStringsField(nullable=True),
+         'instance_uuid': fields.UUIDField(),
+         'security_groups': fields.ObjectField('SecurityGroupList'),
++        'min_num_instances': fields.IntegerField(default=1),
+     }
+ 
+     def obj_make_compatible(self, primitive, target_version):
+@@ -205,9 +214,11 @@ class RequestSpec(base.NovaObject):
+             policies = list(filter_properties.get('group_policies'))
+             hosts = list(filter_properties.get('group_hosts'))
+             members = list(filter_properties.get('group_members'))
++            md = filter_properties.get('group_metadetails')
+             self.instance_group = objects.InstanceGroup(policies=policies,
+                                                         hosts=hosts,
+-                                                        members=members)
++                                                        members=members,
++                                                        metadetails=md)
+             # hosts has to be not part of the updates for saving the object
+             self.instance_group.obj_reset_changes(['hosts'])
+         else:
+@@ -268,6 +279,8 @@ class RequestSpec(base.NovaObject):
+         spec._from_hints(scheduler_hints)
+         spec.requested_destination = filter_properties.get(
+             'requested_destination')
++        spec.min_num_instances = filter_properties.get('min_num_instances',
++                                                       num_instances)
+ 
+         # NOTE(sbauza): Default the other fields that are not part of the
+         # original contract
+@@ -322,10 +335,14 @@ class RequestSpec(base.NovaObject):
+         # NOTE(sbauza): Since this is only needed until the AffinityFilters are
+         # modified by using directly the RequestSpec object, we need to keep
+         # the existing dictionary as a primitive.
++        # add metadetails as this will be needed by
++        # _populate_group_info() when called by the scheduler during upgrade
++        # from 15.12.
+         return {'group_updated': True,
+                 'group_hosts': set(self.instance_group.hosts),
+                 'group_policies': set(self.instance_group.policies),
+-                'group_members': set(self.instance_group.members)}
++                'group_members': set(self.instance_group.members),
++                'group_metadetails': self.instance_group.metadetails}
+ 
+     def to_legacy_request_spec_dict(self):
+         """Returns a legacy request_spec dict from the RequestSpec object.
+@@ -347,6 +364,8 @@ class RequestSpec(base.NovaObject):
+             req_spec['instance_type'] = self.flavor
+         else:
+             req_spec['instance_type'] = {}
++        if self.obj_attr_is_set('min_num_instances'):
++            req_spec['min_num_instances'] = self.min_num_instances
+         return req_spec
+ 
+     def to_legacy_filter_properties_dict(self):
+@@ -428,6 +447,8 @@ class RequestSpec(base.NovaObject):
+             spec_obj.security_groups = security_groups
+         spec_obj.requested_destination = filter_properties.get(
+             'requested_destination')
++        spec_obj.min_num_instances = filter_properties.get(
++                         'min_num_instances', spec_obj.num_instances)
+ 
+         # NOTE(sbauza): Default the other fields that are not part of the
+         # original contract
+diff --git a/nova/policies/__init__.py b/nova/policies/__init__.py
+index 4af7335..4c9662f 100644
+--- a/nova/policies/__init__.py
++++ b/nova/policies/__init__.py
+@@ -94,6 +94,7 @@ from nova.policies import used_limits
+ from nova.policies import virtual_interfaces
+ from nova.policies import volumes
+ from nova.policies import volumes_attachments
++from nova.policies import wrs_server_groups
+ from nova.policies import wrs_server_if
+ 
+ 
+@@ -173,5 +174,6 @@ def list_rules():
+         virtual_interfaces.list_rules(),
+         volumes.list_rules(),
+         volumes_attachments.list_rules(),
+-        wrs_server_if.list_rules()
++        wrs_server_if.list_rules(),
++        wrs_server_groups.list_rules()
+     )
+diff --git a/nova/policies/server_groups.py b/nova/policies/server_groups.py
+index ea6ef2c..b46bb0a 100644
+--- a/nova/policies/server_groups.py
++++ b/nova/policies/server_groups.py
+@@ -73,6 +73,17 @@ server_groups_policies = [
+             }
+         ]
+     ),
++    policy.DocumentedRuleDefault(
++        POLICY_ROOT % 'set_metadata',
++        BASE_POLICY_RULE,
++        "Set some metadata on a server group",
++        [
++            {
++                'method': 'POST',
++                'path': '/os-server-groups/{server_group_id}'
++                        '/action (set_metadata)'
++            }
++        ]),
+ ]
+ 
+ 
+diff --git a/nova/policies/wrs_server_groups.py b/nova/policies/wrs_server_groups.py
+new file mode 100644
+index 0000000..1a292d6
+--- /dev/null
++++ b/nova/policies/wrs_server_groups.py
+@@ -0,0 +1,41 @@
++#
++# Copyright (c) 2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
++
++from oslo_policy import policy
++
++from nova.policies import base
++
++
++BASE_POLICY_NAME = 'os_compute_api:wrs-sg'
++
++
++wrs_sg_policies = [
++    policy.DocumentedRuleDefault(
++        BASE_POLICY_NAME,
++        base.RULE_ADMIN_OR_OWNER,
++        """Add wrs-sg:server_group attribute in the server response.
++
++This check is performed only after the check
++'os_compute_api:servers:show' for GET /servers/{id} and
++'os_compute_api:servers:detail' for GET /servers/detail passes""",
++
++        [
++            {
++                'method': 'GET',
++                'path': '/servers/{id}'
++            },
++            {
++                'method': 'GET',
++                'path': '/servers/detail'
++            }
++        ]),
++]
++
++
++def list_rules():
++    return wrs_sg_policies
+diff --git a/nova/scheduler/filter_scheduler.py b/nova/scheduler/filter_scheduler.py
+index 9217356..42b9656 100644
+--- a/nova/scheduler/filter_scheduler.py
++++ b/nova/scheduler/filter_scheduler.py
+@@ -12,6 +12,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2016-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ """
+ The FilterScheduler is for creating instances locally.
+@@ -22,6 +29,7 @@ Weighing Functions.
+ import random
+ 
+ from oslo_log import log as logging
++from oslo_utils import strutils
+ from six.moves import range
+ 
+ import nova.conf
+@@ -85,6 +93,11 @@ class FilterScheduler(driver.Scheduler):
+         # so prefer the length of instance_uuids unless it is None.
+         num_instances = (len(instance_uuids) if instance_uuids
+                          else spec_obj.num_instances)
++
++        # check against minimum number of instances for success if set
++        #      otherwise default to num_instances
++        if hasattr(spec_obj, 'min_num_instances'):
++            num_instances = spec_obj.min_num_instances
+         selected_hosts = self._schedule(context, spec_obj, instance_uuids,
+             alloc_reqs_by_rp_uuid, provider_summaries)
+ 
+@@ -163,6 +176,20 @@ class FilterScheduler(driver.Scheduler):
+         # before returning
+         claimed_instance_uuids = []
+ 
++        # group policy best effort option
++        # Get metadata for further checks
++        md = {}
++        if spec_obj.instance_group:
++            md = spec_obj.instance_group.get('metadetails', {})
++
++        group_best_effort = strutils.bool_from_string(
++            md.get('wrs-sg:best_effort', False))
++        # If using best-effort, we need to keep hosts as a list
++        # so we can revert to the saved version
++        if group_best_effort:
++            hosts = list(hosts)
++            orig_hosts = hosts
++
+         selected_hosts = []
+ 
+         # NOTE(sbauza): The RequestSpec.num_instances field contains the number
+@@ -173,6 +200,20 @@ class FilterScheduler(driver.Scheduler):
+                          else spec_obj.num_instances)
+         for num in range(num_instances):
+             hosts = self._get_sorted_hosts(spec_obj, hosts, num)
++
++            # for group affinity with best effort enforcement,
++            # if we cannot find hosts meeting affinity policy, then relax the
++            # restriction and try again.
++            if (not hosts and group_best_effort and
++                    spec_obj.instance_group.hosts):
++                LOG.info('Group affinity: no hosts meeting affinity '
++                         'policy, retrying using best-effort.')
++                spec_obj.instance_group.hosts = []
++                # hosts has to be not part of the updates when saving
++                spec_obj.instance_group.obj_reset_changes(['hosts'])
++                # set index to 0 to make sure all filters are used
++                hosts = self._get_sorted_hosts(spec_obj, orig_hosts, 0)
++
+             if not hosts:
+                 # NOTE(jaypipes): If we get here, that means not all instances
+                 # in instance_uuids were able to be matched to a selected host.
+diff --git a/nova/scheduler/filters/affinity_filter.py b/nova/scheduler/filters/affinity_filter.py
+index f8aa47e..e9f5ed5 100644
+--- a/nova/scheduler/filters/affinity_filter.py
++++ b/nova/scheduler/filters/affinity_filter.py
+@@ -100,7 +100,7 @@ class _GroupAntiAffinityFilter(filters.BaseHostFilter):
+ 
+         group_hosts = (spec_obj.instance_group.hosts
+                        if spec_obj.instance_group else [])
+-        LOG.debug("Group anti affinity: check if %(host)s not "
++        LOG.info("Group anti affinity: check if %(host)s not "
+                   "in %(configured)s", {'host': host_state.host,
+                                         'configured': group_hosts})
+         if group_hosts:
+diff --git a/nova/scheduler/utils.py b/nova/scheduler/utils.py
+index ae48e17..80ced8c 100644
+--- a/nova/scheduler/utils.py
++++ b/nova/scheduler/utils.py
+@@ -11,6 +11,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2013-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ """Utility methods for scheduling."""
+ 
+@@ -39,8 +46,10 @@ LOG = logging.getLogger(__name__)
+ 
+ CONF = nova.conf.CONF
+ 
++# new options: metadetails
+ GroupDetails = collections.namedtuple('GroupDetails', ['hosts', 'policies',
+-                                                       'members'])
++                                                       'members',
++                                                       'metadetails'])
+ 
+ 
+ def build_request_spec(ctxt, image, instances, instance_type=None):
+@@ -486,7 +495,9 @@ _SUPPORTS_SOFT_AFFINITY = None
+ _SUPPORTS_SOFT_ANTI_AFFINITY = None
+ 
+ 
+-def _get_group_details(context, instance_uuid, user_group_hosts=None):
++# pass through request_spec
++def _get_group_details(context, instance_uuid, request_spec,
++                       user_group_hosts=None):
+     """Provide group_hosts and group_policies sets related to instances if
+     those instances are belonging to a group and if corresponding filters are
+     enabled.
+@@ -525,6 +536,9 @@ def _get_group_details(context, instance_uuid, user_group_hosts=None):
+ 
+     policies = set(('anti-affinity', 'affinity', 'soft-affinity',
+                     'soft-anti-affinity'))
++
++    filter_properties = request_spec.to_legacy_filter_properties_dict()
++
+     if any((policy in policies) for policy in group.policies):
+         if not _SUPPORTS_AFFINITY and 'affinity' in group.policies:
+             msg = _("ServerGroupAffinityFilter not configured")
+@@ -546,8 +560,39 @@ def _get_group_details(context, instance_uuid, user_group_hosts=None):
+             raise exception.UnsupportedPolicyException(reason=msg)
+         group_hosts = set(group.get_hosts())
+         user_hosts = set(user_group_hosts) if user_group_hosts else set()
++
++        # Count number of members that are not deleted, but only
++        # the instances that are launched_at or building.
++        group_member_uuids = group.get_members_launched(context)
++        members_launched = len(group_member_uuids)
++
++        # total members if launch minimal num of requested instances
++        total_members_min = members_launched + request_spec.min_num_instances
++        # total members if launch all requested instances
++        total_members = members_launched + request_spec.num_instances
++
++        # check group_size limit.
++        md = group.get('metadetails', {})
++        group_size = md.get('wrs-sg:group_size')
++        t_state = None
++        if request_spec.obj_attr_is_set('scheduler_hints') and \
++                            request_spec.scheduler_hints:
++            t_state = request_spec.scheduler_hints.get('task_state', None)
++        # if task_state is missing or None, this is a new VM being launched
++        # and so we need to check the group size limit
++        if group_size and t_state is None:
++            group_size = int(group_size)
++            if total_members_min > group_size:
++                raise exception.InstanceGroupSizeLimit(group_uuid=group.uuid,
++                                                       group_size=group_size)
++            group_exceed = max(total_members - group_size, 0)
++        else:
++            group_exceed = 0
++        md['wrs-sg:group_exceed'] = group_exceed
++
+         return GroupDetails(hosts=user_hosts | group_hosts,
+-                            policies=group.policies, members=group.members)
++                            policies=group.policies, members=group.members,
++                            metadetails=md)
+ 
+ 
+ def setup_instance_group(context, request_spec):
+@@ -562,12 +607,17 @@ def setup_instance_group(context, request_spec):
+     else:
+         group_hosts = None
+     instance_uuid = request_spec.instance_uuid
+-    group_info = _get_group_details(context, instance_uuid, group_hosts)
++
++    group_info = _get_group_details(context, instance_uuid, request_spec,
++                                    user_group_hosts=group_hosts)
+     if group_info is not None:
+         request_spec.instance_group.hosts = list(group_info.hosts)
+         request_spec.instance_group.policies = group_info.policies
+         request_spec.instance_group.members = group_info.members
+ 
++        # metadetails, group_exceed
++        request_spec.instance_group.metadetails = group_info.metadetails
++
+ 
+ def retry_on_timeout(retries=1):
+     """Retry the call in case a MessagingTimeout is raised.
+diff --git a/nova/tests/unit/api/openstack/compute/test_server_groups.py b/nova/tests/unit/api/openstack/compute/test_server_groups.py
+index cc364e1..5fb1ef6 100644
+--- a/nova/tests/unit/api/openstack/compute/test_server_groups.py
++++ b/nova/tests/unit/api/openstack/compute/test_server_groups.py
+@@ -12,6 +12,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2016-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ import mock
+ from oslo_utils import uuidutils
+@@ -46,6 +53,8 @@ def server_group_resp_template(**kwargs):
+     sgroup.setdefault('name', 'test')
+     sgroup.setdefault('policies', [])
+     sgroup.setdefault('members', [])
++    # metadata
++    sgroup.setdefault('metadata', {})
+     return sgroup
+ 
+ 
+@@ -63,6 +72,13 @@ def server_group_db(sg):
+         attrs['members'] = members
+     else:
+         attrs['members'] = []
++
++    # metadata, metadetails
++    if 'metadata' in attrs:
++        attrs['metadetails'] = attrs.pop('metadata')
++    else:
++        attrs['metadetails'] = {}
++
+     attrs['deleted'] = 0
+     attrs['deleted_at'] = None
+     attrs['created_at'] = None
+@@ -196,6 +212,17 @@ class ServerGroupTestV21(test.NoDBTestCase):
+     def _test_list_server_group_offset_and_limit(self, api_version='2.1'):
+         self._test_list_server_group(api_version=api_version, limited=True)
+ 
++    # add create group with passed in metadetails
++    def _create_groups_and_instances_with_metadata(self, ctx, metadetails):
++        instances = [self._create_instance(ctx, cell=None),
++                     self._create_instance(ctx, cell=None)]
++        members = [instance.uuid for instance in instances]
++        ig = objects.InstanceGroup(context=ctx, name='fake_name',
++                  user_id='fake_user', project_id='fake',
++                  members=members, metadetails=metadetails)
++        ig.create()
++        return ig.uuid
++
+     @mock.patch.object(nova.db, 'instance_group_get_all_by_project_id')
+     @mock.patch.object(nova.db, 'instance_group_get_all')
+     def _test_list_server_group(self, mock_get_all, mock_get_by_project,
+@@ -207,6 +234,8 @@ class ServerGroupTestV21(test.NoDBTestCase):
+         p_id = fakes.FAKE_PROJECT_ID
+         u_id = fakes.FAKE_USER_ID
+         if api_version >= '2.13':
++            # WRS:extension - metadata
++            metadata = {'wrs-sg:group_size': '15'}
+             sg1 = server_group_resp_template(id=uuidsentinel.sg1_id,
+                                             name=names[0],
+                                             policies=policies,
+@@ -277,6 +306,8 @@ class ServerGroupTestV21(test.NoDBTestCase):
+         p_id = fakes.FAKE_PROJECT_ID
+         u_id = fakes.FAKE_USER_ID
+         if api_version >= '2.13':
++            # WRS:extension - metadata
++            metadata = {'wrs-sg:group_size': '15'}
+             sg1 = server_group_resp_template(id=uuidsentinel.sg1_id,
+                                             name=names[0],
+                                             policies=policies,
+@@ -324,6 +355,47 @@ class ServerGroupTestV21(test.NoDBTestCase):
+         for member in members:
+             self.assertIn(member, result_members)
+ 
++    # test server group create and query with empty metadetails
++    def test_display_no_metadata(self):
++        ctx = context.RequestContext('fake_user', 'fake')
++        metadetails = None
++        ig_uuid = self._create_groups_and_instances_with_metadata(ctx,
++                                                           metadetails)
++        res_dict = self.controller.show(self.req, ig_uuid)
++        result_metadata = res_dict['server_group']['metadata']
++        self.assertEqual({}, result_metadata)
++
++    # test server group create and query with metadetails
++    def test_display_with_metadata(self):
++        ctx = context.RequestContext('fake_user', 'fake')
++        metadetails = {'wrs-sg:group_size': '15'}
++        ig_uuid = self._create_groups_and_instances_with_metadata(ctx,
++                                                           metadetails)
++        res_dict = self.controller.show(self.req, ig_uuid)
++        result_metadata = res_dict['server_group']['metadata']
++        self.assertEqual(metadetails, result_metadata)
++
++    # test changing metadata: add new key, remove existing key and change
++    # value of existing key
++    @mock.patch('nova.compute.utils.notify_about_server_group_update')
++    def test_save_with_metadata(self, mock_notify):
++        ctx = context.RequestContext('fake_user', 'fake')
++        metadetails = {'wrs-sg:group_size': '15',
++                       'wrs-sg:best_effort': 'true'}
++        ig_uuid = self._create_groups_and_instances_with_metadata(ctx,
++                                                           metadetails)
++        ig = objects.InstanceGroup.get_by_uuid(ctx, ig_uuid)
++        metadetails_new = {'wrs-sg:group_size': '25',
++                          'wrs-sg:best_effort': 'false'}
++        ig.metadetails = metadetails_new
++        ig._changed_fields.add('metadetails')
++        ig.save()
++        res_dict = self.controller.show(self.req, ig_uuid)
++        result_metadata = res_dict['server_group']['metadata']
++        self.assertEqual(2, len(result_metadata))
++        for key in metadetails_new:
++            self.assertEqual(result_metadata[key], metadetails_new[key])
++
+     def test_display_members_with_nonexistent_group(self):
+         self.assertRaises(webob.exc.HTTPNotFound,
+                           self.controller.show, self.req, uuidsentinel.group)
+@@ -555,8 +627,10 @@ class ServerGroupTestV21(test.NoDBTestCase):
+         self.assertRaises(webob.exc.HTTPNotFound, self.controller.delete,
+                           self.req, 'invalid')
+ 
+-    def test_delete_server_group_rbac_default(self):
++    @mock.patch('nova.objects.InstanceGroup.count_members')
++    def test_delete_server_group_rbac_default(self, mock_count_members):
+         ctx = context.RequestContext('fake_user', 'fake')
++        mock_count_members.return_value = 0
+ 
+         # test as admin
+         ig_uuid = self._create_groups_and_instances(ctx)[0]
+@@ -566,8 +640,10 @@ class ServerGroupTestV21(test.NoDBTestCase):
+         ig_uuid = self._create_groups_and_instances(ctx)[0]
+         self.controller.delete(self.req, ig_uuid)
+ 
+-    def test_delete_server_group_rbac_admin_only(self):
++    @mock.patch('nova.objects.InstanceGroup.count_members')
++    def test_delete_server_group_rbac_admin_only(self, mock_count_members):
+         ctx = context.RequestContext('fake_user', 'fake')
++        mock_count_members.return_value = 0
+ 
+         # override policy to restrict to admin
+         rule_name = sg_policies.POLICY_ROOT % 'delete'
+@@ -586,6 +662,15 @@ class ServerGroupTestV21(test.NoDBTestCase):
+             "Policy doesn't allow %s to be performed." % rule_name,
+             exc.format_message())
+ 
++    # don't allow deleting group with instances
++    def test_delete_server_group_non_empty(self):
++        ctx = context.RequestContext('fake_user', 'fake')
++
++        # test as admin
++        ig_uuid = self._create_groups_and_instances(ctx)[0]
++        self.assertRaises(webob.exc.HTTPBadRequest, self.controller.delete,
++                          self.req, ig_uuid)
++
+ 
+ class ServerGroupTestV213(ServerGroupTestV21):
+     wsgi_api_version = '2.13'
+diff --git a/nova/tests/unit/conductor/tasks/test_live_migrate.py b/nova/tests/unit/conductor/tasks/test_live_migrate.py
+index 750b60c..4f25fc1 100644
+--- a/nova/tests/unit/conductor/tasks/test_live_migrate.py
++++ b/nova/tests/unit/conductor/tasks/test_live_migrate.py
+@@ -16,6 +16,8 @@
+ # of this software may be licensed only pursuant to the terms
+ # of an applicable Wind River license agreement.
+ #
++
++import copy
+ import mock
+ import oslo_messaging as messaging
+ import six
+@@ -313,6 +315,77 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
+         # Make sure the spec was updated to include the project_id.
+         self.assertEqual(self.fake_spec.project_id, self.instance.project_id)
+ 
++    # add testcase for server groups to test that _find_destination()
++    # will update RequestSpec with latest instance_group details.
++    def test_find_destination_works_with_instance_group(self):
++        self.fake_spec.instance_group = objects.InstanceGroup(members=["uuid"])
++        self.instance_uuid = self.instance.uuid = "uuid"
++        updated_instance_group = objects.InstanceGroup(members=["uuid",
++                                                                "uuid-2"],
++                                   hosts=['host1', 'host2'],
++                                   policies=['anti-affinity'],
++                                   metadetails={'wrs-sg:best_effort': 'false'})
++        expected_instance_group = copy.deepcopy(updated_instance_group)
++        expected_instance_group.hosts = ['host1', 'host2', 'host3']
++        migration = objects.Migration(source_compute='host1',
++                                      dest_compute='host3')
++        migrations = objects.MigrationList(objects=[migration])
++        empty_migrations = objects.MigrationList(objects=[])
++
++        self.mox.StubOutWithMock(utils, 'get_image_from_system_metadata')
++        self.mox.StubOutWithMock(scheduler_utils, 'setup_instance_group')
++        self.mox.StubOutWithMock(objects.RequestSpec,
++                                 'reset_forced_destinations')
++        self.mox.StubOutWithMock(objects.InstanceGroup,
++                                 'get_by_instance_uuid')
++        self.mox.StubOutWithMock(objects.MigrationList,
++                                 'get_by_filters')
++        filters = {
++            'instance_uuid': 'uuid',
++            'status': ['queued', 'accepted', 'pre-migrating',
++                       'preparing', 'running']
++        }
++
++        empty_migrations_filters = {
++            'instance_uuid': 'uuid-2',
++            'status': ['queued', 'accepted', 'pre-migrating',
++                       'preparing', 'running']
++        }
++
++        self.mox.StubOutWithMock(self.task,
++                                 '_check_compatible_with_source_hypervisor')
++        self.mox.StubOutWithMock(self.task, '_call_livem_checks_on_host')
++
++        def fake_select_destinations(context, request_spec, instance_uuids):
++            self.assertEqual(expected_instance_group.members,
++                             request_spec.instance_group.members)
++            self.assertEqual(expected_instance_group.hosts,
++                             request_spec.instance_group.hosts)
++            return [{'host': 'host1', 'nodename': 'node1',
++                     'limits': 'fake-limits'}]
++
++        self.task.scheduler_client.select_destinations = \
++                                                      fake_select_destinations
++        utils.get_image_from_system_metadata(
++            self.instance.system_metadata).AndReturn("image")
++        scheduler_utils.setup_instance_group(
++            self.context, self.fake_spec)
++        self.fake_spec.reset_forced_destinations()
++        objects.InstanceGroup.get_by_instance_uuid(
++            self.context, self.instance_uuid).AndReturn(updated_instance_group)
++        objects.MigrationList.get_by_filters(
++            self.context, filters).AndReturn(migrations)
++        objects.MigrationList.get_by_filters(
++            self.context, empty_migrations_filters).AndReturn(empty_migrations)
++
++        self.task._check_compatible_with_source_hypervisor("host1")
++        self.task._call_livem_checks_on_host("host1", limits='fake-limits')
++
++        self.mox.ReplayAll()
++        self.assertEqual(("host1", 'fake-limits'),
++                         self.task._find_destination())
++        self.mox.VerifyAll()
++
+     def test_find_destination_works_with_no_request_spec(self):
+         task = live_migrate.LiveMigrationTask(
+             self.context, self.instance, self.destination,
+diff --git a/nova/tests/unit/conductor/tasks/test_migrate.py b/nova/tests/unit/conductor/tasks/test_migrate.py
+index 6086eb2..092942b 100644
+--- a/nova/tests/unit/conductor/tasks/test_migrate.py
++++ b/nova/tests/unit/conductor/tasks/test_migrate.py
+@@ -12,6 +12,7 @@
+ 
+ import mock
+ 
++from nova import availability_zones
+ from nova.compute import rpcapi as compute_rpcapi
+ from nova.conductor.tasks import migrate
+ from nova import objects
+@@ -44,9 +45,40 @@ class MigrationTaskTestCase(test.NoDBTestCase):
+         self.hosts = [dict(host='host1', nodename=None, limits={})]
+         self.filter_properties = {'limits': {}, 'retry': {'num_attempts': 1,
+                                   'hosts': [['host1', None]]}}
++
++        self.instance_group = objects.InstanceGroup()
++        self.instance_group['metadetails'] = {'wrs-sg:best_effort': 'false',
++                                              'wrs-sg:group_size': '2'}
++        self.instance_group['members'] = ['uuid1', 'uuid2']
++        self.instance_group['hosts'] = ['compute1', 'compute2']
++        self.instance_group['policies'] = ['anti-affinity']
++
+         self.reservations = []
+         self.clean_shutdown = True
+ 
++    def _stub_migrations(self, context, filters, dummy):
++        fake_migrations = [
++            {
++                'id': 1234,
++                'source_node': 'node1',
++                'dest_node': 'node3',
++                'source_compute': 'compute1',
++                'dest_compute': 'compute3',
++                'dest_host': '1.2.3.4',
++                'status': 'post-migrating',
++                'instance_uuid': 'uuid1',
++                'old_instance_type_id': 1,
++                'new_instance_type_id': 2,
++                'migration_type': 'resize',
++                'hidden': False,
++                'created_at': '2017-05-29 13:42:02',
++                'updated_at': '2017-05-29 13:42:02',
++                'deleted_at': None,
++                'deleted': False
++            }
++        ]
++        return fake_migrations
++
+     def _generate_task(self):
+         return migrate.MigrationTask(self.context, self.instance, self.flavor,
+                                      self.request_spec, self.reservations,
+@@ -75,3 +107,46 @@ class MigrationTaskTestCase(test.NoDBTestCase):
+             filter_properties=self.filter_properties,
+             node=self.hosts[0]['nodename'], clean_shutdown=self.clean_shutdown)
+         az_mock.assert_called_once_with(self.context, 'host1')
++
++    @mock.patch.object(availability_zones, 'get_host_availability_zone')
++    @mock.patch.object(scheduler_utils, 'setup_instance_group')
++    @mock.patch.object(scheduler_client.SchedulerClient, 'select_destinations')
++    @mock.patch.object(compute_rpcapi.ComputeAPI, 'prep_resize')
++    def test_execute_with_instance_group(self, prep_resize_mock,
++                     sel_dest_mock, sig_mock, mock_get_avail_zone):
++        sel_dest_mock.return_value = self.hosts
++        mock_get_avail_zone.return_value = 'nova'
++
++        filter_properties = {'instance_group': self.instance_group}
++        self.request_spec._populate_group_info(filter_properties)
++
++        # test for the addition of an extra Server group host:
++        self.stub_out('nova.objects.migration.MigrationList.get_by_filters',
++                      self._stub_migrations)
++
++        task = self._generate_task()
++        legacy_request_spec = self.request_spec.to_legacy_request_spec_dict()
++
++        self.filter_properties = \
++            {
++                'limits': {},
++                'retry': {'hosts': [['host1', None]], 'num_attempts': 1},
++                'group_updated': True,
++                'group_policies': {'anti-affinity'},
++                'group_members': {'uuid1', 'uuid2'},
++                'group_hosts': {'compute1', 'compute2', 'compute3'},
++                'group_metadetails': {'wrs-sg:best_effort': 'false',
++                                      'wrs-sg:group_size': '2'}
++            }
++
++        task.execute()
++
++        sig_mock.assert_called_once_with(self.context, self.request_spec)
++        task.scheduler_client.select_destinations.assert_called_once_with(
++            self.context, self.request_spec, [self.instance.uuid])
++        prep_resize_mock.assert_called_once_with(
++            self.context, self.instance, legacy_request_spec['image'],
++            self.flavor, self.hosts[0]['host'], self.reservations,
++            request_spec=legacy_request_spec,
++            filter_properties=self.filter_properties,
++            node=self.hosts[0]['nodename'], clean_shutdown=self.clean_shutdown)
+diff --git a/nova/tests/unit/db/test_migrations.py b/nova/tests/unit/db/test_migrations.py
+index a892535..3dc758d 100644
+--- a/nova/tests/unit/db/test_migrations.py
++++ b/nova/tests/unit/db/test_migrations.py
+@@ -13,6 +13,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2016-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ """
+ Tests for database migrations.
+@@ -362,8 +369,10 @@ class NovaMigrationsCheckers(test_migrations.ModelsMigrationsSync,
+                                     ['instance_uuid', 'device_name']]))
+ 
+     def _check_250(self, engine, data):
+-        self.assertTableNotExists(engine, 'instance_group_metadata')
+-        self.assertTableNotExists(engine, 'shadow_instance_group_metadata')
++        # migration 250 does nothing now since we still
++        # want to use instance_group_metadata
++        oslodbutils.get_table(engine, 'instance_group_metadata')
++        oslodbutils.get_table(engine, 'shadow_instance_group_metadata')
+ 
+     def _check_251(self, engine, data):
+         self.assertColumnExists(engine, 'compute_nodes', 'numa_topology')
+diff --git a/nova/tests/unit/db/test_models.py b/nova/tests/unit/db/test_models.py
+index fd85758..b57e7ea 100644
+--- a/nova/tests/unit/db/test_models.py
++++ b/nova/tests/unit/db/test_models.py
+@@ -12,6 +12,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2016-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ from nova.db.sqlalchemy import api_models
+ from nova.db.sqlalchemy import models
+@@ -41,6 +48,7 @@ class TestSoftDeletesDeprecated(test.NoDBTestCase):
+             'instance_extra',
+             'instance_faults',
+             'instance_group_member',
++            'instance_group_metadata',
+             'instance_group_policy',
+             'instance_groups',
+             'instance_id_mappings',
+diff --git a/nova/tests/unit/fake_policy.py b/nova/tests/unit/fake_policy.py
+index c80cf2b..5197807 100644
+--- a/nova/tests/unit/fake_policy.py
++++ b/nova/tests/unit/fake_policy.py
+@@ -134,6 +134,7 @@ policy_data = """
+     "os_compute_api:server-metadata:delete": "",
+     "os_compute_api:server-metadata:show": "",
+     "os_compute_api:server-metadata:index": "",
+-    "os_compute_api:wrs-if": ""
++    "os_compute_api:wrs-if": "",
++    "os_compute_api:wrs-sg": ""
+ }
+ """
+diff --git a/nova/tests/unit/fake_request_spec.py b/nova/tests/unit/fake_request_spec.py
+index 04d59b4..c8ea0da 100644
+--- a/nova/tests/unit/fake_request_spec.py
++++ b/nova/tests/unit/fake_request_spec.py
+@@ -9,6 +9,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2016-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ from oslo_serialization import jsonutils
+ from oslo_utils import uuidutils
+@@ -86,6 +93,8 @@ def fake_spec_obj(remove_id=False):
+     req_obj.force_nodes = ['node1', 'node2']
+     req_obj.scheduler_hints = {'hint': ['over-there']}
+     req_obj.requested_destination = None
++    # add min_num_instances
++    req_obj.min_num_instances = req_obj.num_instances
+     # This should never be a changed field
+     req_obj.obj_reset_changes(['id'])
+     return req_obj
+diff --git a/nova/tests/unit/objects/test_instance_group.py b/nova/tests/unit/objects/test_instance_group.py
+index d542c18..2e1a5f6 100644
+--- a/nova/tests/unit/objects/test_instance_group.py
++++ b/nova/tests/unit/objects/test_instance_group.py
+@@ -11,6 +11,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2015-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ import copy
+ 
+@@ -35,6 +42,7 @@ _INST_GROUP_DB = {
+     'name': 'fake_name',
+     'policies': ['policy1', 'policy2'],
+     'members': ['instance_id1', 'instance_id2'],
++    'metadetails': {'key11': 'value1', 'key12': 'value2'},
+     'deleted': False,
+     'created_at': _TS_NOW,
+     'updated_at': _TS_NOW,
+@@ -52,6 +60,7 @@ class _TestInstanceGroupObject(object):
+                                                        _DB_UUID)
+         mock_db_get.assert_called_once_with(self.context, _DB_UUID)
+         self.assertEqual(_INST_GROUP_DB['members'], obj.members)
++        self.assertEqual(_INST_GROUP_DB['metadetails'], obj.metadetails)
+         self.assertEqual(_INST_GROUP_DB['policies'], obj.policies)
+         self.assertEqual(_DB_UUID, obj.uuid)
+         self.assertEqual(_INST_GROUP_DB['project_id'], obj.project_id)
+@@ -132,6 +141,7 @@ class _TestInstanceGroupObject(object):
+         obj.user_id = _INST_GROUP_DB['user_id']
+         obj.project_id = _INST_GROUP_DB['project_id']
+         obj.members = _INST_GROUP_DB['members']
++        obj.metadetails = _INST_GROUP_DB['metadetails']
+         obj.policies = _INST_GROUP_DB['policies']
+         obj.updated_at = _TS_NOW
+         obj.created_at = _TS_NOW
+@@ -150,6 +160,7 @@ class _TestInstanceGroupObject(object):
+              'deleted': False,
+              },
+             members=_INST_GROUP_DB['members'],
++            metadata=_INST_GROUP_DB['metadetails'],
+             policies=_INST_GROUP_DB['policies'])
+         mock_notify.assert_called_once_with(
+             self.context, "create",
+@@ -162,6 +173,7 @@ class _TestInstanceGroupObject(object):
+              'deleted_at': None,
+              'deleted': False,
+              'members': _INST_GROUP_DB['members'],
++             'metadetails': _INST_GROUP_DB['metadetails'],
+              'policies': _INST_GROUP_DB['policies'],
+              'server_group_id': _DB_UUID})
+ 
+@@ -263,6 +275,45 @@ class _TestInstanceGroupObject(object):
+         obj = objects.InstanceGroup(self.context)
+         self.assertRaises(exception.ObjectActionError, getattr, obj, 'members')
+ 
++    # add testcase for get_older members
++    @mock.patch.object(objects.InstanceList, 'get_by_filters')
++    def test_get_older_member_hosts(self, mock_get_by_filt):
++        mock_get_by_filt.return_value = [
++            objects.Instance(id=1, uuid='uuid1', host='host1'),
++            objects.Instance(id=2, uuid='uuid2', host='host2'),
++            objects.Instance(id=3, uuid='uuid3', host='host2')]
++
++        obj = objects.InstanceGroup(mock.sentinel.ctx,
++                                    members=['uuid1', 'uuid2', 'uuid3'])
++
++        hosts = obj.get_older_member_hosts('uuid1')
++        self.assertEqual(0, len(hosts))
++        hosts = obj.get_older_member_hosts('uuid2')
++        self.assertEqual(1, len(hosts))
++        self.assertIn('host1', hosts)
++        hosts = obj.get_older_member_hosts('uuid3')
++        self.assertEqual(2, len(hosts))
++        self.assertIn('host1', hosts)
++        self.assertIn('host2', hosts)
++
++    @mock.patch.object(objects.InstanceList, 'get_by_filters')
++    def test_get_older_member_hosts_with_some_none(self, mock_get_by_filt):
++        mock_get_by_filt.return_value = [
++            objects.Instance(id=1, uuid='uuid1', host=None),
++            objects.Instance(id=2, uuid='uuid2', host='host2'),
++            objects.Instance(id=3, uuid='uuid3', host='host3')]
++
++        obj = objects.InstanceGroup(mock.sentinel.ctx,
++                                    members=['uuid1', 'uuid2', 'uuid3'])
++
++        hosts = obj.get_older_member_hosts('uuid1')
++        self.assertEqual(0, len(hosts))
++        hosts = obj.get_older_member_hosts('uuid2')
++        self.assertEqual(0, len(hosts))
++        hosts = obj.get_older_member_hosts('uuid3')
++        self.assertEqual(1, len(hosts))
++        self.assertIn('host2', hosts)
++
+ 
+ class TestInstanceGroupObject(test_objects._LocalTest,
+                               _TestInstanceGroupObject):
+diff --git a/nova/tests/unit/objects/test_objects.py b/nova/tests/unit/objects/test_objects.py
+index 4fc78a8..b5bae25 100644
+--- a/nova/tests/unit/objects/test_objects.py
++++ b/nova/tests/unit/objects/test_objects.py
+@@ -1116,7 +1116,7 @@ object_data = {
+     'InstanceExternalEvent': '1.2-23eb6ba79cde5cd06d3445f845ba4589',
+     'InstanceFault': '1.2-7ef01f16f1084ad1304a513d6d410a38',
+     'InstanceFaultList': '1.2-6bb72de2872fe49ded5eb937a93f2451',
+-    'InstanceGroup': '1.10-1a0c8c7447dc7ecb9da53849430c4a5f',
++    'InstanceGroup': '1.10-542652d905617487079d094a7bd1a6dd',
+     'InstanceGroupList': '1.8-90f8f1a445552bb3bbc9fa1ae7da27d4',
+     'InstanceInfoCache': '1.5-cd8b96fefe0fc8d4d337243ba0bf0e1e',
+     'InstanceList': '2.4-d2c5723da8c1d08e07cb00160edfd292',
+@@ -1156,7 +1156,7 @@ object_data = {
+     'PowerVMLiveMigrateData': '1.1-ac0fdd26da685f12d7038782cabd393a',
+     'Quotas': '1.3-40fcefe522111dddd3e5e6155702cf4e',
+     'QuotasNoOp': '1.3-347a039fc7cfee7b225b68b5181e0733',
+-    'RequestSpec': '1.8-35033ecef47a880f9a5e46e2269e2b97',
++    'RequestSpec': '1.8-0eaed565c4ffb365ca9caa16a6086a08',
+     'ResourceClass': '1.0-e6b367e2cf1733c5f3526f20a3286fe9',
+     'ResourceClassList': '1.1-15ecf022a68ddbb8c2a6739cfc9f8f5e',
+     'ResourceProvider': '1.4-35e8a41d2ece17a862fac5b07ca966af',
+diff --git a/nova/tests/unit/objects/test_request_spec.py b/nova/tests/unit/objects/test_request_spec.py
+index 484a7d9..79309e4 100644
+--- a/nova/tests/unit/objects/test_request_spec.py
++++ b/nova/tests/unit/objects/test_request_spec.py
+@@ -459,7 +459,8 @@ class _TestRequestSpecObject(object):
+                                            memory_mb=8192.0),
+             instance_group=objects.InstanceGroup(hosts=['fake1'],
+                                                  policies=['affinity'],
+-                                                 members=['inst1', 'inst2']),
++                                                 members=['inst1', 'inst2'],
++                                                 metadetails={}),
+             scheduler_hints={'foo': ['bar']},
+             requested_destination=fake_dest)
+         expected = {'ignore_hosts': ['ignoredhost'],
+@@ -475,6 +476,7 @@ class _TestRequestSpecObject(object):
+                     'group_hosts': set(['fake1']),
+                     'group_policies': set(['affinity']),
+                     'group_members': set(['inst1', 'inst2']),
++                    'group_metadetails': {},
+                     'scheduler_hints': {'foo': 'bar'},
+                     'requested_destination': fake_dest}
+         self.assertEqual(expected, spec.to_legacy_filter_properties_dict())
+diff --git a/nova/tests/unit/scheduler/filters/test_affinity_filters.py b/nova/tests/unit/scheduler/filters/test_affinity_filters.py
+index 07124a9..2e889b0 100644
+--- a/nova/tests/unit/scheduler/filters/test_affinity_filters.py
++++ b/nova/tests/unit/scheduler/filters/test_affinity_filters.py
+@@ -9,6 +9,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2016-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ import mock
+ 
+@@ -204,7 +211,9 @@ class TestGroupAffinityFilter(test.NoDBTestCase):
+         host = fakes.FakeHostState('host1', 'node1', {})
+         spec_obj = objects.RequestSpec(instance_group=objects.InstanceGroup(
+             policies=[policy],
+-            hosts=['host2']))
++            hosts=['host2'],
++            members=['fake-uuid1'],
++            metadetails={}))
+         self.assertFalse(filt_cls.host_passes(host, spec_obj))
+ 
+     def test_group_affinity_filter_fails(self):
+diff --git a/nova/tests/unit/scheduler/test_scheduler_utils.py b/nova/tests/unit/scheduler/test_scheduler_utils.py
+index 12dc39f..b147dfd 100644
+--- a/nova/tests/unit/scheduler/test_scheduler_utils.py
++++ b/nova/tests/unit/scheduler/test_scheduler_utils.py
+@@ -12,6 +12,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2013-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ """
+ Tests For Scheduler Utils
+ """
+@@ -274,23 +281,36 @@ class SchedulerUtilsTestCase(test.NoDBTestCase):
+         group.uuid = uuids.fake
+         group.members = [instance.uuid]
+         group.policies = [policy]
++        # metadetails
++        group.metadetails = {"wrs-sg:best_effort": "true",
++                             "wrs-sg:group_size": "2",
++                             "wrs-sg:group_exceed": "0"}
+         return group
+ 
++    # pass through instance_props
+     def _get_group_details(self, group, policy=None):
+         group_hosts = ['hostB']
++        spec = objects.RequestSpec(instance_uuid=uuids.instance)
++        spec.num_instances = 1
++        spec.min_num_instances = 1
+ 
+         with test.nested(
+             mock.patch.object(objects.InstanceGroup, 'get_by_instance_uuid',
+                               return_value=group),
+             mock.patch.object(objects.InstanceGroup, 'get_hosts',
+                               return_value=['hostA']),
+-        ) as (get_group, get_hosts):
++            mock.patch.object(objects.InstanceGroup, 'get_members_launched',
++                              return_value=['FakE-uuid']),
++        ) as (get_group, get_hosts, get_members):
+             scheduler_utils._SUPPORTS_ANTI_AFFINITY = None
+             scheduler_utils._SUPPORTS_AFFINITY = None
+             group_info = scheduler_utils._get_group_details(
+-                self.context, 'fake_uuid', group_hosts)
++                self.context, 'fake_uuid', spec, user_group_hosts=group_hosts)
+             self.assertEqual(
+-                (set(['hostA', 'hostB']), [policy], group.members),
++                (set(['hostA', 'hostB']), [policy], group.members,
++                {"wrs-sg:best_effort": "true",
++                 "wrs-sg:group_size": "2",
++                 "wrs-sg:group_exceed": "0"}),
+                 group_info)
+ 
+     def test_get_group_details(self):
+@@ -299,10 +319,13 @@ class SchedulerUtilsTestCase(test.NoDBTestCase):
+             group = self._create_server_group(policy)
+             self._get_group_details(group, policy=policy)
+ 
++    # pass through instance_props
+     def test_get_group_details_with_no_instance_uuid(self):
+-        group_info = scheduler_utils._get_group_details(self.context, None)
++        group_info = scheduler_utils._get_group_details(self.context, None,
++                                                        mock.ANY)
+         self.assertIsNone(group_info)
+ 
++    # pass through instance_props
+     def _get_group_details_with_filter_not_configured(self, policy):
+         self.flags(enabled_filters=['fake'], group='filter_scheduler')
+         self.flags(weight_classes=['fake'], group='filter_scheduler')
+@@ -314,6 +337,7 @@ class SchedulerUtilsTestCase(test.NoDBTestCase):
+         group.uuid = uuids.fake
+         group.members = [instance.uuid]
+         group.policies = [policy]
++        spec = objects.RequestSpec(instance_uuid=uuids.instance)
+ 
+         with test.nested(
+             mock.patch.object(objects.InstanceGroup, 'get_by_instance_uuid',
+@@ -325,7 +349,7 @@ class SchedulerUtilsTestCase(test.NoDBTestCase):
+             scheduler_utils._SUPPORTS_SOFT_ANTI_AFFINITY = None
+             self.assertRaises(exception.UnsupportedPolicyException,
+                               scheduler_utils._get_group_details,
+-                              self.context, uuids.instance)
++                              self.context, uuids.instance, spec)
+ 
+     def test_get_group_details_with_filter_not_configured(self):
+         policies = ['anti-affinity', 'affinity',
+@@ -333,33 +357,43 @@ class SchedulerUtilsTestCase(test.NoDBTestCase):
+         for policy in policies:
+             self._get_group_details_with_filter_not_configured(policy)
+ 
++    # besteffort, groupsize
+     @mock.patch.object(scheduler_utils, '_get_group_details')
+     def test_setup_instance_group_in_request_spec(self, mock_ggd):
++        metadetails = {"wrs-sg:best_effort": "true",
++                       "wrs-sg:group_size": "2",
++                       "wrs-sg:group_exceed": "0"}
+         mock_ggd.return_value = scheduler_utils.GroupDetails(
+             hosts=set(['hostA', 'hostB']), policies=['policy'],
+-            members=['instance1'])
++            members=['instance1'], metadetails=metadetails)
+         spec = objects.RequestSpec(instance_uuid=uuids.instance)
+         spec.instance_group = objects.InstanceGroup(hosts=['hostC'])
+-
++        spec.num_instances = 1
++        spec.min_num_instances = 1
+         scheduler_utils.setup_instance_group(self.context, spec)
+ 
+         mock_ggd.assert_called_once_with(self.context, uuids.instance,
+-                                         ['hostC'])
++                                         spec,
++                                         user_group_hosts=['hostC'])
+         # Given it returns a list from a set, make sure it's sorted.
+         self.assertEqual(['hostA', 'hostB'], sorted(spec.instance_group.hosts))
+         self.assertEqual(['policy'], spec.instance_group.policies)
+         self.assertEqual(['instance1'], spec.instance_group.members)
++        self.assertEqual(metadetails, spec.instance_group.metadetails)
+ 
++    # 
+     @mock.patch.object(scheduler_utils, '_get_group_details')
+     def test_setup_instance_group_with_no_group(self, mock_ggd):
+         mock_ggd.return_value = None
+         spec = objects.RequestSpec(instance_uuid=uuids.instance)
+         spec.instance_group = objects.InstanceGroup(hosts=['hostC'])
++        spec.num_instances = 1
++        spec.min_num_instances = 1
+ 
+         scheduler_utils.setup_instance_group(self.context, spec)
+ 
+-        mock_ggd.assert_called_once_with(self.context, uuids.instance,
+-                                         ['hostC'])
++        mock_ggd.assert_called_once_with(self.context, uuids.instance, spec,
++                                         user_group_hosts=['hostC'])
+         # Make sure the field isn't touched by the caller.
+         self.assertFalse(spec.instance_group.obj_attr_is_set('policies'))
+         self.assertEqual(['hostC'], spec.instance_group.hosts)
+diff --git a/nova/tests/unit/test_policy.py b/nova/tests/unit/test_policy.py
+index a14bdfb..4932bc4 100644
+--- a/nova/tests/unit/test_policy.py
++++ b/nova/tests/unit/test_policy.py
+@@ -443,6 +443,7 @@ class RealRolePolicyTestCase(test.NoDBTestCase):
+ "os_compute_api:os-server-groups:show",
+ "os_compute_api:os-server-groups:create",
+ "os_compute_api:os-server-groups:delete",
++"os_compute_api:os-server-groups:set_metadata",
+ "os_compute_api:os-shelve:shelve",
+ "os_compute_api:os-shelve:unshelve",
+ "os_compute_api:os-virtual-interfaces",
+@@ -453,6 +454,7 @@ class RealRolePolicyTestCase(test.NoDBTestCase):
+ "os_compute_api:os-volumes-attachments:delete",
+ "os_compute_api:os-availability-zone:list",
+ "os_compute_api:wrs-if",
++"os_compute_api:wrs-sg",
+ )
+ 
+         self.non_admin_only_rules = (
+-- 
+2.7.4
+

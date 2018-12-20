@@ -1,0 +1,435 @@
+From 0a587204d866bdb049234fa944a5fb5f7655d6a3 Mon Sep 17 00:00:00 2001
+From: Daniel Chavolla <daniel.chavolla@windriver.com>
+Date: Wed, 30 Nov 2016 16:24:22 -0500
+Subject: [PATCH 023/143] Usability: Hypervisor Display Enhancements
+
+Changes to add vcpu and memory usage per NUMA node into hypervisor-show CLI and
+Horizon hypervisor view.
+
+Purpose of this US is to extend the hypervisor view for cloud administrators.
+The following requirements are to be addressed:
+
+    Add the following to the nova hypervisor-show CLI command:
+        Currently this command lists "vcpus_used".  Also add fields for:
+            vcpus_by_node_0 - to account for how many vcpus are available
+                 on Numa 0
+            vcpus_by_node_1 - to account for how many vcpus are available
+                 on Numa 1
+            vcpus_used_node0_dedicated -- to account for how many vcpus on
+                 Numa 0 are allocated to VMs with dedicated cpu_policy
+            vcpus_used_node1_dedicated -- to account for how many vcpus on
+                 Numa 1 are allocated to VMs with dedicated cpu_policy
+            vcpus_used_node0_shared -- to account for how many vcpus on
+                 Numa 0 are allocated to VMs with shared cpu_policy
+            vcpus_used_node1_shared -- to account for how many vcpus on
+                 Numa 1 are allocated to VMs with shared cpu_policy
+        Currently this command lists "memory_mb" and  "memory_mb_used".  Also
+        add fields for:
+            memory_mb_by_node_0_4K -- to account for how many MB of  memory
+                 in 4K pages on Numa 0 is available
+            memory_mb_by_node_0_2M -- to account for how many MB of  memory
+                 in 2M pages on Numa 0 is available
+            memory_mb_by_node_1_4K -- to account for how many MB of  memory
+                 in 4K pages on Numa 1 is available
+            memory_mb_by_node_1_2M -- to account for how many MB of  memory
+                 in 2M pages on Numa 1 is available
+            memory_mb_used_by_node_0_4K -- to account for how many MB of  memory
+                 in 4K pages on Numa 0 is being used
+            memory_mb_used_by_node_0_2M -- to account for how many MB of  memory
+                 in 2M pages on Numa 0 is being used
+            memory_mb_used_by_node_1_4K -- to account for how many MB of  memory
+                 in 4K pages on Numa 1 is being used
+            memory_mb_used_by_node_1_2M -- to account for how many MB of  memory
+                 in 2M pages on Numa 1 is being used
+
+Also includes:
+Move reporting of numa stats into resource_tracker._update()
+
+Horizon Hypervisor page is slow to update memory_mb_by_node_X_4k
+and vcpus_used_by_node equivalent.
+This Jira is part of the hypervisor display enhancement
+
+Numa usage reporting was done exclusively in the audit execution path, causing
+the account to be out of date for a time whenever an instance is launched,
+deleted,etc.
+The account then used to be updated eventually when the
+update_available_resources audit runs.
+By moving the call to _add_numa_usage_into_stats() to _update(), numa
+reporting is then also updated whenever an operation on an instance is
+performed.
+
+e58fad3 Remove duplicate resource audit instance log
+   During port to Newton, resource tracker instance info log in
+   _update_usage_from_instance() was added twice.
+
+3d5cb52 Bug 157 fix: Update compute_node stats
+   Changes in Newton moved the copy of self.stats into compute_node to
+   _update_usage_from_instance(). This move breaks the stats needed
+   for hypervisor accounting when no instances are runnign in the node.
+   This change brings this copy back to _update()
+
+__TYPE_primary
+__TAG_hypervisor,display,usability
+__R4_commit_06952cd
+__R3_commit_8b4a2d1
+__TC5067
+---
+ nova/api/openstack/compute/hypervisors.py          | 13 +++++
+ nova/compute/resource_tracker.py                   | 41 ++++++++++++++-
+ nova/compute/stats.py                              | 32 ++++++++++++
+ .../openstack/compute/test_extended_hypervisors.py |  6 +++
+ .../unit/api/openstack/compute/test_hypervisors.py | 59 ++++++++++++++++++++--
+ nova/tests/unit/compute/test_resource_tracker.py   | 40 ---------------
+ 6 files changed, 146 insertions(+), 45 deletions(-)
+
+diff --git a/nova/api/openstack/compute/hypervisors.py b/nova/api/openstack/compute/hypervisors.py
+index 1bf2070..c72dd1c 100644
+--- a/nova/api/openstack/compute/hypervisors.py
++++ b/nova/api/openstack/compute/hypervisors.py
+@@ -88,6 +88,8 @@ class HypervisorsController(wsgi.Controller):
+             else:
+                 hyp_dict['cpu_info'] = hypervisor.cpu_info
+ 
++            self._add_stats_to_dict(hypervisor, hyp_dict)
++
+         if servers:
+             hyp_dict['servers'] = [dict(name=serv['name'], uuid=serv['uuid'])
+                                    for serv in servers]
+@@ -98,6 +100,17 @@ class HypervisorsController(wsgi.Controller):
+ 
+         return hyp_dict
+ 
++    def _add_stats_to_dict(self, hypervisor, hyp_dict):
++        stats = getattr(hypervisor, 'stats')
++        if stats:
++            hyp_dict['vcpus_used_by_node'] = \
++                stats.get('vcpus_used_by_node', None)
++            hyp_dict['vcpus_by_node'] = stats.get('vcpus_by_node', None)
++            hyp_dict['memory_mb_by_node'] = \
++                stats.get('memory_mb_by_node', None)
++            hyp_dict['memory_mb_used_by_node'] = \
++                stats.get('memory_mb_used_by_node', None)
++
+     def _get_compute_nodes_by_name_pattern(self, context, hostname_match):
+         compute_nodes = self.host_api.compute_node_search_by_hypervisor(
+                 context, hostname_match)
+diff --git a/nova/compute/resource_tracker.py b/nova/compute/resource_tracker.py
+index e4c3b4d..845d87a 100644
+--- a/nova/compute/resource_tracker.py
++++ b/nova/compute/resource_tracker.py
+@@ -754,6 +754,44 @@ class ResourceTracker(object):
+         # - move _report_final to reflect _update and metrics
+         self._report_final_resource_view(nodename)
+ 
++    def _add_numa_usage_into_stats(self, compute_node):
++        host_numa_topology, jsonify_result = \
++            hardware.host_topology_and_format_from_host(compute_node)
++        if host_numa_topology:
++            vcpus_by_node = {}
++            vcpus_used_by_node = {}
++            memory_mb_by_node = {}
++            memory_mb_used_by_node = {}
++            for cell in host_numa_topology.cells:
++                pinned = set(cell.pinned_cpus)
++                cpuset = set(cell.cpuset)
++                shared = cell.cpu_usage - len(pinned)
++                vcpus_by_node[cell.id] = len(cpuset)
++                vcpus_used_by_node[cell.id] = \
++                    {"shared": shared, "dedicated": len(pinned)}
++                mem = {}
++                mem_used = {}
++                for M in cell.mempages:
++                    unit = 'K'
++                    size = M.size_kb
++                    if M.size_kb >= units.Ki and M.size_kb < units.Mi:
++                        unit = 'M'
++                        size = M.size_kb / units.Ki
++                    if M.size_kb >= units.Mi:
++                        unit = 'G'
++                        size = M.size_kb / units.Mi
++                    mem_unit = "%(sz)s%(U)s" % {'sz': size, 'U': unit}
++                    mem[mem_unit] = M.size_kb * M.total / units.Ki
++                    mem_used[mem_unit] = M.size_kb * M.used / units.Ki
++                memory_mb_by_node[cell.id] = mem
++                memory_mb_used_by_node[cell.id] = mem_used
++
++            self.stats.vcpus_by_node = jsonutils.dumps(vcpus_by_node)
++            self.stats.vcpus_used_by_node = jsonutils.dumps(vcpus_used_by_node)
++            self.stats.memory_mb_by_node = jsonutils.dumps(memory_mb_by_node)
++            self.stats.memory_mb_used_by_node = \
++                jsonutils.dumps(memory_mb_used_by_node)
++
+     def _get_compute_node(self, context, nodename):
+         """Returns compute node for the host and nodename."""
+         try:
+@@ -901,6 +939,8 @@ class ResourceTracker(object):
+ 
+     def _update(self, context, compute_node):
+         """Update partial stats locally and populate them to Scheduler."""
++        self._add_numa_usage_into_stats(compute_node)
++        compute_node.stats = copy.deepcopy(self.stats)
+         if not self._resource_change(compute_node):
+             return
+         nodename = compute_node.hypervisor_hostname
+@@ -1103,7 +1143,6 @@ class ResourceTracker(object):
+ 
+         cn = self.compute_nodes[nodename]
+         self.stats.update_stats_for_instance(instance, is_removed_instance)
+-        cn.stats = copy.deepcopy(self.stats)
+ 
+         # if it's a new or deleted instance:
+         if is_new_instance or is_removed_instance:
+diff --git a/nova/compute/stats.py b/nova/compute/stats.py
+index 9509c90..06b098a 100644
+--- a/nova/compute/stats.py
++++ b/nova/compute/stats.py
+@@ -83,6 +83,38 @@ class Stats(dict):
+         key = "num_os_type_%s" % os_type
+         return self.get(key, 0)
+ 
++    @property
++    def vcpus_by_node(self):
++        return self.get("vcpus_by_node", {})
++
++    @vcpus_by_node.setter
++    def vcpus_by_node(self, value):
++        self['vcpus_by_node'] = value
++
++    @property
++    def vcpus_used_by_node(self):
++        return self.get("vcpus_used_by_node", {})
++
++    @vcpus_used_by_node.setter
++    def vcpus_used_by_node(self, value):
++        self['vcpus_used_by_node'] = value
++
++    @property
++    def memory_mb_by_node(self):
++        return self.get("memory_mb_by_node", {})
++
++    @memory_mb_by_node.setter
++    def memory_mb_by_node(self, value):
++        self['memory_mb_by_node'] = value
++
++    @property
++    def memory_mb_used_by_node(self):
++        return self.get("memory_mb_used_by_node", {})
++
++    @memory_mb_used_by_node.setter
++    def memory_mb_used_by_node(self, value):
++        self['memory_mb_used_by_node'] = value
++
+     def update_stats_for_instance(self, instance, is_removed=False):
+         """Update stats after an instance is changed."""
+ 
+diff --git a/nova/tests/unit/api/openstack/compute/test_extended_hypervisors.py b/nova/tests/unit/api/openstack/compute/test_extended_hypervisors.py
+index 8bcb79d..bdfdc0b 100644
+--- a/nova/tests/unit/api/openstack/compute/test_extended_hypervisors.py
++++ b/nova/tests/unit/api/openstack/compute/test_extended_hypervisors.py
+@@ -58,6 +58,12 @@ class ExtendedHypervisorsTestV21(test.NoDBTestCase):
+                            'status': 'enabled',
+                            'service': dict(id=2, host='compute2',
+                                         disabled_reason=None)})
++    del DETAIL_HYPERS_DICTS[0]['stats']
++    del DETAIL_HYPERS_DICTS[1]['stats']
++    DETAIL_HYPERS_DICTS[0].update(
++        test_hypervisors.FAKE_VIRT_NUMA_TOPOLOGY_STATS)
++    DETAIL_HYPERS_DICTS[1].update(
++        test_hypervisors.FAKE_VIRT_NUMA_TOPOLOGY_STATS)
+ 
+     def _set_up_controller(self):
+         self.controller = hypervisors_v21.HypervisorsController()
+diff --git a/nova/tests/unit/api/openstack/compute/test_hypervisors.py b/nova/tests/unit/api/openstack/compute/test_hypervisors.py
+index 2932a13..73b42f2 100644
+--- a/nova/tests/unit/api/openstack/compute/test_hypervisors.py
++++ b/nova/tests/unit/api/openstack/compute/test_hypervisors.py
+@@ -38,6 +38,19 @@ CPU_INFO = """
+ "features": [],
+ "model": ""}"""
+ 
++FAKE_VIRT_NUMA_TOPOLOGY_STATS = {
++    'memory_mb_by_node':
++        jsonutils.dumps({"0": {"2M": 3072, "4K": 0},
++                         "1": {"2M": 3072, "4K": 0}}),
++    'memory_mb_used_by_node':
++        jsonutils.dumps({"0": {"2M": 0, "4K": 0},
++                         "1": {"2M": 0, "4K": 0}}),
++    'vcpus_by_node': jsonutils.dumps({"0": 2, "1": 2}),
++    'vcpus_used_by_node':
++        jsonutils.dumps({"0": {"shared": 0.0, "dedicated": 0},
++                         "1": {"shared": 0.0, "dedicated": 0}})}
++
++
+ TEST_HYPERS = [
+     dict(id=1,
+          uuid=uuids.hyper1,
+@@ -58,7 +71,8 @@ TEST_HYPERS = [
+          running_vms=2,
+          cpu_info=CPU_INFO,
+          disk_available_least=100,
+-         host_ip=netaddr.IPAddress('1.1.1.1')),
++         stats=FAKE_VIRT_NUMA_TOPOLOGY_STATS,
++         host_ip=netaddr.IPAddress('1.1.1.1'),),
+     dict(id=2,
+          uuid=uuids.hyper2,
+          service_id=2,
+@@ -78,6 +92,7 @@ TEST_HYPERS = [
+          running_vms=2,
+          cpu_info=CPU_INFO,
+          disk_available_least=100,
++         stats=FAKE_VIRT_NUMA_TOPOLOGY_STATS,
+          host_ip=netaddr.IPAddress('2.2.2.2'))]
+ 
+ 
+@@ -207,6 +222,12 @@ class HypervisorsTestV21(test.NoDBTestCase):
+                            'status': 'enabled',
+                            'service': dict(id=2, host='compute2',
+                                         disabled_reason=None)})
++
++    del DETAIL_HYPERS_DICTS[0]['stats']
++    del DETAIL_HYPERS_DICTS[1]['stats']
++    DETAIL_HYPERS_DICTS[0].update(FAKE_VIRT_NUMA_TOPOLOGY_STATS)
++    DETAIL_HYPERS_DICTS[1].update(FAKE_VIRT_NUMA_TOPOLOGY_STATS)
++
+     INDEX_HYPER_DICTS = [
+         dict(id=1, hypervisor_hostname="hyper1",
+              state='up', status='enabled'),
+@@ -880,7 +901,17 @@ class HypervisorsTestV233(HypervisorsTestV228):
+                 'state': 'up',
+                 'status': 'enabled',
+                 'vcpus': 4,
+-                'vcpus_used': 2}
++                'vcpus_by_node': jsonutils.dumps({"0": 2, "1": 2}),
++                'memory_mb_by_node': jsonutils.dumps(
++                    {"0": {"2M": 3072, "4K": 0},
++                     "1": {"2M": 3072, "4K": 0}}),
++                'memory_mb_used_by_node': jsonutils.dumps(
++                    {"0": {"2M": 0, "4K": 0},
++                     "1": {"2M": 0, "4K": 0}}),
++                'vcpus_used': 2,
++                'vcpus_used_by_node': jsonutils.dumps(
++                    {"0": {"shared": 0.0, "dedicated": 0},
++                     "1": {"shared": 0.0, "dedicated": 0}})}
+             ],
+             'hypervisors_links': [{'href': link, 'rel': 'next'}]
+         }
+@@ -1071,7 +1102,17 @@ class HypervisorsTestV253(HypervisorsTestV252):
+                 'state': 'up',
+                 'status': 'enabled',
+                 'vcpus': 4,
+-                'vcpus_used': 2}
++                'vcpus_by_node': jsonutils.dumps({"0": 2, "1": 2}),
++                'memory_mb_by_node': jsonutils.dumps(
++                    {"0": {"2M": 3072, "4K": 0},
++                     "1": {"2M": 3072, "4K": 0}}),
++                'memory_mb_used_by_node': jsonutils.dumps(
++                    {"0": {"2M": 0, "4K": 0},
++                     "1": {"2M": 0, "4K": 0}}),
++                'vcpus_used': 2,
++                'vcpus_used_by_node': jsonutils.dumps(
++                    {"0": {"shared": 0.0, "dedicated": 0},
++                     "1": {"shared": 0.0, "dedicated": 0}})}
+             ]
+         }
+         # There are no links when using the hypervisor_hostname_pattern
+@@ -1217,7 +1258,17 @@ class HypervisorsTestV253(HypervisorsTestV252):
+                 'state': 'up',
+                 'status': 'enabled',
+                 'vcpus': 4,
+-                'vcpus_used': 2}
++                'vcpus_by_node': jsonutils.dumps({"0": 2, "1": 2}),
++                'memory_mb_by_node': jsonutils.dumps(
++                    {"0": {"2M": 3072, "4K": 0},
++                     "1": {"2M": 3072, "4K": 0}}),
++                'memory_mb_used_by_node': jsonutils.dumps(
++                    {"0": {"2M": 0, "4K": 0},
++                     "1": {"2M": 0, "4K": 0}}),
++                'vcpus_used': 2,
++                'vcpus_used_by_node': jsonutils.dumps(
++                    {"0": {"shared": 0.0, "dedicated": 0},
++                     "1": {"shared": 0.0, "dedicated": 0}})}
+             ],
+             'hypervisors_links': [{'href': link, 'rel': 'next'}]
+         }
+diff --git a/nova/tests/unit/compute/test_resource_tracker.py b/nova/tests/unit/compute/test_resource_tracker.py
+index e2a2939..117aee5 100644
+--- a/nova/tests/unit/compute/test_resource_tracker.py
++++ b/nova/tests/unit/compute/test_resource_tracker.py
+@@ -1421,14 +1421,6 @@ class TestInstanceClaim(BaseTestCase):
+             'running_vms': 1,
+             'vcpus_used': 1,
+             'pci_device_pools': objects.PciDevicePoolList(),
+-            'stats': {
+-                'io_workload': 0,
+-                'num_instances': 1,
+-                'num_task_None': 1,
+-                'num_os_type_' + self.instance.os_type: 1,
+-                'num_proj_' + self.instance.project_id: 1,
+-                'num_vm_' + self.instance.vm_state: 1,
+-            },
+         }
+         _update_compute_node(expected, **vals)
+         with mock.patch.object(self.rt, '_update') as update_mock:
+@@ -1456,14 +1448,6 @@ class TestInstanceClaim(BaseTestCase):
+             'running_vms': 1,
+             'vcpus_used': 1,
+             'pci_device_pools': objects.PciDevicePoolList(),
+-            'stats': {
+-                'io_workload': 0,
+-                'num_instances': 1,
+-                'num_task_None': 1,
+-                'num_os_type_' + self.instance.os_type: 1,
+-                'num_proj_' + self.instance.project_id: 1,
+-                'num_vm_' + self.instance.vm_state: 1,
+-            },
+         }
+         _update_compute_node(expected, **vals)
+         with mock.patch.object(self.rt, '_update') as update_mock:
+@@ -1477,14 +1461,6 @@ class TestInstanceClaim(BaseTestCase):
+         expected_updated = copy.deepcopy(_COMPUTE_NODE_FIXTURES[0])
+         vals = {
+             'pci_device_pools': objects.PciDevicePoolList(),
+-            'stats': {
+-                'io_workload': 0,
+-                'num_instances': 0,
+-                'num_task_None': 0,
+-                'num_os_type_' + self.instance.os_type: 0,
+-                'num_proj_' + self.instance.project_id: 0,
+-                'num_vm_' + self.instance.vm_state: 0,
+-            },
+         }
+         _update_compute_node(expected_updated, **vals)
+ 
+@@ -1509,14 +1485,6 @@ class TestInstanceClaim(BaseTestCase):
+             'running_vms': 1,
+             'vcpus_used': 1,
+             'pci_device_pools': objects.PciDevicePoolList(),
+-            'stats': {
+-                'io_workload': 0,
+-                'num_instances': 1,
+-                'num_task_None': 1,
+-                'num_os_type_' + self.instance.os_type: 1,
+-                'num_proj_' + self.instance.project_id: 1,
+-                'num_vm_' + self.instance.vm_state: 1,
+-            },
+         }
+         _update_compute_node(expected, **vals)
+         with mock.patch.object(self.rt, '_update') as update_mock:
+@@ -1566,14 +1534,6 @@ class TestInstanceClaim(BaseTestCase):
+             'running_vms': 1,
+             'vcpus_used': 1,
+             'pci_device_pools': objects.PciDevicePoolList(),
+-            'stats': {
+-                'io_workload': 0,
+-                'num_instances': 1,
+-                'num_task_None': 1,
+-                'num_os_type_' + self.instance.os_type: 1,
+-                'num_proj_' + self.instance.project_id: 1,
+-                'num_vm_' + self.instance.vm_state: 1,
+-            },
+         }
+         _update_compute_node(expected, **vals)
+         with mock.patch.object(self.rt, '_update') as update_mock:
+-- 
+2.7.4
+

@@ -1,0 +1,1223 @@
+From fa4b6d11f79f8c9b5d2ba6579702709d91d57dc7 Mon Sep 17 00:00:00 2001
+From: Gerry Kopec <Gerry.Kopec@windriver.com>
+Date: Tue, 17 Jan 2017 14:01:33 -0500
+Subject: [PATCH 012/143] primary: vcpu model support and 1G guest hugepage
+
+vcpu model in image/flavor:
+  This adds support for specifying the required VCPU model in the image/
+  flavor.  If the flavor does not set a model then the image may set a
+  model.  If they both set different models an exception will be raised
+  on instance startup.
+
+  The CPU model specified in the flavor will be validated to ensure
+  it's part of the supported list.  We will now also validate the
+  image properties as well, which we didn't do previously.
+
+  It turns out that support for TSX is broken in Haswell, and so Intel
+  shipped a microcode update to disable it.  When it's disabled, this
+  causes qemu to no longer recognize the host as a Haswell processor.
+
+  Accordingly, upstream qemu/libvirt have added support for a
+  "Haswell-noTSX" CPU model, which is just Haswell without TSX support.
+  If the host supports Haswell-noTSX we will report it as supporting
+  Haswell, and if the user asks for Haswell we will actually give them
+  Haswell-noTSX.
+
+  For Broadwell explicitly support both "Broadwell" and "Broadwell-noTSX".
+
+  When we spawn instance without CPU model configured, and
+  CONF.libvirt.cpu_model = none, then the instance boots up with 'qemu'
+  CPU model which should be widely compatible.  However, when None is
+  specified, nova/virt/libvirt/driver::_compare_cpu() check will use the
+  host CPU features, so if we launch on Haswell CPU, it fails to migrate
+  to a SandyBridge which has lesser features.  Since qemu CPU models are
+  generally compatible, and the claims test selects adequate cpu topology,
+  we do need to do the _compare_cpu check when the guest instance CPU
+  model is None so this check is removed.
+
+  Usage:
+  nova flavor-key m1.tiny set hw:cpu_model=Conroe
+  nova flavor-list --extra-specs
+  glance image-create --property hw_cpu_model=Conroe
+
+  Change-Id: I29a84180c538c7fdeaf5d1b537bb50e41a35ed63
+  Change-Id: I5126ade7f27b9316d4b33d57f996a08c4f4c4a12
+
+Export 1G hugepages cpu flag pdpe1gb to guest:
+  This exports cpu flag pdpe1gb (i.e., 1G hugepages) to guest when we
+  specify flavor extra-specs hw:cpu_model=<cpumodel> along with
+  hw:mem_page_size=1048576.
+
+  Compute hosts that support 1G pages have this cpu flag. To use this
+  feature, it is assumed that compute host is provisioned with sufficient
+  1G hugepages for nova/libvirt to use.
+
+  If guest boot command-line appends: hugepagesz=1G hugepages=<N> (and
+  possibly: default_hugepagesz=1G), that should enable 1G pages in guest
+  so long as kernel config options set properly.
+
+  Verify boot commandline in guest for hugepagesz=1G:
+  cat /proc/cmdline
+
+  See pdpe1gb exported in cpu flags on guest:
+  cat /proc/cpuinfo
+
+  See which hugepages sizes are available for mount:
+  ls /sys/kernel/mm/hugepages/
+  hugepages-1048576kB hugepages-2048kB
+
+  Mount hugepages like this in guest:
+  mkdir -p /mnt/huge-1g
+  mount -t hugetlbfs -o pagesize=1048576kB none /mnt/huge-1g
+
+  Can see per numa node allocations here:
+  /sys/devices/system/node/node<x>/hugepages/hugepages-1048576kB/nr_hugepages
+
+  A tox test-case was added to demonstrate setting of flag pdpe1gb occurs
+  when a custom cpu model and 1G memory is specified.
+
+Includes R3 commits:
+61aa274 Port vcpu model support
+673f3e9 Cannot live-migrate VM using default cpu model
+ab77303 Add IvyBridge to supported cpu models
+4ac2e48 Export 1G hugepages cpu flag pdpe1gb to guest
+635e359 Flavor extra-spec API exception errors
+
+For port to Newton, constants MEM_PAGE_SIZE_1G & CPU_FLAG_1G were moved
+to centralized location with libvirt config options.
+
+For port to Pike,
+42f2533 add support for Skylake processor host cpu model
+
+bb7637b Enabled Nested VMX as Flavor extra-spec
+   This code enables Nested VMX feature, which allows a guest VM
+   to run nested VM's. (as a note, flag 'vmx' in Guest VM /proc/cpuinfo
+   indicates that the feature was set correctly)
+
+   To set Nested vmx for a Guest VM, the VM must have
+   the following set:
+   1) use a Flavor with extra-spec hw:wrs:nested_vmx=True
+
+   2A) use a Flavor with hw:cpu_model=<valid CPU model> (ex. Broadwell, etc.)
+    or alternatively
+   2B) use an image that specifies a valid CPU model
+
+   Code allows extra-spec 'hw:wrs:nested_vmx' to have
+   any of the following values (case insensitive):
+   '0', '1', 'f', 'false', 'n', 'no', 'off',
+   'on', 't', 'true', 'y', 'yes'
+   Any other value will result in an HTTP 400 BadRequest
+   response.
+
+   If no Compute host has vmx enabled, extra-spec hw:wrs:nested_vmx
+   cannot be set to True. This way we avoid setting it up in VirtualBox
+   and for other hosts runnning qemu only.
+
+   'vmx' feature is set on Guest VM, only if Flavor or Image specifies
+   a CPU model (options 2A and 2B above), since it cannot be set if
+   default qemu64 model is used.
+
+3a755ab US92450: Add host cpu passthrough option to "VCPU Model" flavor extra spec
+   Include the changes for enabling cpu-passthrough as CPU model, and
+   the changes to filter hosts when cold migrating, live migrating,
+   and evacuating.
+
+   To pass down the info to the vcpu model filter, we pack 'task_state'
+   'host' and 'node' into requestSpec.scheduler_hints
+
+d57e53e bug 273: Failed to launch vm with cpu passthrough spec
+   _passthrough_host_passes() should not be called when launching
+   an instance
+
+1c0954d US107077: Skylake-Server support in Nova
+
+__TYPE_primary
+__TAG_cpumodel
+__R4_commit_b5a703a
+__R3_commit_7d26b82
+__TC2987,TC5065,TC5138,TC5139,TC5140,TC5141,TC5142,TC5145,TC6569
+---
+ nova/api/openstack/compute/flavors_extraspecs.py   |  72 ++++++++-
+ nova/api/openstack/compute/servers.py              |   3 +-
+ nova/conductor/manager.py                          |  38 +++++
+ nova/conductor/tasks/live_migrate.py               |  27 +++-
+ nova/conf/libvirt.py                               |   4 +
+ nova/exception.py                                  |  13 +-
+ nova/objects/fields.py                             |  32 +++-
+ nova/objects/image_meta.py                         |  11 +-
+ nova/scheduler/filters/vcpu_model_filter.py        | 173 +++++++++++++++++++++
+ .../unit/conductor/tasks/test_live_migrate.py      |   8 +-
+ nova/tests/unit/conductor/test_conductor.py        |  29 +++-
+ nova/tests/unit/objects/test_objects.py            |   2 +-
+ .../scheduler/filters/test_vcpu_model_filter.py    | 146 +++++++++++++++++
+ nova/tests/unit/virt/libvirt/test_driver.py        |  58 ++++++-
+ nova/virt/libvirt/driver.py                        |  95 ++++++++++-
+ 15 files changed, 695 insertions(+), 16 deletions(-)
+ create mode 100644 nova/scheduler/filters/vcpu_model_filter.py
+ create mode 100644 nova/tests/unit/scheduler/filters/test_vcpu_model_filter.py
+
+diff --git a/nova/api/openstack/compute/flavors_extraspecs.py b/nova/api/openstack/compute/flavors_extraspecs.py
+index aebca70..88a58e8 100644
+--- a/nova/api/openstack/compute/flavors_extraspecs.py
++++ b/nova/api/openstack/compute/flavors_extraspecs.py
+@@ -12,7 +12,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
+-
++#
++# Copyright (c) 2016-2017 Wind River Systems, Inc.
++#
++# The right to copy, distribute, modify, or otherwise make use
++# of this software may be licensed only pursuant to the terms
++# of an applicable Wind River license agreement.
++#
+ import six
+ import webob
+ 
+@@ -21,14 +27,64 @@ from nova.api.openstack.compute.schemas import flavors_extraspecs
+ from nova.api.openstack import extensions
+ from nova.api.openstack import wsgi
+ from nova.api import validation
++from nova import context as novacontext
+ from nova import exception
+ from nova.i18n import _
++from nova import objects
++from nova.objects import fields
+ from nova.policies import flavor_extra_specs as fes_policies
+ from nova import utils
+ 
++from oslo_serialization import jsonutils
++from oslo_utils import strutils
++
+ 
+ class FlavorExtraSpecsController(wsgi.Controller):
+     """The flavor extra specs API controller for the OpenStack API."""
++
++    @staticmethod
++    def _validate_vcpu_models(flavor):
++        key = 'hw:cpu_model'
++        if key in flavor.extra_specs:
++            model = flavor.extra_specs[key]
++            if model not in fields.CPUModel.ALL:
++                msg = (_("Invalid %(K)s '%(M)s', must be one of: %(V)s.") %
++                       {'K': key,
++                        'M': model,
++                        'V': ', '.join(fields.CPUModel.ALL)
++                       })
++                raise webob.exc.HTTPBadRequest(explanation=msg)
++
++    @staticmethod
++    def _validate_nested_vmx(flavor):
++        key = 'hw:wrs:nested_vmx'
++        specs = flavor.extra_specs
++        if key in specs:
++            value = specs[key]
++            try:
++                is_vmx_requested = strutils.bool_from_string(value,
++                                                             strict=True)
++            except ValueError as error:
++                raise webob.exc.HTTPBadRequest(explanation=error.message)
++
++            # Check if at least one Host has 'vmx' feature enabled
++            if is_vmx_requested:
++                context = novacontext.get_admin_context()
++                compute_nodes = objects.ComputeNodeList.get_all(context)
++                for node in compute_nodes:
++                    cpu_info = jsonutils.loads(node.cpu_info)
++                    if 'vmx' in cpu_info['features']:
++                        return
++                msg = _("No Compute host was found with vmx enabled.")
++                raise webob.exc.HTTPConflict(explanation=msg)
++
++    # Should this go in the flavor object as part of the save()
++    # routine?  If you really need the context to validate something,
++    # add it back in to the args.
++    def _validate_extra_specs(self, flavor):
++        self._validate_vcpu_models(flavor)
++        self._validate_nested_vmx(flavor)
++
+     def _get_extra_specs(self, context, flavor_id):
+         flavor = common.get_flavor(context, flavor_id)
+         return dict(extra_specs=flavor.extra_specs)
+@@ -67,6 +123,7 @@ class FlavorExtraSpecsController(wsgi.Controller):
+         flavor = common.get_flavor(context, flavor_id)
+         try:
+             flavor.extra_specs = dict(flavor.extra_specs, **specs)
++            self._validate_extra_specs(flavor)
+             flavor.save()
+         except exception.FlavorExtraSpecUpdateCreateFailed as e:
+             raise webob.exc.HTTPConflict(explanation=e.format_message())
+@@ -87,6 +144,7 @@ class FlavorExtraSpecsController(wsgi.Controller):
+         flavor = common.get_flavor(context, flavor_id)
+         try:
+             flavor.extra_specs = dict(flavor.extra_specs, **body)
++            self._validate_extra_specs(flavor)
+             flavor.save()
+         except exception.FlavorExtraSpecUpdateCreateFailed as e:
+             raise webob.exc.HTTPConflict(explanation=e.format_message())
+@@ -111,14 +169,22 @@ class FlavorExtraSpecsController(wsgi.Controller):
+     # NOTE(gmann): Here should be 204(No Content) instead of 200 by v2.1
+     # +microversions because the flavor extra specs has been deleted
+     # completely when returning a response.
+-    @extensions.expected_errors(404)
++    @extensions.expected_errors((400, 404, 409))
+     def delete(self, req, flavor_id, id):
+         """Deletes an existing extra spec."""
+         context = req.environ['nova.context']
+         context.can(fes_policies.POLICY_ROOT % 'delete')
+         flavor = common.get_flavor(context, flavor_id)
+         try:
+-            del flavor.extra_specs[id]
++            # The id object is an aggregation of multiple extra spec keys
++            # The keys are aggregated using the ';'  character
++            # This allows multiple extra specs to be deleted in one call
++            # This is required since some validators will raise an exception
++            # if one extra spec exists while another is missing
++            ids = id.split(';')
++            for an_id in ids:
++                del flavor.extra_specs[an_id]
++            self._validate_extra_specs(flavor)
+             flavor.save()
+         except (exception.FlavorExtraSpecsNotFound,
+                 exception.FlavorNotFound) as e:
+diff --git a/nova/api/openstack/compute/servers.py b/nova/api/openstack/compute/servers.py
+index ef643b4..a1abc37 100644
+--- a/nova/api/openstack/compute/servers.py
++++ b/nova/api/openstack/compute/servers.py
+@@ -641,7 +641,8 @@ class ServersController(wsgi.Controller):
+                 exception.RealtimeConfigurationInvalid,
+                 exception.RealtimeMaskNotFoundOrInvalid,
+                 exception.SnapshotNotFound,
+-                exception.UnableToAutoAllocateNetwork) as error:
++                exception.UnableToAutoAllocateNetwork,
++                exception.ImageVCPUModelForbidden) as error:
+             raise exc.HTTPBadRequest(explanation=error.format_message())
+         except (exception.PortInUse,
+                 exception.InstanceExists,
+diff --git a/nova/conductor/manager.py b/nova/conductor/manager.py
+index 01517f7..e29b7e9 100644
+--- a/nova/conductor/manager.py
++++ b/nova/conductor/manager.py
+@@ -11,6 +11,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2016-2017 Wind River Systems, Inc.
++#
++# The right to copy, distribute, modify, or otherwise make use
++# of this software may be licensed only pursuant to the terms
++# of an applicable Wind River license agreement.
++#
+ 
+ """Handles database requests from other nova services."""
+ 
+@@ -294,6 +301,14 @@ class ComputeTaskManager(base.Base):
+         if not request_spec:
+             # Make sure we hydrate a new RequestSpec object with the new flavor
+             # and not the nested one from the instance
++
++            # these hints are needed by the vcpu filter
++            hints = filter_properties.get('scheduler_hints', {})
++            hints['task_state'] = instance.task_state or ""
++            hints['host'] = instance.host or ""
++            hints['node'] = instance.node or ""
++            filter_properties['scheduler_hints'] = hints
++
+             request_spec = objects.RequestSpec.from_components(
+                 context, instance.uuid, image,
+                 flavor, instance.numa_topology, instance.pci_requests,
+@@ -304,6 +319,17 @@ class ComputeTaskManager(base.Base):
+             # the right one and not the original flavor
+             request_spec.flavor = flavor
+ 
++            # these hints are needed by the vcpu filter
++            hints = {}
++            hints['task_state'] = [instance.task_state or ""]
++            hints['host'] = [instance.host or ""]
++            hints['node'] = [instance.node or ""]
++            if request_spec.obj_attr_is_set('scheduler_hints') and \
++                    request_spec.scheduler_hints:
++                request_spec.scheduler_hints.update(hints)
++            else:
++                request_spec.scheduler_hints = hints
++
+         task = self._build_cold_migrate_task(context, instance, flavor,
+                                              request_spec,
+                                              reservations, clean_shutdown)
+@@ -875,6 +901,18 @@ class ComputeTaskManager(base.Base):
+                     # if we want to make sure that the next destination
+                     # is not forced to be the original host
+                     request_spec.reset_forced_destinations()
++
++                    # these hints are needed by the vcpu filter
++                    hints = dict()
++                    hints['task_state'] = [instance.task_state or ""]
++                    hints['host'] = [instance.host or ""]
++                    hints['node'] = [instance.node or ""]
++                    if request_spec.obj_attr_is_set('scheduler_hints') and \
++                            request_spec.scheduler_hints:
++                        request_spec.scheduler_hints.update(hints)
++                    else:
++                        request_spec.scheduler_hints = hints
++
+                 try:
+                     request_spec.ensure_project_id(instance)
+                     hosts = self._schedule_instances(context, request_spec,
+diff --git a/nova/conductor/tasks/live_migrate.py b/nova/conductor/tasks/live_migrate.py
+index 0fb7d74..18a5714 100644
+--- a/nova/conductor/tasks/live_migrate.py
++++ b/nova/conductor/tasks/live_migrate.py
+@@ -9,7 +9,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
+-
++#
++# Copyright (c) 2016-2017 Wind River Systems, Inc.
++#
++# The right to copy, distribute, modify, or otherwise make use
++# of this software may be licensed only pursuant to the terms
++# of an applicable Wind River license agreement.
++#
+ from oslo_log import log as logging
+ import oslo_messaging as messaging
+ import six
+@@ -235,6 +241,14 @@ class LiveMigrationTask(base.TaskBase):
+             # NOTE(sbauza): We were unable to find an original RequestSpec
+             # object - probably because the instance is old.
+             # We need to mock that the old way
++
++            # these hints are needed by the vcpu filter
++            hints = filter_properties.get('scheduler_hints', {})
++            hints['task_state'] = self.instance.task_state or ""
++            hints['host'] = self.instance.host or ""
++            hints['node'] = self.instance.node or ""
++            filter_properties['scheduler_hints'] = hints
++
+             request_spec = objects.RequestSpec.from_components(
+                 self.context, self.instance.uuid, image,
+                 self.instance.flavor, self.instance.numa_topology,
+@@ -243,6 +257,17 @@ class LiveMigrationTask(base.TaskBase):
+             )
+         else:
+             request_spec = self.request_spec
++            # these hints are needed by the vcpu filter
++            hints = dict()
++            hints['task_state'] = [self.instance.task_state or ""]
++            hints['host'] = [self.instance.host or ""]
++            hints['node'] = [self.instance.node or ""]
++            if request_spec.obj_attr_is_set('scheduler_hints') and \
++                request_spec.scheduler_hints:
++                request_spec.scheduler_hints.update(hints)
++            else:
++                request_spec.scheduler_hints = hints
++
+             # NOTE(sbauza): Force_hosts/nodes needs to be reset
+             # if we want to make sure that the next destination
+             # is not forced to be the original host
+diff --git a/nova/conf/libvirt.py b/nova/conf/libvirt.py
+index 91f4302..803d677 100644
+--- a/nova/conf/libvirt.py
++++ b/nova/conf/libvirt.py
+@@ -32,6 +32,10 @@ from oslo_config import cfg
+ 
+ from nova.conf import paths
+ 
++# memory page size for 1G
++MEM_PAGE_SIZE_1G = 1048576
++# cpu flag for 1G pages
++CPU_FLAG_1G = 'pdpe1gb'
+ 
+ libvirt_group = cfg.OptGroup("libvirt",
+                              title="Libvirt Options",
+diff --git a/nova/exception.py b/nova/exception.py
+index c444b06..8233f74 100644
+--- a/nova/exception.py
++++ b/nova/exception.py
+@@ -13,7 +13,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
+-
++#
++# Copyright (c) 2016-2017 Wind River Systems, Inc.
++#
++# The right to copy, distribute, modify, or otherwise make use
++# of this software may be licensed only pursuant to the terms
++# of an applicable Wind River license agreement.
++#
+ """Nova base exception handling.
+ 
+ Includes decorator for re-raising Nova-type exceptions.
+@@ -1803,6 +1809,11 @@ class ImageVCPULimitsRangeImpossible(Invalid):
+                 "are impossible to satisfy for vcpus count %(vcpus)d")
+ 
+ 
++class ImageVCPUModelForbidden(Invalid):
++    msg_fmt = _("Image vCPU model is not permitted to override configuration "
++                "set against the flavor")
++
++
+ class InvalidArchitectureName(Invalid):
+     msg_fmt = _("Architecture name '%(arch)s' is not recognised")
+ 
+diff --git a/nova/objects/fields.py b/nova/objects/fields.py
+index 0b24632..e724d12 100644
+--- a/nova/objects/fields.py
++++ b/nova/objects/fields.py
+@@ -11,7 +11,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
+-
++#
++# Copyright (c) 2016-2017 Wind River Systems, Inc.
++#
++# The right to copy, distribute, modify, or otherwise make use
++# of this software may be licensed only pursuant to the terms
++# of an applicable Wind River license agreement.
++#
+ import os
+ import re
+ 
+@@ -299,6 +305,26 @@ class CPUMode(BaseNovaEnum):
+     ALL = (CUSTOM, HOST_MODEL, HOST_PASSTHROUGH)
+ 
+ 
++# List of Intel based guest CPU models that can be selected from a user
++# defined instance type
++class CPUModel(BaseNovaEnum):
++    # We use the ordering of the cpu models to determine whether a
++    # given host can emulate a specified virtual model, so it's not
++    # just an enum.
++    ALL = ("Passthrough",
++           "Conroe",
++           "Penryn",
++           "Nehalem",
++           "Westmere",
++           "SandyBridge",
++           "IvyBridge",
++           "Haswell",
++           "Broadwell-noTSX",
++           "Broadwell",
++           "Skylake-Client",
++           "Skylake-Server")
++
++
+ class CPUMatch(BaseNovaEnum):
+ 
+     MINIMUM = 'minimum'
+@@ -1085,6 +1111,10 @@ class CPUModeField(BaseEnumField):
+     AUTO_TYPE = CPUMode()
+ 
+ 
++class CPUModelField(BaseEnumField):
++    AUTO_TYPE = CPUModel()
++
++
+ class CPUMatchField(BaseEnumField):
+     AUTO_TYPE = CPUMatch()
+ 
+diff --git a/nova/objects/image_meta.py b/nova/objects/image_meta.py
+index 3beb500..451b614 100644
+--- a/nova/objects/image_meta.py
++++ b/nova/objects/image_meta.py
+@@ -11,7 +11,13 @@
+ # WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ # License for the specific language governing permissions and limitations
+ # under the License.
+-
++#
++# Copyright (c) 2016-2017 Wind River Systems, Inc.
++#
++# The right to copy, distribute, modify, or otherwise make use
++# of this software may be licensed only pursuant to the terms
++# of an applicable Wind River license agreement.
++#
+ import copy
+ 
+ from oslo_utils import versionutils
+@@ -251,6 +257,9 @@ class ImageMetaProps(base.NovaObject):
+         # maximum number of CPU threads per core
+         'hw_cpu_max_threads': fields.IntegerField(),
+ 
++        # desired CPU model
++        'hw_cpu_model': fields.CPUModelField(),
++
+         # CPU allocation policy
+         'hw_cpu_policy': fields.CPUAllocationPolicyField(),
+ 
+diff --git a/nova/scheduler/filters/vcpu_model_filter.py b/nova/scheduler/filters/vcpu_model_filter.py
+new file mode 100644
+index 0000000..07da3a4
+--- /dev/null
++++ b/nova/scheduler/filters/vcpu_model_filter.py
+@@ -0,0 +1,173 @@
++#
++# Copyright (c) 2013-2017 Wind River Systems, Inc.
++#
++# The right to copy, distribute, modify, or otherwise make use
++# of this software may be licensed only pursuant to the terms
++# of an applicable Wind River license agreement.
++#
++
++"""Scheduler filter "VCpuModelFilter", host_passes() returns True when the host
++CPU model is newer than or equal to the guest CPU model as specified in the
++instance type.
++
++The CPU models considered are currently limited to a subset of the Intel CPU
++family.  See nova.constants.VCPU_MODEL for the complete list.
++"""
++
++from nova import context
++from nova import exception
++from nova import objects
++from nova.objects import fields
++from nova.scheduler import filters
++from oslo_log import log as logging
++from oslo_serialization import jsonutils
++
++LOG = logging.getLogger(__name__)
++
++
++class VCpuModelFilter(filters.BaseHostFilter):
++    """Filter hosts that support the necessary virtual cpu model.
++    """
++
++    # Instance type data does not change within a request
++    run_filter_once_per_request = True
++
++    def _is_compatible(self, host, guest):
++        """Determine if the host CPU model is capable of emulating the guest CPU
++        model.  For this determination we are currently only interested in
++        Intel based CPUs in the most recent family (from pentiumpro to
++        Haswell)
++        """
++        try:
++            host_index = fields.CPUModel.ALL.index(host)
++        except ValueError:
++            # The host CPU model is not in our list.  This is unexpected and
++            # likely indicates that support for a new processor needs to be
++            # added and validated.
++            return False
++        try:
++            guest_index = fields.CPUModel.ALL.index(guest)
++        except ValueError:
++            # The guest CPU model is not in our list.  We can't tell whether
++            # we can support it or not.
++            return False
++        return bool(guest_index <= host_index)
++
++    def _passthrough_host_passes(self, host_state, spec_obj):
++        hints = spec_obj.scheduler_hints
++        if not hints['host'] or not hints['node']:
++            LOG.info("(%(host)s, %(node)s) CANNOT SCHEDULE: "
++                     "VCPU Passthrough guest migrating from unknown host",
++                     {'host': host_state.host,
++                     'node': host_state.nodename})
++            return False
++
++        ctxt = context.get_admin_context()
++        try:
++            source_node = objects.ComputeNode.get_by_host_and_nodename(ctxt,
++                hints['host'][0], hints['node'][0])
++        except exception.NotFound:
++            LOG.info("(%(host)s, %(node)s) CANNOT SCHEDULE: "
++                     "No compute node record found for source %(h)s, %(n)s)",
++                     {'host': host_state.host,
++                     'node': host_state.nodename,
++                     'h': hints['host'][0], 'n': hints['node'][0]})
++            return False
++
++        source_model = self._get_cpu_model(source_node.cpu_info)
++        host_model = self._get_cpu_model(host_state.cpu_info)
++        same_cpu_features = self._cpus_have_same_features(host_state.cpu_info,
++                                                      source_node.cpu_info)
++        key = 'vcpu_model'
++        if source_model != host_model or not same_cpu_features:
++            LOG.info("(%(host)s, %(node)s) CANNOT SCHEDULE: "
++                     "different model or incompatible cpu features: "
++                     "host %(key)s = %(host_model)s, "
++                     "required = %(required)s",
++                     {'host': host_state.host,
++                     'node': host_state.nodename,
++                     'key': key,
++                     'host_model': host_model,
++                     'required': source_model})
++            return False
++
++        LOG.info("(%(host)s, %(node)s) "
++                 "PASS: host %(key)s = %(host_model)s, "
++                 "required = %(required)s",
++                 {'host': host_state.host,
++                 'node': host_state.nodename,
++                 'key': key,
++                 'host_model': host_model,
++                 'required': source_model})
++        return True
++
++    def _get_cpu_model(self, cpu_info):
++        """Parses the driver CPU info structure to extract the host CPU model
++        """
++        info = jsonutils.loads(cpu_info)
++        return info['model']
++
++    def _cpus_have_same_features(self, host_cpu_info, cpu_info):
++        info = jsonutils.loads(cpu_info)
++        host_info = jsonutils.loads(host_cpu_info)
++        return cmp(info['features'], host_info['features']) == 0
++
++    def _is_host_kvm(self, cpu_info):
++        info = jsonutils.loads(cpu_info)
++        if 'vmx' in info['features']:
++            return True
++        return False
++
++    def host_passes(self, host_state, spec_obj):
++        """If the host CPU model is newer than or equal to the guest CPU model
++        that is specified in the flavor or image then this host is deemed
++        capable of instantiating this instance.
++        """
++        flavor_model = spec_obj.flavor.extra_specs.get("hw:cpu_model")
++        image_model = spec_obj.image.properties.get("hw_cpu_model")
++        if (image_model is not None and flavor_model is not None and
++            image_model != flavor_model):
++            raise exception.ImageVCPUModelForbidden()
++
++        model = flavor_model or image_model
++        if not model:
++            LOG.info("(%(host)s, %(node)s) PASS: no required vCPU model",
++                     {'host': host_state.host,
++                     'node': host_state.nodename})
++            return True
++
++        if model == 'Passthrough' and \
++                not self._is_host_kvm(host_state.cpu_info):
++            LOG.info("(%(host)s, %(node)s) CANNOT SCHEDULE: "
++                     "Passthrough VCPU Model only available on 'kvm' hosts",
++                     {'host': host_state.host,
++                     'node': host_state.nodename})
++            return False
++
++        task_state = spec_obj.scheduler_hints.get('task_state')
++        if model == 'Passthrough':
++            if task_state and ('scheduling' not in task_state):
++                return self._passthrough_host_passes(host_state, spec_obj)
++
++        key = 'vcpu_model'
++        host_model = self._get_cpu_model(host_state.cpu_info)
++        if self._is_compatible(host_model, model):
++            LOG.info("(%(host)s, %(node)s) "
++                     "PASS: host %(key)s = %(host_model)s, "
++                     "required = %(required)s",
++                     {'host': host_state.host,
++                     'node': host_state.nodename,
++                     'key': key,
++                     'host_model': host_model,
++                     'required': model})
++            return True
++        else:
++            LOG.info("(%(host)s, %(node)s) CANNOT SCHEDULE: "
++                     "host %(key)s = %(host_model)s, "
++                     "required = %(required)s",
++                     {'host': host_state.host,
++                     'node': host_state.nodename,
++                     'key': key,
++                     'host_model': host_model,
++                     'required': model})
++            return False
+diff --git a/nova/tests/unit/conductor/tasks/test_live_migrate.py b/nova/tests/unit/conductor/tasks/test_live_migrate.py
+index eb95152..750b60c 100644
+--- a/nova/tests/unit/conductor/tasks/test_live_migrate.py
++++ b/nova/tests/unit/conductor/tasks/test_live_migrate.py
+@@ -9,7 +9,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
+-
++#
++# Copyright (c) 2016-2017 Wind River Systems, Inc.
++#
++# The right to copy, distribute, modify, or otherwise make use
++# of this software may be licensed only pursuant to the terms
++# of an applicable Wind River license agreement.
++#
+ import mock
+ import oslo_messaging as messaging
+ import six
+diff --git a/nova/tests/unit/conductor/test_conductor.py b/nova/tests/unit/conductor/test_conductor.py
+index 2a1107c..bcaf994 100644
+--- a/nova/tests/unit/conductor/test_conductor.py
++++ b/nova/tests/unit/conductor/test_conductor.py
+@@ -12,7 +12,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
+-
++#
++# Copyright (c) 2016-2017 Wind River Systems, Inc.
++#
++# The right to copy, distribute, modify, or otherwise make use
++# of this software may be licensed only pursuant to the terms
++# of an applicable Wind River license agreement.
++#
+ """Tests for the conductor service."""
+ 
+ import copy
+@@ -2119,6 +2125,9 @@ class ConductorTaskTestCase(_BaseTaskTestCase, test_compute.BaseTestCase):
+             image_ref='fake-image_ref',
+             instance_type_id=flavor['id'],
+             vm_state=vm_states.ACTIVE,
++            task_state=task_states.RESIZE_PREP,
++            host='host',
++            node='node',
+             system_metadata={},
+             uuid=uuids.instance,
+             user_id=fakes.FAKE_USER_ID,
+@@ -2170,6 +2179,9 @@ class ConductorTaskTestCase(_BaseTaskTestCase, test_compute.BaseTestCase):
+         inst_obj = objects.Instance(
+             image_ref='fake-image_ref',
+             vm_state=vm_states.STOPPED,
++            task_state=task_states.RESIZE_PREP,
++            host='host',
++            node='node',
+             instance_type_id=flavor['id'],
+             system_metadata={},
+             uuid=uuids.instance,
+@@ -2213,6 +2225,9 @@ class ConductorTaskTestCase(_BaseTaskTestCase, test_compute.BaseTestCase):
+         inst_obj = objects.Instance(
+             image_ref='fake-image_ref',
+             vm_state=vm_states.STOPPED,
++            task_state=task_states.RESIZE_PREP,
++            host='host',
++            node='node',
+             instance_type_id=flavor['id'],
+             system_metadata={},
+             uuid=uuids.instance,
+@@ -2253,6 +2268,9 @@ class ConductorTaskTestCase(_BaseTaskTestCase, test_compute.BaseTestCase):
+         inst_obj = objects.Instance(
+             image_ref='fake-image_ref',
+             vm_state=vm_states.STOPPED,
++            task_state=task_states.RESIZE_PREP,
++            host='host',
++            node='node',
+             instance_type_id=flavor['id'],
+             system_metadata={},
+             uuid=uuids.instance,
+@@ -2297,6 +2315,9 @@ class ConductorTaskTestCase(_BaseTaskTestCase, test_compute.BaseTestCase):
+         inst_obj = objects.Instance(
+             image_ref='fake-image_ref',
+             vm_state=vm_states.STOPPED,
++            task_state=task_states.RESIZE_PREP,
++            host='host',
++            node='node',
+             instance_type_id=flavor['id'],
+             system_metadata={},
+             uuid=uuids.instance,
+@@ -2361,6 +2382,9 @@ class ConductorTaskTestCase(_BaseTaskTestCase, test_compute.BaseTestCase):
+         inst_obj = objects.Instance(
+             image_ref='fake-image_ref',
+             vm_state=vm_states.STOPPED,
++            task_state=task_states.RESIZE_PREP,
++            host='host',
++            node='node',
+             instance_type_id=flavor['id'],
+             system_metadata={},
+             uuid=uuids.instance,
+@@ -2394,6 +2418,9 @@ class ConductorTaskTestCase(_BaseTaskTestCase, test_compute.BaseTestCase):
+         inst_obj = objects.Instance(
+             image_ref='fake-image_ref',
+             vm_state=vm_states.STOPPED,
++            task_state=task_states.RESIZE_PREP,
++            host='host',
++            node='node',
+             instance_type_id=flavor['id'],
+             system_metadata={},
+             uuid=uuids.instance,
+diff --git a/nova/tests/unit/objects/test_objects.py b/nova/tests/unit/objects/test_objects.py
+index e3e9fc2..713fe43 100644
+--- a/nova/tests/unit/objects/test_objects.py
++++ b/nova/tests/unit/objects/test_objects.py
+@@ -1106,7 +1106,7 @@ object_data = {
+     'HVSpec': '1.2-de06bcec472a2f04966b855a49c46b41',
+     'IDEDeviceBus': '1.0-29d4c9f27ac44197f01b6ac1b7e16502',
+     'ImageMeta': '1.8-642d1b2eb3e880a367f37d72dd76162d',
+-    'ImageMetaProps': '1.19-a64c0dccbe29dcc6ac9c5f6b3615aa5f',
++    'ImageMetaProps': '1.19-0026c9536269e84f6ad289279c403a50',
+     'Instance': '2.3-4f98ab23f4b0a25fabb1040c8f5edecc',
+     'InstanceAction': '1.1-f9f293e526b66fca0d05c3b3a2d13914',
+     'InstanceActionEvent': '1.1-e56a64fa4710e43ef7af2ad9d6028b33',
+diff --git a/nova/tests/unit/scheduler/filters/test_vcpu_model_filter.py b/nova/tests/unit/scheduler/filters/test_vcpu_model_filter.py
+new file mode 100644
+index 0000000..dbf059e
+--- /dev/null
++++ b/nova/tests/unit/scheduler/filters/test_vcpu_model_filter.py
+@@ -0,0 +1,146 @@
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++#
++# Copyright (c) 2016-2017 Wind River Systems, Inc.
++#
++# The right to copy, distribute, modify, or otherwise make use
++# of this software may be licensed only pursuant to the terms
++# of an applicable Wind River license agreement.
++#
++
++from nova import objects
++from nova.scheduler.filters import vcpu_model_filter
++from nova import test
++from nova.tests.unit.scheduler import fakes
++
++
++class TestVCPUModelFilter(test.NoDBTestCase):
++
++    def setUp(self):
++        super(TestVCPUModelFilter, self).setUp()
++        self.filt_cls = vcpu_model_filter.VCpuModelFilter()
++
++    def test_vcpu_model_not_specified(self):
++        spec_obj = objects.RequestSpec(
++            flavor=objects.Flavor(memory_mb=1024, extra_specs={}),
++            image=objects.ImageMeta(properties=objects.ImageMetaProps()),
++            scheduler_hints={'task_state': ['scheduling'], 'host': ['host1'],
++                             'node': ['node1']})
++        host = fakes.FakeHostState('host1', 'node1', {})
++        self.assertTrue(self.filt_cls.host_passes(host, spec_obj))
++
++    def test_vcpu_model_flavor_passes(self):
++        spec_obj = objects.RequestSpec(
++            flavor=objects.Flavor(extra_specs={'hw:cpu_model': 'Nehalem'}),
++            image=objects.ImageMeta(properties=objects.ImageMetaProps()),
++            scheduler_hints={'task_state': ['scheduling'], 'host': ['host1'],
++                             'node': ['node1']})
++        host = fakes.FakeHostState('host1', 'node1',
++                {'cpu_info': '{"model": "Broadwell"}'})
++        self.assertTrue(self.filt_cls.host_passes(host, spec_obj))
++
++    def test_vcpu_model_flavor_fails(self):
++        spec_obj = objects.RequestSpec(
++            flavor=objects.Flavor(extra_specs={'hw:cpu_model': 'Nehalem'}),
++            image=objects.ImageMeta(properties=objects.ImageMetaProps()),
++            scheduler_hints={'task_state': ['scheduling'], 'host': ['host1'],
++                             'node': ['node1']})
++        host = fakes.FakeHostState('host1', 'node1',
++                {'cpu_info': '{"model": "Conroe"}'})
++        self.assertFalse(self.filt_cls.host_passes(host, spec_obj))
++
++    def test_vcpu_model_image_passes(self):
++        props = objects.ImageMetaProps(hw_cpu_model='Nehalem')
++        spec_obj = objects.RequestSpec(
++            flavor=objects.Flavor(memory_mb=1024, extra_specs={}),
++            image=objects.ImageMeta(properties=props),
++            scheduler_hints={'task_state': ['scheduling'], 'host': ['host1'],
++                             'node': ['node1']})
++        host = fakes.FakeHostState('host1', 'node1',
++                {'cpu_info': '{"model": "Broadwell"}'})
++        self.assertTrue(self.filt_cls.host_passes(host, spec_obj))
++
++    def test_vcpu_model_image_fails(self):
++        props = objects.ImageMetaProps(hw_cpu_model='Nehalem')
++        spec_obj = objects.RequestSpec(
++            flavor=objects.Flavor(memory_mb=1024, extra_specs={}),
++            image=objects.ImageMeta(properties=props),
++            scheduler_hints={'task_state': ['scheduling'], 'host': ['host1'],
++                             'node': ['node1']})
++        host = fakes.FakeHostState('host1', 'node1',
++                {'cpu_info': '{"model": "Conroe"}'})
++        self.assertFalse(self.filt_cls.host_passes(host, spec_obj))
++
++    def test_passthrough_vcpu_model_flavor_passes(self):
++        spec_obj = objects.RequestSpec(
++            flavor=objects.Flavor(extra_specs={'hw:cpu_model': 'Passthrough'}),
++            image=objects.ImageMeta(properties=objects.ImageMetaProps()),
++            scheduler_hints={'task_state': ['scheduling'], 'host': ['host1'],
++                             'node': ['node1']})
++        host = fakes.FakeHostState('host1', 'node1',
++                {'cpu_info': '{"model": "Broadwell", "features": ["vmx"]}'})
++        self.assertTrue(self.filt_cls.host_passes(host, spec_obj))
++
++    def test_passthrough_migrate_vcpu_model_flavor_passes(self):
++        spec_obj = objects.RequestSpec(
++            flavor=objects.Flavor(extra_specs={'hw:cpu_model': 'Passthrough'}),
++            image=objects.ImageMeta(properties=objects.ImageMetaProps()),
++            scheduler_hints={'task_state': ['migrating'], 'host': ['host1'],
++                             'node': ['node1']})
++        host = fakes.FakeHostState('host1', 'node1',
++                {'cpu_info': '{"model": "Broadwell", '
++                             '"features": ["pge", "avx", "vmx"]}'})
++        self.stub_out('nova.objects.ComputeNode.get_by_host_and_nodename',
++                self._fake_compute_node_get_by_host_and_nodename)
++        self.assertTrue(self.filt_cls.host_passes(host, spec_obj))
++
++    def test_passthrough_migrate_vcpu_model_flavor_fails(self):
++        spec_obj = objects.RequestSpec(
++            flavor=objects.Flavor(extra_specs={'hw:cpu_model': 'Passthrough'}),
++            image=objects.ImageMeta(properties=objects.ImageMetaProps()),
++            scheduler_hints={'task_state': ['migrating'], 'host': ['host1'],
++                             'node': ['node1']})
++        host = fakes.FakeHostState('host1', 'node1',
++                {'cpu_info': '{"model": "IvyBridge", '
++                             '"features": ["pge", "avx", "vmx"]}'})
++        self.stub_out('nova.objects.ComputeNode.get_by_host_and_nodename',
++                self._fake_compute_node_get_by_host_and_nodename)
++        self.assertFalse(self.filt_cls.host_passes(host, spec_obj))
++
++    def test_passthrough_migrate_vcpu_model_flavor_features_fails(self):
++        spec_obj = objects.RequestSpec(
++            flavor=objects.Flavor(extra_specs={'hw:cpu_model': 'Passthrough'}),
++            image=objects.ImageMeta(properties=objects.ImageMetaProps()),
++            scheduler_hints={'task_state': ['migrating'], 'host': ['host1'],
++                             'node': ['node1']})
++        host = fakes.FakeHostState('host1', 'node1',
++                {'cpu_info': '{"model": "Broadwell", '
++                             '"features": ["pge", "avx", "vmx", "clflush"]}'})
++        self.stub_out('nova.objects.ComputeNode.get_by_host_and_nodename',
++                self._fake_compute_node_get_by_host_and_nodename)
++        self.assertFalse(self.filt_cls.host_passes(host, spec_obj))
++
++    def test_passthrough_migrate_vcpu_model_flavor_kvm_fails(self):
++        spec_obj = objects.RequestSpec(
++            flavor=objects.Flavor(extra_specs={'hw:cpu_model': 'Passthrough'}),
++            image=objects.ImageMeta(properties=objects.ImageMetaProps()),
++            scheduler_hints={'task_state': ['scheduling'], 'host': ['host1'],
++                             'node': ['node1']})
++        host = fakes.FakeHostState('host1', 'node1',
++                {'cpu_info': '{"model": "Broadwell", '
++                             '"features": ["pge", "avx"]}'})
++        self.assertFalse(self.filt_cls.host_passes(host, spec_obj))
++
++    def _fake_compute_node_get_by_host_and_nodename(self, cn, ctx, host, node):
++        cpu_info = '{"model": "Broadwell", "features": ["pge", "avx", "vmx"]}'
++        compute_node = objects.ComputeNode(cpu_info=cpu_info)
++        return compute_node
+diff --git a/nova/tests/unit/virt/libvirt/test_driver.py b/nova/tests/unit/virt/libvirt/test_driver.py
+index a886d47..b00f5e2 100755
+--- a/nova/tests/unit/virt/libvirt/test_driver.py
++++ b/nova/tests/unit/virt/libvirt/test_driver.py
+@@ -12,7 +12,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
+-
++#
++# Copyright (c) 2016-2017 Wind River Systems, Inc.
++#
++# The right to copy, distribute, modify, or otherwise make use
++# of this software may be licensed only pursuant to the terms
++# of an applicable Wind River license agreement.
++#
+ from collections import deque
+ from collections import OrderedDict
+ import contextlib
+@@ -5877,6 +5883,53 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+         self.assertEqual(conf.cpu.cores, 1)
+         self.assertEqual(conf.cpu.threads, 1)
+ 
++    def test_get_guest_cpu_config_custom_1G(self):
++        cpumodel = 'Broadwell'
++        drvr = libvirt_driver.LibvirtDriver(fake.FakeVirtAPI(), True)
++        instance_ref = objects.Instance(**self.test_instance)
++        instance_ref.flavor.extra_specs = {'hw:cpu_model': cpumodel,
++                                           'hw:mem_page_size': '1048576'}
++        image_meta = objects.ImageMeta.from_dict(self.test_image_meta)
++
++        self.flags(cpu_mode='none',
++                   cpu_model=cpumodel,
++                   group='libvirt')
++        disk_info = blockinfo.get_disk_info(CONF.libvirt.virt_type,
++                                            instance_ref,
++                                            image_meta)
++        conf = drvr._get_guest_config(instance_ref,
++                                      _fake_network_info(self, 1),
++                                      image_meta, disk_info)
++        self.assertIsInstance(conf.cpu,
++                              vconfig.LibvirtConfigGuestCPU)
++        self.assertEqual(conf.cpu.mode, 'custom')
++        self.assertEqual(conf.cpu.model, cpumodel)
++        self.assertIn('pdpe1gb', set([f.name for f in conf.cpu.features]))
++
++    def test_get_guest_cpu_config_custom_vmx(self):
++        cpumodel = 'Broadwell'
++        drvr = libvirt_driver.LibvirtDriver(fake.FakeVirtAPI(), True)
++        instance_ref = objects.Instance(**self.test_instance)
++        instance_ref.flavor.extra_specs = {'hw:cpu_model': cpumodel,
++                                           'hw:wrs:nested_vmx': 'true'}
++        image_meta = objects.ImageMeta.from_dict(self.test_image_meta)
++
++        self.flags(cpu_mode='none',
++                   cpu_model=cpumodel,
++                   group='libvirt')
++        disk_info = blockinfo.get_disk_info(CONF.libvirt.virt_type,
++                                            instance_ref,
++                                            image_meta)
++
++        conf = drvr._get_guest_config(instance_ref,
++                                      _fake_network_info(self, 1),
++                                      image_meta, disk_info)
++        self.assertIsInstance(conf.cpu,
++                              vconfig.LibvirtConfigGuestCPU)
++        self.assertEqual(conf.cpu.mode, 'custom')
++        self.assertEqual(conf.cpu.model, cpumodel)
++        self.assertIn('vmx', set([f.name for f in conf.cpu.features]))
++
+     def test_get_guest_cpu_topology(self):
+         instance_ref = objects.Instance(**self.test_instance)
+         instance_ref.flavor.vcpus = 8
+@@ -7471,7 +7524,8 @@ class LibvirtConnTestCase(test.NoDBTestCase,
+         result = drvr.check_can_live_migrate_destination(
+             self.context, instance_ref, compute_info, compute_info)
+         result.is_volume_backed = False
+-        mock_cpu.assert_called_once_with(None, 'asdf', instance_ref)
++        # Cannot live migrate a VM with default cpu model
++        # We do not call _compare_cpu in this case.
+         expected_result = {"filename": 'fake',
+                            "image_type": CONF.libvirt.images_type,
+                            "block_migration": False,
+diff --git a/nova/virt/libvirt/driver.py b/nova/virt/libvirt/driver.py
+index e657ced..14f33bd 100644
+--- a/nova/virt/libvirt/driver.py
++++ b/nova/virt/libvirt/driver.py
+@@ -17,7 +17,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
+-
++#
++# Copyright (c) 2016-2017 Wind River Systems, Inc.
++#
++# The right to copy, distribute, modify, or otherwise make use
++# of this software may be licensed only pursuant to the terms
++# of an applicable Wind River license agreement.
++#
+ """
+ A connection to a hypervisor through libvirt.
+ 
+@@ -3664,6 +3670,74 @@ class LibvirtDriver(driver.ComputeDriver):
+ 
+         return cpu
+ 
++    def _get_guest_custom_cpu_config(self, flavor, image_meta):
++        """Allow the guest CPU model to be override from the instance type
++        """
++        flavor_model = flavor.extra_specs.get("hw:cpu_model")
++        image_model = image_meta.properties.get("hw_cpu_model")
++        model = flavor_model or image_model
++        pgsize = hardware._numa_get_pagesize_constraints(flavor, image_meta)
++
++        if (image_model is not None and flavor_model is not None and
++            image_model != flavor_model):
++            raise exception.ImageVCPUModelForbidden()
++        if model:
++            if model not in fields.CPUModel.ALL:
++                msg = _("Instance type or image property requested an "
++                        "explicit CPU model, but %s is not supported") % model
++                raise exception.Invalid(msg)
++
++            # Haswell is a special case.  Intel disabled the TSX support
++            # because it was broken, so libvirt/qemu added a Haswell-noTSX
++            # model.  If someone asks for Haswell we will actually give them
++            # Haswell-noTSX.
++            if model == 'Haswell':
++                model = 'Haswell-noTSX'
++
++            cpu = vconfig.LibvirtConfigGuestCPU()
++            if model == 'Passthrough':
++                if CONF.libvirt.virt_type != 'kvm':
++                    msg = "CPU Passthrough only available on 'kvm' hosts"
++                    raise exception.Invalid(msg)
++                cpu.mode = "host-passthrough"
++                caps = self._host.get_capabilities()
++                cpu.model = caps.host.cpu.model
++            else:
++                cpu.mode = "custom"
++                cpu.model = model
++
++            # Check whether 1G hugepages has been requested (i.e.,
++            # mem_page_size is 1G), and then add the cpu flag to the guest
++            # feature list. We know this host supports 1G since the scheduler
++            # numa topology filter has already excluded hosts that don't have
++            # 1G memory.
++            if pgsize == nova.conf.libvirt.MEM_PAGE_SIZE_1G:
++                xf = vconfig.LibvirtConfigGuestCPUFeature()
++                xf.name = nova.conf.libvirt.CPU_FLAG_1G
++                xf.policy = 'require'
++                cpu.features.add(xf)
++
++            # Check to see if nested_vmx extra-spec was requested
++            # and then check if host has vmx set
++            nested_vmx = strutils.bool_from_string(flavor.extra_specs.get(
++                'hw:wrs:nested_vmx', 'false'))
++            if nested_vmx:
++                caps = self._host.get_capabilities()
++                host_features_list = [feature.name for feature
++                                        in caps.host.cpu.features]
++                if 'vmx' not in host_features_list:
++                    host_name = self._host.get_hostname()
++                    msg = _('Host %s does not have vmx feature set')
++                    raise exception.Invalid(msg % host_name)
++
++                vmx = vconfig.LibvirtConfigGuestCPUFeature()
++                vmx.name = 'vmx'
++                vmx.policy = 'require'
++                cpu.features.add(vmx)
++
++            return cpu
++        return None
++
+     def _get_guest_cpu_config(self, flavor, image_meta,
+                               guest_cpu_numa_config, instance_numa_topology):
+         cpu = self._get_guest_cpu_model_config()
+@@ -3671,6 +3745,11 @@ class LibvirtDriver(driver.ComputeDriver):
+         if cpu is None:
+             return None
+ 
++        if cpu.mode == "none" or cpu.mode is None:
++            custom_cpu = self._get_guest_custom_cpu_config(flavor, image_meta)
++            if custom_cpu is not None:
++                cpu = custom_cpu
++
+         topology = hardware.get_best_cpu_topology(
+                 flavor, image_meta, numa_topology=instance_numa_topology)
+ 
+@@ -5485,6 +5564,12 @@ class LibvirtDriver(driver.ComputeDriver):
+         cpu_info['model'] = caps.host.cpu.model
+         cpu_info['vendor'] = caps.host.cpu.vendor
+ 
++        # Haswell is a special case.  Intel disabled the TSX support
++        # because it was broken, so libvirt/qemu added a Haswell-noTSX
++        # model.  To minimize confusion we will report this as Haswell.
++        if cpu_info['model'] == 'Haswell-noTSX':
++            cpu_info['model'] = 'Haswell'
++
+         topology = dict()
+         topology['cells'] = len(getattr(caps.host.topology, 'cells', [1]))
+         topology['sockets'] = caps.host.cpu.sockets
+@@ -5933,8 +6018,12 @@ class LibvirtDriver(driver.ComputeDriver):
+ 
+         # Compare CPU
+         if not instance.vcpu_model or not instance.vcpu_model.model:
+-            source_cpu_info = src_compute_info['cpu_info']
+-            self._compare_cpu(None, source_cpu_info, instance)
++            # Cannot live migrate a VM with default cpu model
++            # Assume compatibility instead of using the host CPU info
++            # for the case when instance.vcpu_model.cpu_model not specified.
++            # We have satisfied topology check via claims test and we are
++            # using a generally compatible qemu CPU model in this case.
++            pass
+         else:
+             self._compare_cpu(instance.vcpu_model, None, instance)
+ 
+-- 
+2.7.4
+

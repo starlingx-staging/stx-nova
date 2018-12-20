@@ -1,0 +1,584 @@
+From 06fb1dd9507b72251d6811f5fa6788217a63bce4 Mon Sep 17 00:00:00 2001
+From: Jim Gauld <james.gauld@windriver.com>
+Date: Wed, 13 Jul 2016 03:42:10 -0400
+Subject: [PATCH] Mitaka rebase - stevedore entry-points for compute
+ monitor metrics
+
+Compute monitor metic stevedore entry-points are now defined in
+setup.cfg. VswitchMonitor and PlatformMonitor entry-points are added.
+
+This includes Mitaka fixes for PlatformMonitor, should be merged with
+commit 1c3bdd8a. This also adds enhancement to PlatformMonitor to
+fallback to parsing /proc/stat if /proc/schedstat not enabled.
+
+When rebasing, this should be merged with commit ba128a4f and commit
+1c3bdd8a .
+---
+ nova/compute/monitors/__init__.py                  |   1 +
+ nova/compute/monitors/platform/__init__.py         |   0
+ nova/compute/monitors/platform/platform_monitor.py | 250 +++++++++++++++++++++
+ nova/compute/monitors/platform_monitor.py          | 178 ---------------
+ nova/objects/fields.py                             |   4 +
+ nova/scheduler/filters/platform_filter.py          |   5 +-
+ nova/scheduler/host_manager.py                     |  11 +-
+ nova/tests/unit/objects/test_objects.py            |   2 +-
+ setup.cfg                                          |   4 +
+ 9 files changed, 272 insertions(+), 183 deletions(-)
+ create mode 100644 nova/compute/monitors/platform/__init__.py
+ create mode 100644 nova/compute/monitors/platform/platform_monitor.py
+ delete mode 100644 nova/compute/monitors/platform_monitor.py
+
+diff --git a/nova/compute/monitors/__init__.py b/nova/compute/monitors/__init__.py
+index f8cceb3..a2bdaa4 100644
+--- a/nova/compute/monitors/__init__.py
++++ b/nova/compute/monitors/__init__.py
+@@ -53,6 +53,7 @@ class MonitorHandler(object):
+     NAMESPACES = [
+         'nova.compute.monitors.cpu',
+         'nova.compute.monitors.vswitch',
++        'nova.compute.monitors.platform',
+     ]
+ 
+     def __init__(self, resource_tracker):
+diff --git a/nova/compute/monitors/platform/__init__.py b/nova/compute/monitors/platform/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/nova/compute/monitors/platform/platform_monitor.py b/nova/compute/monitors/platform/platform_monitor.py
+new file mode 100644
+index 0000000..78cc54a
+--- /dev/null
++++ b/nova/compute/monitors/platform/platform_monitor.py
+@@ -0,0 +1,250 @@
++# Copyright 2016 Intel Corporation.
++# All Rights Reserved.
++#
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++"""
++Platform monitor to retrieve platform CPU and MEM utilization
++"""
++
++import copy
++import os
++import re
++
++from oslo_log import log as logging
++from oslo_utils import timeutils
++
++from nova.compute.monitors import base
++from nova import exception
++from nova.i18n import _LE, _LW
++from nova.objects import fields
++import nova.utils as utils
++
++LOG = logging.getLogger(__name__)
++
++ONE_BILLION = 1000000000
++ONE_MILLION = 1000000
++ONE_THOUSAND = 1000
++ONE_HUNDRED = 100
++USER_HZ = 100
++CLOCK_NS = int(ONE_BILLION / USER_HZ)
++PROC_STAT = '/proc/stat'
++PROC_SCHEDSTAT = '/proc/schedstat'
++SCHEDSTAT_VERSION = '15'
++COMPUTE_RESERVED = '/etc/nova/compute_reserved.conf'
++
++
++class PlatformMonitor(base.MonitorBase):
++
++    """Platform monitor metrics."""
++
++    def __init__(self, resource_tracker):
++        super(PlatformMonitor, self).__init__(resource_tracker)
++        self.source = 'platform-monitor-stats'
++        self.driver = resource_tracker.driver
++        now = timeutils.utcnow()
++        self._data = {}
++        self._data['timestamp'] = now
++        self._data[fields.MonitorMetricType.PLATFORM_CPU_PERCENT] = 0
++        self._data[fields.MonitorMetricType.PLATFORM_MEM_PERCENT] = 0
++        self._t0 = {}
++        self._t0['timestamp'] = now
++        self._cpu_list = []
++
++        # check if schedstat and specific version supported.
++        # if not supported, fallback to jiffies, do not raise exception.
++        self.is_schedstat = False
++        try:
++            with open(PROC_SCHEDSTAT) as f:
++                for line in f:
++                    if 'version' in line:
++                        sp = line.split()
++                        if sp[1] == SCHEDSTAT_VERSION:
++                            self.is_schedstat = True
++                            break
++                        else:
++                            LOG.warning(_LW('expected schedstat version '
++                                            '%(ver)d, got: %(got)s'),
++                                        {'ver': SCHEDSTAT_VERSION,
++                                         'got': sp[1]})
++                            break
++        except IOError as e:
++            LOG.warning(_LW('schedstat unavailable; using jiffies'))
++
++        # get platform configured cores
++        try:
++            with open(COMPUTE_RESERVED) as f:
++                for line in f:
++                    if 'PLATFORM_CPU_LIST' in line:
++                        sp = line.split('=')
++                        self._cpu_list = utils.range_to_list(
++                            re.findall('"(.*)"', sp[1])[0])
++        except IOError as e:
++            LOG.error(_LE('Cannot open: %(file)s, error = %(err)s'),
++                      {'file': COMPUTE_RESERVED, 'err': e})
++            raise exception.ResourceMonitorError(
++                monitor=self.__class__.__name__)
++
++        self._update_data(init=True)
++
++    def get_metric_names(self):
++        return set([
++            fields.MonitorMetricType.PLATFORM_CPU_PERCENT,
++            fields.MonitorMetricType.PLATFORM_MEM_PERCENT,
++        ])
++
++    def get_metrics(self):
++        metrics = []
++        self._update_data()
++        for name in self.get_metric_names():
++            metrics.append((name, self._data[name], self._data["timestamp"]))
++        return metrics
++
++    def _update_data(self, init=False, **kwargs):
++        # Don't allow to call this function so frequently (<= 1 sec)
++        now = timeutils.utcnow()
++        if self._data.get("timestamp") is not None:
++            delta = timeutils.delta_seconds(self._data['timestamp'], now)
++            if not init and delta <= 1:
++                return
++        self._data['timestamp'] = now
++        self._update_data_mem(init=init)
++        self._update_data_cpu(init=init)
++
++    # Calculate relative percent used platform 4K memory
++    def _update_data_mem(self, init=False, **kwargs):
++        avail = 0
++        with open('/proc/meminfo') as fp:
++            m = fp.read().split()
++
++        MemFree = int(m[m.index('MemFree:') + 1])
++        Buffers = int(m[m.index('Buffers:') + 1])
++        Cached = int(m[m.index('Cached:') + 1])
++        SReclaimable = int(m[m.index('SReclaimable:') + 1])
++        path = "/sys/devices/system/node/"
++
++        dir = os.listdir(path)
++        for file_name in dir:
++            # look for /sys/devices/system/node/node() dirs
++            if 'node' in file_name:
++                # look into /sys/devices/system/node/node()/meminfo
++                # to compute available 4K memory from MemFree, FilePages,
++                # and SReclaimable
++                f_minfo = "%s/%s/meminfo" % (path, file_name)
++                try:
++                    with open(f_minfo) as fm:
++                        lines = fm.readlines()
++                        for line in lines:
++                            match_list = ["MemFree:", "FilePages:",
++                                          "SReclaimable:"]
++                            if any(x in line for x in match_list):
++                                sp = line.split()
++                                avail += int(sp[3])
++                except IOError:
++                    avail = 0
++
++        # now calculate PSS from /proc/*/smaps
++        path = '/proc'
++        dirs = [os.path.join(path, d) for d in os.listdir(path) if
++                os.path.isdir(os.path.join(path, d))]
++        pss_sum = 0
++        for dir in dirs:
++            file = dir + '/smaps'
++            if os.path.exists(file):
++                try:
++                    with open(file) as fd:
++                        for line in fd.readlines():
++                            if line.startswith("Pss"):
++                                sp = line.split()
++                                pss_sum += int(sp[1])
++                except IOError:
++                    pass
++
++        # mem_total is the total mem available to the platform.
++        # since we excluded huge pages, it is avail + pss
++        mem_total = avail + pss_sum
++
++        mem_usage = 100.0 * float(mem_total - MemFree - Buffers - Cached -
++                                  SReclaimable) / float(mem_total)
++        self._data[fields.MonitorMetricType.PLATFORM_MEM_PERCENT] = mem_usage
++        LOG.debug("Average Platform Memory Usage: %.2f%%" % mem_usage)
++
++    # Calculate relative occupancy of platform cpus.
++    def _update_data_cpu(self, init=False, **kwargs):
++        cpus = []
++        for cpu in self._cpu_list:
++            cpus.append("cpu%s" % cpu)
++
++        t1 = {}
++        t1['timestamp'] = self._data['timestamp']
++
++        if self.is_schedstat:
++            # Obtain cumulative cputime (nanoseconds) from 7th field of
++            # /proc/schedstat. This is the time running tasks on this cpu.
++            try:
++                with open(PROC_SCHEDSTAT) as f:
++                    for line in f:
++                        l = [x for x in cpus if x in line]
++                        if l:
++                            cpu = l[0]
++                            sp = line.split()
++                            t1[cpu] = int(sp[7])
++            except Exception as e:
++                LOG.error(_LE('parsing %(file)s: error=%(err)s'),
++                          {'file': PROC_SCHEDSTAT, 'err': e})
++                return
++        else:
++            try:
++                with open(PROC_STAT) as f:
++                    for line in f:
++                        l = [x for x in cpus if x in line]
++                        if l:
++                            # total cputime excluding idle and iowait
++                            # cpu<x> user nice sys idle iowt hirq sirq steal
++                            cpu = l[0]
++                            sp = line.split()
++                            user = int(sp[1])
++                            nice = int(sp[2])
++                            sys = int(sp[3])
++                            hirq = int(sp[6])
++                            sirq = int(sp[7])
++                            steal = int(sp[8])
++                            t1[cpu] = CLOCK_NS \
++                                * (user + nice + sys + hirq + sirq + steal)
++            except Exception as e:
++                LOG.error(_LE('parsing %(file)s: error=%(err)s'),
++                          {'file': PROC_STAT, 'err': e})
++                return
++
++        if init:
++            self._t0 = copy.deepcopy(t1)
++            return
++
++        # Calculate average occupancy of platform cores
++        n_cpus = 0
++        cputime_ms = 0
++        elapsed_s = timeutils.delta_seconds(self._t0['timestamp'],
++                                            self._data['timestamp'])
++        for cpu in cpus:
++            n_cpus += 1
++            cputime_ms += (t1[cpu] - self._t0[cpu]) / ONE_MILLION
++        if n_cpus > 0 and elapsed_s > 0:
++            occupancy_p = ONE_HUNDRED * float(cputime_ms) / ONE_THOUSAND \
++                / float(elapsed_s) / n_cpus
++        else:
++            occupancy_p = 0.0
++
++        self._t0 = copy.deepcopy(t1)
++
++        self._data[fields.MonitorMetricType.PLATFORM_CPU_PERCENT] = occupancy_p
++        LOG.debug("Average Platform Cpu Usage: %.2f%%" % occupancy_p)
+diff --git a/nova/compute/monitors/platform_monitor.py b/nova/compute/monitors/platform_monitor.py
+deleted file mode 100644
+index e801d9c..0000000
+--- a/nova/compute/monitors/platform_monitor.py
++++ /dev/null
+@@ -1,178 +0,0 @@
+-# Copyright 2016 Intel Corporation.
+-# All Rights Reserved.
+-#
+-#    Licensed under the Apache License, Version 2.0 (the "License"); you may
+-#    not use this file except in compliance with the License. You may obtain
+-#    a copy of the License at
+-#
+-#         http://www.apache.org/licenses/LICENSE-2.0
+-#
+-#    Unless required by applicable law or agreed to in writing, software
+-#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+-#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+-#    License for the specific language governing permissions and limitations
+-#    under the License.
+-
+-"""
+-Platform monitor to retrieve platform CPU and MEM information
+-"""
+-
+-import os
+-import re
+-import time
+-
+-from nova.compute import monitors
+-import nova.utils as utils
+-from oslo_log import log as logging
+-
+-LOG = logging.getLogger(__name__)
+-
+-ONE_MILLION = 1000000
+-ONE_THOUSAND = 1000
+-ONE_HUNDRED = 100
+-
+-
+-class PlatformMonitor(monitors.ResourceMonitorBase):
+-    """CPU monitor base."""
+-
+-    def __init__(self, parent):
+-        super(PlatformMonitor, self).__init__(parent)
+-        self.source = 'platform-monitor-stats'
+-        self._cpu_stats = {}
+-        self._cpu_usage_percent = 0
+-        self._mem_usage_percent = 0
+-        self._cpu_list = []
+-
+-        with open('/etc/nova/compute_reserved.conf') as f:
+-            lines = f.readlines()
+-            for line in lines:
+-                if "PLATFORM_CPU_LIST" in line:
+-                    sp = line.split('=')
+-                    self._cpu_list = utils.range_to_list(
+-                            re.findall('"(.*)"', sp[1])[0])
+-
+-    @monitors.ResourceMonitorBase.add_timestamp
+-    def _get_platform_cpu_usage_percent(self, **kwargs):
+-        return self._cpu_usage_percent
+-
+-    @monitors.ResourceMonitorBase.add_timestamp
+-    def _get_platform_mem_usage_percent(self, **kwargs):
+-        return self._mem_usage_percent
+-
+-    def _update_data(self, **kwargs):
+-        self._update_data_mem()
+-        self._update_data_cpu()
+-
+-    # Calculate relative percent used platform 4K memory
+-    def _update_data_mem(self, **kwargs):
+-        avail = 0
+-        with open('/proc/meminfo') as fp:
+-            m = fp.read().split()
+-
+-        MemFree = int(m[m.index('MemFree:') + 1])
+-        Buffers = int(m[m.index('Buffers:') + 1])
+-        Cached = int(m[m.index('Cached:') + 1])
+-        SReclaimable = int(m[m.index('SReclaimable:') + 1])
+-        path = "/sys/devices/system/node/"
+-
+-        dir = os.listdir(path)
+-        for file_name in dir:
+-            # look for /sys/devices/system/node/node() dirs
+-            if 'node' in file_name:
+-                # look into /sys/devices/system/node/node()/meminfo
+-                # to compute available 4K memory from MemFree, FilePages,
+-                # and SReclaimable
+-                f_minfo = "%s/%s/meminfo" % (path, file_name)
+-                try:
+-                    with open(f_minfo) as fm:
+-                        lines = fm.readlines()
+-                        for line in lines:
+-                            match_list = ["MemFree:", "FilePages:",
+-                                          "SReclaimable:"]
+-                            if any(x in line for x in match_list):
+-                                sp = line.split()
+-                                avail += int(sp[3])
+-                except IOError:
+-                    avail = 0
+-
+-        # now calculate PSS from /proc/*/smaps
+-        path = '/proc'
+-        dirs = [os.path.join(path, d) for d in os.listdir(path) if
+-                os.path.isdir(os.path.join(path, d))]
+-        pss_sum = 0
+-        for dir in dirs:
+-            file = dir + '/smaps'
+-            if os.path.exists(file):
+-                try:
+-                    with open(file) as fd:
+-                        for line in fd.readlines():
+-                            if line.startswith("Pss"):
+-                                sp = line.split()
+-                                pss_sum += int(sp[1])
+-                except IOError:
+-                    pass
+-
+-        # mem_total is the total mem available to the platform.
+-        # since we excluded huge pages, it is avail + pss
+-        mem_total = avail + pss_sum
+-
+-        mem_usage = 100.0 * float(mem_total - MemFree - Buffers - Cached -
+-                                  SReclaimable) / float(mem_total)
+-        self._mem_usage_percent = mem_usage
+-        LOG.debug("Average Platform Memory Usage: %.2f%%" % mem_usage)
+-
+-    # Calculate relative occupancy of platform cpus.
+-    def _update_data_cpu(self, **kwargs):
+-        # Don't allow to call this function so frequently (<= 1 sec)
+-        now = time.time()
+-        if self._cpu_stats.get("timestamp") is not None:
+-            delta = now - self._cpu_stats.get("timestamp")
+-            if delta <= 1:
+-                return
+-
+-        cpus = []
+-        cpu_times = {}
+-        for cpu in self._cpu_list:
+-            cpus.append("cpu%s" % cpu)
+-
+-        # Obtain cumulative cpu time from /proc/schedstat, row cpuX, 7th field.
+-        # 7th field is the sum of all time spent running by tasks on this
+-        # processor (in ms)
+-        with open('/proc/schedstat') as f:
+-            lines = f.readlines()
+-            # first check version
+-            for line in lines:
+-                if "version" in line:
+-                    sp = line.split()
+-                    if sp[1] != "15":
+-                        # only version 15 supported
+-                        return
+-                l = [cp for cp in cpus if cp in line]
+-                if l:
+-                    sp = line.split()
+-                    cpu_times[l[0]] = sp[7]
+-
+-        if not self._cpu_stats:
+-            self._cpu_stats = cpu_times.copy()
+-            self._cpu_stats['timestamp'] = now
+-            return
+-
+-        n_cpus = 0
+-        cputime_ms = 0
+-        elapsed_s = now - self._cpu_stats['timestamp']
+-        for cpu in cpu_times:
+-            n_cpus += 1
+-            cputime_ms += (int(cpu_times[cpu]) - int(self._cpu_stats[cpu])) \
+-                           / ONE_MILLION
+-        if n_cpus > 0:
+-            occupancy_p = (ONE_HUNDRED * float(cputime_ms)) \
+-                          / ONE_THOUSAND / float(elapsed_s) / n_cpus
+-        else:
+-            occupancy_p = 0.0
+-
+-        self._cpu_usage_percent = occupancy_p
+-        LOG.debug("Average Platform Cpu Usage: %.2f%%" %
+-                  self._cpu_usage_percent)
+-
+-        self._cpu_stats = cpu_times.copy()
+-        self._cpu_stats['timestamp'] = now
+diff --git a/nova/objects/fields.py b/nova/objects/fields.py
+index 5ac1672..039f962 100644
+--- a/nova/objects/fields.py
++++ b/nova/objects/fields.py
+@@ -492,6 +492,8 @@ class MonitorMetricType(Enum):
+     VSWITCH_MAX_AVAIL = "vswitch.max_avail"
+     VSWITCH_MULTI_AVAIL = "vswitch.multi_avail"
+     VSWITCH_UTIL = "vswitch.util"
++    PLATFORM_CPU_PERCENT = "platform.cpu.usage.percent"
++    PLATFORM_MEM_PERCENT = "platform.mem.usage.percent"
+ 
+     ALL = (
+         CPU_FREQUENCY,
+@@ -509,6 +511,8 @@ class MonitorMetricType(Enum):
+         VSWITCH_MAX_AVAIL,
+         VSWITCH_MULTI_AVAIL,
+         VSWITCH_UTIL,
++        PLATFORM_CPU_PERCENT,
++        PLATFORM_MEM_PERCENT,
+     )
+ 
+     def __init__(self):
+diff --git a/nova/scheduler/filters/platform_filter.py b/nova/scheduler/filters/platform_filter.py
+index bc27ff4..bb684bd 100644
+--- a/nova/scheduler/filters/platform_filter.py
++++ b/nova/scheduler/filters/platform_filter.py
+@@ -19,6 +19,7 @@
+ from oslo_config import cfg
+ from oslo_log import log as logging
+ 
++from nova.objects import fields
+ from nova.scheduler import filters
+ 
+ LOG = logging.getLogger(__name__)
+@@ -57,9 +58,9 @@ class PlatformFilter(filters.BaseHostFilter):
+ 
+         try:
+             host_plat_cpu_usage = host_state.metrics.get(
+-                'platform.cpu.usage.percent').value
++                fields.MonitorMetricType.PLATFORM_CPU_PERCENT).value
+             host_plat_mem_usage = host_state.metrics.get(
+-                'platform.mem.usage.percent').value
++                fields.MonitorMetricType.PLATFORM_MEM_PERCENT).value
+         except AttributeError:
+             # If host does not support these metrics we fall into legacy mode
+             return True
+diff --git a/nova/scheduler/host_manager.py b/nova/scheduler/host_manager.py
+index 582ba45..b0b1e0a 100644
+--- a/nova/scheduler/host_manager.py
++++ b/nova/scheduler/host_manager.py
+@@ -247,8 +247,15 @@ class HostState(object):
+ 
+         # extension - add debug logs for each metric
+         nodename = compute.get('hypervisor_hostname')
+-        for m in self.metrics.objects:
+-            LOG.debug('metrics(%s): metric=%s' % (nodename, m.to_dict()))
++        metrics_ = {}
++        if self.metrics:
++            for m in self.metrics.objects:
++                if hasattr(m, 'name') and hasattr(m, 'value'):
++                    metrics_.update({m.name: m.value})
++        LOG.debug('metrics(%s): %s'
++            % (nodename, ', '.join(['%s=%s' % (k, v) for (k, v) in
++                                    sorted(metrics_.items())]))
++        )
+ 
+         # update allocation ratios given by the ComputeNode object
+         self.cpu_allocation_ratio = compute.cpu_allocation_ratio
+diff --git a/nova/tests/unit/objects/test_objects.py b/nova/tests/unit/objects/test_objects.py
+index d254287..959f120 100644
+--- a/nova/tests/unit/objects/test_objects.py
++++ b/nova/tests/unit/objects/test_objects.py
+@@ -1161,7 +1161,7 @@ object_data = {
+     'Migration': '1.4-17979b9f2ae7f28d97043a220b2a8350',
+     'MigrationContext': '1.0-d8c2f10069e410f639c49082b5932c92',
+     'MigrationList': '1.3-55595bfc1a299a5962614d0821a3567e',
+-    'MonitorMetric': '1.1-6e3500fac4ab912863d4caaca3d64e41',
++    'MonitorMetric': '1.1-0fc771d8b3f29946f43a72547ceb07f9',
+     'MonitorMetricList': '1.1-15ecf022a68ddbb8c2a6739cfc9f8f5e',
+     'NotificationPublisher': '1.0-bbbc1402fb0e443a3eb227cc52b61545',
+     'NUMACell': '1.2-861855e70b6f06080da5d1aebade8b63',
+diff --git a/setup.cfg b/setup.cfg
+index 66115d7..34e2fb3 100644
+--- a/setup.cfg
++++ b/setup.cfg
+@@ -41,6 +41,10 @@ oslo.config.opts.defaults =
+ 
+ nova.compute.monitors.cpu =
+     virt_driver = nova.compute.monitors.cpu.virt_driver:Monitor
++nova.compute.monitors.vswitch =
++    vswitch_monitor = nova.compute.monitors.vswitch.vswitch_monitor:VswitchMonitor
++nova.compute.monitors.platform =
++    platform_monitor = nova.compute.monitors.platform.platform_monitor:PlatformMonitor
+ nova.compute.resources =
+ 
+ nova.image.download.modules =
+-- 
+2.7.4
+

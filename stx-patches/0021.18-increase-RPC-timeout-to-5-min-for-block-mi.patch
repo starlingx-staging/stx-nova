@@ -1,0 +1,35 @@
+From 0ebba2d37ce14e6f5ea01d34c02e91e1853fb3d5 Mon Sep 17 00:00:00 2001
+From: Jack Ding <jack.ding@windriver.com>
+Date: Tue, 11 Apr 2017 16:35:13 -0400
+Subject: [PATCH] increase RPC timeout to 5 min for block migration
+
+Increase RPC msg timeout from 1 minute to 5 minutes for block migration,
+in case glance image download takes too long at destination.
+---
+ nova/compute/rpcapi.py | 10 +++++++++-
+ 1 file changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/nova/compute/rpcapi.py b/nova/compute/rpcapi.py
+index 3b772b8..7a5a12f 100644
+--- a/nova/compute/rpcapi.py
++++ b/nova/compute/rpcapi.py
+@@ -736,7 +736,15 @@ class ComputeAPI(object):
+             version = '4.0'
+             if migrate_data:
+                 migrate_data = migrate_data.to_legacy_dict()
+-        cctxt = client.prepare(server=host, version=version)
++
++        # increase RPC msg timeout from 1 minute to 5 minutes
++        # for block migration, in case glance image download takes too long at
++        # destination
++        if (migrate_data and 'block_migration' in migrate_data and
++                migrate_data.block_migration):
++            cctxt = client.prepare(server=host, version=version, timeout=300)
++        else:
++            cctxt = client.prepare(server=host, version=version)
+         result = cctxt.call(ctxt, 'pre_live_migration',
+                             instance=instance,
+                             block_migration=block_migration,
+-- 
+2.7.4
+

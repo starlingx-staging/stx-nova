@@ -1,0 +1,138 @@
+From e00fdcb04e01d47351d0c8ab1d6c27177e83b902 Mon Sep 17 00:00:00 2001
+From: Jim Gauld <james.gauld@windriver.com>
+Date: Wed, 18 May 2016 00:04:38 -0400
+Subject: [PATCH 016/143] primary: Non-normalized scheduler weights
+
+This commit merges R3 commits:
+
+7ff9457 Port non-normalized scheduler weights to Mitaka
+    This disables the scheduler weigher normalization feature, and is now
+    configurable via CONF.normalize_weigher.
+
+    Disabling normalization does not change the rank of hosts that are
+    selected when a single weigher is used, it just changes optics of
+    the calculated "weight" to be a real value instead of a
+    completely-useless-garbage number.  The weight from selected host
+    is displayed in scheduler log, so that should make some sense.
+
+    This update contains the weight normalization component from:
+    d6d9e76 - Nova compute claims load balance using vswitch utilization
+
+fccd0fe Fix for disabling normalized weights
+    This removes the weigher functionality introduced in Mitaka that
+    sets weights to zero if there is <= 1 host to schedule.
+
+    This improves the optics of the scheduler logs, where the resulting
+    weight actually means something.
+
+__TYPE_primary
+__TAG_scheduler,weigher
+__R4_commit_6854e59
+__R3_commit_f67c667
+__TC2988
+---
+ nova/conf/scheduler.py          |  7 +++++++
+ nova/tests/unit/conf_fixture.py | 10 ++++++++++
+ nova/weights.py                 | 22 +++++++++++++++++-----
+ 3 files changed, 34 insertions(+), 5 deletions(-)
+
+diff --git a/nova/conf/scheduler.py b/nova/conf/scheduler.py
+index ecd1716..eb9f830 100644
+--- a/nova/conf/scheduler.py
++++ b/nova/conf/scheduler.py
+@@ -123,6 +123,13 @@ is added to avoid any overhead from constantly checking. If enabled,
+ every time this runs, we will select any unmapped hosts out of each
+ cell database on every run.
+ """),
++# extension - prevent normalization of weights; post-analysis of scheduler
++# logs requires unaltered values
++    cfg.BoolOpt("normalize_weigher",
++        default=False,
++        help="""
++Normalize weigher list values between 0 and 1.0.
++"""),
+ ]
+ 
+ filter_scheduler_group = cfg.OptGroup(name="filter_scheduler",
+diff --git a/nova/tests/unit/conf_fixture.py b/nova/tests/unit/conf_fixture.py
+index c037754..bfbc212 100644
+--- a/nova/tests/unit/conf_fixture.py
++++ b/nova/tests/unit/conf_fixture.py
+@@ -13,6 +13,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2016 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ from oslo_config import fixture as config_fixture
+ from oslo_policy import opts as policy_opts
+@@ -89,3 +96,6 @@ class ConfFixture(config_fixture.Config):
+         policy_opts.set_defaults(self.conf)
+         self.addCleanup(utils.cleanup_dns_managers)
+         self.addCleanup(ipv6.api.reset_backend)
++
++        # extension
++        self.conf.set_default('normalize_weigher', True, group='scheduler')
+diff --git a/nova/weights.py b/nova/weights.py
+index 4c5ccdc..857c5eb 100644
+--- a/nova/weights.py
++++ b/nova/weights.py
+@@ -12,6 +12,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2015-2016 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ """
+ Pluggable Weighing support
+@@ -21,8 +28,11 @@ import abc
+ 
+ import six
+ 
++import nova.conf
+ from nova import loadables
+ 
++CONF = nova.conf.CONF
++
+ 
+ def normalize(weight_list, minval=None, maxval=None):
+     """Normalize the values in a list between 0 and 1.0.
+@@ -125,16 +135,18 @@ class BaseWeightHandler(loadables.BaseLoader):
+         """Return a sorted (descending), normalized list of WeighedObjects."""
+         weighed_objs = [self.object_class(obj, 0.0) for obj in obj_list]
+ 
+-        if len(weighed_objs) <= 1:
+-            return weighed_objs
++        if CONF.scheduler.normalize_weigher:
++            if len(weighed_objs) <= 1:
++                return weighed_objs
+ 
+         for weigher in weighers:
+             weights = weigher.weigh_objects(weighed_objs, weighing_properties)
+ 
+             # Normalize the weights
+-            weights = normalize(weights,
+-                                minval=weigher.minval,
+-                                maxval=weigher.maxval)
++            if CONF.scheduler.normalize_weigher:
++                weights = normalize(weights,
++                                    minval=weigher.minval,
++                                    maxval=weigher.maxval)
+ 
+             for i, weight in enumerate(weights):
+                 obj = weighed_objs[i]
+-- 
+2.7.4
+

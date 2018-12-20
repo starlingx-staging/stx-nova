@@ -1,0 +1,888 @@
+From 5f01d905624a546b7719b75ade0fa2cb7dba1ccd Mon Sep 17 00:00:00 2001
+From: Gerry Kopec <Gerry.Kopec@windriver.com>
+Date: Wed, 18 May 2016 20:15:33 -0400
+Subject: [PATCH 018/143] primary: KVM failure detection & recovery and orphan
+ instance cleanup
+
+This commit merges the following R3 commits:
+
+2d6afc9 Port KVM failure detection and recovery
+    Port R2 commit:
+    7063b69 VIM: Refactor KVM failure detection and recovery
+       This moves the kvm failure detection and recovery functionality into
+       TiS VIM. This update includes nova changes to distinguish between a
+       KVM crash and stop, as well as sending crash notification
+
+    In addition, added tox testcases for crashed power_state and lifecycle
+    event.
+
+80cfc70 add audit to clean up orphan instances
+    This commit adds an audit to find and deal with instances that are
+    listed in the hypervisor on a given compute node but are not
+    listed in the nova database as running on that compute node.
+
+    Instances in the middle of migration or waiting for resize/migrate
+    confirmation will not be destroyed.
+
+    As part of this we introduce a libvirt routine to destroy/undefine
+    a domain given only the name (needed if the domain is not listed
+    in the nova DB).
+
+    If we take an exception getting the information from the nova DB,
+    there's not much point in continuing the audit with bad data so
+    just exit and hope it does better next time around.
+
+    Also, if we get an InstanceNotFound exception when doing the
+    destroy(), there's a chance we'll get it when calling cleanup() so
+    just ignore that exception and continue on.
+
+    This includes the following kilo commits:
+    6138f54c add audit to clean up orphan instances
+    5342042f Trouble destroying illegitimate instance
+    ac7b182d improve orphan audit robustness
+
+    Change-Id: I4ca36a44d20be7493f58a69029f966eb62c6a921
+
+f383c58 Fix handling of KVM failure in mitaka
+    The changes to support KVM failure detection and recovery (commit
+    2d6afc9174a) don't work in mitaka because upstream an additional
+    check was added to handle_lifecycle_check to verify that event
+    matches the current state of the instance (according to libvirt).
+    When the hypervisor crashes, libvirt shows the guest in the shutdown
+    state, but we map it to the crashed state so the VIM will restart the
+    guest.
+
+    The fix is to extend the state check in handle_lifecycle_event to
+    handle this special case.
+
+8cfdb1a synchronize _sync_instance_power_state() from LifeCycle events
+  Calling _sync_instance_power_state() from power_state periodic audit
+  is already synchronized. This change makes calling this function from
+  LifeCycle events handling path synchronized to avoid race conditions
+  when 2 threads calling the same function.
+  This change is a candidate for upstreaming.
+
+cf95427 VMs remain in shutoff state after killing kvm process.
+  These changes deal with race conditions between power_state audit
+  and instance lifecycle events handling when killing kvm process.
+
+  1. Skip stopping instance if current DB power_state is CRASHED.
+  Without this change when instance is stopped by power_state audit
+  the available_state is reset to '' from 'failed, crashed'. If VIM
+  happens to check the available_state at this time after failed the
+  instance during recovering process, it considers fail-instance task
+  is not complete therefore reboot fsm is stuck for ever.
+
+  2. In _sync_instance_power_state(), reset task_state to None when
+  instance crashed. Without this change, if task_state is set to
+  powering-off by power_state audit thread the reboot triggered by VIM
+  recovery will fail.
+
+  3. In _sync_instance_power_state(), return if db power_state is
+  set to crashed. DB power_state being CRASHED here means the instance
+  is in the middle of handling lifecycle event. The current thread is
+  from power_state audit and it should be skipped to allow lifecyle
+  handling to proceed to instance recovery.
+
+d20e24a nova: Bug 272: orphan vm is not removed
+   This updated adds back the routine: nova/virt/libvirt/host.py
+   _get_domain_by_name() which was removed upstream, but is still
+   needed by our orphan audit.
+
+__TYPE_primary
+__TAG_robustness,libvirt,recovery
+__R4_commit_2814422
+__R3_commit_07c7ac8
+__TC2989,TC2990
+---
+ nova/compute/manager.py                     | 202 +++++++++++++++++++++++++---
+ nova/notifications/base.py                  |  10 ++
+ nova/tests/unit/compute/test_compute.py     |  35 +++++
+ nova/tests/unit/compute/test_compute_mgr.py |  38 +++++-
+ nova/tests/unit/test_notifications.py       |  11 +-
+ nova/tests/unit/virt/libvirt/fakelibvirt.py |  16 +++
+ nova/tests/unit/virt/libvirt/test_host.py   |  45 +++++++
+ nova/virt/driver.py                         |  12 +-
+ nova/virt/event.py                          |  10 ++
+ nova/virt/libvirt/driver.py                 |  47 +++++++
+ nova/virt/libvirt/host.py                   |  36 ++++-
+ 11 files changed, 439 insertions(+), 23 deletions(-)
+
+diff --git a/nova/compute/manager.py b/nova/compute/manager.py
+index c39d9a0..a355c4b 100644
+--- a/nova/compute/manager.py
++++ b/nova/compute/manager.py
+@@ -540,6 +540,7 @@ class ComputeManager(manager.Manager):
+         else:
+             self._live_migration_semaphore = compute_utils.UnlimitedSemaphore()
+         self._failed_builds = 0
++        self.suspected_uuids = set([])
+ 
+         super(ComputeManager, self).__init__(service_name="compute",
+                                              *args, **kwargs)
+@@ -1078,13 +1079,27 @@ class ComputeManager(manager.Manager):
+             vm_power_state = power_state.RUNNING
+         elif event.get_transition() == virtevent.EVENT_LIFECYCLE_SUSPENDED:
+             vm_power_state = power_state.SUSPENDED
++        # add handling of crashed event
++        elif event.get_transition() == virtevent.EVENT_LIFECYCLE_CRASHED:
++            vm_power_state = power_state.CRASHED
+         else:
+             LOG.warning("Unexpected power state %d", event.get_transition())
+ 
++        @utils.synchronized(instance.uuid)
++        def sync_instance_power_state():
++            self._sync_instance_power_state(context,
++                                            instance,
++                                            vm_power_state)
++
+         # Note(lpetrut): The event may be delayed, thus not reflecting
+         # the current instance power state. In that case, ignore the event.
+         current_power_state = self._get_power_state(context, instance)
+-        if current_power_state == vm_power_state:
++        if (current_power_state == vm_power_state or
++                # We map hypervisor crashes to the CRASHED power state,
++                # but libvirt will put the guest in the SHUTDOWN state. See
++                # nova.virt.libvirt.host.Host._event_lifecycle_callback...
++                (vm_power_state == power_state.CRASHED and
++                 current_power_state == power_state.SHUTDOWN)):
+             LOG.debug('Synchronizing instance power state after lifecycle '
+                       'event "%(event)s"; current vm_state: %(vm_state)s, '
+                       'current task_state: %(task_state)s, current DB '
+@@ -1096,9 +1111,7 @@ class ComputeManager(manager.Manager):
+                        'db_power_state': instance.power_state,
+                        'vm_power_state': vm_power_state},
+                       instance_uuid=instance.uuid)
+-            self._sync_instance_power_state(context,
+-                                            instance,
+-                                            vm_power_state)
++            sync_instance_power_state()
+ 
+     def handle_events(self, event):
+         if isinstance(event, virtevent.LifecycleEvent):
+@@ -1165,6 +1178,8 @@ class ComputeManager(manager.Manager):
+                 CONF.concurrent_disk_operations)
+ 
+         try:
++            # Destroy any running domains not in the DB
++            self._destroy_orphan_instances(context)
+             # checking that instance was not already evacuated to other host
+             self._destroy_evacuated_instances(context)
+             for instance in instances:
+@@ -2544,6 +2559,15 @@ class ComputeManager(manager.Manager):
+         @utils.synchronized(instance.uuid)
+         def do_stop_instance():
+             current_power_state = self._get_power_state(context, instance)
++            # Get the latest DB info to minimize race condition.
++            # If the instance is crashed, skip stopping and let VIM recovery
++            # code takes over.
++            instance.refresh()
++            if instance.power_state == power_state.CRASHED:
++                LOG.info('Skip stopping instance since instance crashed.',
++                         instance_uuid=instance.uuid)
++                return
++
+             LOG.debug('Stopping instance; current vm_state: %(vm_state)s, '
+                       'current task_state: %(task_state)s, current DB '
+                       'power_state: %(db_power_state)s, current VM '
+@@ -4602,6 +4626,13 @@ class ComputeManager(manager.Manager):
+                 self.host, action=fields.NotificationAction.UNSHELVE,
+                 phase=fields.NotificationPhase.END)
+ 
++    # add handling of instance crash
++    def _request_recovery(self, context, instance):
++        """Instance crashed notification for recovery request."""
++        instance.save(expected_task_state=[None])
++        self._instance_update(context, instance,
++                              power_state=power_state.CRASHED)
++
+     @messaging.expected_exceptions(NotImplementedError)
+     @wrap_instance_fault
+     def reset_network(self, context, instance):
+@@ -6607,6 +6638,10 @@ class ComputeManager(manager.Manager):
+         db_power_state = db_instance.power_state
+         vm_state = db_instance.vm_state
+ 
++        # skip periodic synv when VM Crashed event is being handled
++        if db_power_state == power_state.CRASHED:
++            return
++
+         if self.host != db_instance.host:
+             # on the sending end of nova-compute _sync_power_state
+             # may have yielded to the greenthread performing a live
+@@ -6623,16 +6658,22 @@ class ComputeManager(manager.Manager):
+                      instance=db_instance)
+             return
+         elif db_instance.task_state is not None:
+-            # on the receiving end of nova-compute, it could happen
+-            # that the DB instance already report the new resident
+-            # but the actual VM has not showed up on the hypervisor
+-            # yet. In this case, let's allow the loop to continue
+-            # and run the state sync in a later round
+-            LOG.info("During sync_power_state the instance has a "
+-                     "pending task (%(task)s). Skip.",
+-                     {'task': db_instance.task_state},
+-                     instance=db_instance)
+-            return
++            # if instance crashed reset task_state to allow recovery
++            if vm_state == vm_states.ACTIVE \
++                    and vm_power_state == power_state.CRASHED:
++                db_instance.task_state = None
++                db_instance.save()
++            else:
++                # on the receiving end of nova-compute, it could happen
++                # that the DB instance already report the new resident
++                # but the actual VM has not showed up on the hypervisor
++                # yet. In this case, let's allow the loop to continue
++                # and run the state sync in a later round
++                LOG.info("During sync_power_state the instance has a "
++                         "pending task (%(task)s). Skip.",
++                         {'task': db_instance.task_state},
++                         instance=db_instance)
++                return
+ 
+         orig_db_power_state = db_power_state
+         if vm_power_state != db_power_state:
+@@ -6660,8 +6701,8 @@ class ComputeManager(manager.Manager):
+             pass
+         elif vm_state == vm_states.ACTIVE:
+             # The only rational power state should be RUNNING
+-            if vm_power_state in (power_state.SHUTDOWN,
+-                                  power_state.CRASHED):
++            # CRASHED is handled separately
++            if vm_power_state == power_state.SHUTDOWN:
+                 LOG.warning("Instance shutdown by itself. Calling the "
+                             "stop API. Current vm_state: %(vm_state)s, "
+                             "current task_state: %(task_state)s, "
+@@ -6687,6 +6728,11 @@ class ComputeManager(manager.Manager):
+                     # For example, there might be another task scheduled.
+                     LOG.exception("error during stop() in sync_power_state.",
+                                   instance=db_instance)
++            # add handling of crashed state
++            elif vm_power_state == power_state.CRASHED:
++                LOG.warning("Instance crashed. Let VIM recover it.(%s)",
++                            db_instance.uuid)
++                self._request_recovery(context, db_instance)
+             elif vm_power_state == power_state.SUSPENDED:
+                 LOG.warning("Instance is suspended unexpectedly. Calling "
+                             "the stop API.", instance=db_instance)
+@@ -7287,3 +7333,127 @@ class ComputeManager(manager.Manager):
+                               error, instance=instance)
+         image_meta = objects.ImageMeta.from_instance(instance)
+         self.driver.unquiesce(context, instance, image_meta)
++
++    def _destroy_orphan_instances(self, context):
++        """Helper to destroy orphan instances.
++
++        Destroys instances that are lingering on hypervisor without
++        a record in the database. Deleted instances with database records
++        will be cleaned up by _cleanup_running_deleted_instances().
++        """
++        # Determine instances on this hypervisor and find each corresponding
++        # instance in the database.
++        filters = {}
++        local_instances = []
++        try:
++            driver_instances = self.driver.list_instances()
++            driver_uuids = self.driver.list_instance_uuids()
++            filters['uuid'] = driver_uuids
++            with utils.temporary_mutation(context, read_deleted='yes'):
++                local_instances = objects.InstanceList.get_by_filters(
++                    context, filters, use_slave=True)
++            db_names = [instance.name for instance in local_instances]
++        except Exception:
++            LOG.error('Error finding orphans instances', exc_info=1)
++            return
++
++        # Instances found on hypervisor but not in database are orphans.
++        # We want to destroy them, but they have no DB entry so we can't
++        # use self.driver.destroy()
++        orphan_instances = set(driver_instances) - set(db_names)
++        for inst_name in orphan_instances:
++            try:
++                LOG.warning('Detected orphan instance %s on hypervisor '
++                            'but not in nova database; deleting this domain.',
++                            inst_name)
++                self.driver.destroy_name(inst_name)
++            except Exception as ex:
++                LOG.warning('Trouble destroying orphan %(name)s: %(details)s',
++                            {'name': inst_name, 'details': ex})
++
++        # Now find instances that are in the nova DB but aren't
++        # supposed to be running on this host.  Ignore ones that are
++        # migrating/resizing or waiting for migrate/resize confirmation.
++        # task_state of RESIZE_MIGRATED/RESIZE_FINISH is fair game.
++        suspected_instances = []
++        for instance in local_instances:
++            if instance.host != self.host:
++                if (instance.task_state in [task_states.MIGRATING,
++                                            task_states.RESIZE_MIGRATING]
++                        or instance.vm_state in [vm_states.RESIZED]):
++                    continue
++                else:
++                    suspected_instances.append(instance)
++        suspected_instances = set(suspected_instances)
++
++        # Look for suspected instances that were also suspect last time
++        # through the audit.  If so we will kill them.
++        to_kill = set([instance for instance in suspected_instances
++                       if instance.uuid in self.suspected_uuids])
++        suspected_instances -= to_kill
++        self.suspected_uuids = set([instance.uuid for instance in
++                                           suspected_instances])
++        for instance in to_kill:
++            try:
++                # Logic taken from _destroy_evacuated_instances()
++                LOG.info('Deleting instance %(inst_name)s as its host ('
++                         '%(instance_host)s) is not equal to our '
++                         'host (%(our_host)s).',
++                         {'inst_name': instance.name,
++                          'instance_host': instance.host,
++                          'our_host': self.host}, instance=instance)
++
++                # Calling self.driver.destroy when the instance is not
++                # found in the database causes self.driver.cleanup to fail
++                # because is it trying to access the instance in the database.
++                # More precisely when it is trying to destroy the disks.
++                instance_not_found = False
++                try:
++                    network_info = self.network_api.get_instance_nw_info(
++                        context, instance)
++                    bdi = self._get_instance_block_device_info(context,
++                                                               instance)
++                    destroy_disks = not (self._is_instance_storage_shared(
++                                                            context, instance))
++                except exception.InstanceNotFound:
++                    instance_not_found = True
++                    network_info = network_model.NetworkInfo()
++                    bdi = {}
++                    LOG.info('Instance has been marked deleted already, '
++                             'removing it from the hypervisor.',
++                             instance=instance)
++                    # always destroy disks if the instance was deleted
++                    destroy_disks = True
++
++                try:
++                    self.driver.destroy(context, instance,
++                                        network_info,
++                                        bdi, destroy_disks)
++                except exception.InstanceNotFound as ex:
++                    if instance_not_found:
++                        # We want to ensure that we want to ensure that we
++                        # clean up as much as possible
++                        try:
++                            self.driver.cleanup(context, instance,
++                                                network_info,
++                                                bdi, destroy_disks=False)
++                        except exception.InstanceNotFound as ex:
++                            # The above call may throw an exception but
++                            # we want to call it anyways since it might
++                            # clean things up a bit.
++                            pass
++                    else:
++                        raise ex
++            except Exception as ex:
++                LOG.warning('Trouble destroying illegitimate instance '
++                            '%(inst_name)s: %(details)s.',
++                            {'inst_name': instance.name, 'details': ex})
++
++    @periodic_task.periodic_task(spacing=300)
++    def _cleanup_running_orphan_instances(self, context):
++        """Cleanup orphan instances.
++
++        Periodic task to clean up instances which are erroneously still
++        lingering on the hypervisor without a record in the database.
++        """
++        self._destroy_orphan_instances(context)
+diff --git a/nova/notifications/base.py b/nova/notifications/base.py
+index b33e36a..0797bba 100644
+--- a/nova/notifications/base.py
++++ b/nova/notifications/base.py
+@@ -13,6 +13,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2013-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ """Functionality related to notifications common to multiple layers of
+ the system.
+@@ -208,11 +215,14 @@ def _compute_states_payload(instance, old_vm_state=None,
+     if old_task_state is None:
+         old_task_state = instance["task_state"]
+ 
++    # add instance power_state to states_payload
++    power_state = instance["power_state"]
+     states_payload = {
+         "old_state": old_vm_state,
+         "state": new_vm_state,
+         "old_task_state": old_task_state,
+         "new_task_state": new_task_state,
++        "power_state": power_state,
+     }
+     return states_payload
+ 
+diff --git a/nova/tests/unit/compute/test_compute.py b/nova/tests/unit/compute/test_compute.py
+index 810219c..1f6604b 100644
+--- a/nova/tests/unit/compute/test_compute.py
++++ b/nova/tests/unit/compute/test_compute.py
+@@ -15,6 +15,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2015-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ """Tests for compute service."""
+ 
+ import contextlib
+@@ -6704,6 +6711,34 @@ class ComputeTestCase(BaseTestCase,
+                                                   exc_info,
+                                                   fault_message='hoge')
+ 
++    # 
++    def test_cleanup_orphan_domain(self):
++        instance = self._create_fake_instance_obj({'host': 'dummyhost'})
++        fake_name = 'dummyname'
++        fake_uuid = 'some-instance-uuid-aaa'
++        with test.nested(
++            mock.patch.object(objects.InstanceList, 'get_by_filters'),
++            mock.patch.object(self.compute.driver, 'list_instances'),
++            mock.patch.object(self.compute.driver, 'list_instance_uuids'),
++            mock.patch.object(self.compute.driver, 'destroy_name'),
++            mock.patch.object(self.compute.driver, 'destroy')
++        ) as (
++            instance_get_by_filters_mock,
++            list_instances_mock,
++            list_instance_uuids_mock,
++            destroy_name_mock,
++            destroy_mock
++        ):
++            instance_get_by_filters_mock.return_value = [instance]
++            list_instances_mock.return_value = [fake_name, instance.name]
++            list_instance_uuids_mock.return_value = [fake_uuid, instance.uuid]
++            self.compute._destroy_orphan_instances(self.context)
++            destroy_name_mock.assert_called_once_with(fake_name)
++            self.assertEqual(self.compute.suspected_uuids, ({instance.uuid}))
++            self.compute._destroy_orphan_instances(self.context)
++            destroy_mock.assert_called_once_with(self.context, instance,
++                                                 mock.ANY, mock.ANY, mock.ANY)
++
+     def _test_cleanup_running(self, action):
+         admin_context = context.get_admin_context()
+         deleted_at = (timeutils.utcnow() -
+diff --git a/nova/tests/unit/compute/test_compute_mgr.py b/nova/tests/unit/compute/test_compute_mgr.py
+index d158cf1..0d8ed92 100644
+--- a/nova/tests/unit/compute/test_compute_mgr.py
++++ b/nova/tests/unit/compute/test_compute_mgr.py
+@@ -9,6 +9,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2013-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ """Unit tests for ComputeManager()."""
+ 
+@@ -113,6 +120,8 @@ class ComputeManagerUnitTestCase(test.NoDBTestCase):
+                      virtevent.EVENT_LIFECYCLE_RESUMED: power_state.RUNNING,
+                      virtevent.EVENT_LIFECYCLE_SUSPENDED:
+                          power_state.SUSPENDED,
++                     # add crashed event
++                     virtevent.EVENT_LIFECYCLE_CRASHED: power_state.CRASHED,
+         }
+ 
+         for transition, pwr_state in event_map.items():
+@@ -706,7 +715,7 @@ class ComputeManagerUnitTestCase(test.NoDBTestCase):
+         mock_host_get.assert_called_once_with(self.context, our_host,
+                                 expected_attrs=['info_cache', 'metadata'])
+         mock_init_virt.assert_called_once_with()
+-        mock_temp_mut.assert_called_once_with(self.context, read_deleted='yes')
++        mock_temp_mut.assert_called_with(self.context, read_deleted='yes')
+         mock_get_inst.assert_called_once_with(self.context)
+         mock_get_net.assert_called_once_with(self.context, deleted_instance)
+ 
+@@ -1605,8 +1614,8 @@ class ComputeManagerUnitTestCase(test.NoDBTestCase):
+             self.assertTrue(mock_save.called)
+ 
+     def test_sync_instance_power_state_to_stop(self):
+-        for ps in (power_state.SHUTDOWN, power_state.CRASHED,
+-                   power_state.SUSPENDED):
++        # don't include crashed state - see added testcase
++        for ps in (power_state.SHUTDOWN, power_state.SUSPENDED):
+             self._test_sync_to_stop(power_state.RUNNING, vm_states.ACTIVE, ps)
+ 
+         for ps in (power_state.SHUTDOWN, power_state.CRASHED):
+@@ -1616,6 +1625,25 @@ class ComputeManagerUnitTestCase(test.NoDBTestCase):
+         self._test_sync_to_stop(power_state.SHUTDOWN, vm_states.STOPPED,
+                                 power_state.RUNNING, force=True)
+ 
++    # add testcase for crashed scenario. Detect call to _request_recovery
++    def test_sync_instance_power_state_crashed(self):
++        driver_power_state = power_state.CRASHED
++        instance = self._get_sync_instance(
++                                power_state.RUNNING, vm_states.ACTIVE)
++
++        self.mox.StubOutWithMock(objects.Instance, 'refresh')
++        self.mox.StubOutWithMock(objects.Instance, 'save')
++        self.mox.StubOutWithMock(self.compute, '_request_recovery')
++
++        instance.refresh(use_slave=False)
++        instance.save()
++        self.compute._request_recovery(self.context, instance)
++        self.mox.ReplayAll()
++        self.compute._sync_instance_power_state(self.context, instance,
++                                                driver_power_state)
++        self.mox.VerifyAll()
++        self.mox.UnsetStubs()
++
+     def test_sync_instance_power_state_to_terminate(self):
+         self._test_sync_to_stop(power_state.RUNNING, vm_states.ACTIVE,
+                                 power_state.SHUTDOWN,
+@@ -3713,6 +3741,7 @@ class ComputeManagerUnitTestCase(test.NoDBTestCase):
+             self.context, vm_state=vm_states.ACTIVE,
+             task_state=None, power_state=power_state.SHUTDOWN)
+ 
++        @mock.patch.object(instance, 'refresh')
+         @mock.patch.object(self.compute, '_get_power_state',
+                            return_value=power_state.SHUTDOWN)
+         @mock.patch.object(compute_utils, 'notify_about_instance_action')
+@@ -3720,11 +3749,12 @@ class ComputeManagerUnitTestCase(test.NoDBTestCase):
+         @mock.patch.object(self.compute, '_power_off_instance')
+         @mock.patch.object(instance, 'save')
+         def do_test(save_mock, power_off_mock, notify_mock,
+-                    notify_action_mock, get_state_mock):
++                    notify_action_mock, get_state_mock, refresh_mock):
+             # run the code
+             self.compute.stop_instance(self.context, instance, True)
+             # assert the calls
+             self.assertEqual(2, get_state_mock.call_count)
++            refresh_mock.assert_called_once_with()
+             notify_mock.assert_has_calls([
+                 mock.call(self.context, instance, 'power_off.start'),
+                 mock.call(self.context, instance, 'power_off.end')
+diff --git a/nova/tests/unit/test_notifications.py b/nova/tests/unit/test_notifications.py
+index 6de2aae..9f82260 100644
+--- a/nova/tests/unit/test_notifications.py
++++ b/nova/tests/unit/test_notifications.py
+@@ -12,6 +12,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2013-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ """Tests for common notifications."""
+ 
+@@ -630,8 +637,10 @@ class NotificationsTestCase(test.TestCase):
+ class NotificationsFormatTestCase(test.NoDBTestCase):
+ 
+     def test_state_computation(self):
++        # add power_state
+         instance = {'vm_state': mock.sentinel.vm_state,
+-                    'task_state': mock.sentinel.task_state}
++                    'task_state': mock.sentinel.task_state,
++                    'power_state': None}
+         states = notifications._compute_states_payload(instance)
+         self.assertEqual(mock.sentinel.vm_state, states['state'])
+         self.assertEqual(mock.sentinel.vm_state, states['old_state'])
+diff --git a/nova/tests/unit/virt/libvirt/fakelibvirt.py b/nova/tests/unit/virt/libvirt/fakelibvirt.py
+index 306f115..bdcce0b 100644
+--- a/nova/tests/unit/virt/libvirt/fakelibvirt.py
++++ b/nova/tests/unit/virt/libvirt/fakelibvirt.py
+@@ -11,6 +11,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2013-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ import sys
+ import time
+@@ -103,6 +110,15 @@ VIR_NODE_CPU_STATS_ALL_CPUS = -1
+ 
+ VIR_DOMAIN_START_PAUSED = 1
+ 
++# add virDomainEventStoppedDetailType enum definitions
++VIR_DOMAIN_EVENT_STOPPED_SHUTDOWN = 0
++VIR_DOMAIN_EVENT_STOPPED_DESTROYED = 1
++VIR_DOMAIN_EVENT_STOPPED_CRASHED = 2
++VIR_DOMAIN_EVENT_STOPPED_MIGRATED = 3
++VIR_DOMAIN_EVENT_STOPPED_SAVED = 4
++VIR_DOMAIN_EVENT_STOPPED_FAILED = 5
++VIR_DOMAIN_EVENT_STOPPED_FROM_SNAPSHOT = 6
++
+ # libvirtError enums
+ # (Intentionally different from what's in libvirt. We do this to check,
+ #  that consumers of the library are using the symbolic names rather than
+diff --git a/nova/tests/unit/virt/libvirt/test_host.py b/nova/tests/unit/virt/libvirt/test_host.py
+index 6f2dff79a3..0ba5762 100644
+--- a/nova/tests/unit/virt/libvirt/test_host.py
++++ b/nova/tests/unit/virt/libvirt/test_host.py
+@@ -13,6 +13,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2016-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ import eventlet
+ from eventlet import greenthread
+@@ -213,6 +220,44 @@ class HostTestCase(test.NoDBTestCase):
+         self.assertEqual(got_events[0].transition,
+                          event.EVENT_LIFECYCLE_STOPPED)
+ 
++    # add testcase for crashed event
++    def test_event_lifecycle_crashed(self):
++        got_events = []
++
++        def handler(event):
++            got_events.append(event)
++
++        hostimpl = host.Host("qemu:///system",
++                             lifecycle_event_handler=handler)
++
++        conn = hostimpl.get_connection()
++        hostimpl._init_events_pipe()
++
++        fake_dom_xml = """
++                <domain type='kvm'>
++                  <uuid>cef19ce0-0ca2-11df-855d-b19fbce37686</uuid>
++                  <devices>
++                    <disk type='file'>
++                      <source file='filename'/>
++                    </disk>
++                  </devices>
++                </domain>
++            """
++        dom = fakelibvirt.Domain(conn,
++                                 fake_dom_xml,
++                                 False)
++        hostimpl._event_lifecycle_callback(
++            conn, dom, fakelibvirt.VIR_DOMAIN_EVENT_STOPPED,
++                       fakelibvirt.VIR_DOMAIN_EVENT_STOPPED_FAILED, hostimpl)
++        hostimpl._dispatch_events()
++
++        self.assertEqual(len(got_events), 1)
++        self.assertIsInstance(got_events[0], event.LifecycleEvent)
++        self.assertEqual(got_events[0].uuid,
++                         "cef19ce0-0ca2-11df-855d-b19fbce37686")
++        self.assertEqual(got_events[0].transition,
++                         event.EVENT_LIFECYCLE_CRASHED)
++
+     def test_event_emit_delayed_call_delayed(self):
+         ev = event.LifecycleEvent(
+             "cef19ce0-0ca2-11df-855d-b19fbce37686",
+diff --git a/nova/virt/driver.py b/nova/virt/driver.py
+index 64f5f49..9502667 100644
+--- a/nova/virt/driver.py
++++ b/nova/virt/driver.py
+@@ -13,7 +13,7 @@
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
+ #
+-# Copyright (c) 2014-2016 Wind River Systems, Inc.
++# Copyright (c) 2014-2017 Wind River Systems, Inc.
+ #
+ # The right to copy, distribute, modify, or otherwise make use
+ # of this software may be licensed only pursuant to the terms
+@@ -1624,6 +1624,16 @@ class ComputeDriver(object):
+         """
+         return instance.get('host')
+ 
++    def destroy_name(self, instance_name):
++        """Destroy an instance domain if we only know 'name' and not the full
++        instance (i.e., we lost instance object and it is not in Database).
++        Using this routine is a last resort to reap instances, the preferred
++        method is to use self.destroy(instance).
++
++        This does not unplug VIFs, destroy block devices, or destroy disks.
++        """
++        raise NotImplementedError()
++
+ 
+ def load_compute_driver(virtapi, compute_driver=None):
+     """Load a compute driver module.
+diff --git a/nova/virt/event.py b/nova/virt/event.py
+index 3b065bc..4b79672 100644
+--- a/nova/virt/event.py
++++ b/nova/virt/event.py
+@@ -11,6 +11,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2013-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ """
+ Asynchronous event notifications from virtualization drivers.
+@@ -29,6 +36,8 @@ EVENT_LIFECYCLE_STOPPED = 1
+ EVENT_LIFECYCLE_PAUSED = 2
+ EVENT_LIFECYCLE_RESUMED = 3
+ EVENT_LIFECYCLE_SUSPENDED = 4
++# add crashed event
++EVENT_LIFECYCLE_CRASHED = 5
+ 
+ NAMES = {
+     EVENT_LIFECYCLE_STARTED: _('Started'),
+@@ -36,6 +45,7 @@ NAMES = {
+     EVENT_LIFECYCLE_PAUSED: _('Paused'),
+     EVENT_LIFECYCLE_RESUMED: _('Resumed'),
+     EVENT_LIFECYCLE_SUSPENDED: _('Suspended'),
++    EVENT_LIFECYCLE_CRASHED: _('Crashed')
+ }
+ 
+ 
+diff --git a/nova/virt/libvirt/driver.py b/nova/virt/libvirt/driver.py
+index 15820cb..45387b3 100644
+--- a/nova/virt/libvirt/driver.py
++++ b/nova/virt/libvirt/driver.py
+@@ -8259,3 +8259,50 @@ class LibvirtDriver(driver.ComputeDriver):
+     def is_supported_fs_format(self, fs_type):
+         return fs_type in [disk_api.FS_FORMAT_EXT2, disk_api.FS_FORMAT_EXT3,
+                            disk_api.FS_FORMAT_EXT4, disk_api.FS_FORMAT_XFS]
++
++    def destroy_name(self, instance_name):
++        """Destroy a domain by name.
++
++        Destroy a domain if we only know 'name' and not the full instance
++        (i.e., we lost or never had the instance object and it is not in
++        the DB.)  Using this routine is a last resort to reap instances, the
++        preferred method is to use self.destroy(instance).
++
++        This does not unplug VIFs, destroy block devices, or destroy disks.
++        """
++        try:
++            virt_dom = self._host._get_domain_by_name(instance_name)
++            try:
++                (state, _max_mem, _mem, _cpus, _t) = virt_dom.info()
++                state = libvirt_guest.LIBVIRT_POWER_STATE[state]
++                if state not in [power_state.SHUTDOWN, power_state.CRASHED]:
++                    virt_dom.destroy()
++            except libvirt.libvirtError as e:
++                errcode = e.get_error_code()
++                if errcode == libvirt.VIR_ERR_OPERATION_TIMEOUT:
++                    LOG.warning(
++                        "Cannot destroy instance, operation time out, %s",
++                        instance_name)
++                    reason = _("operation time out")
++                    raise exception.InstancePowerOffFailure(reason=reason)
++                with excutils.save_and_reraise_exception():
++                    LOG.error('Error from libvirt during destroy. '
++                              'Code=%(errcode)s Error=%(e)s, name=%(name)s',
++                              ({'errcode': errcode,
++                                'e': e,
++                                'name': instance_name}))
++
++            try:
++                virt_dom.undefineFlags(
++                    libvirt.VIR_DOMAIN_UNDEFINE_MANAGED_SAVE)
++            except libvirt.libvirtError as e:
++                with excutils.save_and_reraise_exception():
++                    errcode = e.get_error_code()
++                    LOG.error('Error from libvirt during destroy. '
++                              'Code=%(errcode)s Error=%(e)s, name=%(name)s',
++                              ({'errcode': errcode,
++                                'e': e,
++                                'name': instance_name}))
++        except exception.InstanceNotFound:
++            # If the instance is already gone, we're happy.
++            pass
+diff --git a/nova/virt/libvirt/host.py b/nova/virt/libvirt/host.py
+index 10a7dab..41573cd 100644
+--- a/nova/virt/libvirt/host.py
++++ b/nova/virt/libvirt/host.py
+@@ -17,6 +17,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2013-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ """
+ Manages information about the host OS and hypervisor.
+@@ -165,7 +172,11 @@ class Host(object):
+         uuid = dom.UUIDString()
+         transition = None
+         if event == libvirt.VIR_DOMAIN_EVENT_STOPPED:
+-            transition = virtevent.EVENT_LIFECYCLE_STOPPED
++            # transition to crashed if stop failed
++            if detail == libvirt.VIR_DOMAIN_EVENT_STOPPED_FAILED:
++                transition = virtevent.EVENT_LIFECYCLE_CRASHED
++            else:
++                transition = virtevent.EVENT_LIFECYCLE_STOPPED
+         elif event == libvirt.VIR_DOMAIN_EVENT_STARTED:
+             transition = virtevent.EVENT_LIFECYCLE_STARTED
+         elif event == libvirt.VIR_DOMAIN_EVENT_SUSPENDED:
+@@ -561,6 +572,29 @@ class Host(object):
+                     'ex': ex})
+             raise exception.InternalError(msg)
+ 
++    # routine is removed upstream, but needed by orphan cleanup audit
++    def _get_domain_by_name(self, instance_name):
++        """Retrieve libvirt domain object given an instance name.
++
++        All libvirt error handling should be handled in this method and
++        relevant nova exceptions should be raised in response.
++
++        """
++        try:
++            conn = self.get_connection()
++            return conn.lookupByName(instance_name)
++        except libvirt.libvirtError as ex:
++            error_code = ex.get_error_code()
++            if error_code == libvirt.VIR_ERR_NO_DOMAIN:
++                raise exception.InstanceNotFound(instance_id=instance_name)
++
++            msg = (_('Error from libvirt while looking up %(instance_name)s: '
++                     '[Error Code %(error_code)s] %(ex)s') %
++                   {'instance_name': instance_name,
++                    'error_code': error_code,
++                    'ex': ex})
++            raise exception.NovaException(msg)
++
+     def list_guests(self, only_running=True, only_guests=True):
+         """Get a list of Guest objects for nova instances
+ 
+-- 
+2.7.4
+

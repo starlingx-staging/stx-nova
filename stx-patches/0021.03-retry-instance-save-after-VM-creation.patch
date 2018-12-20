@@ -1,0 +1,66 @@
+From 62ecf84b8eb4a655e3afcdefde459c897a67e7c4 Mon Sep 17 00:00:00 2001
+From: Chris Friesen <chris.friesen@windriver.com>
+Date: Mon, 11 Jan 2016 12:34:43 -0600
+Subject: [PATCH] retry instance save after VM creation
+
+In a customer site we saw a case where the VM was created successfully
+but the instance save() call timed out, resulting in the instance being
+torn down and causing problems later when it got recreated with no NICs.
+
+As a partial workaround, let's allow 2 retries for the instance save()
+in order to minimize the likelihood that we'll need to tear down the
+instance.
+
+Change-Id: Id28acc0a9d8ca6066b0b72a3e18e0997da28d19b
+
+(cherry picked from commit 3e24b30)
+---
+ nova/compute/manager.py | 33 ++++++++++++++++++++++++++-------
+ 1 file changed, 26 insertions(+), 7 deletions(-)
+
+diff --git a/nova/compute/manager.py b/nova/compute/manager.py
+index e3e5de2..1a41d05 100644
+--- a/nova/compute/manager.py
++++ b/nova/compute/manager.py
+@@ -2024,13 +2024,32 @@ class ComputeManager(manager.Manager):
+ 
+         self._update_instance_after_spawn(context, instance)
+ 
+-        try:
+-            instance.save(expected_task_state=task_states.SPAWNING)
+-        except (exception.InstanceNotFound,
+-                exception.UnexpectedDeletingTaskStateError) as e:
+-            with excutils.save_and_reraise_exception():
+-                self._notify_about_instance_usage(context, instance,
+-                    'create.error', fault=e)
++        # We observed this instance.save() call to timeout under stress test.
++        # It would be a shame to tear the instance down simply because the
++        # conductor is busy, so give it a couple of chances.
++        attempt = 0
++        retries = 2
++        while True:
++            try:
++                instance.save(expected_task_state=task_states.SPAWNING)
++                break
++            except (exception.InstanceNotFound,
++                    exception.UnexpectedDeletingTaskStateError) as e:
++                with excutils.save_and_reraise_exception():
++                    self._notify_about_instance_usage(context, instance,
++                        'create.error', fault=e)
++            except messaging.MessagingTimeout:
++                attempt += 1
++                if attempt <= retries:
++                    LOG.warning(_LW(
++                        "Retrying instance.save() for uuid %(uuid)s "
++                        "after a MessagingTimeout, attempt %(attempt)s "
++                        "of %(retries)s."),
++                            {'uuid': instance.uuid, 'attempt': attempt,
++                             'retries': retries})
++                else:
++                    raise
+ 
+         self._update_scheduler_instance_info(context, instance)
+         self._notify_about_instance_usage(context, instance, 'create.end',
+-- 
+2.7.4
+

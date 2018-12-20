@@ -1,0 +1,236 @@
+From 8239b5be039a4dd232dba45a7a272d87ebcf19bd Mon Sep 17 00:00:00 2001
+From: Jim Gauld <james.gauld@windriver.com>
+Date: Thu, 30 Mar 2017 23:58:53 -0400
+Subject: [PATCH 045/143] nova service enabled flag for nova-goenabled
+
+Write out volatile flag file /var/run/nova/.nova_<service>_enabled
+indicating that the particular service has started.
+
+This flag is used by nova-compute init and nova-goenabled scripts so
+that we sufficiently wait for GOENABLED.
+
+nfv-vim subsequently issues nova API os-services/force-down and
+os-services/enable to enable the compute service.
+
+2652314 compute init_host enhancement to not wait for plug_vifs
+
+   Reduce wait time in nova-compute initialization by not waiting for
+   instance network connectivity during init_host phase when VIFs are
+   plugged. It turns out we properly wait anyways when instances are
+   hard-rebooted during the init or later by nfv-vim recovery.
+
+   On Supermicro hardware, this recovers 15 seconds wait per instance
+   during initialization after host reboot or lock/unlock.
+
+   Optional parameter wait_vifs=boolean is added to virt/libvirt/driver.py
+   plug_vifs, with default wait_vifs=True.
+
+   The compute host per instance initialization is called with
+   wait_vifs=False,
+   eg., compute/manager.py:init_host -> _init_instance ->
+          self.driver.plug_vifs(instance, net_info, wait_vifs=False)
+
+   This means the compute will GOENABLED sooner, hence earlier recovery
+   by nfv-vim.
+
+__TYPE_primary
+__TAG_goenabled
+__R4_commit_6c9d00d
+---
+ nova/compute/manager.py                     |  2 +-
+ nova/conf/service.py                        |  3 +++
+ nova/service.py                             | 14 ++++++++++++++
+ nova/tests/fixtures.py                      |  1 +
+ nova/tests/unit/compute/test_compute_mgr.py |  4 ++--
+ nova/virt/driver.py                         |  3 ++-
+ nova/virt/fake.py                           |  2 +-
+ nova/virt/hyperv/driver.py                  |  2 +-
+ nova/virt/ironic/driver.py                  |  2 +-
+ nova/virt/libvirt/driver.py                 |  5 +++--
+ nova/virt/xenapi/driver.py                  |  2 +-
+ 11 files changed, 30 insertions(+), 10 deletions(-)
+
+diff --git a/nova/compute/manager.py b/nova/compute/manager.py
+index 1280df3..af32e42 100644
+--- a/nova/compute/manager.py
++++ b/nova/compute/manager.py
+@@ -979,7 +979,7 @@ class ComputeManager(manager.Manager):
+ 
+         net_info = instance.get_network_info()
+         try:
+-            self.driver.plug_vifs(instance, net_info)
++            self.driver.plug_vifs(instance, net_info, wait_vifs=False)
+         except NotImplementedError as e:
+             LOG.debug(e, instance=instance)
+         except exception.VirtualInterfacePlugException:
+diff --git a/nova/conf/service.py b/nova/conf/service.py
+index fea55f2..1a3b7b2 100644
+--- a/nova/conf/service.py
++++ b/nova/conf/service.py
+@@ -168,6 +168,9 @@ Possible Values:
+                ],
+                default='nova.network.manager.VlanManager',
+                help='Full class name for the Manager for network'),
++    cfg.BoolOpt('service_enabled_flag',
++               default=True,
++               help='Write flag file /var/run/nova/.nova_<service>_enabled'),
+     ]
+ 
+ 
+diff --git a/nova/service.py b/nova/service.py
+index 01dceb5..200c295 100644
+--- a/nova/service.py
++++ b/nova/service.py
+@@ -185,6 +185,20 @@ class Service(service.Service):
+         # Add service to the ServiceGroup membership group.
+         self.servicegroup_api.join(self.host, self.topic, self)
+ 
++        # Write volatile flag file indicating service has started.
++        if CONF.service_enabled_flag:
++            volatile_dir = '/var/run/nova'
++            if os.path.isdir(volatile_dir):
++                flag = "{}/.nova_{}_enabled".format(volatile_dir, self.topic)
++                try:
++                    open(flag, 'w').close()
++                    LOG.info('service %(topic)s ready',
++                             {'topic': self.topic})
++                except Exception as e:
++                    LOG.error(
++                        'Cannot create file: %(file)s, error=%(error)s',
++                        {'file': flag, 'error': e})
++
+         if self.periodic_enable:
+             if self.periodic_fuzzy_delay:
+                 initial_delay = random.randint(0, self.periodic_fuzzy_delay)
+diff --git a/nova/tests/fixtures.py b/nova/tests/fixtures.py
+index 6f54048..3810305 100644
+--- a/nova/tests/fixtures.py
++++ b/nova/tests/fixtures.py
+@@ -74,6 +74,7 @@ class ServiceFixture(fixtures.Fixture):
+ 
+     def setUp(self):
+         super(ServiceFixture, self).setUp()
++        CONF.set_override('service_enabled_flag', False)
+         self.service = service.Service.create(**self.kwargs)
+         self.service.start()
+         self.addCleanup(self.service.kill)
+diff --git a/nova/tests/unit/compute/test_compute_mgr.py b/nova/tests/unit/compute/test_compute_mgr.py
+index 064bd80..0986a62 100644
+--- a/nova/tests/unit/compute/test_compute_mgr.py
++++ b/nova/tests/unit/compute/test_compute_mgr.py
+@@ -805,7 +805,7 @@ class ComputeManagerUnitTestCase(test.NoDBTestCase):
+         self.compute._init_instance('fake-context', instance)
+         mock_get_power.assert_has_calls([mock.call(mock.ANY, instance),
+                                          mock.call(mock.ANY, instance)])
+-        mock_plug.assert_called_once_with(instance, mock.ANY)
++        mock_plug.assert_called_once_with(instance, mock.ANY, wait_vifs=False)
+         mock_get_inst.assert_called_once_with(mock.ANY, instance)
+         mock_resume.assert_called_once_with(mock.ANY, instance, mock.ANY,
+                                             'fake-bdm')
+@@ -985,7 +985,7 @@ class ComputeManagerUnitTestCase(test.NoDBTestCase):
+             mock_retry.assert_called_once_with(self.context, instance,
+                 power_state.SHUTDOWN)
+             mock_get_nw.assert_called_once_with()
+-            mock_plug.assert_called_once_with(instance, [])
++            mock_plug.assert_called_once_with(instance, [], wait_vifs=False)
+             mock_get_inst.assert_called_once_with(self.context, instance)
+             mock_finish.assert_called_once_with(self.context, instance,
+                                                 [], [], power_on)
+diff --git a/nova/virt/driver.py b/nova/virt/driver.py
+index 50e9b02..64556b7 100644
+--- a/nova/virt/driver.py
++++ b/nova/virt/driver.py
+@@ -1191,7 +1191,7 @@ class ComputeDriver(object):
+         # TODO(Vek): Need to pass context in for access to auth_token
+         raise NotImplementedError()
+ 
+-    def plug_vifs(self, instance, network_info):
++    def plug_vifs(self, instance, network_info, wait_vifs=True):
+         """Plug virtual interfaces (VIFs) into the given `instance` at
+         instance boot time.
+ 
+@@ -1201,6 +1201,7 @@ class ComputeDriver(object):
+             The instance which gets VIFs plugged.
+         :param nova.network.model.NetworkInfo network_info:
+             The object which contains information about the VIFs to plug.
++        :param boolean wait_vifs: wait for network connectivity.
+ 
+         :return: None
+         """
+diff --git a/nova/virt/fake.py b/nova/virt/fake.py
+index 1421100..bcff168 100644
+--- a/nova/virt/fake.py
++++ b/nova/virt/fake.py
+@@ -173,7 +173,7 @@ class FakeDriver(driver.ComputeDriver):
+     def list_instance_uuids(self):
+         return list(self.instances.keys())
+ 
+-    def plug_vifs(self, instance, network_info):
++    def plug_vifs(self, instance, network_info, wait_vifs=True):
+         """Plug VIFs into networks."""
+         pass
+ 
+diff --git a/nova/virt/hyperv/driver.py b/nova/virt/hyperv/driver.py
+index 9481701..ac4a19b 100644
+--- a/nova/virt/hyperv/driver.py
++++ b/nova/virt/hyperv/driver.py
+@@ -279,7 +279,7 @@ class HyperVDriver(driver.ComputeDriver):
+     def get_instance_disk_info(self, instance, block_device_info=None):
+         pass
+ 
+-    def plug_vifs(self, instance, network_info):
++    def plug_vifs(self, instance, network_info, wait_vifs=True):
+         """Plug VIFs into networks."""
+         self._vmops.plug_vifs(instance, network_info)
+ 
+diff --git a/nova/virt/ironic/driver.py b/nova/virt/ironic/driver.py
+index 66f2a4b..8cb9e80 100644
+--- a/nova/virt/ironic/driver.py
++++ b/nova/virt/ironic/driver.py
+@@ -1423,7 +1423,7 @@ class IronicDriver(virt_driver.ComputeDriver):
+                 LOG.debug("VIF %(vif)s isn't attached to Ironic node %(node)s",
+                           {'vif': port_id, 'node': node.uuid})
+ 
+-    def plug_vifs(self, instance, network_info):
++    def plug_vifs(self, instance, network_info, wait_vifs=True):
+         """Plug VIFs into networks.
+ 
+         :param instance: The instance object.
+diff --git a/nova/virt/libvirt/driver.py b/nova/virt/libvirt/driver.py
+index 49adbc0..c61afc6 100644
+--- a/nova/virt/libvirt/driver.py
++++ b/nova/virt/libvirt/driver.py
+@@ -862,14 +862,15 @@ class LibvirtDriver(driver.ComputeDriver):
+                {'count': waiting, 'vm': instance['uuid']})
+         raise exception.NovaException(msg)
+ 
+-    def plug_vifs(self, instance, network_info):
++    def plug_vifs(self, instance, network_info, wait_vifs=True):
+         """Plug VIFs into networks."""
+         for vif in network_info:
+             LOG.info("plugging vif %(v)s from %(i)s",
+                      {'v': str(vif), 'i': instance.uuid})
+             self.vif_driver.plug(instance, vif)
+         # Wait for network connectivity
+-        self._query_vifs(instance, network_info)
++        if wait_vifs:
++            self._query_vifs(instance, network_info)
+ 
+     def _unplug_vifs(self, instance, network_info, ignore_errors):
+         """Unplug VIFs from networks."""
+diff --git a/nova/virt/xenapi/driver.py b/nova/virt/xenapi/driver.py
+index 4917e4d..45900b0 100644
+--- a/nova/virt/xenapi/driver.py
++++ b/nova/virt/xenapi/driver.py
+@@ -304,7 +304,7 @@ class XenAPIDriver(driver.ComputeDriver):
+         """inject network info for specified instance."""
+         self._vmops.inject_network_info(instance, nw_info)
+ 
+-    def plug_vifs(self, instance, network_info):
++    def plug_vifs(self, instance, network_info, wait_vifs=True):
+         """Plug VIFs into networks."""
+         self._vmops.plug_vifs(instance, network_info)
+ 
+-- 
+2.7.4
+

@@ -1,0 +1,104 @@
+From 494fb77271aca28af98b2527d0d5943635d407b2 Mon Sep 17 00:00:00 2001
+From: Francois Palin <francois.palin@windriver.com>
+Date: Wed, 25 Jan 2017 09:43:55 -0500
+Subject: [PATCH] modified Nova to make the "suspend"
+ HTTP API call act as though it were the "pause" call.
+
+Note that the VM state shows "paused" both for VM status and
+power state. VM is saved to RAM.
+---
+ nova/api/openstack/compute/suspend_server.py       | 13 ++++++++++--
+ .../api/openstack/compute/test_suspend_server.py   | 24 ++++++++++++++++++----
+ 2 files changed, 31 insertions(+), 6 deletions(-)
+
+diff --git a/nova/api/openstack/compute/suspend_server.py b/nova/api/openstack/compute/suspend_server.py
+index fa55b25..0f9f5e1 100644
+--- a/nova/api/openstack/compute/suspend_server.py
++++ b/nova/api/openstack/compute/suspend_server.py
+@@ -11,6 +11,13 @@
+ #   WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #   License for the specific language governing permissions and limitations
+ #   under the License.
++#
++# Copyright (c) 2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ from webob import exc
+ 
+@@ -40,7 +47,8 @@ class SuspendServerController(wsgi.Controller):
+             context.can(ss_policies.POLICY_ROOT % 'suspend',
+                         target={'user_id': server.user_id,
+                                 'project_id': server.project_id})
+-            self.compute_api.suspend(context, server)
++            # suspend operation stubbed for pause
++            self.compute_api.pause(context, server)
+         except exception.InstanceUnknownCell as e:
+             raise exc.HTTPNotFound(explanation=e.format_message())
+         except exception.InstanceIsLocked as e:
+@@ -58,7 +66,8 @@ class SuspendServerController(wsgi.Controller):
+         context.can(ss_policies.POLICY_ROOT % 'resume')
+         try:
+             server = common.get_instance(self.compute_api, context, id)
+-            self.compute_api.resume(context, server)
++            # suspend operation stubbed for pause
++            self.compute_api.unpause(context, server)
+         except exception.InstanceUnknownCell as e:
+             raise exc.HTTPNotFound(explanation=e.format_message())
+         except exception.InstanceIsLocked as e:
+diff --git a/nova/tests/unit/api/openstack/compute/test_suspend_server.py b/nova/tests/unit/api/openstack/compute/test_suspend_server.py
+index d3576e5..76c42cb 100644
+--- a/nova/tests/unit/api/openstack/compute/test_suspend_server.py
++++ b/nova/tests/unit/api/openstack/compute/test_suspend_server.py
+@@ -41,17 +41,32 @@ class SuspendServerTestsV21(admin_only_action_common.CommonTests):
+         self.mox.StubOutWithMock(self.compute_api, 'get')
+ 
+     def test_suspend_resume(self):
+-        self._test_actions(['_suspend', '_resume'])
++        # suspend operation stubbed for pause
++        method_translations = {'_suspend': 'pause',
++                               '_resume': 'unpause'}
++        self._test_actions(['_suspend', '_resume'],
++                           method_translations=method_translations)
+ 
+     def test_suspend_resume_with_non_existed_instance(self):
+         self._test_actions_with_non_existed_instance(['_suspend', '_resume'])
+ 
+     def test_suspend_resume_raise_conflict_on_invalid_state(self):
++        # suspend operation stubbed for pause
++        method_translations = {'_suspend': 'pause',
++                               '_resume': 'unpause'}
++        exception_args = {'_suspend': 'suspend',
++                         '_resume': 'resume'}
+         self._test_actions_raise_conflict_on_invalid_state(['_suspend',
+-                                                            '_resume'])
++                                                            '_resume'],
++                                method_translations=method_translations,
++                                exception_args=exception_args)
+ 
+     def test_actions_with_locked_instance(self):
+-        self._test_actions_with_locked_instance(['_suspend', '_resume'])
++        # suspend operation stubbed for pause
++        method_translations = {'_suspend': 'pause',
++                               '_resume': 'unpause'}
++        self._test_actions_with_locked_instance(['_suspend', '_resume'],
++                           method_translations=method_translations)
+ 
+ 
+ class SuspendServerPolicyEnforcementV21(test.NoDBTestCase):
+@@ -94,7 +109,8 @@ class SuspendServerPolicyEnforcementV21(test.NoDBTestCase):
+                       "Policy doesn't allow %s to be performed." % rule_name,
+                       exc.format_message())
+ 
+-    @mock.patch('nova.compute.api.API.suspend')
++    # suspend operation stubbed for pause
++    @mock.patch('nova.compute.api.API.pause')
+     @mock.patch('nova.api.openstack.common.get_instance')
+     def test_suspend_overridden_policy_pass_with_same_user(self,
+                                                         get_instance_mock,
+-- 
+2.7.4
+

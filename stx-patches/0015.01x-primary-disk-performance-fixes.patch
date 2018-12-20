@@ -1,0 +1,600 @@
+From 7959947f90a7e952427a5f7de7beb42f7a19480c Mon Sep 17 00:00:00 2001
+From: Gerry Kopec <Gerry.Kopec@windriver.com>
+Date: Mon, 16 May 2016 15:36:32 -0400
+Subject: [PATCH 015/143] primary: disk performance fixes
+
+Port disk performance fixes to Newton
+Reduce the impact of image conversions:
+  When doing image conversions we don't want to fill up the (limited)
+  linux write cache since it can slow down management processes.
+
+  We tell qemu-img to use "none" for the output file caching.  This
+  will cause it to use O_DIRECT for writes.  Reads will still be
+  cached, since the readahead may be useful.
+
+  In addition, we specify a lower IO priority for the image
+  conversions than for nova-compute itself.  Note that the lower IO
+  priority for image operations may not be helping currently as CFQ IO
+  priorities are not properly tracked when going through the LVM layer.
+  However leaving in as it not hurting anything and can come into use
+  when future kernel properly tracks the IO priorities.
+
+Rreduce disk contention from image operations:
+  In order to reduce the I/O load from qemu-img convert and the
+  glance downloads, we limit how many parallel disk-heavy operations
+  we allow.
+
+  The default is two, compute nodes with a high-performance disk
+  subsystem (multiple disks striped behind hardware RAID) may benefit
+  from raising this.
+
+(cherry picked from R3 commit 17a2ca0)
+
+For port to Pike,
+3e27660 Live-migration failed: Pre live migration failed at dest node
+   For CoW local image backing instance, the qcow2 image backing file is
+   converted into raw format during pre live migration. Such conversion took
+   too long and had caused the pre-live migration RPC timeout. The image under
+   test was about 248MB (with virtual size of 2.2 G). The RPC timeout value
+   was 60 seconds.
+
+   To eliminate such conversion, we set force_raw_images=False in
+   nova.conf. Only the qcow2 and raw image formats are not converted, other
+   image formats, such as vmdk and vdi, are still be converted during pre live
+   migration.
+   We have seen problems with backing file formats other than qcow2/raw,
+   so we unconditionally force those formats to raw.
+
+ f849bfd Failed to boot local_lvm vms on ip20-27 with compute-2 on
+   local_lvm storage backing
+   Instead of writing just 512 byte, we change the code to write 4096.
+   The 4KB byte is needed so this works on 4Kn drives.
+   The nova libvirt driver code gets the disk cache mode information by
+   running a open/write test to determine whether the direct io is supported
+   or not. The write is too small for a 4096-byte sector hard drive so the
+   cache mode is incorrectly set.
+   -If direct I/O is supported, then it sets the "disk_cachemode" to
+   "none".
+    This disk cache mode is compatible with io=native
+   -If direct I/O is NOT supported, then it sets the "disk_cachemode" to
+   "writethrough".
+    This disk cache mode is not compatible with io=native
+
+__TYPE_primary
+__TAG_robustness,disk
+__R4_commit_9669ff7
+__R3_commit_6bc9322
+__TC5094
+---
+ nova/compute/manager.py                           | 12 ++++++
+ nova/conf/compute.py                              |  8 +++-
+ nova/tests/unit/virt/libvirt/test_driver.py       | 22 ++++++++---
+ nova/tests/unit/virt/libvirt/test_imagebackend.py | 48 ++++++++++++++++++-----
+ nova/tests/unit/virt/libvirt/test_utils.py        | 28 ++++++++++---
+ nova/tests/unit/virt/test_images.py               | 14 ++++++-
+ nova/utils.py                                     | 11 ++++++
+ nova/virt/images.py                               | 32 +++++++++++++--
+ nova/virt/libvirt/driver.py                       | 24 ++++++++----
+ nova/virt/libvirt/utils.py                        | 17 +++++++-
+ 10 files changed, 181 insertions(+), 35 deletions(-)
+
+diff --git a/nova/compute/manager.py b/nova/compute/manager.py
+index 925154a..c39d9a0 100644
+--- a/nova/compute/manager.py
++++ b/nova/compute/manager.py
+@@ -14,6 +14,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2013-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ """Handles all processes relating to instances (guest vms).
+ 
+@@ -1152,6 +1159,11 @@ class ComputeManager(manager.Manager):
+ 
+         self.init_virt_events()
+ 
++        # one-time initialization
++        utils.disk_op_sema = \
++            eventlet.semaphore.BoundedSemaphore(
++                CONF.concurrent_disk_operations)
++
+         try:
+             # checking that instance was not already evacuated to other host
+             self._destroy_evacuated_instances(context)
+diff --git a/nova/conf/compute.py b/nova/conf/compute.py
+index f441319..8f6e50b 100644
+--- a/nova/conf/compute.py
++++ b/nova/conf/compute.py
+@@ -1125,12 +1125,18 @@ Related options:
+ """),
+ ]
+ 
+-# add option for default vif model
++# add option for default vif model, concurrent disk-IO limit
+ wrs_compute_opts = [
+     cfg.StrOpt('default_vif_model',
+                default='virtio',
+                help='Name of default emulated VIF hardware type (e.g., '
+                     'virtio, e1000, etc...)'),
++    cfg.IntOpt('concurrent_disk_operations',
++               default=2,
++               help='Number of disk-IO-intensive operations (glance image'
++                    'downloads, image format conversions, etc.) that we will'
++                    'do in parallel.  If this is set too high then response'
++                    'time suffers.'),
+ ]
+ 
+ 
+diff --git a/nova/tests/unit/virt/libvirt/test_driver.py b/nova/tests/unit/virt/libvirt/test_driver.py
+index 9291e85..5c6e9be 100755
+--- a/nova/tests/unit/virt/libvirt/test_driver.py
++++ b/nova/tests/unit/virt/libvirt/test_driver.py
+@@ -13,12 +13,13 @@
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
+ #
+-# Copyright (c) 2016-2017 Wind River Systems, Inc.
++# Copyright (c) 2013-2017 Wind River Systems, Inc.
+ #
+ # The right to copy, distribute, modify, or otherwise make use
+ # of this software may be licensed only pursuant to the terms
+ # of an applicable Wind River license agreement.
+ #
++
+ from collections import deque
+ from collections import OrderedDict
+ import contextlib
+@@ -64,6 +65,7 @@ from nova.api.metadata import base as instance_metadata
+ from nova.compute import manager
+ from nova.compute import power_state
+ from nova.compute import task_states
++from nova.compute import utils as compute_utils
+ from nova.compute import vm_states
+ import nova.conf
+ from nova import context
+@@ -16729,9 +16731,14 @@ class LibvirtDriverTestCase(test.NoDBTestCase):
+         path = '/test/disk'
+         _path_qcow = path + '_qcow'
+ 
+-        self.drvr._disk_raw_to_qcow2(path)
++        # mock out disk concurrency sema and add ionice & no caching
++        # options to qemu-img
++        with mock.patch.object(utils, 'disk_op_sema',
++                               new_callable=compute_utils.UnlimitedSemaphore):
++            self.drvr._disk_raw_to_qcow2(path)
+         mock_execute.assert_has_calls([
+-            mock.call('qemu-img', 'convert', '-f', 'raw',
++            mock.call('ionice', '-c2', '-n4',
++                      'qemu-img', 'convert', '-f', 'raw', '-t', 'none',
+                       '-O', 'qcow2', path, _path_qcow),
+             mock.call('mv', _path_qcow, path)])
+ 
+@@ -16740,9 +16747,14 @@ class LibvirtDriverTestCase(test.NoDBTestCase):
+         path = '/test/disk'
+         _path_raw = path + '_raw'
+ 
+-        self.drvr._disk_qcow2_to_raw(path)
++        # mock out disk concurrency sema and add ionice & no caching
++        # options to qemu-img
++        with mock.patch.object(utils, 'disk_op_sema',
++                               new_callable=compute_utils.UnlimitedSemaphore):
++            self.drvr._disk_qcow2_to_raw(path)
+         mock_execute.assert_has_calls([
+-            mock.call('qemu-img', 'convert', '-f', 'qcow2',
++            mock.call('ionice', '-c2', '-n4',
++                      'qemu-img', 'convert', '-f', 'qcow2', '-t', 'none',
+                       '-O', 'raw', path, _path_raw),
+             mock.call('mv', _path_raw, path)])
+ 
+diff --git a/nova/tests/unit/virt/libvirt/test_imagebackend.py b/nova/tests/unit/virt/libvirt/test_imagebackend.py
+index a083a2c..0b9c647 100644
+--- a/nova/tests/unit/virt/libvirt/test_imagebackend.py
++++ b/nova/tests/unit/virt/libvirt/test_imagebackend.py
+@@ -12,6 +12,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2016-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ import base64
+ import inspect
+@@ -28,6 +35,7 @@ from oslo_utils import imageutils
+ from oslo_utils import units
+ from oslo_utils import uuidutils
+ 
++from nova.compute import utils as compute_utils
+ import nova.conf
+ from nova import context
+ from nova import exception
+@@ -35,6 +43,7 @@ from nova import objects
+ from nova import test
+ from nova.tests.unit import fake_processutils
+ from nova.tests.unit.virt.libvirt import fake_libvirt_utils
++from nova import utils
+ from nova.virt.image import model as imgmodel
+ from nova.virt import images
+ from nova.virt.libvirt import config as vconfig
+@@ -656,13 +665,18 @@ class LvmTestCase(_ImageTestCase, test.NoDBTestCase):
+         self.LV = '%s_%s' % (self.INSTANCE['uuid'], self.NAME)
+         self.PATH = os.path.join('/dev', self.VG, self.LV)
+ 
++    # mock out disk concurrency sema
++    @mock.patch.object(utils, 'disk_op_sema')
+     @mock.patch.object(imagebackend.lvm, 'create_volume')
+     @mock.patch.object(imagebackend.disk, 'get_disk_size',
+                        return_value=TEMPLATE_SIZE)
+     @mock.patch.object(imagebackend.utils, 'execute')
+-    def _create_image(self, sparse, mock_execute, mock_get, mock_create):
++    def _create_image(self, sparse, mock_execute, mock_get, mock_create,
++                      mock_disk_op_sema):
+         fn = mock.MagicMock()
+-        cmd = ('qemu-img', 'convert', '-t', 'none', '-O', 'raw',
++        # add ionice option to qemu-img
++        cmd = ('ionice', '-c2', '-n4',
++               'qemu-img', 'convert', '-t', 'none', '-O', 'raw',
+                self.TEMPLATE_PATH, self.PATH)
+ 
+         image = self.image_class(self.INSTANCE, self.NAME)
+@@ -689,16 +703,20 @@ class LvmTestCase(_ImageTestCase, test.NoDBTestCase):
+                                             self.SIZE, sparse=sparse)
+         fn.assert_called_once_with(target=self.PATH, ephemeral_size=None)
+ 
++    # mock out disk concurrency sema
++    @mock.patch.object(utils, 'disk_op_sema')
+     @mock.patch.object(imagebackend.disk, 'resize2fs')
+     @mock.patch.object(imagebackend.lvm, 'create_volume')
+     @mock.patch.object(imagebackend.disk, 'get_disk_size',
+                        return_value=TEMPLATE_SIZE)
+     @mock.patch.object(imagebackend.utils, 'execute')
+     def _create_image_resize(self, sparse, mock_execute, mock_get,
+-                             mock_create, mock_resize):
++                             mock_create, mock_resize, mock_disk_op_sema):
+         fn = mock.MagicMock()
+         fn(target=self.TEMPLATE_PATH)
+-        cmd = ('qemu-img', 'convert', '-t', 'none', '-O', 'raw',
++        # add ionice option to qemu-img
++        cmd = ('ionice', '-c2', '-n4',
++               'qemu-img', 'convert', '-t', 'none', '-O', 'raw',
+                self.TEMPLATE_PATH, self.PATH)
+         image = self.image_class(self.INSTANCE, self.NAME)
+         image.create_image(fn, self.TEMPLATE_PATH, self.SIZE)
+@@ -927,8 +945,11 @@ class EncryptedLvmTestCase(_ImageTestCase, test.NoDBTestCase):
+             fn = mock.Mock()
+ 
+             image = self.image_class(self.INSTANCE, self.NAME)
+-            image.create_image(fn, self.TEMPLATE_PATH, self.TEMPLATE_SIZE,
+-                context=self.CONTEXT)
++            # mock out disk concurrency sema
++            with mock.patch.object(utils, 'disk_op_sema',
++                               new_callable=compute_utils.UnlimitedSemaphore):
++                image.create_image(fn, self.TEMPLATE_PATH, self.TEMPLATE_SIZE,
++                    context=self.CONTEXT)
+ 
+             fn.assert_called_with(context=self.CONTEXT,
+                 target=self.TEMPLATE_PATH)
+@@ -942,7 +963,9 @@ class EncryptedLvmTestCase(_ImageTestCase, test.NoDBTestCase):
+                 CONF.ephemeral_storage_encryption.cipher,
+                 CONF.ephemeral_storage_encryption.key_size,
+                 self.KEY)
+-            cmd = ('qemu-img',
++            # add ionice option to qemu-img
++            cmd = ('ionice', '-c2', '-n4',
++                   'qemu-img',
+                    'convert',
+                    '-t', 'none',
+                    '-O',
+@@ -1006,8 +1029,11 @@ class EncryptedLvmTestCase(_ImageTestCase, test.NoDBTestCase):
+             fn = mock.Mock()
+ 
+             image = self.image_class(self.INSTANCE, self.NAME)
+-            image.create_image(fn, self.TEMPLATE_PATH, self.SIZE,
+-                context=self.CONTEXT)
++            # mock out disk concurrency sema
++            with mock.patch.object(utils, 'disk_op_sema',
++                               new_callable=compute_utils.UnlimitedSemaphore):
++                image.create_image(fn, self.TEMPLATE_PATH, self.SIZE,
++                    context=self.CONTEXT)
+ 
+             fn.assert_called_with(context=self.CONTEXT,
+                                   target=self.TEMPLATE_PATH)
+@@ -1023,7 +1049,9 @@ class EncryptedLvmTestCase(_ImageTestCase, test.NoDBTestCase):
+                  CONF.ephemeral_storage_encryption.cipher,
+                  CONF.ephemeral_storage_encryption.key_size,
+                  self.KEY)
+-            cmd = ('qemu-img',
++            # add ionice & no cache options to qemu-img
++            cmd = ('ionice', '-c2', '-n4',
++                   'qemu-img',
+                    'convert',
+                    '-t', 'none',
+                    '-O',
+diff --git a/nova/tests/unit/virt/libvirt/test_utils.py b/nova/tests/unit/virt/libvirt/test_utils.py
+index 1e3f784..44eaabb 100644
+--- a/nova/tests/unit/virt/libvirt/test_utils.py
++++ b/nova/tests/unit/virt/libvirt/test_utils.py
+@@ -12,6 +12,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2016-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ import functools
+ import os
+@@ -24,6 +31,7 @@ from oslo_config import cfg
+ from oslo_utils import fileutils
+ import six
+ 
++from nova.compute import utils as compute_utils
+ from nova import context
+ from nova import exception
+ from nova import objects
+@@ -545,12 +553,17 @@ disk size: 4.4M
+                         '/some/path')
+         mock_execute.assert_called_once_with(*execute_args, run_as_root=True)
+ 
+-    def _do_test_extract_snapshot(self, mock_execute, src_format='qcow2',
++    @mock.patch.object(utils, 'disk_op_sema')
++    def _do_test_extract_snapshot(self, mock_execute, mock_disk_op_sema,
++                                  src_format='qcow2',
+                                   dest_format='raw', out_format='raw'):
+         libvirt_utils.extract_snapshot('/path/to/disk/image', src_format,
+                                        '/extracted/snap', dest_format)
+-        qemu_img_cmd = ('qemu-img', 'convert', '-f',
+-                        src_format, '-O', out_format)
++        # mock out disk concurrency sema and add ionice & no caching
++        # options to qemu-img
++        qemu_img_cmd = ('ionice', '-c2', '-n4', 'qemu-img', 'convert',
++                        '-t', 'none',
++                        '-f', src_format, '-O', out_format)
+         if CONF.libvirt.snapshot_compression and dest_format == "qcow2":
+             qemu_img_cmd += ('-c',)
+         qemu_img_cmd += ('/path/to/disk/image', '/extracted/snap')
+@@ -712,12 +725,17 @@ disk size: 4.4M
+ 
+         target = 't.qcow2'
+         self.executes = []
+-        expected_commands = [('qemu-img', 'convert', '-t', 'none',
++        # add ionice option to qemu-img and mock out disk
++        # concurrency sema
++        expected_commands = [('ionice', '-c2', '-n4',
++                              'qemu-img', 'convert', '-t', 'none',
+                               '-O', 'raw', '-f', 'qcow2',
+                               't.qcow2.part', 't.qcow2.converted'),
+                              ('rm', 't.qcow2.part'),
+                              ('mv', 't.qcow2.converted', 't.qcow2')]
+-        images.fetch_to_raw(context, image_id, target)
++        with mock.patch.object(utils, 'disk_op_sema',
++                               new_callable=compute_utils.UnlimitedSemaphore):
++            images.fetch_to_raw(context, image_id, target)
+         self.assertEqual(self.executes, expected_commands)
+ 
+         target = 't.raw'
+diff --git a/nova/tests/unit/virt/test_images.py b/nova/tests/unit/virt/test_images.py
+index c6864f2..b6d3920 100644
+--- a/nova/tests/unit/virt/test_images.py
++++ b/nova/tests/unit/virt/test_images.py
+@@ -11,6 +11,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2016-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ import os
+ 
+@@ -18,6 +25,7 @@ import mock
+ from oslo_concurrency import processutils
+ import six
+ 
++from nova.compute import utils as compute_utils
+ from nova import exception
+ from nova import test
+ from nova import utils
+@@ -45,9 +53,13 @@ class QemuTestCase(test.NoDBTestCase):
+         self.assertTrue(image_info)
+         self.assertTrue(str(image_info))
+ 
++    # mock out disk concurrency sema
++    @mock.patch.object(utils, 'disk_op_sema',
++                       new_callable=compute_utils.UnlimitedSemaphore)
+     @mock.patch.object(utils, 'execute',
+                        side_effect=processutils.ProcessExecutionError)
+-    def test_convert_image_with_errors(self, mocked_execute):
++    def test_convert_image_with_errors(self, mocked_execute,
++                                       mock_disk_op_sema):
+         self.assertRaises(exception.ImageUnacceptable,
+                           images.convert_image,
+                           '/path/that/does/not/exist',
+diff --git a/nova/utils.py b/nova/utils.py
+index 9a28e55..c783021 100644
+--- a/nova/utils.py
++++ b/nova/utils.py
+@@ -14,6 +14,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2013-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ """Utilities and helper functions."""
+ 
+@@ -100,6 +107,10 @@ VIM_IMAGE_ATTRIBUTES = (
+ 
+ _FILE_CACHE = {}
+ 
++# used to enforce a limit on disk-IO-intensive operations
++# (image downloads, image conversions) at any given time.
++disk_op_sema = None
++
+ 
+ # WRS:extension
+ def list_to_range(input_list=None):
+diff --git a/nova/virt/images.py b/nova/virt/images.py
+index be2a9d9..0463a8c 100644
+--- a/nova/virt/images.py
++++ b/nova/virt/images.py
+@@ -14,6 +14,13 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2016-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
+ 
+ """
+ Handling of VM disk images.
+@@ -118,12 +125,16 @@ def _convert_image(source, dest, in_format, out_format, run_as_root):
+     # on persistent storage when the command exits. Without (2), a host crash
+     # may leave a corrupt image in the image cache, which Nova cannot recover
+     # automatically.
+-    cmd = ('qemu-img', 'convert', '-t', 'none', '-O', out_format)
++    # add ionice option to qemu-img and execute operation
++    # with disk concurrency sema
++    cmd = ('ionice', '-c2', '-n4',
++           'qemu-img', 'convert', '-t', 'none', '-O', out_format)
+     if in_format is not None:
+         cmd = cmd + ('-f', in_format)
+     cmd = cmd + (source, dest)
+     try:
+-        utils.execute(*cmd, run_as_root=run_as_root)
++        with utils.disk_op_sema:
++            utils.execute(*cmd, run_as_root=run_as_root)
+     except processutils.ProcessExecutionError as exp:
+         msg = (_("Unable to convert image to %(format)s: %(exp)s") %
+                {'format': out_format, 'exp': exp})
+@@ -132,7 +143,9 @@ def _convert_image(source, dest, in_format, out_format, run_as_root):
+ 
+ def fetch(context, image_href, path):
+     with fileutils.remove_path_on_error(path):
+-        IMAGE_API.download(context, image_href, dest_path=path)
++        # execute operation with disk concurrency sema
++        with utils.disk_op_sema:
++            IMAGE_API.download(context, image_href, dest_path=path)
+ 
+ 
+ def get_info(context, image_href):
+diff --git a/nova/virt/libvirt/driver.py b/nova/virt/libvirt/driver.py
+index 14f33bd..15820cb 100644
+--- a/nova/virt/libvirt/driver.py
++++ b/nova/virt/libvirt/driver.py
+@@ -18,12 +18,13 @@
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
+ #
+-# Copyright (c) 2016-2017 Wind River Systems, Inc.
++# Copyright (c) 2013-2017 Wind River Systems, Inc.
+ #
+ # The right to copy, distribute, modify, or otherwise make use
+ # of this software may be licensed only pursuant to the terms
+ # of an applicable Wind River license agreement.
+ #
++
+ """
+ A connection to a hypervisor through libvirt.
+ 
+@@ -7698,16 +7700,24 @@ class LibvirtDriver(driver.ComputeDriver):
+     def _disk_raw_to_qcow2(path):
+         """Converts a raw disk to qcow2."""
+         path_qcow = path + '_qcow'
+-        utils.execute('qemu-img', 'convert', '-f', 'raw',
+-                      '-O', 'qcow2', path, path_qcow)
++        # add ionice & no caching options to qemu-img and execute
++        # operation with disk concurrency sema
++        with utils.disk_op_sema:
++            utils.execute('ionice', '-c2', '-n4',
++                          'qemu-img', 'convert', '-f', 'raw', '-t', 'none',
++                          '-O', 'qcow2', path, path_qcow)
+         utils.execute('mv', path_qcow, path)
+ 
+     @staticmethod
+     def _disk_qcow2_to_raw(path):
+         """Converts a qcow2 disk to raw."""
+         path_raw = path + '_raw'
+-        utils.execute('qemu-img', 'convert', '-f', 'qcow2',
+-                      '-O', 'raw', path, path_raw)
++        # add ionice & no caching options to qemu-img and execute
++        # operation with disk concurrency sema
++        with utils.disk_op_sema:
++            utils.execute('ionice', '-c2', '-n4',
++                          'qemu-img', 'convert', '-f', 'qcow2', '-t', 'none',
++                          '-O', 'raw', path, path_raw)
+         utils.execute('mv', path_raw, path)
+ 
+     def finish_migration(self, context, migration, instance, disk_info,
+diff --git a/nova/virt/libvirt/utils.py b/nova/virt/libvirt/utils.py
+index f0d83cf..3e90f8f 100644
+--- a/nova/virt/libvirt/utils.py
++++ b/nova/virt/libvirt/utils.py
+@@ -17,6 +17,14 @@
+ #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
++#
++# Copyright (c) 2016-2017 Wind River Systems, Inc.
++#
++#
++#
++#
++#
++
+ 
+ import errno
+ import os
+@@ -316,14 +324,19 @@ def extract_snapshot(disk_path, source_fmt, out_path, dest_fmt):
+     if dest_fmt == 'ploop':
+         dest_fmt = 'parallels'
+ 
+-    qemu_img_cmd = ('qemu-img', 'convert', '-f', source_fmt, '-O', dest_fmt)
++    # add ionice & no caching options to qemu-img
++    qemu_img_cmd = ('ionice', '-c2', '-n4',
++                    'qemu-img', 'convert', '-t', 'none',
++                    '-f', source_fmt, '-O', dest_fmt)
+ 
+     # Conditionally enable compression of snapshots.
+     if CONF.libvirt.snapshot_compression and dest_fmt == "qcow2":
+         qemu_img_cmd += ('-c',)
+ 
+     qemu_img_cmd += (disk_path, out_path)
+-    execute(*qemu_img_cmd)
++    # execute operation with disk concurrency sema
++    with utils.disk_op_sema:
++        execute(*qemu_img_cmd)
+ 
+ 
+ def load_file(path):
+-- 
+2.7.4
+
