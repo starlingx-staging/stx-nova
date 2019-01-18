@@ -80,9 +80,6 @@ TIME_UNITS = {
 
 
 _IS_NEUTRON = None
-_IS_LOWLATENCY = None
-
-PLATFORM_CONF = "/etc/platform/platform.conf"
 
 synchronized = lockutils.synchronized_with_prefix('nova-')
 
@@ -1289,29 +1286,6 @@ def is_neutron():
 
     _IS_NEUTRON = nova.network.is_neutron()
     return _IS_NEUTRON
-
-
-def is_host_lowlatency():
-    global _IS_LOWLATENCY
-
-    if _IS_LOWLATENCY is not None:
-        return _IS_LOWLATENCY
-
-    _IS_LOWLATENCY = _get_host_lowlatency_info()
-    return _IS_LOWLATENCY
-
-
-def _get_host_lowlatency_info():
-    try:
-        with open(PLATFORM_CONF) as f:
-            for line in f:
-                if 'subfunction' in line:
-                    return 'lowlatency' in line
-
-    except IOError as e:
-        LOG.error('Cannot open: %(file)s, error = %(err)s',
-                  {'file': PLATFORM_CONF, 'err': e})
-    return False
 
 
 def is_auto_disk_config_disabled(auto_disk_config_raw):

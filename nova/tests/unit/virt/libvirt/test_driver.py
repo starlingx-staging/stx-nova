@@ -15422,15 +15422,11 @@ class LibvirtConnTestCase(test.NoDBTestCase,
         for fs in supported_fs:
             self.assertFalse(drvr.is_supported_fs_format(fs))
 
-    @mock.patch('nova.objects.instance.Instance.obj_load_attr')
-    @mock.patch('nova.virt.libvirt.driver.LibvirtDriver._set_cpu_latency')
     @mock.patch('nova.virt.libvirt.host.Host.write_instance_config')
     @mock.patch('nova.virt.libvirt.host.Host.get_guest')
     def test_post_live_migration_at_destination(
-            self, mock_get_guest, mock_write_instance_config,
-            mock_cpulatency, mock_loadattr):
+            self, mock_get_guest, mock_write_instance_config):
         instance = objects.Instance(id=1, uuid=uuids.instance)
-        instance.numa_topology = objects.InstanceNUMATopology()
         dom = mock.MagicMock()
         dom.XMLDesc.return_value = "<domain></domain>"
         guest = libvirt_guest.Guest(dom)
