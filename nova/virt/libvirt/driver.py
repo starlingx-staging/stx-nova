@@ -1010,8 +1010,6 @@ class LibvirtDriver(driver.ComputeDriver):
             if CONF.libvirt.virt_type == 'lxc':
                 self._teardown_container(instance)
 
-        self._set_cpu_latency(instance.numa_topology, 'high')
-
     def destroy(self, context, instance, network_info, block_device_info=None,
                 destroy_disks=True):
         self._destroy(instance)
@@ -5837,8 +5835,6 @@ class LibvirtDriver(driver.ComputeDriver):
                                            block_device_info, guest,
                                            destroy_disks_on_failure)
 
-        self._set_cpu_latency(instance.numa_topology, 'low')
-
         # Affine irqs associated with PCI/PT and SRIOV network devices.
         # This chooses the subset of cpus from instance numa_topology that
         # reside on the same numa node as the PCI device.
@@ -5850,34 +5846,6 @@ class LibvirtDriver(driver.ComputeDriver):
         if pause:
             guest.resume()
         return guest
-
-    def _set_cpu_latency(self, numa_topology_or_list, latency):
-        if numa_topology_or_list is None:
-            LOG.warning('Skip setting up cpu latency, '
-                        'numa_topology not defined')
-            return
-        if not utils.is_host_lowlatency():
-            return
-        if isinstance(numa_topology_or_list, objects.InstanceNUMATopology):
-            if (numa_topology_or_list.cells and
-                 (not numa_topology_or_list.cells[0].cpu_pinning_requested)):
-                return
-            pinned = []
-            for cell in numa_topology_or_list.cells:
-                if cell.cpu_policy == 'dedicated' and cell.cpu_pinning:
-                    pinned.append(utils.list_to_range(
-                        cell.cpu_pinning.values()))
-            range = utils.list_to_range(pinned)
-        elif isinstance(numa_topology_or_list, list):
-            range = utils.list_to_range(numa_topology_or_list)
-        else:
-            LOG.error('Error setting up cpu latency: invalid numa_topology')
-            return
-        try:
-            utils.execute('/usr/bin/set-cpu-wakeup-latency.sh', latency, range,
-                          run_as_root=True)
-        except processutils.ProcessExecutionError as err:
-            LOG.error('Error setting up cpu latency: %s', err)
 
     def _get_vcpu_total(self):
         """Get available vcpu number of physical computer.
@@ -8149,7 +8117,6 @@ class LibvirtDriver(driver.ComputeDriver):
         :param network_info: instance network information
         """
         self.unplug_vifs(instance, network_info)
-        self._set_cpu_latency(instance.numa_topology, 'high')
 
     def post_live_migration_at_destination(self, context,
                                            instance,
@@ -8180,7 +8147,6 @@ class LibvirtDriver(driver.ComputeDriver):
         guest_from_xml = self._host.write_instance_config(xml)
         # WRS: put floating vCPU tasks in proper cpusets
         libvirt_utils.assign_floating_cpusets(guest_from_xml.domain, instance)
-        self._set_cpu_latency(instance.numa_topology, 'low')
 
     def _get_instance_disk_info_from_config(self, guest_config,
                                             block_device_info):
@@ -9257,7 +9223,6 @@ class LibvirtDriver(driver.ComputeDriver):
         # dom.pinEmulator(cpumap[0],
         #                libvirt.VIR_DOMAIN_AFFECT_LIVE |
         #                libvirt.VIR_DOMAIN_AFFECT_CONFIG)
-        self._set_cpu_latency([phys_cpu], "high")
 
         # Return the physical cpu index
         return virt_cpu, phys_cpu
@@ -9318,7 +9283,6 @@ class LibvirtDriver(driver.ComputeDriver):
             # Ignore problems here.
             # We've already done the actual physical pinning.
             pass
-        self._set_cpu_latency([pcpu], "low")
 
     def destroy_name(self, instance_name):
         """Destroy a domain by name.

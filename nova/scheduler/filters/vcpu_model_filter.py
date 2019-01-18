@@ -50,7 +50,7 @@ class VCpuModelFilter(filters.BaseHostFilter):
             # we can support it or not.
             return False
 
-        # if guest request IBRS cpu, but host does not support 'IBRS', then 
+        # if guest request IBRS cpu, but host does not support 'IBRS', then
         # return false directly
         if('IBRS' in guest and 'IBRS' not in host):
             return False
