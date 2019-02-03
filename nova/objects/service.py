@@ -31,7 +31,7 @@ LOG = logging.getLogger(__name__)
 
 
 # NOTE(danms): This is the global service version counter
-SERVICE_VERSION = 37
+SERVICE_VERSION = 38
 
 
 # NOTE(danms): This is our SERVICE_VERSION history. The idea is that any
@@ -151,6 +151,8 @@ SERVICE_VERSION_HISTORY = (
     {'compute_rpc': '5.0'},
     # Version 37: prep_resize takes a RequestSpec object
     {'compute_rpc': '5.1'},
+    # Version 38: Compute RPC version 5.2
+    {'compute_rpc': '5.2'},
 )
 
 
