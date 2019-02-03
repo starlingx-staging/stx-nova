@@ -350,6 +350,9 @@ class ComputeAPI(object):
         * 5.0 - Remove 4.x compatibility
         * 5.1 - Make prep_resize() take a RequestSpec object rather than a
                 legacy dict.
+        * 5.2 - Add migration and limits arguments to
+                check_can_live_migrate_destination(). Add do_cleanup argument
+                to rollback_live_migration_at_destination()
     '''
 
     VERSION_ALIASES = {
@@ -502,16 +505,25 @@ class ComputeAPI(object):
                    instance=instance, diff=diff)
 
     def check_can_live_migrate_destination(self, ctxt, instance, destination,
-                                           block_migration, disk_over_commit):
-        version = '5.0'
+                                           block_migration, disk_over_commit,
+                                           migration, limits):
         client = self.router.client(ctxt)
+        version = '5.2'
+        kwargs = {
+            'instance': instance,
+            'block_migration': block_migration,
+            'disk_over_commit': disk_over_commit,
+            'migration': migration,
+            'limits': limits
+        }
+        if not client.can_send_version(version):
+            kwargs.pop('migration')
+            kwargs.pop('limits')
+            version = '5.0'
         cctxt = client.prepare(server=destination, version=version,
                                call_monitor_timeout=CONF.rpc_response_timeout,
                                timeout=CONF.long_rpc_timeout)
-        return cctxt.call(ctxt, 'check_can_live_migrate_destination',
-                          instance=instance,
-                          block_migration=block_migration,
-                          disk_over_commit=disk_over_commit)
+        return cctxt.call(ctxt, 'check_can_live_migrate_destination', **kwargs)
 
     def check_can_live_migrate_source(self, ctxt, instance, dest_check_data):
         version = '5.0'
@@ -873,13 +885,20 @@ class ComputeAPI(object):
 
     def rollback_live_migration_at_destination(self, ctxt, instance, host,
                                                destroy_disks,
-                                               migrate_data):
-        version = '5.0'
+                                               migrate_data, do_cleanup):
+        version = '5.2'
         client = self.router.client(ctxt)
+        kwargs = {
+            'instance': instance,
+            'destroy_disks': destroy_disks,
+            'migrate_data': migrate_data,
+            'do_cleanup': do_cleanup
+        }
+        if not client.can_send_version(version):
+            kwargs.pop('do_cleanup')
+            version = '5.0'
         cctxt = client.prepare(server=host, version=version)
-        cctxt.cast(ctxt, 'rollback_live_migration_at_destination',
-                   instance=instance, destroy_disks=destroy_disks,
-                   migrate_data=migrate_data)
+        cctxt.cast(ctxt, 'rollback_live_migration_at_destination', **kwargs)
 
     def set_admin_password(self, ctxt, instance, new_pass):
         version = '5.0'

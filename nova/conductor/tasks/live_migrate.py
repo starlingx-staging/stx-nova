@@ -268,7 +268,8 @@ class LiveMigrationTask(base.TaskBase):
         try:
             self.migrate_data = self.compute_rpcapi.\
                 check_can_live_migrate_destination(self.context, self.instance,
-                    destination, self.block_migration, self.disk_over_commit)
+                    destination, self.block_migration, self.disk_over_commit,
+                    None, None)
         except messaging.MessagingTimeout:
             msg = _("Timeout while checking if we can live migrate to host: "
                     "%s") % destination

@@ -278,7 +278,8 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
                           mock.call(self.destination)],
                          mock_get_info.call_args_list)
         mock_check.assert_called_once_with(self.context, self.instance,
-            self.destination, self.block_migration, self.disk_over_commit)
+            self.destination, self.block_migration, self.disk_over_commit,
+            None, None)
 
     def test_check_requested_destination_fails_with_same_dest(self):
         self.task.destination = "same"
