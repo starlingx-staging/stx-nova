@@ -6345,7 +6345,8 @@ class ComputeTestCase(BaseTestCase,
         mock_rollback.assert_called_once_with(c, instance, dest_host,
             destroy_disks=True,
             migrate_data=test.MatchType(
-                            migrate_data_obj.XenapiLiveMigrateData))
+                            migrate_data_obj.XenapiLiveMigrateData),
+            do_cleanup=True)
 
     @mock.patch.object(compute_rpcapi.ComputeAPI, 'pre_live_migration')
     @mock.patch.object(compute_rpcapi.ComputeAPI,

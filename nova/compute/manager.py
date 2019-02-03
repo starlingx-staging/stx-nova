@@ -488,7 +488,7 @@ class ComputeVirtAPI(virtapi.VirtAPI):
 class ComputeManager(manager.Manager):
     """Manages the running instances from creation to destruction."""
 
-    target = messaging.Target(version='5.1')
+    target = messaging.Target(version='5.2')
 
     def __init__(self, compute_driver=None, *args, **kwargs):
         """Load configuration options and connect to the hypervisor."""
@@ -6201,7 +6201,8 @@ class ComputeManager(manager.Manager):
     @wrap_instance_event(prefix='compute')
     @wrap_instance_fault
     def check_can_live_migrate_destination(self, ctxt, instance,
-                                           block_migration, disk_over_commit):
+                                           block_migration, disk_over_commit,
+                                           migration=None, limits=None):
         """Check if it is possible to execute live migration.
 
         This runs checks on the destination host, and then calls
@@ -6213,6 +6214,8 @@ class ComputeManager(manager.Manager):
                                 if None, calculate it in driver
         :param disk_over_commit: if true, allow disk over commit
                                  if None, ignore disk usage checking
+        :param migration: objects.Migration object for this live migration.
+        :param limits: objects.SchedulerLimits object for this live migration.
         :returns: a dict containing migration info
         """
         src_compute_info = obj_base.obj_to_primitive(
@@ -7100,7 +7103,7 @@ class ComputeManager(manager.Manager):
         if do_cleanup:
             self.compute_rpcapi.rollback_live_migration_at_destination(
                     context, instance, dest, destroy_disks=destroy_disks,
-                    migrate_data=migrate_data)
+                    migrate_data=migrate_data, do_cleanup=do_cleanup)
         elif utils.is_neutron():
             # The port binding profiles need to be cleaned up.
             with errors_out_migration_ctxt(migration):
@@ -7138,8 +7141,8 @@ class ComputeManager(manager.Manager):
     @wrap_instance_event(prefix='compute')
     @wrap_instance_fault
     def rollback_live_migration_at_destination(self, context, instance,
-                                               destroy_disks,
-                                               migrate_data):
+                                               destroy_disks, migrate_data,
+                                               do_cleanup=True):
         """Cleaning up image directory that is created pre_live_migration.
 
         :param context: security context
