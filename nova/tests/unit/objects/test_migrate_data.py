@@ -68,6 +68,94 @@ class _TestLibvirtLiveMigrateData(object):
         expected_info['boot_index'] = '1'
         self.assertEqual(expected_info, obj.as_disk_info())
 
+    def test_pin_mapping(self):
+        data = lambda x: x['nova_object.data']
+        obj = migrate_data.PinMapping(guest_id=0, host_ids=set([1]))
+        manifest = ovo_base.obj_tree_get_versions(obj.obj_name())
+        primitive = data(obj.obj_to_primitive(target_version='1.0',
+                                              version_manifest=manifest))
+        self.assertEqual(0, primitive['guest_id'])
+        self.assertEqual((1,), primitive['host_ids'])
+
+    def test_pin_mapping_hash(self):
+        self.assertEqual(
+            migrate_data.PinMapping(guest_id=0,
+                                    host_ids=set([1])).__hash__(),
+            hash('0-1'))
+        self.assertEqual(
+            migrate_data.PinMapping(guest_id=0,
+                                    host_ids=set([1, 0])).__hash__(),
+            hash('0-0-1'))
+        self.assertEqual(
+            migrate_data.PinMapping(guest_id=0,
+                                    host_ids=set([0, 1])).__hash__(),
+            hash('0-0-1'))
+        self.assertNotEqual(
+            migrate_data.PinMapping(guest_id=1,
+                                    host_ids=set([0, 1])).__hash__(),
+            migrate_data.PinMapping(guest_id=10,
+                                    host_ids=set([1])).__hash__())
+
+    def test_numa_migrate_data_eq(self):
+        self.assertEqual(
+            migrate_data.NUMAMigrateData(
+                cpu_pins=[migrate_data.PinMapping(guest_id=0,
+                                                  host_ids=set([1, 2]))],
+                cell_pins=[migrate_data.PinMapping(guest_id=2,
+                                                   host_ids=set([3]))],
+                emulator_pins=set([4, 5]),
+                sched_vcpus=set((6, 7)),
+                sched_priority=8),
+            migrate_data.NUMAMigrateData(
+                cpu_pins=[migrate_data.PinMapping(guest_id=0,
+                                                  host_ids=set([2, 1]))],
+                cell_pins=[migrate_data.PinMapping(guest_id=2,
+                                                   host_ids=set([3]))],
+                emulator_pins=set([5, 4]),
+                sched_vcpus=set((7, 6)),
+                sched_priority=8))
+        self.assertNotEqual(
+            migrate_data.NUMAMigrateData(
+                cpu_pins=[migrate_data.PinMapping(guest_id=0,
+                                                  host_ids=set([1, 2]))],
+                cell_pins=[migrate_data.PinMapping(guest_id=2,
+                                                   host_ids=set([3]))],
+                emulator_pins=set([4, 5])),
+            migrate_data.NUMAMigrateData(
+                cpu_pins=[migrate_data.PinMapping(guest_id=1,
+                                                  host_ids=set([2, 1]))],
+                cell_pins=[migrate_data.PinMapping(guest_id=2,
+                                                   host_ids=set([3]))],
+                emulator_pins=set([5, 4])))
+        self.assertNotEqual(
+            migrate_data.NUMAMigrateData(
+                cpu_pins=[migrate_data.PinMapping(guest_id=0,
+                                                  host_ids=set([1, 2]))],
+                cell_pins=[migrate_data.PinMapping(guest_id=2,
+                                                   host_ids=set([3]))],
+                emulator_pins=set([4, 5])),
+            migrate_data.NUMAMigrateData(
+                cpu_pins=[migrate_data.PinMapping(guest_id=0,
+                                                  host_ids=set([2, 1]))],
+                cell_pins=[migrate_data.PinMapping(guest_id=2,
+                                                   host_ids=set([3]))],
+                emulator_pins=set([5])))
+
+    def test_numa_migrate_data(self):
+        data = lambda x: x['nova_object.data']
+        obj = migrate_data.NUMAMigrateData(
+            cpu_pins=[migrate_data.PinMapping(guest_id=0, host_ids=set([1]))],
+            cell_pins=[migrate_data.PinMapping(guest_id=2, host_ids=set([3]))],
+            emulator_pins=set([4]))
+        manifest = ovo_base.obj_tree_get_versions(obj.obj_name())
+        primitive = data(obj.obj_to_primitive(target_version='1.0',
+                                              version_manifest=manifest))
+        self.assertEqual(data(primitive['cpu_pins'][0]), {'guest_id': 0,
+                                                          'host_ids': (1,)})
+        self.assertEqual(data(primitive['cell_pins'][0]), {'guest_id': 2,
+                                                           'host_ids': (3,)})
+        self.assertEqual(primitive['emulator_pins'], (4,))
+
     def test_obj_make_compatible(self):
         obj = migrate_data.LibvirtLiveMigrateData(
             src_supports_native_luks=True,
@@ -76,30 +164,46 @@ class _TestLibvirtLiveMigrateData(object):
             serial_listen_addr='127.0.0.1',
             target_connect_addr='127.0.0.1',
             dst_wants_file_backed_memory=False,
-            file_backed_memory_discard=False)
+            file_backed_memory_discard=False,
+            instance_numa_topology=objects.InstanceNUMATopology(),
+            dst_numa_config=migrate_data.NUMAMigrateData())
+        manifest = ovo_base.obj_tree_get_versions(obj.obj_name())
 
         data = lambda x: x['nova_object.data']
 
         primitive = data(obj.obj_to_primitive())
         self.assertIn('file_backed_memory_discard', primitive)
-        primitive = data(obj.obj_to_primitive(target_version='1.0'))
+        primitive = data(obj.obj_to_primitive(target_version='1.0',
+                                              version_manifest=manifest))
         self.assertNotIn('target_connect_addr', primitive)
         self.assertNotIn('supported_perf_events', primitive)
         self.assertNotIn('old_vol_attachment_ids', primitive)
         self.assertNotIn('src_supports_native_luks', primitive)
         self.assertNotIn('dst_wants_file_backed_memory', primitive)
-        primitive = data(obj.obj_to_primitive(target_version='1.1'))
+        primitive = data(obj.obj_to_primitive(target_version='1.1',
+                                              version_manifest=manifest))
         self.assertNotIn('serial_listen_ports', primitive)
-        primitive = data(obj.obj_to_primitive(target_version='1.2'))
+        primitive = data(obj.obj_to_primitive(target_version='1.2',
+                                              version_manifest=manifest))
         self.assertNotIn('supported_perf_events', primitive)
-        primitive = data(obj.obj_to_primitive(target_version='1.3'))
+        primitive = data(obj.obj_to_primitive(target_version='1.3',
+                                              version_manifest=manifest))
         self.assertNotIn('old_vol_attachment_ids', primitive)
-        primitive = data(obj.obj_to_primitive(target_version='1.4'))
+        primitive = data(obj.obj_to_primitive(target_version='1.4',
+                                              version_manifest=manifest))
         self.assertNotIn('src_supports_native_luks', primitive)
-        primitive = data(obj.obj_to_primitive(target_version='1.6'))
+        primitive = data(obj.obj_to_primitive(target_version='1.6',
+                                              version_manifest=manifest))
         self.assertNotIn('dst_wants_file_backed_memory', primitive)
-        primitive = data(obj.obj_to_primitive(target_version='1.7'))
+        primitive = data(obj.obj_to_primitive(target_version='1.7',
+                                              version_manifest=manifest))
         self.assertNotIn('file_backed_memory_discard', primitive)
+        primitive = data(obj.obj_to_primitive(target_version='1.9',
+                                              version_manifest=manifest))
+        self.assertNotIn('dst_numa_config', primitive)
+        primitive = data(obj.obj_to_primitive(target_version='1.9',
+                                              version_manifest=manifest))
+        self.assertNotIn('instance_numa_topology', primitive)
 
     def test_bdm_obj_make_compatible(self):
         obj = migrate_data.LibvirtLiveMigrateBDMInfo(
