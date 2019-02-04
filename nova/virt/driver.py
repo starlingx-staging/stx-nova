@@ -1207,6 +1207,19 @@ class ComputeDriver(object):
         """
         raise NotImplementedError()
 
+    def get_dst_numa_config(self, instance_numa_topology, flavor, image_meta):
+        """Builds a NUMAMigrateData object to send to the source of a live
+        migration, containing information about how the instance is to be
+        pinned on the destination host.
+
+        :param instance_numa_topology: The InstanceNUMATopology as fitted to
+                                       the destination by the live migration
+                                       Claim.
+        :param flavor: The instance flavor.
+        :param image_metada: The instance's image properties.
+        """
+        raise NotImplementedError()
+
     def cleanup_live_migration_destination_check(self, context,
                                                  dest_check_data):
         """Do required cleanup on dest host after check_can_live_migrate calls

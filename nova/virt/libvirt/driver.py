@@ -7227,8 +7227,62 @@ class LibvirtDriver(driver.ComputeDriver):
         data.file_backed_memory_discard = (CONF.libvirt.file_backed_memory and
             self._host.has_min_version(MIN_LIBVIRT_FILE_BACKED_DISCARD_VERSION,
                                        MIN_QEMU_FILE_BACKED_DISCARD_VERSION))
-
         return data
+
+    def get_dst_numa_config(self, instance_numa_topology, flavor, image_meta):
+        """Builds a NUMAMigrateData object to send to the source of a live
+        migration, containing information about how the instance is to be
+        pinned on the destination host.
+
+        TODO(artom) This should be optimized away. We should decouple the
+        XML-related bits from the business logic, and obtain everything we need
+        from InstanceNUMATopology, which is already included in the live
+        migration Claim.
+
+        :param instance_numa_topology: The InstanceNUMATopology as fitted to
+                                       the destination by the live migration
+                                       Claim.
+        :param flavor: The instance flavor.
+        :param image_metada: The instance's image properties.
+        """
+        LOG.debug('Building NUMA live migration data')
+        config = objects.NUMAMigrateData(cpu_pins=[], emulator_pins=None,
+                                         cell_pins=[], sched_vcpus=None,
+                                         sched_priority=None)
+        allowed_cpus = hardware.get_vcpu_pin_set()
+        cpu_set, guest_cpu_tune, guest_cpu_numa, guest_numa_tune = \
+            self._get_guest_numa_config(instance_numa_topology, flavor,
+                                        allowed_cpus, image_meta)
+        LOG.debug('Guest NUMA config is: '
+                  'cpu_set: %(cpu_set)s, '
+                  'guest_cpu_tune: %(guest_cpu_tune)s, '
+                  'guest_cpu_numa: %(guest_cpu_numa)s, '
+                  'guest_numa_tune: %(guest_numa_tune)s',
+                  {'cpu_set': cpu_set,
+                   'guest_cpu_tune': guest_cpu_tune,
+                   'guest_cpu_numa': guest_cpu_numa,
+                   'guest_numa_tune': guest_numa_tune})
+        if guest_cpu_tune:
+            for pin in guest_cpu_tune.vcpupin:
+                config.cpu_pins.append(objects.PinMapping(
+                    guest_id=int(pin.id), host_ids=pin.cpuset))
+
+            config.emulator_pins = guest_cpu_tune.emulatorpin.cpuset
+
+            if guest_cpu_tune.vcpusched:
+                # NOTE(artom) vcpushed is a list, but there's only ever 1
+                # element in it (see _get_guest_numa_config under
+                # wants_realtime)
+                config.sched_vcpus = guest_cpu_tune.vcpusched[0].vcpus
+                config.sched_priority = guest_cpu_tune.vcpusched[0].priority
+
+        if guest_numa_tune:
+            for node in guest_numa_tune.memnodes:
+                config.cell_pins.append(objects.PinMapping(
+                    guest_id=node.cellid, host_ids=set(node.nodeset)))
+
+        LOG.debug('Built NUMA live migration data: %s', config)
+        return config
 
     def cleanup_live_migration_destination_check(self, context,
                                                  dest_check_data):
