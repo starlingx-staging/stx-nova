@@ -95,6 +95,54 @@ class VIFMigrateData(obj_base.NovaObject):
         return vif
 
 
+@obj_base.NovaObjectRegistry.register
+class PinMapping(obj_base.NovaObject):
+    # Version 1.0: Initial version
+    VERSION = '1.0'
+
+    fields = {
+        # Guest resource ID - for example, CPU 0.
+        'guest_id': fields.IntegerField(),
+        # Host resources IDS - for example, (cell 0, cell 1)
+        'host_ids': fields.SetOfIntegersField(),
+    }
+
+    def __eq__(self, other):
+        return (self.guest_id == other.guest_id and
+                self.host_ids == other.host_ids)
+
+    def __hash__(self):
+        """Concatenate the sorted ids with a delimiter, then calculate that
+        string's hash.
+
+        guest_id = 1    host_ids = (3, 2, 4)   hash = hash('1-2-3-4')
+        guest_id = 1    host_ids = (23, 4)     hash = hash('1-23-4')
+        """
+        sorted_host_ids = list(self.host_ids)
+        sorted_host_ids.sort()
+        return hash(str(self.guest_id) + '-' +
+                    '-'.join([str(host_id) for host_id in sorted_host_ids]))
+
+
+@obj_base.NovaObjectRegistry.register
+class NUMAMigrateData(obj_base.NovaObject):
+    # Version 1.0: Initial version
+    VERSION = '1.0'
+
+    fields = {
+        'cpu_pins': fields.ListOfObjectsField('PinMapping'),
+        'cell_pins': fields.ListOfObjectsField('PinMapping'),
+        'emulator_pins': fields.SetOfIntegersField(nullable=True),
+        'sched_vcpus': fields.SetOfIntegersField(nullable=True),
+        'sched_priority': fields.IntegerField(nullable=True),
+    }
+
+    def __eq__(self, other):
+        return (set(self.cpu_pins) == set(other.cpu_pins) and
+                set(self.cell_pins) == set(other.cell_pins) and
+                self.emulator_pins == other.emulator_pins)
+
+
 @obj_base.NovaObjectRegistry.register_if(False)
 class LiveMigrateData(obj_base.NovaObject):
     # Version 1.0: Initial version
@@ -186,7 +234,8 @@ class LibvirtLiveMigrateData(LiveMigrateData):
     # Version 1.7: Added dst_wants_file_backed_memory
     # Version 1.8: Added file_backed_memory_discard
     # Version 1.9: Inherited vifs from LiveMigrateData
-    VERSION = '1.9'
+    # Version 1.10: Added dst_numa_config and instance_numa_topology fields
+    VERSION = '1.10'
 
     fields = {
         'filename': fields.StringField(),
@@ -210,12 +259,20 @@ class LibvirtLiveMigrateData(LiveMigrateData):
         # file_backed_memory_discard is ignored unless
         # dst_wants_file_backed_memory is set
         'file_backed_memory_discard': fields.BooleanField(),
+        'instance_numa_topology': fields.ObjectField('InstanceNUMATopology',
+                                                     nullable=True),
+        'dst_numa_config': fields.ObjectField('NUMAMigrateData',
+                                              nullable=True),
     }
 
     def obj_make_compatible(self, primitive, target_version):
         super(LibvirtLiveMigrateData, self).obj_make_compatible(
             primitive, target_version)
         target_version = versionutils.convert_version_to_tuple(target_version)
+        if target_version < (1, 10) and 'instance_numa_topology' in primitive:
+            del primitive['instance_numa_topology']
+        if target_version < (1, 10) and 'dst_numa_config' in primitive:
+            del primitive['dst_numa_config']
         if target_version < (1, 9) and 'vifs' in primitive:
             del primitive['vifs']
         if target_version < (1, 8):
