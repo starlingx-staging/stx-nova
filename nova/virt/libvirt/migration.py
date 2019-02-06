@@ -25,6 +25,7 @@ from oslo_log import log as logging
 from nova.compute import power_state
 import nova.conf
 from nova import exception
+from nova.virt import hardware
 from nova.virt.libvirt import config as vconfig
 
 LOG = logging.getLogger(__name__)
@@ -88,7 +89,55 @@ def get_updated_guest_xml(guest, migrate_data, get_volume_config,
     xml_doc = _update_memory_backing_xml(xml_doc, migrate_data)
     if get_vif_config is not None:
         xml_doc = _update_vif_xml(xml_doc, migrate_data, get_vif_config)
+    if 'dst_numa_config' in migrate_data and migrate_data.dst_numa_config:
+        xml_doc = _update_numa_xml(xml_doc, migrate_data)
     return etree.tostring(xml_doc, encoding='unicode')
+
+
+def _update_numa_xml(xml_doc, migrate_data):
+    LOG.debug('Updating NUMA XML')
+    cpu_pins = migrate_data.dst_numa_config.cpu_pins
+    if cpu_pins:
+        for pin_mapping in cpu_pins:
+            vcpupin = xml_doc.find(
+                './cputune/vcpupin[@vcpu="%d"]' % pin_mapping.guest_id)
+            vcpupin.set('cpuset',
+                        hardware.format_cpu_spec(pin_mapping.host_ids))
+            LOG.debug('Set CPU pin guest %d -> host %s',
+                      pin_mapping.guest_id, pin_mapping.host_ids)
+
+    emulator_pins = migrate_data.dst_numa_config.emulator_pins
+    if emulator_pins:
+        emulatorpin = xml_doc.find('./cputune/emulatorpin')
+        emulatorpin.set('cpuset', hardware.format_cpu_spec(emulator_pins))
+        LOG.debug('Set emulator pins to %s', emulator_pins)
+
+    cell_pins = migrate_data.dst_numa_config.cell_pins
+    all_cells = []
+    if cell_pins:
+        for pin_mapping in cell_pins:
+            all_cells.extend(pin_mapping.host_ids)
+            memnode = xml_doc.find(
+                './numatune/memnode[@cellid="%d"]' % pin_mapping.guest_id)
+            memnode.set('nodeset',
+                        hardware.format_cpu_spec(pin_mapping.host_ids))
+            LOG.debug('Set cell pin guest %d -> host %s',
+                      pin_mapping.guest_id, pin_mapping.host_ids)
+
+    for page in xml_doc.findall('./memoryBacking/hugepages/page'):
+        page.set('nodeset', hardware.format_cpu_spec(all_cells))
+    LOG.debug('Set hugepages nodeset to %s', all_cells)
+
+    sched_vcpus = migrate_data.dst_numa_config.sched_vcpus
+    sched_priority = migrate_data.dst_numa_config.sched_priority
+    if sched_vcpus and sched_priority:
+        vcpusched = xml_doc.find('./cputune/vcpusched')
+        vcpusched.set('vcpus', hardware.format_cpu_spec(sched_vcpus))
+        vcpusched.set('priority', str(sched_priority))
+        LOG.debug('Set scheduler on CPUs %s to priority %d',
+                  sched_vcpus, sched_priority)
+
+    return xml_doc
 
 
 def _update_graphics_xml(xml_doc, migrate_data):
