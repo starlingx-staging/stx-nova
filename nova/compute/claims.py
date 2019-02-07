@@ -270,7 +270,8 @@ class MoveClaim(Claim):
     Move can be either a migrate/resize, live-migrate or an evacuate operation.
     """
     def __init__(self, context, instance, nodename, instance_type, image_meta,
-                 tracker, resources, pci_requests, overhead=None, limits=None):
+                 tracker, resources, pci_requests, overhead=None, limits=None,
+                 migration=None):
         self.context = context
         self.instance_type = instance_type
         if isinstance(image_meta, dict):
@@ -279,7 +280,7 @@ class MoveClaim(Claim):
         super(MoveClaim, self).__init__(context, instance, nodename, tracker,
                                         resources, pci_requests,
                                         overhead=overhead, limits=limits)
-        self.migration = None
+        self.migration = migration
 
     @property
     def disk_gb(self):
@@ -297,8 +298,20 @@ class MoveClaim(Claim):
 
     @property
     def numa_topology(self):
-        return hardware.numa_get_constraints(self.instance_type,
-                                             self.image_meta)
+        numa_topology = hardware.numa_get_constraints(self.instance_type,
+                                                      self.image_meta)
+        # NOTE(artom) If we're live migrating an instance with a NUMA topology
+        # using the libvirt driver, the pagesize needs to remain the
+        # same as on the source. x86 is the only architecture to support
+        # changing the pagesize with the instance running, and even then
+        # post-copy live migration requires a constant pagesize. Override what
+        # numa_get_constraints() gave us with the page size from
+        # instance.numa_topology.
+        if (numa_topology and self.migration and
+                self.migration.migration_type == 'live-migration'):
+            for cell in numa_topology.cells:
+                cell.pagesize = self.instance.numa_topology.cells[0].pagesize
+        return numa_topology
 
     def abort(self):
         """Compute operation requiring claimed resources has failed or
@@ -310,3 +323,8 @@ class MoveClaim(Claim):
             self.instance, self.nodename,
             instance_type=self.instance_type)
         self.instance.drop_migration_context()
+
+    def __str__(self):
+        return ("[Claim: %d MB memory, %d GB disk, "
+                "%s topology]" % (self.memory_mb, self.disk_gb,
+                                  self.claimed_numa_topology))

@@ -27,6 +27,7 @@ from nova.pci import manager as pci_manager
 from nova import test
 from nova.tests.unit import fake_instance
 from nova.tests.unit.pci import fakes as pci_fakes
+from nova.virt import hardware
 
 _NODENAME = 'fake-node'
 
@@ -398,7 +399,7 @@ class MoveClaimTestCase(ClaimTestCase):
         numa_topology = kwargs.pop('numa_topology', None)
         image_meta = image_meta or {}
         self.instance = self._fake_instance(**kwargs)
-        self.instance.numa_topology = None
+        self.instance.numa_topology = numa_topology
         if numa_topology:
             self.db_numa_topology = {
                     'id': 1, 'created_at': None, 'updated_at': None,
@@ -419,10 +420,11 @@ class MoveClaimTestCase(ClaimTestCase):
         @mock.patch('nova.db.api.instance_extra_get_by_instance_uuid',
                     return_value=self.db_numa_topology)
         def get_claim(mock_extra_get, mock_numa_get):
-            return claims.MoveClaim(self.context, self.instance, _NODENAME,
-                                    instance_type, image_meta, self.tracker,
-                                    self.resources, requests,
-                                    overhead=overhead, limits=limits)
+            return claims.MoveClaim(
+                self.context, self.instance, _NODENAME, instance_type,
+                image_meta, self.tracker, self.resources, requests,
+                overhead=overhead, limits=limits,
+                migration=objects.Migration(migration_type='live-migration'))
         return get_claim()
 
     @mock.patch('nova.objects.Instance.drop_migration_context')
@@ -439,3 +441,26 @@ class MoveClaimTestCase(ClaimTestCase):
         image_meta = objects.ImageMeta()
         claim = self._claim(image_meta=image_meta)
         self.assertIsInstance(claim.image_meta, objects.ImageMeta)
+
+    @mock.patch.object(objects.NUMACell, 'can_fit_pagesize', return_value=True)
+    def test_numa_topology_pagesize(self, _):
+        numa_constraints = objects.InstanceNUMATopology(
+            cells=[objects.InstanceNUMACell(id=1, cpuset=set([1, 2]),
+                                            memory=512, pagesize=1)])
+        with mock.patch.object(hardware, 'numa_get_constraints',
+                               return_value=numa_constraints):
+            instance_to_fit = objects.InstanceNUMATopology(
+                cells=[objects.InstanceNUMACell(id=1, cpuset=set([1, 2]),
+                                                memory=512, pagesize=2)])
+            claim = self._claim(numa_topology=instance_to_fit)
+            self.assertEqual(2, claim.numa_topology.cells[0].pagesize)
+
+    @mock.patch.object(objects.NUMACell, 'can_fit_pagesize', return_value=True)
+    def test_numa_topology_none_pagesize(self, _):
+        with mock.patch.object(hardware, 'numa_get_constraints',
+                               return_value=None):
+            instance_to_fit = objects.InstanceNUMATopology(
+                cells=[objects.InstanceNUMACell(id=1, cpuset=set([1, 2]),
+                                                memory=512)])
+            claim = self._claim(numa_topology=instance_to_fit)
+            self.assertIsNone(claim.numa_topology)
