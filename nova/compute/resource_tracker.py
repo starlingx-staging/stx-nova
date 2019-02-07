@@ -73,15 +73,6 @@ def _instance_in_resize_state(instance):
     return False
 
 
-def _is_trackable_migration(migration):
-    # Only look at resize/migrate migration and evacuation records
-    # NOTE(danms): RT should probably examine live migration
-    # records as well and do something smart. However, ignore
-    # those for now to avoid them being included in below calculations.
-    return migration.migration_type in ('resize', 'migration',
-                                        'evacuation')
-
-
 def _normalize_inventory_from_cn_obj(inv_data, cn):
     """Helper function that injects various information from a compute node
     object into the inventory dict returned from the virt driver's
@@ -256,6 +247,27 @@ class ResourceTracker(object):
                                 migration, image_meta=image_meta,
                                 limits=limits)
 
+    @utils.synchronized(COMPUTE_RESOURCE_SEMAPHORE)
+    def live_migration_claim(self, context, instance, nodename, migration,
+                             limits):
+        """Builds a MoveClaim for a live migration.
+
+        :param context: The request context.
+        :param instance: The instance being live migrated.
+        :param nodename: The nodename of the destination host.
+        :param migration: The Migration object associated with this live
+                          migration.
+        :param limits: A SchedulerLimits object from when the scheduler
+                       selected the destination host.
+        :returns: A MoveClaim for this live migration.
+        """
+        # Flavor and image cannot change during a live migration.
+        instance_type = instance.flavor
+        image_meta = instance.image_meta
+        return self._move_claim(context, instance, instance_type, nodename,
+                                migration, move_type='live-migration',
+                                image_meta=image_meta, limits=limits)
+
     def _move_claim(self, context, instance, new_instance_type, nodename,
                     migration, move_type=None, image_meta=None, limits=None):
         """Indicate that resources are needed for a move to this host.
@@ -289,6 +301,7 @@ class ResourceTracker(object):
         if self.disabled(nodename):
             # compute_driver doesn't support resource tracking, just
             # generate the migration record and continue the resize:
+            LOG.debug('Resource tracking not supported, returning NopClaim')
             return claims.NopClaim(migration=migration)
 
         # get memory overhead required to build this instance:
@@ -323,9 +336,8 @@ class ResourceTracker(object):
         claim = claims.MoveClaim(context, instance, nodename,
                                  new_instance_type, image_meta, self, cn,
                                  new_pci_requests, overhead=overhead,
-                                 limits=limits)
+                                 limits=limits, migration=migration)
 
-        claim.migration = migration
         claimed_pci_devices_objs = []
         if self.pci_tracker:
             # NOTE(jaypipes): ComputeNode.pci_device_pools is set below
@@ -394,7 +406,8 @@ class ResourceTracker(object):
         migration.dest_compute = self.host
         migration.dest_node = nodename
         migration.dest_host = self.driver.get_host_ip_addr()
-        migration.status = 'pre-migrating'
+        if migration.migration_type != 'live-migration':
+            migration.status = 'pre-migrating'
         migration.save()
 
     def _set_instance_host_and_node(self, instance, nodename):
@@ -1065,8 +1078,6 @@ class ResourceTracker(object):
         """Update usage for a single migration.  The record may
         represent an incoming or outbound migration.
         """
-        if not _is_trackable_migration(migration):
-            return
 
         uuid = migration.instance_uuid
         LOG.info("Updating resource usage from migration %s", migration.uuid,
