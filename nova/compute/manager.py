@@ -6282,12 +6282,43 @@ class ComputeManager(manager.Manager):
             block_migration, disk_over_commit)
         LOG.debug('destination check data is %s', dest_check_data)
         try:
-            migrate_data = self.compute_rpcapi.\
+            source_check_data = self.compute_rpcapi.\
                                 check_can_live_migrate_source(ctxt, instance,
                                                               dest_check_data)
+            migrate_data = self._prepare_numa_live_migration(ctxt, instance,
+                                                             source_check_data,
+                                                             migration, limits)
         finally:
             self.driver.cleanup_live_migration_destination_check(ctxt,
                     dest_check_data)
+        return migrate_data
+
+    def _prepare_numa_live_migration(self, ctxt, instance, migrate_data,
+                                     migration, limits):
+        """Prepares for a NUMA live migration if necessary by making a
+        resources claim and asking our virt driver for dst_numa_config.
+
+        :param ctxt: Request context
+        :param instance: The Instance being live migrated
+        :param migrate_data: The MigrateData object for this live migration
+        :param migration: The Migration object for this live migration
+        :param limits: The SchedulerLimits object for this live migration
+        :returns: migrate_data with dst_numa_config if necessary
+        """
+        numa_live_migration = ('instance_numa_topology' in migrate_data
+                               and migrate_data.instance_numa_topology)
+        if numa_live_migration and migration:
+            try:
+                claim = self.rt.live_migration_claim(
+                    ctxt, instance, self._get_nodename(instance), migration,
+                    limits)
+                LOG.debug('Created live migration claim %s', claim)
+            except exception.ComputeResourcesUnavailable as e:
+                raise exception.MigrationPreCheckError(
+                    reason=e.format_message())
+            migrate_data.dst_numa_config = self.driver.get_dst_numa_config(
+                claim.claimed_numa_topology, instance.flavor,
+                instance.image_meta)
         return migrate_data
 
     @wrap_exception()
@@ -7060,6 +7091,7 @@ class ComputeManager(manager.Manager):
             except exception.ComputeHostNotFound:
                 LOG.exception('Failed to get compute_info for %s', self.host)
             finally:
+                instance.apply_migration_context()
                 instance.host = self.host
                 instance.power_state = current_power_state
                 instance.task_state = None
@@ -7186,8 +7218,17 @@ class ComputeManager(manager.Manager):
 
         do_cleanup, destroy_disks = self._live_migration_cleanup_flags(
                 migrate_data)
-
-        if do_cleanup:
+        # NOTE(artom) Before NUMA live migration and the resource claim it
+        # does, we only called rollback_live_migration_at_destination if
+        # do_cleanup was True. Now, if the destination did a claim, we need to
+        # call rlmad() regardless to ensure it drops the claim and migration
+        # context that was created. We pass it do_cleanup to tell it wether an
+        # old-style cleanup is necessary. However, if the destination isn't
+        # aware of NUMA live migration, we need to preserve the old way of
+        # calling it by checking do_cleanup ourselves.
+        numa_live_migration = ('dst_numa_config' in migrate_data
+                               and migrate_data.dst_numa_config)
+        if do_cleanup or numa_live_migration:
             self.compute_rpcapi.rollback_live_migration_at_destination(
                     context, instance, dest, destroy_disks=destroy_disks,
                     migrate_data=migrate_data, do_cleanup=do_cleanup)
@@ -7230,7 +7271,9 @@ class ComputeManager(manager.Manager):
     def rollback_live_migration_at_destination(self, context, instance,
                                                destroy_disks, migrate_data,
                                                do_cleanup=True):
-        """Cleaning up image directory that is created pre_live_migration.
+        """Drop the MoveClaim (if one was created) for the live migration, and
+        if necessary clean up the image directory that was created by
+        pre_live_migration.
 
         :param context: security context
         :param instance: a nova.objects.instance.Instance object sent over rpc
@@ -7245,6 +7288,20 @@ class ComputeManager(manager.Manager):
             context, instance, self.host,
             action=fields.NotificationAction.LIVE_MIGRATION_ROLLBACK_DEST,
             phase=fields.NotificationPhase.START)
+        if 'dst_numa_config' in migrate_data and migrate_data.dst_numa_config:
+            instance.drop_migration_context()
+            self.rt.drop_move_claim(
+                context, instance, self._get_nodename(instance),
+                instance.flavor, prefix='_new')
+        if do_cleanup:
+            self._do_rollback_live_migration_at_destination(context, instance,
+                                                            destroy_disks,
+                                                            migrate_data,
+                                                            network_info)
+
+    def _do_rollback_live_migration_at_destination(self, context, instance,
+                                                   destroy_disks,
+                                                   migrate_data, network_info):
         try:
             # NOTE(tr3buchet): tear down networks on dest host (nova-net)
             # NOTE(mriedem): For neutron, this call will delete any
