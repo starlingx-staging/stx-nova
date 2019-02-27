@@ -7369,6 +7369,15 @@ class LibvirtDriver(driver.ComputeDriver):
         # default to True here for all computes >= Queens.
         dest_check_data.src_supports_native_luks = True
 
+        # NOTE(artom) Used to indicate that the source can perform a NUMA-aware
+        # live migration. instance.numa_topology will be present as it has
+        # already been loaded at the API layer via expected_attrs (but it may
+        # be None).
+        if instance.numa_topology:
+            LOG.debug('Instance has a NUMA topology, preparing for NUMA '
+                      'live migration')
+            dest_check_data.instance_numa_topology = instance.numa_topology
+
         return dest_check_data
 
     def _is_shared_block_storage(self, instance, dest_check_data,
