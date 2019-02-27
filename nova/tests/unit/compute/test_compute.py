@@ -6823,7 +6823,7 @@ class ComputeTestCase(BaseTestCase,
             ret = self.compute.rollback_live_migration_at_destination(c,
                                                         instance=instance,
                                                         destroy_disks=True,
-                                                        migrate_data=None)
+                                                        migrate_data=[])
         self.assertIsNone(ret)
         self.assertEqual(len(fake_notifier.NOTIFICATIONS), 2)
         msg = fake_notifier.NOTIFICATIONS[0]
@@ -6838,7 +6838,7 @@ class ComputeTestCase(BaseTestCase,
                         {'swap': None, 'ephemerals': [],
                          'root_device_name': None,
                          'block_device_mapping': []},
-                        destroy_disks=True, migrate_data=None)
+                        destroy_disks=True, migrate_data=[])
         mock_notify.assert_has_calls([
                 mock.call(c, instance, self.compute.host,
                           action='live_migration_rollback_dest',

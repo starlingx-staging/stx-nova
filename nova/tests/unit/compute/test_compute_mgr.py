@@ -2646,6 +2646,106 @@ class ComputeManagerUnitTestCase(test.NoDBTestCase,
                               connector, bdm, uuids.new_attachment_id,
                               bdm.device_name)
 
+    def test_prepare_numa_live_migration(self):
+        mock_claim = mock.Mock()
+        mock_claim.claimed_numa_topology = mock.sentinel.claimed_topology
+        stub_image_meta = objects.ImageMeta()
+        stub_numamigratedata = objects.NUMAMigrateData(
+            cpu_pins=[], cell_pins=[], emulator_pins=None, sched_vcpus=None,
+            sched_priority=None)
+        with test.nested(
+            mock.patch.object(self.compute.rt,
+                              'live_migration_claim',
+                              return_value=mock_claim),
+            mock.patch.object(self.compute, '_get_nodename',
+                              return_value='fake-node'),
+            mock.patch.object(objects.ImageMeta, 'from_instance',
+                              return_value=stub_image_meta),
+            mock.patch.object(fake_driver.FakeDriver, 'get_dst_numa_config',
+                              return_value=stub_numamigratedata)
+        ) as (mock_lm_claim, mock_get_nodename, mock_from_instance,
+              mock_dst_numa_config):
+            instance = objects.Instance(flavor=objects.Flavor())
+            md = objects.LibvirtLiveMigrateData()
+            md.instance_numa_topology = objects.InstanceNUMATopology(
+                cells=[objects.InstanceNUMACell(id=1, cpuset=set([1, 2]),
+                                                memory=512)])
+            new_md = self.compute._prepare_numa_live_migration(
+                self.context, instance, md, mock.sentinel.migration,
+                mock.sentinel.limits)
+            mock_lm_claim.assert_called_with(
+                self.context, instance, 'fake-node', mock.sentinel.migration,
+                mock.sentinel.limits)
+            mock_dst_numa_config.assert_called_with(
+                mock.sentinel.claimed_topology, instance.flavor,
+                stub_image_meta)
+            self.assertEqual(stub_numamigratedata, new_md.dst_numa_config)
+
+    def test_prepare_numa_live_migration_migration_none(self):
+        with test.nested(
+            mock.patch.object(self.compute.rt,
+                              'live_migration_claim'),
+            mock.patch.object(fake_driver.FakeDriver, 'get_dst_numa_config')
+        ) as (mock_lm_claim, mock_dst_numa_config):
+            instance = objects.Instance()
+            md = objects.LibvirtLiveMigrateData()
+            md.instance_numa_topology = objects.InstanceNUMATopology(
+                cells=[objects.InstanceNUMACell(id=1, cpuset=set([1, 2]),
+                                                memory=512)])
+            new_md = self.compute._prepare_numa_live_migration(
+                self.context, instance, md, None, mock.sentinel.limits)
+            mock_lm_claim.assert_not_called()
+            mock_dst_numa_config.assert_not_called()
+            self.assertNotIn('dst_numa_config', new_md)
+
+    def test_prepare_numa_live_migration_no_instance_numa_topo(self):
+        with test.nested(
+            mock.patch.object(self.compute.rt,
+                              'live_migration_claim'),
+            mock.patch.object(fake_driver.FakeDriver, 'get_dst_numa_config')
+        ) as (mock_lm_claim, mock_dst_numa_config):
+            instance = objects.Instance()
+            md = objects.LibvirtLiveMigrateData()
+            new_md = self.compute._prepare_numa_live_migration(
+                self.context, instance, md, mock.sentinel.migration,
+                mock.sentinel.limits)
+            mock_lm_claim.assert_not_called()
+            mock_dst_numa_config.assert_not_called()
+            self.assertNotIn('dst_numa_config', new_md)
+
+    def test_prepare_numa_live_migration_claim_raises(self):
+        stub_image_meta = objects.ImageMeta()
+        stub_numamigratedata = objects.NUMAMigrateData(
+            cpu_pins=[], cell_pins=[], emulator_pins=None, sched_vcpus=None,
+            sched_priority=None)
+        with test.nested(
+            mock.patch.object(
+                self.compute.rt, 'live_migration_claim',
+                side_effect=exception.ComputeResourcesUnavailable(
+                    reason='bork')),
+            mock.patch.object(self.compute, '_get_nodename',
+                              return_value='fake-node'),
+            mock.patch.object(objects.ImageMeta, 'from_instance',
+                              return_value=stub_image_meta),
+            mock.patch.object(fake_driver.FakeDriver, 'get_dst_numa_config',
+                              return_value=stub_numamigratedata)
+        ) as (mock_lm_claim, mock_get_nodename, mock_from_instance,
+              mock_dst_numa_config):
+            instance = objects.Instance(flavor=objects.Flavor())
+            md = objects.LibvirtLiveMigrateData()
+            md.instance_numa_topology = objects.InstanceNUMATopology(
+                cells=[objects.InstanceNUMACell(id=1, cpuset=set([1, 2]),
+                                                memory=512)])
+            self.assertRaises(
+                exception.MigrationPreCheckError,
+                self.compute._prepare_numa_live_migration,
+                self.context, instance, md, mock.sentinel.migration,
+                mock.sentinel.limits)
+            mock_lm_claim.assert_called_with(
+                self.context, instance, 'fake-node', mock.sentinel.migration,
+                mock.sentinel.limits)
+            mock_dst_numa_config.assert_not_called()
+
     @mock.patch.object(objects.BlockDeviceMappingList, 'get_by_instance_uuid')
     @mock.patch.object(fake_driver.FakeDriver,
                        'check_can_live_migrate_source')
@@ -7953,6 +8053,7 @@ class ComputeManagerMigrationTestCase(test.NoDBTestCase,
 
     def test_post_live_migration_at_destination_success(self):
 
+        @mock.patch.object(objects.Instance, 'apply_migration_context')
         @mock.patch.object(self.instance, 'save')
         @mock.patch.object(self.compute.network_api, 'get_instance_nw_info',
                            return_value='test_network')
@@ -7969,7 +8070,8 @@ class ComputeManagerMigrationTestCase(test.NoDBTestCase,
                      _get_compute_info, _get_power_state,
                      _get_instance_block_device_info,
                      _notify_about_instance_usage, migrate_instance_finish,
-                     setup_networks_on_host, get_instance_nw_info, save):
+                     setup_networks_on_host, get_instance_nw_info, save,
+                     mock_apply_mig_ctxt):
 
             cn = mock.Mock(spec_set=['hypervisor_hostname'])
             cn.hypervisor_hostname = 'test_host'
@@ -8024,11 +8126,13 @@ class ComputeManagerMigrationTestCase(test.NoDBTestCase,
             self.assertIsNone(self.instance.task_state)
             save.assert_called_once_with(
                 expected_task_state=task_states.MIGRATING)
+            mock_apply_mig_ctxt.assert_called_with()
 
         _do_test()
 
     def test_post_live_migration_at_destination_compute_not_found(self):
 
+        @mock.patch.object(objects.Instance, 'apply_migration_context')
         @mock.patch.object(self.instance, 'save')
         @mock.patch.object(self.compute, 'network_api')
         @mock.patch.object(self.compute, '_notify_about_instance_usage')
@@ -8043,7 +8147,8 @@ class ComputeManagerMigrationTestCase(test.NoDBTestCase,
         def _do_test(mock_notify, post_live_migration_at_destination,
                      _get_compute_info, _get_power_state,
                      _get_instance_block_device_info,
-                     _notify_about_instance_usage, network_api, save):
+                     _notify_about_instance_usage, network_api, save,
+                     mock_apply_mig_ctxt):
             cn = mock.Mock(spec_set=['hypervisor_hostname'])
             cn.hypervisor_hostname = 'test_host'
             _get_compute_info.return_value = cn
@@ -8056,11 +8161,13 @@ class ComputeManagerMigrationTestCase(test.NoDBTestCase,
                 mock.call(self.context, self.instance, self.instance.host,
                           action='live_migration_post_dest', phase='end')])
             self.assertIsNone(self.instance.node)
+            mock_apply_mig_ctxt.assert_called_with()
 
         _do_test()
 
     def test_post_live_migration_at_destination_unexpected_exception(self):
 
+        @mock.patch.object(objects.Instance, 'apply_migration_context')
         @mock.patch.object(compute_utils, 'add_instance_fault_from_exc')
         @mock.patch.object(self.instance, 'save')
         @mock.patch.object(self.compute, 'network_api')
@@ -8074,7 +8181,7 @@ class ComputeManagerMigrationTestCase(test.NoDBTestCase,
         def _do_test(post_live_migration_at_destination, _get_compute_info,
                      _get_power_state, _get_instance_block_device_info,
                      _notify_about_instance_usage, network_api, save,
-                     add_instance_fault_from_exc):
+                     add_instance_fault_from_exc, mock_apply_mig_ctxt):
             cn = mock.Mock(spec_set=['hypervisor_hostname'])
             cn.hypervisor_hostname = 'test_host'
             _get_compute_info.return_value = cn
@@ -8083,6 +8190,7 @@ class ComputeManagerMigrationTestCase(test.NoDBTestCase,
                               self.compute.post_live_migration_at_destination,
                               self.context, self.instance, False)
             self.assertEqual(vm_states.ERROR, self.instance.vm_state)
+            mock_apply_mig_ctxt.assert_called_with()
 
         _do_test()
 
@@ -8093,6 +8201,7 @@ class ComputeManagerMigrationTestCase(test.NoDBTestCase,
         """Tests that neutron fails to delete the source host port bindings
         but we handle the error and just log it.
         """
+        @mock.patch.object(objects.Instance, 'apply_migration_context')
         @mock.patch.object(self.compute, '_notify_about_instance_usage')
         @mock.patch.object(self.compute, 'network_api')
         @mock.patch.object(self.compute, '_get_instance_block_device_info')
@@ -8103,7 +8212,8 @@ class ComputeManagerMigrationTestCase(test.NoDBTestCase,
                                hypervisor_hostname='fake-dest-host'))
         @mock.patch.object(self.instance, 'save')
         def _do_test(instance_save, get_compute_node, get_power_state,
-                     get_bdms, network_api, legacy_notify):
+                     get_bdms, network_api, legacy_notify,
+                     mock_apply_mig_ctxt):
             # setup_networks_on_host is called three times:
             # 1. set the migrating_to port binding profile value (no-op)
             # 2. delete the source host port bindings - we make this raise
@@ -8118,6 +8228,7 @@ class ComputeManagerMigrationTestCase(test.NoDBTestCase,
             self.assertEqual(1, mock_log_error.call_count)
             self.assertIn('Network cleanup failed for source host',
                           mock_log_error.call_args[0][0])
+            mock_apply_mig_ctxt.assert_called_with()
 
         _do_test()
 
@@ -8406,9 +8517,10 @@ class ComputeManagerMigrationTestCase(test.NoDBTestCase,
             self.compute.network_api.setup_networks_on_host.side_effect = (
                 exception.PortBindingDeletionFailed(
                     port_id=uuids.port_id, host='fake-dest-host'))
+            mock_md = mock.MagicMock()
             self.compute.rollback_live_migration_at_destination(
                 self.context, self.instance, destroy_disks=False,
-                migrate_data=mock.sentinel.migrate_data)
+                migrate_data=mock_md)
             self.assertEqual(1, mock_log_error.call_count)
             self.assertIn('Network cleanup failed for destination host',
                           mock_log_error.call_args[0][0])
@@ -8416,7 +8528,7 @@ class ComputeManagerMigrationTestCase(test.NoDBTestCase,
                 self.context, self.instance,
                 network_api.get_instance_nw_info.return_value,
                 get_bdms.return_value, destroy_disks=False,
-                migrate_data=mock.sentinel.migrate_data)
+                migrate_data=mock_md)
 
         _do_test()
 
