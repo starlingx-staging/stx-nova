@@ -186,7 +186,7 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
         self.task.instance.numa_topology = None
         mock_get.return_value = objects.ComputeNode(
             uuid=uuids.cn1, hypervisor_type='kvm')
-        self.task._check_instance_has_no_numa()
+        self.task._check_instance_has_no_numa(self.context)
 
     @mock.patch.object(objects.ComputeNode, 'get_by_host_and_nodename')
     def test_check_instance_has_no_numa_passes_non_kvm(self, mock_get):
@@ -196,20 +196,24 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
                                             memory=1024)])
         mock_get.return_value = objects.ComputeNode(
             uuid=uuids.cn1, hypervisor_type='xen')
-        self.task._check_instance_has_no_numa()
+        self.task._check_instance_has_no_numa(self.context)
 
+    @mock.patch.object(objects.Service, 'get_minimum_version',
+                       return_value=38)
     @mock.patch.object(objects.ComputeNode, 'get_by_host_and_nodename')
-    def test_check_instance_has_no_numa_passes_workaround(self, mock_get):
+    def test_check_instance_has_no_numa_passes_workaround(self, mock_get, _):
         self.flags(enable_numa_live_migration=True, group='workarounds')
         self.task.instance.numa_topology = objects.InstanceNUMATopology(
             cells=[objects.InstanceNUMACell(id=0, cpuset=set([0]),
                                             memory=1024)])
         mock_get.return_value = objects.ComputeNode(
             uuid=uuids.cn1, hypervisor_type='kvm')
-        self.task._check_instance_has_no_numa()
+        self.task._check_instance_has_no_numa(self.context)
 
+    @mock.patch.object(objects.Service, 'get_minimum_version',
+                       return_value=38)
     @mock.patch.object(objects.ComputeNode, 'get_by_host_and_nodename')
-    def test_check_instance_has_no_numa_fails(self, mock_get):
+    def test_check_instance_has_no_numa_fails(self, mock_get, _):
         self.flags(enable_numa_live_migration=False, group='workarounds')
         mock_get.return_value = objects.ComputeNode(
             uuid=uuids.cn1, hypervisor_type='QEMU')
@@ -217,7 +221,20 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
             cells=[objects.InstanceNUMACell(id=0, cpuset=set([0]),
                                             memory=1024)])
         self.assertRaises(exception.MigrationPreCheckError,
-                          self.task._check_instance_has_no_numa)
+                          self.task._check_instance_has_no_numa,
+                          self.context)
+
+    @mock.patch.object(objects.Service, 'get_minimum_version',
+                       return_value=39)
+    @mock.patch.object(objects.ComputeNode, 'get_by_host_and_nodename')
+    def test_check_instance_has_no_numa_new_svc_passes(self, mock_get, _):
+        self.flags(enable_numa_live_migration=False, group='workarounds')
+        mock_get.return_value = objects.ComputeNode(
+            uuid=uuids.cn1, hypervisor_type='kvm')
+        self.task.instance.numa_topology = objects.InstanceNUMATopology(
+            cells=[objects.InstanceNUMACell(id=0, cpuset=set([0]),
+                                            memory=1024)])
+        self.task._check_instance_has_no_numa(self.context)
 
     @mock.patch.object(objects.Service, 'get_by_compute_host')
     @mock.patch.object(servicegroup.API, 'service_is_up')
