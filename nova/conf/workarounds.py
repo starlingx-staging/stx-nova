@@ -198,15 +198,18 @@ Related options:
         help="""
 Enable live migration of instances with NUMA topologies.
 
-Live migration of instances with NUMA topologies is disabled by default
-when using the libvirt driver. This includes live migration of instances with
-CPU pinning or hugepages. CPU pinning and huge page information for such
-instances is not currently re-calculated, as noted in `bug #1289064`_.  This
-means that if instances were already present on the destination host, the
-migrated instance could be placed on the same dedicated cores as these
-instances or use hugepages allocated for another instance. Alternately, if the
-host platforms were not homogeneous, the instance could be assigned to
-non-existent cores or be inadvertently split across host NUMA nodes.
+NUMA live migration is only supported on deployments that have been fully
+upgraded to Stein. In previous versions, or in mixed Rocky/Stein deployments
+with a rolling upgrade in progress, live migration of instances with NUMA
+topologies is disabled by default when using the libvirt driver. This includes
+live migration of instances with CPU pinning or hugepages. CPU pinning and huge
+page information for such instances is not currently re-calculated, as noted in
+`bug #1289064`_.  This means that if instances were already present on the
+destination host, the migrated instance could be placed on the same dedicated
+cores as these instances or use hugepages allocated for another instance.
+Alternately, if the host platforms were not homogeneous, the instance could be
+assigned to non-existent cores or be inadvertently split across host NUMA
+nodes.
 
 Despite these known issues, there may be cases where live migration is
 necessary. By enabling this option, operators that are aware of the issues and

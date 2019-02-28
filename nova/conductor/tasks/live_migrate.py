@@ -69,7 +69,7 @@ class LiveMigrationTask(base.TaskBase):
 
     def _execute(self):
         self._check_instance_is_active()
-        self._check_instance_has_no_numa()
+        self._check_instance_has_no_numa(self.context)
         self._check_host_is_up(self.source)
 
         self._source_cn, self._held_allocations = (
@@ -160,7 +160,7 @@ class LiveMigrationTask(base.TaskBase):
                     state=power_state.STATE_MAP[self.instance.power_state],
                     method='live migrate')
 
-    def _check_instance_has_no_numa(self):
+    def _check_instance_has_no_numa(self, context):
         """Prevent live migrations of instances with NUMA topologies."""
         if not self.instance.numa_topology:
             return
@@ -175,17 +175,20 @@ class LiveMigrationTask(base.TaskBase):
         if hypervisor_type.lower() != obj_fields.HVType.QEMU:
             return
 
-        msg = ('Instance has an associated NUMA topology. '
-               'Instance NUMA topologies, including related attributes '
-               'such as CPU pinning, huge page and emulator thread '
-               'pinning information, are not currently recalculated on '
-               'live migration. See bug #1289064 for more information.'
-               )
-
-        if CONF.workarounds.enable_numa_live_migration:
-            LOG.warning(msg, instance=self.instance)
-        else:
-            raise exception.MigrationPreCheckError(reason=msg)
+        numa_live_migration = (
+            objects.Service.get_minimum_version(context,
+                                                'nova-compute') > 38)
+        if not numa_live_migration:
+            msg = ('Instance has an associated NUMA topology. '
+                   'Instance NUMA topologies, including related attributes '
+                   'such as CPU pinning, huge page and emulator thread '
+                   'pinning information, are not currently recalculated on '
+                   'live migration. See bug #1289064 for more information.'
+                   )
+            if CONF.workarounds.enable_numa_live_migration:
+                LOG.warning(msg, instance=self.instance)
+            else:
+                raise exception.MigrationPreCheckError(reason=msg)
 
     def _check_host_is_up(self, host):
         service = objects.Service.get_by_compute_host(self.context, host)
