@@ -6678,28 +6678,6 @@ class ComputeManager(manager.Manager):
             for instance in to_unrescue:
                 self.compute_api.unrescue(context, instance)
 
-    @periodic_task.periodic_task(spacing=CONF.pci_affine_interval)
-    def _affine_pci_dev_instances(self, context):
-        """Periodically reaffine pci device irqs.  This will correct the
-        affinity setting of dynamically created irqs.
-        """
-        filters = {'vm_state': vm_states.ACTIVE,
-                   'task_state': None,
-                   'deleted': False,
-                   'host': self.host}
-        instances = objects.InstanceList.get_by_filters(
-            context, filters, expected_attrs=[], use_slave=True)
-        for instance in instances:
-            if len(instance.pci_devices.objects) == 0:
-                continue
-            try:
-                self.driver.affine_pci_dev_irqs(instance, wait_for_irqs=False)
-            except NotImplementedError:
-                return
-            except Exception as e:
-                LOG.info("Error affining pci device irqs: %s.",
-                         e, instance=instance)
-
     @periodic_task.periodic_task
     def _poll_unconfirmed_resizes(self, context):
         if CONF.resize_confirm_window == 0:

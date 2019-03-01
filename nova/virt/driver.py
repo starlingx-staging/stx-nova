@@ -1667,12 +1667,6 @@ class ComputeDriver(object):
     def get_l3_closids_used(self):
         return 0
 
-    # WRS: extension
-    def affine_pci_dev_irqs(self, instance, wait_for_irqs=True):
-        """Affine PCI device irqs to VM's pcpus."""
-        raise NotImplementedError()
-
-
 def load_compute_driver(virtapi, compute_driver=None):
     """Load a compute driver module.
 

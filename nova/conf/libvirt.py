@@ -1044,19 +1044,6 @@ Related options:
 ),
 ]
 
-# WRS: add options for PCI IRQ affinity, msi irq detection parameters
-libvirt_pci_irq_opts = [
-    cfg.IntOpt('msi_irq_timeout',
-               default=45,
-               help='Number of seconds to wait for msi irq configuration'),
-    cfg.IntOpt('msi_irq_since',
-               default=6,
-               help='Number of seconds to wait for msi irqs to stabilize.'),
-    cfg.IntOpt('msi_irq_check_interval',
-               default=2,
-               help='Check interval in seconds for msi irqs to stabilize.'),
-]
-
 ALL_OPTS = list(itertools.chain(
     libvirt_general_opts,
     libvirt_imagebackend_opts,
@@ -1074,7 +1061,6 @@ ALL_OPTS = list(itertools.chain(
     libvirt_volume_smbfs_opts,
     libvirt_remotefs_opts,
     libvirt_volume_vzstorage_opts,
-    libvirt_pci_irq_opts,
 ))
 
 

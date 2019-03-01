@@ -487,10 +487,6 @@ class LibvirtDriver(driver.ComputeDriver):
         # beginning to ensure any syntax error will be reported and
         # avoid any re-calculation when computing resources.
         self._reserved_hugepages = hardware.numa_get_reserved_huge_pages()
-
-        self._msi_irq_count = {}
-        self._msi_irq_since = {}
-        self._msi_irq_elapsed = {}
         self._cachetune_support = None
         self._cachetune_cdp_support = None
 
@@ -2988,108 +2984,6 @@ class LibvirtDriver(driver.ComputeDriver):
 
         timer = loopingcall.FixedIntervalLoopingCall(_wait_for_boot)
         timer.start(interval=0.5).wait()
-
-    def affine_pci_dev_irqs(self, instance, wait_for_irqs=True):
-        """Affine PCI device irqs to VM's pcpus."""
-
-        def _wait_for_msi_irqs(instance):
-            """Check each pci device has the expected number of msi irqs."""
-            _prev = self._msi_irq_count.copy()
-            addrs = set()
-            for pci_dev in instance.pci_devices.objects:
-                addr = pci_dev.address
-                addrs.update([addr])
-                try:
-                    irqs, msi_irqs = pci_utils.get_irqs_by_pci_address(addr)
-                except Exception as e:
-                    msi_irqs = set()
-                    LOG.error('_wait_for_msi_irqs: pci_addr=%(A)s, '
-                              'error=%(E)s',
-                              {'A': addr, 'E': e})
-                self._msi_irq_count[addr] = len(msi_irqs)
-                self._msi_irq_elapsed[addr] += \
-                    CONF.libvirt.msi_irq_check_interval
-                if _prev[addr] == self._msi_irq_count[addr]:
-                    self._msi_irq_since[addr] += \
-                        CONF.libvirt.msi_irq_check_interval
-                else:
-                    self._msi_irq_since[pci_dev.address] = 0
-
-            # Done when msi irq counts have not changed for some time
-            if all((self._msi_irq_count[k] > 0) and
-                   (self._msi_irq_since[k] >= CONF.libvirt.msi_irq_since)
-                   for k in addrs):
-                raise loopingcall.LoopingCallDone()
-
-            # Abort due to timeout
-            if all(self._msi_irq_elapsed[k] >= CONF.libvirt.msi_irq_timeout
-                   for k in addrs):
-                msg = (_("reached %(timeout)s seconds timeout, waiting for "
-                         "msi irqs of pci_addrs: %(addrs)s")
-                       % {'addrs': list(addrs),
-                          'timeout': CONF.libvirt.msi_irq_timeout})
-                LOG.warning(msg)
-                raise loopingcall.LoopingCallDone()
-
-        # Determine how many msi irqs we expect to be configured.
-        if len(instance.pci_devices.objects) == 0:
-            return
-
-        # Initialize msi irq tracking.
-        for pci_dev in instance.pci_devices.objects:
-            if wait_for_irqs or (pci_dev.address not in self._msi_irq_count):
-                self._msi_irq_count[pci_dev.address] = 0
-                self._msi_irq_since[pci_dev.address] = 0
-                self._msi_irq_elapsed[pci_dev.address] = 0
-
-        # Wait for msi irqs to be configured.
-        if wait_for_irqs:
-            timer = loopingcall.FixedIntervalLoopingCall(
-                _wait_for_msi_irqs, instance)
-            timer.start(interval=CONF.libvirt.msi_irq_check_interval).wait()
-
-        @utils.synchronized(instance.uuid)
-        def do_affine_pci_dev_instance():
-            """Set pci device irq affinity for this instance."""
-            instance.refresh()
-            numa_topology = instance.get('numa_topology')
-            flavor = instance.get_flavor()
-            for pci_dev in instance.pci_devices.objects:
-                try:
-                    irqs, msi_irqs, pci_numa_node, pci_cpulist = \
-                        pci_utils.set_irqs_affinity_by_pci_address(
-                            pci_dev.address, flavor=flavor,
-                            numa_topology=numa_topology)
-                except Exception as e:
-                    irqs = set()
-                    msi_irqs = set()
-                    pci_numa_node = None
-                    pci_cpulist = ''
-                    LOG.error("Could not affine irqs for pci_addr:%(A)s, "
-                              "error: %(E)s",
-                              {"A": pci_dev.address, "E": e},
-                              instance=instance)
-
-                # Log irqs affined when there is a change in the counts.
-                msi_irq_count = len(msi_irqs)
-                if ((msi_irq_count != self._msi_irq_count[pci_dev.address]) or
-                        wait_for_irqs):
-                    self._msi_irq_count[pci_dev.address] = msi_irq_count
-                    LOG.info("IRQs affined for pci_addr=%(A)s, "
-                             "dev_id=%(D)s, dev_type=%(T)s, "
-                             "vendor_id=%(V)s, product_id=%(P)s, "
-                             "irqs=%(I)s, msi_irqs:%(M)s, "
-                             "numa_node=%(N)s, cpulist=%(C)s",
-                             {'A': pci_dev.address,
-                              'D': pci_dev.dev_id,
-                              'T': pci_dev.dev_type,
-                              'V': pci_dev.vendor_id,
-                              'P': pci_dev.product_id,
-                              'I': ', '.join(map(str, irqs)),
-                              'M': ', '.join(map(str, msi_irqs)),
-                              'N': pci_numa_node, 'C': pci_cpulist},
-                             instance=instance)
-        do_affine_pci_dev_instance()
 
     def _flush_libvirt_console(self, pty):
         out, err = utils.execute('dd',
@@ -5834,13 +5728,6 @@ class LibvirtDriver(driver.ComputeDriver):
                 self._cleanup_failed_start(context, instance, network_info,
                                            block_device_info, guest,
                                            destroy_disks_on_failure)
-
-        # Affine irqs associated with PCI/PT and SRIOV network devices.
-        # This chooses the subset of cpus from instance numa_topology that
-        # reside on the same numa node as the PCI device.
-        # This is done asynchronously since it takes a while for the msi irqs
-        # to be configured.
-        utils.spawn_n(self.affine_pci_dev_irqs, instance)
 
         # Resume only if domain has been paused
         if pause:

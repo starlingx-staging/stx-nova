@@ -953,23 +953,6 @@ Possible values:
 * 0: Will run at the default periodic interval.
 * Any value < 0: Disables the option.
 * Any positive integer in seconds.
-"""),
-    cfg.IntOpt('pci_affine_interval',
-               default=60,
-help="""
-Number of seconds between pci affinity updates
-
-This option specifies how often the pci_affine_interval
-periodic task should run. A number less than 0 means to disable the
-task completely. Leaving this at the default of 0 will cause this to
-run at the default periodic interval. Setting it to any positive
-value will cause it to run at approximately that number of seconds.
-
-Possible values:
-
-* 0: Will run at the default periodic interval.
-* Any value < 0: Disables the option.
-* Any positive integer in seconds.
 """)
 ]
 
