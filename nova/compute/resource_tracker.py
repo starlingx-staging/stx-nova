@@ -70,6 +70,10 @@ def _instance_in_resize_state(instance):
                 task_states.resizing_states + task_states.rebuild_states)):
         return True
 
+    if (vm in [vm_states.ACTIVE, vm_states.PAUSED]
+            and task == task_states.MIGRATING):
+        return True
+
     return False
 
 
