@@ -6905,6 +6905,7 @@ class ComputeManager(manager.Manager):
             LOG.exception("Post live migration at destination %s failed",
                           dest, instance=instance, error=error)
 
+        instance.refresh()
         do_cleanup, destroy_disks = self._live_migration_cleanup_flags(
                 migrate_data)
 
