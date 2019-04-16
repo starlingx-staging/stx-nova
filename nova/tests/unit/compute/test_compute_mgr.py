@@ -8235,11 +8235,12 @@ class ComputeManagerMigrationTestCase(test.NoDBTestCase,
     @mock.patch('nova.objects.ConsoleAuthToken.'
                 'clean_console_auths_for_instance')
     def _call_post_live_migration(self, mock_clean, *args, **kwargs):
+        @mock.patch.object(self.instance, 'refresh')
         @mock.patch.object(self.compute, 'update_available_resource')
         @mock.patch.object(self.compute, 'compute_rpcapi')
         @mock.patch.object(self.compute, '_notify_about_instance_usage')
         @mock.patch.object(self.compute, 'network_api')
-        def _do_call(nwapi, notify, rpc, update):
+        def _do_call(nwapi, notify, rpc, update, refresh):
             bdms = objects.BlockDeviceMappingList(objects=[])
             return self.compute._post_live_migration(self.context,
                                                      self.instance,
@@ -8305,6 +8306,7 @@ class ComputeManagerMigrationTestCase(test.NoDBTestCase,
                                                    source_node='src')
         image_bdm.attachment_id = uuids.attachment3
 
+        @mock.patch.object(instance, 'refresh')
         @mock.patch('nova.compute.utils.notify_about_instance_action')
         @mock.patch('nova.objects.ConsoleAuthToken.'
                     'clean_console_auths_for_instance')
@@ -8323,7 +8325,7 @@ class ComputeManagerMigrationTestCase(test.NoDBTestCase,
         def _test(mock_net_api, mock_notify, mock_driver,
                   mock_rpc, mock_get_bdm_info, mock_attach_delete,
                   mock_update_resource, mock_bdm_save, mock_ga,
-                  mock_clean, mock_notify_action):
+                  mock_clean, mock_notify_action, mock_refresh):
             self._mock_rt()
             bdms = objects.BlockDeviceMappingList(objects=[vol_bdm, image_bdm])
 
@@ -8374,6 +8376,7 @@ class ComputeManagerMigrationTestCase(test.NoDBTestCase,
 
         # Based on the number of mocks here, clearly _post_live_migration is
         # too big at this point...
+        @mock.patch.object(self.instance, 'refresh')
         @mock.patch.object(self.compute, '_get_instance_block_device_info')
         @mock.patch.object(self.compute.network_api, 'get_instance_nw_info',
                            return_value=nw_info)
@@ -8397,7 +8400,7 @@ class ComputeManagerMigrationTestCase(test.NoDBTestCase,
                   post_live_migration_at_destination,
                   post_live_migration_at_source, migrate_instance_start,
                   _notify_about_instance_usage, get_instance_nw_info,
-                  _get_instance_block_device_info):
+                  _get_instance_block_device_info, refresh):
             self._mock_rt()
             self.compute._post_live_migration(
                 self.context, self.instance, 'fake-dest',
