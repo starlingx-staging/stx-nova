@@ -184,7 +184,11 @@ class TestInstanceNotificationSampleWithMultipleCompute(
             'instance-live_migration_post-end',
             replacements={
                 'reservation_id': server['reservation_id'],
-                'uuid': server['id']},
+                'uuid': server['id'],
+                'host': 'host2',
+                'node': 'host2',
+                'power_state': 'pending',
+                'task_state': None},
             actual=fake_notifier.VERSIONED_NOTIFICATIONS[7])
 
     def _test_live_migration_abort(self, server):
