@@ -26,6 +26,7 @@ from nova import exception
 from nova.network import model as network_model
 from nova import objects
 from nova import test
+from nova.tests.unit import matchers
 from nova.tests.unit.virt.libvirt import fakelibvirt
 from nova.virt.libvirt import config as vconfig
 from nova.virt.libvirt import guest as libvirt_guest
