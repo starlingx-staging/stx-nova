@@ -55,7 +55,7 @@ def _get_not_deleted(context, uuids):
     cell_mappings = {}
     found_inst_uuids = []
 
-    # Get a master list of cell mappings, and a list of instance
+    # Get a main list of cell mappings, and a list of instance
     # uuids organized by cell
     for im in mappings:
         if not im.cell_mapping:

@@ -49,7 +49,7 @@ api_db_opts = [
     cfg.BoolOpt('sqlite_synchronous',
         default=True,
         help=''),
-    cfg.StrOpt('slave_connection',
+    cfg.StrOpt('subordinate_connection',
         secret=True,
         help=''),
     cfg.StrOpt('mysql_sql_mode',

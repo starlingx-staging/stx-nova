@@ -164,7 +164,7 @@ class Service(base.NovaPersistentObject, base.NovaObject,
     # Version 1.1: Added compute_node nested object
     # Version 1.2: String attributes updated to support unicode
     # Version 1.3: ComputeNode version 1.5
-    # Version 1.4: Added use_slave to get_by_compute_host
+    # Version 1.4: Added use_subordinate to get_by_compute_host
     # Version 1.5: ComputeNode version 1.6
     # Version 1.6: ComputeNode version 1.7
     # Version 1.7: ComputeNode version 1.8
@@ -340,13 +340,13 @@ class Service(base.NovaPersistentObject, base.NovaObject,
 
     @staticmethod
     @db.select_db_reader_mode
-    def _db_service_get_by_compute_host(context, host, use_slave=False):
+    def _db_service_get_by_compute_host(context, host, use_subordinate=False):
         return db.service_get_by_compute_host(context, host)
 
     @base.remotable_classmethod
-    def get_by_compute_host(cls, context, host, use_slave=False):
+    def get_by_compute_host(cls, context, host, use_subordinate=False):
         db_service = cls._db_service_get_by_compute_host(context, host,
-                                                         use_slave=use_slave)
+                                                         use_subordinate=use_subordinate)
         return cls._from_db_object(context, cls(), db_service)
 
     # NOTE(ndipanov): This is deprecated and should be removed on the next
@@ -441,11 +441,11 @@ class Service(base.NovaPersistentObject, base.NovaObject,
 
     @staticmethod
     @db.select_db_reader_mode
-    def _db_service_get_minimum_version(context, binaries, use_slave=False):
+    def _db_service_get_minimum_version(context, binaries, use_subordinate=False):
         return db.service_get_minimum_version(context, binaries)
 
     @base.remotable_classmethod
-    def get_minimum_version_multi(cls, context, binaries, use_slave=False):
+    def get_minimum_version_multi(cls, context, binaries, use_subordinate=False):
         if not all(binary.startswith('nova-') for binary in binaries):
             LOG.warning('get_minimum_version called with likely-incorrect '
                         'binaries `%s\'', ','.join(binaries))
@@ -456,7 +456,7 @@ class Service(base.NovaPersistentObject, base.NovaObject,
               any(binary not in cls._MIN_VERSION_CACHE
                   for binary in binaries)):
             min_versions = cls._db_service_get_minimum_version(
-                context, binaries, use_slave=use_slave)
+                context, binaries, use_subordinate=use_subordinate)
             if min_versions:
                 min_versions = {binary: version or 0
                                 for binary, version in
@@ -477,9 +477,9 @@ class Service(base.NovaPersistentObject, base.NovaObject,
         return version
 
     @base.remotable_classmethod
-    def get_minimum_version(cls, context, binary, use_slave=False):
+    def get_minimum_version(cls, context, binary, use_subordinate=False):
         return cls.get_minimum_version_multi(context, [binary],
-                                             use_slave=use_slave)
+                                             use_subordinate=use_subordinate)
 
 
 def get_minimum_version_all_cells(context, binaries, require_all=False):

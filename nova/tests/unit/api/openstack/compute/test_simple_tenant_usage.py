@@ -115,7 +115,7 @@ def _fake_instance_deleted_flavorless(context, start, end, instance_id,
 @classmethod
 def fake_get_active_deleted_flavorless(cls, context, begin, end=None,
                                        project_id=None, host=None,
-                                       expected_attrs=None, use_slave=False,
+                                       expected_attrs=None, use_subordinate=False,
                                        limit=None, marker=None):
     # First get some normal instances to have actual usage
     instances = [
@@ -135,7 +135,7 @@ def fake_get_active_deleted_flavorless(cls, context, begin, end=None,
 @classmethod
 def fake_get_active_by_window_joined(cls, context, begin, end=None,
                                      project_id=None, host=None,
-                                     expected_attrs=None, use_slave=False,
+                                     expected_attrs=None, use_subordinate=False,
                                      limit=None, marker=None):
     return objects.InstanceList(objects=[
         _fake_instance(START, STOP, x,
@@ -246,12 +246,12 @@ class SimpleTenantUsageTestV21(test.TestCase):
 
         def fake_get_active_by_window_joined(context, begin, end=None,
                                     project_id=None, host=None,
-                                    expected_attrs=None, use_slave=False,
+                                    expected_attrs=None, use_subordinate=False,
                                     limit=None, marker=None):
             self.assertEqual(['flavor'], expected_attrs)
             return orig_get_active_by_window_joined(context, begin, end,
                                                     project_id, host,
-                                                    expected_attrs, use_slave)
+                                                    expected_attrs, use_subordinate)
 
         with mock.patch.object(objects.InstanceList,
                                'get_active_by_window_joined',

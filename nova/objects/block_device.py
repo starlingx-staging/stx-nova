@@ -130,8 +130,8 @@ class BlockDeviceMapping(base.NovaPersistentObject, base.NovaObject,
         # non-nullable in a future release.
 
         # NOTE(mdbooth): We wrap this method in a retry loop because it can
-        # fail (safely) on multi-master galera if concurrent updates happen on
-        # different masters. It will never fail on single-master. We can only
+        # fail (safely) on multi-main galera if concurrent updates happen on
+        # different mains. It will never fail on single-main. We can only
         # ever need one retry.
 
         uuid = uuidutils.generate_uuid()
@@ -335,7 +335,7 @@ class BlockDeviceMapping(base.NovaPersistentObject, base.NovaObject,
 class BlockDeviceMappingList(base.ObjectListBase, base.NovaObject):
     # Version 1.0: Initial version
     # Version 1.1: BlockDeviceMapping <= version 1.1
-    # Version 1.2: Added use_slave to get_by_instance_uuid
+    # Version 1.2: Added use_subordinate to get_by_instance_uuid
     # Version 1.3: BlockDeviceMapping <= version 1.2
     # Version 1.4: BlockDeviceMapping <= version 1.3
     # Version 1.5: BlockDeviceMapping <= version 1.4
@@ -373,28 +373,28 @@ class BlockDeviceMappingList(base.ObjectListBase, base.NovaObject):
     @staticmethod
     @db.select_db_reader_mode
     def _db_block_device_mapping_get_all_by_instance_uuids(
-            context, instance_uuids, use_slave=False):
+            context, instance_uuids, use_subordinate=False):
         return db.block_device_mapping_get_all_by_instance_uuids(
                 context, instance_uuids)
 
     @base.remotable_classmethod
-    def get_by_instance_uuids(cls, context, instance_uuids, use_slave=False):
+    def get_by_instance_uuids(cls, context, instance_uuids, use_subordinate=False):
         db_bdms = cls._db_block_device_mapping_get_all_by_instance_uuids(
-            context, instance_uuids, use_slave=use_slave)
+            context, instance_uuids, use_subordinate=use_subordinate)
         return base.obj_make_list(
                 context, cls(), objects.BlockDeviceMapping, db_bdms or [])
 
     @staticmethod
     @db.select_db_reader_mode
     def _db_block_device_mapping_get_all_by_instance(
-            context, instance_uuid, use_slave=False):
+            context, instance_uuid, use_subordinate=False):
         return db.block_device_mapping_get_all_by_instance(
             context, instance_uuid)
 
     @base.remotable_classmethod
-    def get_by_instance_uuid(cls, context, instance_uuid, use_slave=False):
+    def get_by_instance_uuid(cls, context, instance_uuid, use_subordinate=False):
         db_bdms = cls._db_block_device_mapping_get_all_by_instance(
-            context, instance_uuid, use_slave=use_slave)
+            context, instance_uuid, use_subordinate=use_subordinate)
         return base.obj_make_list(
                 context, cls(), objects.BlockDeviceMapping, db_bdms or [])
 

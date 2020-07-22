@@ -212,7 +212,7 @@ class VolumeAttachmentsSample(test_servers.ServersSampleBase):
     def _stub_db_bdms_get_all_by_instance(self, server_id):
 
         def fake_bdms_get_all_by_instance(context, instance_uuid,
-                                          use_slave=False):
+                                          use_subordinate=False):
             bdms = [
                 fake_block_device.FakeDbBlockDeviceDict(
                 {'id': 1, 'volume_id': self.OLD_VOLUME_ID,

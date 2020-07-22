@@ -3173,7 +3173,7 @@ class XenAPIAggregateTestCase(stubs.XenAPITestBase):
         self.aggr = objects.Aggregate(context=self.context, id=1,
                                       **values)
         self.fake_metadata = {pool_states.POOL_FLAG: 'XenAPI',
-                              'master_compute': 'host',
+                              'main_compute': 'host',
                               'availability_zone': 'fake_zone',
                               pool_states.KEY: pool_states.ACTIVE,
                               'host': xenapi_fake.get_record('host',
@@ -3183,15 +3183,15 @@ class XenAPIAggregateTestCase(stubs.XenAPITestBase):
     @mock.patch('nova.virt.xenapi.pool.ResourcePool.add_to_aggregate')
     def test_pool_add_to_aggregate_called_by_driver(
             self, mock_add_to_aggregate):
-        def pool_add_to_aggregate(context, aggregate, host, slave_info=None):
+        def pool_add_to_aggregate(context, aggregate, host, subordinate_info=None):
             self.assertEqual("CONTEXT", context)
             self.assertEqual("AGGREGATE", aggregate)
             self.assertEqual("HOST", host)
-            self.assertEqual("SLAVEINFO", slave_info)
+            self.assertEqual("SLAVEINFO", subordinate_info)
         mock_add_to_aggregate.side_effect = pool_add_to_aggregate
 
         self.conn.add_to_aggregate("CONTEXT", "AGGREGATE", "HOST",
-                                   slave_info="SLAVEINFO")
+                                   subordinate_info="SLAVEINFO")
 
         self.assertTrue(mock_add_to_aggregate.called)
 
@@ -3199,14 +3199,14 @@ class XenAPIAggregateTestCase(stubs.XenAPITestBase):
     def test_pool_remove_from_aggregate_called_by_driver(
             self, mock_remove_from_aggregate):
         def pool_remove_from_aggregate(context, aggregate, host,
-                                       slave_info=None):
+                                       subordinate_info=None):
             self.assertEqual("CONTEXT", context)
             self.assertEqual("AGGREGATE", aggregate)
             self.assertEqual("HOST", host)
-            self.assertEqual("SLAVEINFO", slave_info)
+            self.assertEqual("SLAVEINFO", subordinate_info)
         mock_remove_from_aggregate.side_effect = pool_remove_from_aggregate
         self.conn.remove_from_aggregate("CONTEXT", "AGGREGATE", "HOST",
-                                        slave_info="SLAVEINFO")
+                                        subordinate_info="SLAVEINFO")
 
         self.assertTrue(mock_remove_from_aggregate.called)
 
@@ -3220,9 +3220,9 @@ class XenAPIAggregateTestCase(stubs.XenAPITestBase):
         self.assertThat(self.fake_metadata,
                         matchers.DictMatches(result.metadata))
 
-    @mock.patch('nova.virt.xenapi.pool.ResourcePool._join_slave')
-    def test_join_slave(self, mock_join_slave):
-        # Ensure join_slave gets called when the request gets to master.
+    @mock.patch('nova.virt.xenapi.pool.ResourcePool._join_subordinate')
+    def test_join_subordinate(self, mock_join_subordinate):
+        # Ensure join_subordinate gets called when the request gets to main.
         aggregate = self._aggregate_setup(hosts=['host', 'host2'],
                                           metadata=self.fake_metadata)
         self.conn._pool.add_to_aggregate(self.context, aggregate, "host2",
@@ -3231,7 +3231,7 @@ class XenAPIAggregateTestCase(stubs.XenAPITestBase):
                                          user='fake_user',
                                          passwd='fake_pass',
                                          xenhost_uuid='fake_uuid'))
-        self.assertTrue(mock_join_slave.called)
+        self.assertTrue(mock_join_subordinate.called)
 
     @mock.patch.object(xenapi_fake.SessionBase, 'pool_set_name_label')
     def test_add_to_aggregate_first_host(self, mock_pool_set_name_label):
@@ -3263,17 +3263,17 @@ class XenAPIAggregateTestCase(stubs.XenAPITestBase):
                           self.conn._pool.remove_from_aggregate,
                           self.context, result, "test_host")
 
-    @mock.patch('nova.virt.xenapi.pool.ResourcePool._eject_slave')
-    def test_remove_slave(self, mock_eject_slave):
-        # Ensure eject slave gets called.
+    @mock.patch('nova.virt.xenapi.pool.ResourcePool._eject_subordinate')
+    def test_remove_subordinate(self, mock_eject_subordinate):
+        # Ensure eject subordinate gets called.
         self.fake_metadata['host2'] = 'fake_host2_uuid'
         aggregate = self._aggregate_setup(hosts=['host', 'host2'],
                 metadata=self.fake_metadata, aggr_state=pool_states.ACTIVE)
         self.conn._pool.remove_from_aggregate(self.context, aggregate, "host2")
-        self.assertTrue(mock_eject_slave.called)
+        self.assertTrue(mock_eject_subordinate.called)
 
     @mock.patch('nova.virt.xenapi.pool.ResourcePool._clear_pool')
-    def test_remove_master_solo(self, mock_clear_pool):
+    def test_remove_main_solo(self, mock_clear_pool):
         # Ensure metadata are cleared after removal.
         aggregate = self._aggregate_setup(metadata=self.fake_metadata)
         self.conn._pool.remove_from_aggregate(self.context, aggregate, "host")
@@ -3284,8 +3284,8 @@ class XenAPIAggregateTestCase(stubs.XenAPITestBase):
                 pool_states.KEY: pool_states.ACTIVE},
                 matchers.DictMatches(result.metadata))
 
-    def test_remote_master_non_empty_pool(self):
-        # Ensure AggregateError is raised if removing the master.
+    def test_remote_main_non_empty_pool(self):
+        # Ensure AggregateError is raised if removing the main.
         aggregate = self._aggregate_setup(hosts=['host', 'host2'],
                                           metadata=self.fake_metadata)
 
@@ -3403,7 +3403,7 @@ class XenAPIAggregateTestCase(stubs.XenAPITestBase):
                           self.compute.add_aggregate_host,
                           self.context, host="fake_host",
                           aggregate=self.aggr,
-                          slave_info=None)
+                          subordinate_info=None)
         self.assertEqual(self.aggr.metadata[pool_states.KEY],
                 pool_states.ERROR)
         self.assertEqual(self.aggr.hosts, ['fake_host'])
@@ -3414,16 +3414,16 @@ class MockComputeAPI(object):
         self._mock_calls = []
 
     def add_aggregate_host(self, ctxt, aggregate,
-                                     host_param, host, slave_info):
+                                     host_param, host, subordinate_info):
         self._mock_calls.append((
             self.add_aggregate_host, ctxt, aggregate,
-            host_param, host, slave_info))
+            host_param, host, subordinate_info))
 
     def remove_aggregate_host(self, ctxt, host, aggregate_id, host_param,
-                              slave_info):
+                              subordinate_info):
         self._mock_calls.append((
             self.remove_aggregate_host, ctxt, host, aggregate_id,
-            host_param, slave_info))
+            host_param, subordinate_info))
 
 
 class StubDependencies(object):
@@ -3438,10 +3438,10 @@ class StubDependencies(object):
     def _get_metadata(self, *_ignore):
         return {
             pool_states.KEY: {},
-            'master_compute': 'master'
+            'main_compute': 'main'
         }
 
-    def _create_slave_info(self, *ignore):
+    def _create_subordinate_info(self, *ignore):
         return "SLAVE_INFO"
 
 
@@ -3455,33 +3455,33 @@ class HypervisorPoolTestCase(test.NoDBTestCase):
         'id': 98,
         'hosts': [],
         'metadata': {
-            'master_compute': 'master',
+            'main_compute': 'main',
             pool_states.POOL_FLAG: '',
             pool_states.KEY: ''
             }
         }
     fake_aggregate = objects.Aggregate(**fake_aggregate)
 
-    def test_slave_asks_master_to_add_slave_to_pool(self):
-        slave = ResourcePoolWithStubs()
+    def test_subordinate_asks_main_to_add_subordinate_to_pool(self):
+        subordinate = ResourcePoolWithStubs()
 
-        slave.add_to_aggregate("CONTEXT", self.fake_aggregate, "slave")
-
-        self.assertIn(
-            (slave.compute_rpcapi.add_aggregate_host,
-            "CONTEXT", "slave", self.fake_aggregate,
-            "master", "SLAVE_INFO"),
-            slave.compute_rpcapi._mock_calls)
-
-    def test_slave_asks_master_to_remove_slave_from_pool(self):
-        slave = ResourcePoolWithStubs()
-
-        slave.remove_from_aggregate("CONTEXT", self.fake_aggregate, "slave")
+        subordinate.add_to_aggregate("CONTEXT", self.fake_aggregate, "subordinate")
 
         self.assertIn(
-            (slave.compute_rpcapi.remove_aggregate_host,
-             "CONTEXT", "slave", 98, "master", "SLAVE_INFO"),
-            slave.compute_rpcapi._mock_calls)
+            (subordinate.compute_rpcapi.add_aggregate_host,
+            "CONTEXT", "subordinate", self.fake_aggregate,
+            "main", "SLAVE_INFO"),
+            subordinate.compute_rpcapi._mock_calls)
+
+    def test_subordinate_asks_main_to_remove_subordinate_from_pool(self):
+        subordinate = ResourcePoolWithStubs()
+
+        subordinate.remove_from_aggregate("CONTEXT", self.fake_aggregate, "subordinate")
+
+        self.assertIn(
+            (subordinate.compute_rpcapi.remove_aggregate_host,
+             "CONTEXT", "subordinate", 98, "main", "SLAVE_INFO"),
+            subordinate.compute_rpcapi._mock_calls)
 
 
 class SwapXapiHostTestCase(test.NoDBTestCase):

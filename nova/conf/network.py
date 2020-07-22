@@ -1012,19 +1012,19 @@ nova-network is deprecated, as are any related configuration options.
 nova-network is deprecated, as are any related configuration options.
 """,
         help="Bind user's password for LDAP server"),
-    cfg.StrOpt('ldap_dns_soa_hostmaster',
-        default='hostmaster@example.org',
+    cfg.StrOpt('ldap_dns_soa_hostmain',
+        default='hostmain@example.org',
         deprecated_for_removal=True,
         deprecated_since='16.0.0',
         deprecated_reason="""
 nova-network is deprecated, as are any related configuration options.
 """,
         help="""
-Hostmaster for LDAP DNS driver Statement of Authority
+Hostmain for LDAP DNS driver Statement of Authority
 
 Possible values:
 
-* Any valid string representing LDAP DNS hostmaster.
+* Any valid string representing LDAP DNS hostmain.
 """),
     cfg.MultiStrOpt('ldap_dns_servers',
         default=['dns.example.org'],
@@ -1062,7 +1062,7 @@ nova-network is deprecated, as are any related configuration options.
         help="""
 Refresh interval (in seconds) for LDAP DNS driver Start of Authority
 
-Time interval, a secondary/slave DNS server waits before requesting for
+Time interval, a secondary/subordinate DNS server waits before requesting for
 primary DNS server's current SOA record. If the records are different,
 secondary DNS server will request a zone transfer from primary.
 
@@ -1078,7 +1078,7 @@ nova-network is deprecated, as are any related configuration options.
         help="""
 Retry interval (in seconds) for LDAP DNS driver Start of Authority
 
-Time interval, a secondary/slave DNS server should wait, if an
+Time interval, a secondary/subordinate DNS server should wait, if an
 attempt to transfer zone failed during the previous refresh interval.
 """),
     cfg.IntOpt('ldap_dns_soa_expiry',
@@ -1091,7 +1091,7 @@ nova-network is deprecated, as are any related configuration options.
         help="""
 Expiry interval (in seconds) for LDAP DNS driver Start of Authority
 
-Time interval, a secondary/slave DNS server holds the information
+Time interval, a secondary/subordinate DNS server holds the information
 before it is no longer considered authoritative.
 """),
     cfg.IntOpt('ldap_dns_soa_minimum',

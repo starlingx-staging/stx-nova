@@ -78,7 +78,7 @@ def stub_max_server_metadata():
 
 
 def return_server_nonexistent(context, server_id,
-        columns_to_join=None, use_slave=False):
+        columns_to_join=None, use_subordinate=False):
     raise exception.InstanceNotFound(instance_id=server_id)
 
 

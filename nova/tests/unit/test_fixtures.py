@@ -451,7 +451,7 @@ class TestAllServicesCurrentFixture(testtools.TestCase):
         self.assertEqual(123, service_obj.Service.get_minimum_version(
             None, 'nova-compute'))
         mock_db.assert_called_once_with(None, ['nova-compute'],
-                                        use_slave=False)
+                                        use_subordinate=False)
         mock_db.reset_mock()
         compute_rpcapi.LAST_VERSION = 123
         self.useFixture(fixtures.AllServicesCurrent())

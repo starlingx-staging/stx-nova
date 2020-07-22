@@ -60,10 +60,10 @@ class ComputeXenTestCase(stubs.XenAPITestBaseNoDB):
             self.compute._sync_power_states(ctxt)
 
             mock_instance_list_get_by_host.assert_called_once_with(
-               ctxt, self.compute.host, expected_attrs=[], use_slave=True)
+               ctxt, self.compute.host, expected_attrs=[], use_subordinate=True)
             mock_compute_get_num_instances.assert_called_once_with()
             mock_compute_sync_powerstate.assert_called_once_with(
-               ctxt, instance, power_state.NOSTATE, use_slave=True)
+               ctxt, instance, power_state.NOSTATE, use_subordinate=True)
             mock_vm_utils_lookup.assert_called_once_with(
                self.compute.driver._session, instance['name'],
                False)
