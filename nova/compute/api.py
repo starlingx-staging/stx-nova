@@ -3486,7 +3486,7 @@ class API(base.Base):
 
             # Check whether host exists or not.
             node = objects.ComputeNode.get_first_node_by_host_for_old_compat(
-                context, host_name, use_slave=True)
+                context, host_name, use_subordinate=True)
 
         self._check_auto_disk_config(instance, **extra_instance_updates)
 

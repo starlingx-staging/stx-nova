@@ -244,7 +244,7 @@ class DecoratorTestCase(test.TestCase):
     def test_select_db_reader_mode_select_sync(self, mock_clone, mock_using):
 
         @db.select_db_reader_mode
-        def func(self, context, value, use_slave=False):
+        def func(self, context, value, use_subordinate=False):
             pass
 
         mock_clone.return_value = enginefacade._TransactionContextManager(
@@ -261,21 +261,21 @@ class DecoratorTestCase(test.TestCase):
     def test_select_db_reader_mode_select_async(self, mock_clone, mock_using):
 
         @db.select_db_reader_mode
-        def func(self, context, value, use_slave=False):
+        def func(self, context, value, use_subordinate=False):
             pass
 
         mock_clone.return_value = enginefacade._TransactionContextManager(
             mode=enginefacade._ASYNC_READER)
         ctxt = context.get_admin_context()
         value = 'some_value'
-        func(self, ctxt, value, use_slave=True)
+        func(self, ctxt, value, use_subordinate=True)
 
         mock_clone.assert_called_once_with(mode=enginefacade._ASYNC_READER)
         mock_using.assert_called_once_with(ctxt)
 
     @mock.patch.object(enginefacade._TransactionContextManager, 'using')
     @mock.patch.object(enginefacade._TransactionContextManager, '_clone')
-    def test_select_db_reader_mode_no_use_slave_select_sync(self, mock_clone,
+    def test_select_db_reader_mode_no_use_subordinate_select_sync(self, mock_clone,
                                                             mock_using):
 
         @db.select_db_reader_mode
@@ -738,8 +738,8 @@ class SqlAlchemyDbApiNoDbTestCase(test.NoDBTestCase):
         mock_ctxt_mgr.writer.get_engine.assert_called_once_with()
 
     @mock.patch.object(sqlalchemy_api, 'main_context_manager')
-    def test_get_engine_use_slave(self, mock_ctxt_mgr):
-        sqlalchemy_api.get_engine(use_slave=True)
+    def test_get_engine_use_subordinate(self, mock_ctxt_mgr):
+        sqlalchemy_api.get_engine(use_subordinate=True)
         mock_ctxt_mgr.reader.get_engine.assert_called_once_with()
 
     def test_get_db_conf_with_connection(self):

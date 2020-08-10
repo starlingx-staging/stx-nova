@@ -135,14 +135,14 @@ def get_context_manager(context):
     return _context_manager_from_context(context) or main_context_manager
 
 
-def get_engine(use_slave=False, context=None):
+def get_engine(use_subordinate=False, context=None):
     """Get a database engine object.
 
-    :param use_slave: Whether to use the slave connection
+    :param use_subordinate: Whether to use the subordinate connection
     :param context: The request context that can contain a context manager
     """
     ctxt_mgr = get_context_manager(context)
-    if use_slave:
+    if use_subordinate:
         return ctxt_mgr.reader.get_engine()
     return ctxt_mgr.writer.get_engine()
 
@@ -183,9 +183,9 @@ def require_context(f):
 def select_db_reader_mode(f):
     """Decorator to select synchronous or asynchronous reader mode.
 
-    The kwarg argument 'use_slave' defines reader mode. Asynchronous reader
-    will be used if 'use_slave' is True and synchronous reader otherwise.
-    If 'use_slave' is not specified default value 'False' will be used.
+    The kwarg argument 'use_subordinate' defines reader mode. Asynchronous reader
+    will be used if 'use_subordinate' is True and synchronous reader otherwise.
+    If 'use_subordinate' is not specified default value 'False' will be used.
 
     Wrapped function must have a context in the arguments.
     """
@@ -196,9 +196,9 @@ def select_db_reader_mode(f):
         keyed_args = inspect.getcallargs(wrapped_func, *args, **kwargs)
 
         context = keyed_args['context']
-        use_slave = keyed_args.get('use_slave', False)
+        use_subordinate = keyed_args.get('use_subordinate', False)
 
-        if use_slave:
+        if use_subordinate:
             reader_mode = get_context_manager(context).async_
         else:
             reader_mode = get_context_manager(context).reader
@@ -5538,7 +5538,7 @@ def archive_deleted_rows(max_rows=None, before=None):
     table_to_rows_archived = {}
     deleted_instance_uuids = []
     total_rows_archived = 0
-    meta = MetaData(get_engine(use_slave=True))
+    meta = MetaData(get_engine(use_subordinate=True))
     meta.reflect()
     # Reverse sort the tables so we get the leaf nodes first for processing.
     for table in reversed(meta.sorted_tables):

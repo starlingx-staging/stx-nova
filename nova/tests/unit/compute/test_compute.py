@@ -796,7 +796,7 @@ class ComputeVolumeTestCase(BaseTestCase):
         mock_get_counter.assert_called_once_with([])
         mock_last.assert_called_once_with()
         mock_get_host.assert_called_once_with(ctxt, 'fake-mini',
-                                              use_slave=True)
+                                              use_subordinate=True)
 
     @mock.patch.object(objects.InstanceList, 'get_by_host')
     @mock.patch.object(objects.BlockDeviceMappingList,
@@ -815,10 +815,10 @@ class ComputeVolumeTestCase(BaseTestCase):
         got_host_bdms = self.compute._get_host_volume_bdms('fake-context')
         mock_get_by_host.assert_called_once_with('fake-context',
                                                  self.compute.host,
-                                                 use_slave=False)
+                                                 use_subordinate=False)
         mock_get_by_inst.assert_called_once_with('fake-context',
                                                  uuids.volume_instance,
-                                                 use_slave=False)
+                                                 use_subordinate=False)
         self.assertEqual(expected_host_bdms, got_host_bdms)
 
     @mock.patch.object(utils, 'last_completed_audit_period')
@@ -844,7 +844,7 @@ class ComputeVolumeTestCase(BaseTestCase):
         self.flags(volume_usage_poll_interval=10)
         self.compute._poll_volume_usage(ctxt)
 
-        mock_get_bdms.assert_called_once_with(ctxt, use_slave=True)
+        mock_get_bdms.assert_called_once_with(ctxt, use_subordinate=True)
 
     @mock.patch.object(compute_utils, 'notify_about_volume_usage')
     @mock.patch.object(compute_manager.ComputeManager, '_get_host_volume_bdms')
@@ -864,7 +864,7 @@ class ComputeVolumeTestCase(BaseTestCase):
         self.flags(volume_usage_poll_interval=10)
         self.compute._poll_volume_usage(self.context)
 
-        mock_get_bdms.assert_called_once_with(self.context, use_slave=True)
+        mock_get_bdms.assert_called_once_with(self.context, use_subordinate=True)
         mock_notify.assert_called_once_with(
             self.context, test.MatchType(objects.VolumeUsage),
             self.compute.host)
@@ -983,7 +983,7 @@ class ComputeVolumeTestCase(BaseTestCase):
         mock_get.assert_called_once_with(self.context, uuids.volume_id,
                                          instance.uuid)
         mock_stats.assert_called_once_with(instance, 'vdb')
-        mock_get_bdms.assert_called_once_with(self.context, use_slave=True)
+        mock_get_bdms.assert_called_once_with(self.context, use_subordinate=True)
         mock_get_all(self.context, host_volume_bdms)
         mock_exists.assert_called_once_with(mock.ANY)
 
@@ -7048,8 +7048,8 @@ class ComputeTestCase(BaseTestCase,
         mock_cleanup.assert_called_once_with(ctxt, inst2, bdms,
                                              detach=False)
         mock_get_uuid.assert_has_calls([
-            mock.call(ctxt, inst1.uuid, use_slave=True),
-            mock.call(ctxt, inst2.uuid, use_slave=True)])
+            mock.call(ctxt, inst1.uuid, use_subordinate=True),
+            mock.call(ctxt, inst2.uuid, use_subordinate=True)])
         mock_get_inst.assert_called_once_with(ctxt,
                                               {'deleted': True,
                                                'soft_deleted': False})
@@ -7241,13 +7241,13 @@ class ComputeTestCase(BaseTestCase,
                 'require_nw_info': 0, 'setup_network': 0}
 
         def fake_instance_get_all_by_host(context, host,
-                                          columns_to_join, use_slave=False):
+                                          columns_to_join, use_subordinate=False):
             call_info['get_all_by_host'] += 1
             self.assertEqual([], columns_to_join)
             return instances[:]
 
         def fake_instance_get_by_uuid(context, instance_uuid,
-                                      columns_to_join, use_slave=False):
+                                      columns_to_join, use_subordinate=False):
             if instance_uuid not in instance_map:
                 raise exception.InstanceNotFound(instance_id=instance_uuid)
             call_info['get_by_uuid'] += 1
@@ -7421,7 +7421,7 @@ class ComputeTestCase(BaseTestCase,
 
         def fake_instance_get_all_by_filters(context, filters,
                                              expected_attrs=None,
-                                             use_slave=False):
+                                             use_subordinate=False):
             self.assertEqual(["system_metadata"], expected_attrs)
             return instances
 
@@ -7471,7 +7471,7 @@ class ComputeTestCase(BaseTestCase,
                        task_states.REBOOTING, task_states.REBOOT_STARTED,
                        task_states.REBOOT_PENDING]}
         get.assert_called_once_with(ctxt, filters,
-                                    expected_attrs=[], use_slave=True)
+                                    expected_attrs=[], use_subordinate=True)
 
     def test_poll_unconfirmed_resizes(self):
         instances = [
@@ -7523,7 +7523,7 @@ class ComputeTestCase(BaseTestCase,
             migrations.append(fake_mig)
 
         def fake_instance_get_by_uuid(context, instance_uuid,
-                columns_to_join=None, use_slave=False):
+                columns_to_join=None, use_subordinate=False):
             self.assertIn('metadata', columns_to_join)
             self.assertIn('system_metadata', columns_to_join)
             # raise InstanceNotFound exception for non-existing instance
@@ -7535,7 +7535,7 @@ class ComputeTestCase(BaseTestCase,
                     return instance
 
         def fake_migration_get_unconfirmed_by_dest_compute(context,
-                resize_confirm_window, dest_compute, use_slave=False):
+                resize_confirm_window, dest_compute, use_subordinate=False):
             self.assertEqual(dest_compute, CONF.host)
             return migrations
 
@@ -8040,7 +8040,7 @@ class ComputeTestCase(BaseTestCase,
 
         mock_get_filter.assert_called_once_with(ctxt, mock.ANY,
                 expected_attrs=instance_obj.INSTANCE_DEFAULT_FIELDS,
-                use_slave=True)
+                use_subordinate=True)
         mock_delete_old.assert_has_calls([mock.call(instance1, 3600),
                                           mock.call(instance2, 3600)])
         mock_get_uuid.assert_has_calls([mock.call(ctxt, instance1.uuid),
@@ -8070,9 +8070,9 @@ class ComputeTestCase(BaseTestCase,
         mock_get.assert_has_calls([mock.call(mock.ANY), mock.call(mock.ANY),
                                    mock.call(mock.ANY)])
         mock_sync.assert_has_calls([
-            mock.call(ctxt, mock.ANY, power_state.NOSTATE, use_slave=True),
-            mock.call(ctxt, mock.ANY, power_state.RUNNING, use_slave=True),
-            mock.call(ctxt, mock.ANY, power_state.SHUTDOWN, use_slave=True)])
+            mock.call(ctxt, mock.ANY, power_state.NOSTATE, use_subordinate=True),
+            mock.call(ctxt, mock.ANY, power_state.RUNNING, use_subordinate=True),
+            mock.call(ctxt, mock.ANY, power_state.SHUTDOWN, use_subordinate=True)])
 
     @mock.patch.object(compute_manager.ComputeManager, '_get_power_state')
     @mock.patch.object(compute_manager.ComputeManager,
@@ -12401,7 +12401,7 @@ class ComputeAggrTestCase(BaseTestCase):
                        fake_driver_add_to_aggregate)
 
         self.compute.add_aggregate_host(self.context, host="host",
-            aggregate=self.aggr, slave_info=None)
+            aggregate=self.aggr, subordinate_info=None)
         self.assertTrue(fake_driver_add_to_aggregate.called)
 
     def test_remove_aggregate_host(self):
@@ -12414,35 +12414,35 @@ class ComputeAggrTestCase(BaseTestCase):
                        fake_driver_remove_from_aggregate)
 
         self.compute.remove_aggregate_host(self.context,
-            aggregate=self.aggr, host="host", slave_info=None)
+            aggregate=self.aggr, host="host", subordinate_info=None)
         self.assertTrue(fake_driver_remove_from_aggregate.called)
 
-    def test_add_aggregate_host_passes_slave_info_to_driver(self):
+    def test_add_aggregate_host_passes_subordinate_info_to_driver(self):
         def driver_add_to_aggregate(cls, context, aggregate, host, **kwargs):
             self.assertEqual(self.context, context)
             self.assertEqual(aggregate.id, self.aggr.id)
             self.assertEqual(host, "the_host")
-            self.assertEqual("SLAVE_INFO", kwargs.get("slave_info"))
+            self.assertEqual("SLAVE_INFO", kwargs.get("subordinate_info"))
 
         self.stub_out("nova.virt.fake.FakeDriver.add_to_aggregate",
                        driver_add_to_aggregate)
 
         self.compute.add_aggregate_host(self.context, host="the_host",
-            slave_info="SLAVE_INFO", aggregate=self.aggr)
+            subordinate_info="SLAVE_INFO", aggregate=self.aggr)
 
-    def test_remove_from_aggregate_passes_slave_info_to_driver(self):
+    def test_remove_from_aggregate_passes_subordinate_info_to_driver(self):
         def driver_remove_from_aggregate(cls, context, aggregate, host,
                                          **kwargs):
             self.assertEqual(self.context, context)
             self.assertEqual(aggregate.id, self.aggr.id)
             self.assertEqual(host, "the_host")
-            self.assertEqual("SLAVE_INFO", kwargs.get("slave_info"))
+            self.assertEqual("SLAVE_INFO", kwargs.get("subordinate_info"))
 
         self.stub_out("nova.virt.fake.FakeDriver.remove_from_aggregate",
                        driver_remove_from_aggregate)
 
         self.compute.remove_aggregate_host(self.context,
-            aggregate=self.aggr, host="the_host", slave_info="SLAVE_INFO")
+            aggregate=self.aggr, host="the_host", subordinate_info="SLAVE_INFO")
 
 
 class DisabledInstanceTypesTestCase(BaseTestCase):

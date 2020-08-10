@@ -3198,7 +3198,7 @@ class ConductorTaskTestCase(_BaseTaskTestCase, test_compute.BaseTestCase):
         get_source_node.assert_called_once_with(
             self.ctxt, instance.host, instance.node)
         get_dest_node.assert_called_once_with(
-            self.ctxt, 'dest-host', use_slave=True)
+            self.ctxt, 'dest-host', use_subordinate=True)
         notify.assert_called_once_with(
             self.ctxt, instance.uuid, 'rebuild_server',
             {'vm_state': instance.vm_state, 'task_state': None}, ex, reqspec)
@@ -3230,7 +3230,7 @@ class ConductorTaskTestCase(_BaseTaskTestCase, test_compute.BaseTestCase):
         get_source_node.assert_called_once_with(
             self.ctxt, instance.host, instance.node)
         get_dest_node.assert_called_once_with(
-            self.ctxt, 'dest-host', use_slave=True)
+            self.ctxt, 'dest-host', use_subordinate=True)
         claim.assert_called_once_with(
             self.ctxt, self.conductor.report_client, instance,
             get_source_node.return_value, get_dest_node.return_value)

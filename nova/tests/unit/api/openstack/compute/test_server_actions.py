@@ -963,7 +963,7 @@ class ServerActionsControllerTestV21(test.TestCase):
                     delete_on_termination=False)]
 
         def fake_block_device_mapping_get_all_by_instance(context, inst_id,
-                                                          use_slave=False):
+                                                          use_subordinate=False):
             return [fake_block_device.FakeDbBlockDeviceDict(
                         {'volume_id': _fake_id('a'),
                          'source_type': 'snapshot',
@@ -1074,7 +1074,7 @@ class ServerActionsControllerTestV21(test.TestCase):
         image_service = glance.get_default_image_service()
 
         def fake_block_device_mapping_get_all_by_instance(context, inst_id,
-                                                          use_slave=False):
+                                                          use_subordinate=False):
             return [fake_block_device.FakeDbBlockDeviceDict(
                         {'volume_id': _fake_id('a'),
                          'source_type': 'snapshot',

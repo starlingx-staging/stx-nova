@@ -662,7 +662,7 @@ class ImageCacheManagerTestCase(test.NoDBTestCase):
                 'soft_deleted': True,
             }
             mock_instance_list.assert_called_once_with(
-                ctxt, filters, expected_attrs=[], use_slave=True)
+                ctxt, filters, expected_attrs=[], use_subordinate=True)
 
     def test_store_swap_image(self):
         image_cache_manager = imagecache.ImageCacheManager()
